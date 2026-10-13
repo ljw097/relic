@@ -109,3 +109,14 @@ def test_raw_shellcode():
     f = an.functions[0x1000]
     assert sorted(f.blocks) == [0x1000, 0x1004, 0x1006]
     assert sorted(f.blocks[0x1000].succs) == [0x1004, 0x1006]
+
+
+def test_vulns_use_decompiled_arguments_on_x86_32(vuln32):
+    """cdecl passes arguments on the stack: the format-string and ret2win checks need them."""
+    from relic.analysis import analyze
+    findings = analyze(vuln32).vulns()
+    kinds = {(f.func, f.kind) for f in findings}
+    assert ("show_note", "format-string") in kinds
+    assert ("win", "win-function") in kinds
+    assert ("vuln", "dangerous-call") in kinds
+    assert not any(f.func == "menu" and f.kind == "format-string" for f in findings)   # scanf("%d")

@@ -2,7 +2,7 @@
 
 리버싱과 포너블을 위한 디스어셈블러 / 디컴파일러 (WIP).
 
-현재는 **분석 엔진, CLI, GUI**와 x86-64/x86-32 **디컴파일러**(`relic decompile`)가 동작합니다. GUI 디컴파일 뷰와 다른 아키텍처 리프터는 개발 중입니다.
+현재는 **분석 엔진, CLI, GUI**와 x86-64/x86-32 **디컴파일러**(`relic decompile`, GUI Pseudocode 탭)가 동작합니다. 다른 아키텍처 리프터는 개발 중입니다.
 진행 상황은 [TODO.md](TODO.md), 디컴파일러 설계는 [docs/decompiler-plan.md](docs/decompiler-plan.md)를 참고하세요.
 
 ## 기능
@@ -20,7 +20,7 @@
 | GUI | 함수 목록, 디스어셈블리 / CFG 그래프 / 의사 코드 / 헥스, xref·문자열·import·vulns·checksec 패널 |
 | 디컴파일러 (x86-64, x86-32) | 리프팅 → SSA·최적화 → 호출 인자·스택 버퍼·카나리 → out-of-SSA → 구조화 → C 출력(`relic decompile`) |
 
-> 인자 추적 기반 탐지(포맷 스트링, ret2win)와 점프 테이블 복원은 현재 **x86-64에서만** 동작합니다.
+> 인자 추적 기반 탐지(포맷 스트링, ret2win)는 **x86-64·x86-32**, 점프 테이블 복원은 **x86-64**에서만 동작합니다.
 
 ## 설치
 

@@ -48,10 +48,26 @@ class AnalysisThread(QThread):
         try:
             from ..analysis import analyze
             an = analyze(self.path, self.arch, self.base)
-            extra = {"checksec": an.checksec(), "vulns": an.vulns()}
+            extra = {"checksec": an.checksec()}
             self.done.emit(an, extra)
         except Exception as e:  # noqa: BLE001 - surfaced to the user
             self.failed.emit(f"{type(e).__name__}: {e}\n\n{traceback.format_exc()}")
+
+
+class VulnsThread(QThread):
+    """Runs the pwnable heuristics after the window is up (they may decompile functions)."""
+
+    done = Signal(object)
+
+    def __init__(self, an: Analysis, parent=None):
+        super().__init__(parent)
+        self.an = an
+
+    def run(self):
+        try:
+            self.done.emit(self.an.vulns())
+        except Exception:  # noqa: BLE001 - an empty table beats a crashed GUI
+            self.done.emit([])
 
 
 class Table(QTableView):
@@ -134,6 +150,7 @@ class MainWindow(QMainWindow):
         super().__init__(parent)
         self.an: Analysis | None = None
         self.thread: AnalysisThread | None = None
+        self.vulns_thread: VulnsThread | None = None
         self.cur: int | None = None
         self.back: list[int] = []
         self.fwd: list[int] = []
@@ -258,11 +275,14 @@ class MainWindow(QMainWindow):
         self.thread.start()
 
     def wait(self, ms: int = 60000) -> bool:
-        """Block until a background analysis finishes (for scripts and tests)."""
-        if self.thread is None:
-            return True
-        ok = self.thread.wait(ms)
-        QApplication.processEvents()
+        """Block until a background analysis (and the vulns scan after it) finishes."""
+        ok = True
+        if self.thread is not None:
+            ok = self.thread.wait(ms)
+            QApplication.processEvents()
+        if self.vulns_thread is not None:
+            ok = self.vulns_thread.wait(ms) and ok
+            QApplication.processEvents()
         return ok
 
     def _failed(self, msg: str):
@@ -280,7 +300,14 @@ class MainWindow(QMainWindow):
         self.disasm.func = self.graph.func = None
         self.setWindowTitle(f"Relic - {os.path.basename(an.bin.path)}  [{an.bin.describe()}]")
         self._fill_functions()
-        self._fill_tables(extra.get("checksec") or an.checksec(), extra.get("vulns"))
+        self._fill_tables(extra.get("checksec") or an.checksec())
+        if "vulns" in extra:
+            self._fill_vulns(extra["vulns"])
+        else:
+            self._fill_vulns(None)
+            self.vulns_thread = VulnsThread(an, self)
+            self.vulns_thread.done.connect(self._fill_vulns)
+            self.vulns_thread.start()
         self.statusBar().showMessage(f"{len(an.functions)} functions, {len(an.strings)} strings", 5000)
         main = an.function_by_name("main")
         start = main.addr if main else an.bin.entry
@@ -298,7 +325,20 @@ class MainWindow(QMainWindow):
         t.setSortingEnabled(True)
         t.fit()
 
-    def _fill_tables(self, checksec: dict, vulns):
+    def _fill_vulns(self, vulns):
+        """Fill the Vulns table; None shows that the scan is still running."""
+        self.vulns.setSortingEnabled(False)
+        self.vulns.clear_rows()
+        if vulns is None:
+            self.vulns.add_row(["...", "", "", "", "scanning (call arguments are being decompiled)"])
+            return
+        sev_color = {"high": THEME["jump"], "medium": THEME["label"], "low": THEME["call"]}
+        for v in vulns:
+            self.vulns.add_row([v.severity, v.addr, v.func, v.kind, v.message], v.addr, sev_color.get(v.severity))
+        self.vulns.setSortingEnabled(True)
+        self.vulns.fit()
+
+    def _fill_tables(self, checksec: dict):
         an, b = self.an, self.an.bin
         t = self.strings.table
         t.setSortingEnabled(False)
@@ -322,14 +362,6 @@ class MainWindow(QMainWindow):
         for k, v in checksec.items():
             self.checksec.add_row([k, v])
         self.checksec.fit()
-
-        self.vulns.setSortingEnabled(False)
-        self.vulns.clear_rows()
-        sev_color = {"high": THEME["jump"], "medium": THEME["label"], "low": THEME["call"]}
-        for v in vulns if vulns is not None else an.vulns():
-            self.vulns.add_row([v.severity, v.addr, v.func, v.kind, v.message], v.addr, sev_color.get(v.severity))
-        self.vulns.setSortingEnabled(True)
-        self.vulns.fit()
 
         t = self.info.table
         t.setSortingEnabled(False)
@@ -576,6 +608,8 @@ class MainWindow(QMainWindow):
             return
         if self.thread is not None:
             self.thread.wait()
+        if self.vulns_thread is not None:
+            self.vulns_thread.wait()
         self.decomp.shutdown()
         super().closeEvent(e)
 

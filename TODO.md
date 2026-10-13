@@ -18,7 +18,8 @@
   - ARM: 리터럴 풀 `ldr rN, [pc, #off]`, `add rN, pc, rN`
   - MIPS: `lui` + `addiu`, `$gp` 기준 접근
 - [ ] **P0** 호출 규약별 인자 추출을 `vulns`에서 공통 사용
-  - x64 SysV / Win64, x86 cdecl(스택 `push`, `mov [esp+N]`), AArch64 x0–x7, ARM r0–r3, MIPS a0–a3, RISC-V a0–a7, PPC r3–r10
+  - [x] x64 SysV / Win64, x86 cdecl: 디컴파일러가 복원한 호출 인자 사용 (x64는 블록 안 역추적으로 결론이 안 날 때만; GUI는 창을 먼저 띄우고 백그라운드에서 스캔)
+  - [ ] AArch64 x0–x7, ARM r0–r3, MIPS a0–a3, RISC-V a0–a7, PPC r3–r10 (해당 리프터가 생기면 같은 경로로)
 - [ ] **P1** 점프 테이블: x86-32 PIC(GOT 기준 오프셋), AArch64(`ldrb/ldrh` + `adr` + `add ..., lsl`), ARM(`ldrls pc, [pc, rN, lsl #2]`)
   - 상대 테이블은 후보 기준 주소들을 검증해서 선택
 - [ ] **P1** MIPS: `.MIPS.stubs` / GOT(`DT_MIPS_GOTSYM`, `DT_MIPS_LOCAL_GOTNO`) 기반 import 이름 해석, 지연 슬롯을 블록에 포함
