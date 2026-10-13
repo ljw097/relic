@@ -9,7 +9,7 @@
 
 | 영역 | 상태 |
 |---|---|
-| 로더 | ELF / PE / RAW(셸코드·펌웨어 blob) |
+| 로더 | ELF / PE(import, export, COFF 심볼) / RAW(셸코드·펌웨어 blob) |
 | 디스어셈블 | capstone 기반: x86, x64, ARM, AArch64, MIPS, RISC-V, PPC |
 | 함수 탐색 / CFG | 재귀 하강, noreturn 처리, tail call, x86-64 점프 테이블 복원 |
 | stripped 바이너리 | `__libc_start_main` 인자로 `main` 복구, 프롤로그 스캔, `.init_array` 시드 |

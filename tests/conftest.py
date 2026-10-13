@@ -23,7 +23,11 @@ VARIANTS = {
     "vuln32_pie": ["-m32", "-O1", "-fstack-protector-strong", "-pie", "-fPIE"],
     "flow32_O0": ["-m32", "-O0", "-no-pie"],
     "flow32_O2": ["-m32", "-O2", "-fno-tree-vectorize", "-no-pie"],
+    # Windows PE with MinGW (skipped where the cross compilers are missing)
+    "vuln64_pe": ["-O0"],
+    "vuln32_pe": ["-O0"],
 }
+COMPILERS = {"vuln64_pe": "x86_64-w64-mingw32-gcc", "vuln32_pe": "i686-w64-mingw32-gcc"}
 SOURCES = {"flow_O0": FLOW_SRC, "flow_O2": FLOW_SRC, "flow32_O0": FLOW_SRC, "flow32_O2": FLOW_SRC}
 
 
@@ -32,9 +36,9 @@ def _build(name: str) -> str:
     src_path = SOURCES.get(name, SRC)
     if os.path.exists(out) and os.path.getmtime(out) >= os.path.getmtime(src_path) and not name.endswith("_stripped"):
         return out
-    cc = shutil.which("gcc") or shutil.which("cc")
+    cc = shutil.which(COMPILERS[name]) if name in COMPILERS else (shutil.which("gcc") or shutil.which("cc"))
     if cc is None:
-        pytest.skip("no C compiler available")
+        pytest.skip(f"no C compiler for {name}")
     os.makedirs(BINS, exist_ok=True)
     if name.endswith("_stripped"):
         src = _build(name[: -len("_stripped")])
@@ -86,3 +90,5 @@ vuln32 = _fixture("vuln32")
 vuln32_pie = _fixture("vuln32_pie")
 flow32_O0 = _fixture("flow32_O0")
 flow32_O2 = _fixture("flow32_O2")
+vuln64_pe = _fixture("vuln64_pe")
+vuln32_pe = _fixture("vuln32_pe")

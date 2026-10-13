@@ -123,6 +123,8 @@ def find_vulns(an: "Analysis") -> list[Finding]:
     b = an.bin
     out: list[Finding] = []
     ir_cache: dict = {}
+    # integer argument registers of the binary's calling convention (SysV or Win64)
+    regs = ("rcx", "rdx", "r8", "r9") if b.format == "PE" else X64_ARGS
     for f in an.functions.values():
         if f.is_import:
             continue
@@ -156,7 +158,8 @@ def find_vulns(an: "Analysis") -> list[Finding]:
                     return _arg_state(args, k)
 
                 if base in FORMAT_ARG:
-                    state, val = arg(FORMAT_ARG[base], X64_ARGS[FORMAT_ARG[base]])
+                    k = FORMAT_ARG[base]
+                    state, val = arg(k, regs[k] if k < len(regs) else "")
                     fmt = b.read_cstring(val) if state == "const" and val else None
                     if state == "var" or (state == "const" and fmt is None):
                         if "scanf" not in base:
@@ -169,7 +172,7 @@ def find_vulns(an: "Analysis") -> list[Finding]:
                         out.append(Finding(i.addr, f.name, "medium", "format-string",
                                            f"{base}() format string lives in writable memory"))
                 if base in ("system", "execve", "execl", "execv", "popen"):
-                    state, val = arg(0, "rdi")
+                    state, val = arg(0, regs[0])
                     cmd = b.read_cstring(val) if state == "const" and val else None
                     if cmd and ("/sh" in cmd or "cat " in cmd or "flag" in cmd):
                         out.append(Finding(f.addr, f.name, "info", "win-function",
