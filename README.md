@@ -18,7 +18,7 @@
 | 포너블 휴리스틱 | `gets`·`strcpy` 등 위험 함수, 비상수 포맷 스트링, 폭 없는 `scanf("%s")`, ret2win 후보 |
 | 프로젝트 | 이름 변경·주석을 `<binary>.relic.json`에 저장 |
 | GUI | 함수 목록, 디스어셈블리 / CFG 그래프 / 헥스, xref·문자열·import·vulns·checksec 패널 |
-| 디컴파일러 | 설계 단계 |
+| 디컴파일러 | 단계 1: x86/x64 → IR 리프팅 (`relic ir`), 이후 단계는 설계 중 |
 
 > 인자 추적 기반 탐지(포맷 스트링, ret2win)와 점프 테이블 복원은 현재 **x86-64에서만** 동작합니다.
 
@@ -44,6 +44,7 @@ relic strings   ./chall
 relic imports   ./chall
 relic xrefs     ./chall menu
 relic vulns     ./chall              # 포너블 휴리스틱
+relic ir        ./chall vuln         # 디컴파일러 IR (디버깅용)
 relic disasm    sc.bin --arch x64 --base 0x1000 -n 30   # RAW blob
 ```
 
@@ -100,6 +101,7 @@ relic/
   loader/      ELF / PE / RAW → 공통 Binary 모델 (섹션, 세그먼트, 심볼, import, 재배치)
   disasm.py    capstone 래퍼, 명령어 분류(call/jmp/cjmp/ret/halt), 분기 대상·데이터 참조 추출
   analysis/    함수 탐색·CFG(functions), 문자열, checksec, 취약점 휴리스틱, xref, 프로젝트 저장
+  decompiler/  IR, 리프터(x86/x64), IR 인터프리터 — 디컴파일러 파이프라인
   listing.py   심볼/문자열 주석이 붙은 디스어셈블리 리스팅 (CLI·GUI 공용)
   gui/         PySide6 메인 윈도우와 뷰 위젯
   __main__.py  CLI

@@ -1,6 +1,6 @@
 # 디컴파일러 계획
 
-상태: 설계 단계 (코드 없음). 이 문서는 구현 순서와 모듈 경계를 정한다.
+상태: 단계 1 완료 (IR + x86/x64 리프터, `relic/decompiler/`). 이 문서는 구현 순서와 모듈 경계를 정한다.
 
 ## 목표
 
@@ -53,6 +53,7 @@ relic/decompiler/
   structure.py    제어 흐름 구조화
   types.py        타입 추론
   emit.py         C 출력
+  interp.py       IR 인터프리터 (리프팅·최적화 패스의 의미 보존 테스트용)
 ```
 
 `relic.analysis`는 디컴파일러를 몰라도 동작해야 한다. 의존 방향은 `decompiler → analysis → disasm → loader`.
@@ -65,6 +66,8 @@ relic/decompiler/
 - **문장(Stmt)**: `Assign(dst, expr)`, `Store(addr, expr, bits)`, `Branch(cond, true, false)`, `Jump(target)`, `IndirectJump(expr, targets)`, `CallStmt(call)`, `Return(expr?)`, `Unknown(insn)`
 - 각 문장에 원래 명령어 주소를 붙여 GUI에서 디스어셈블리와 연결한다.
 - 플래그는 처음에 개별 레지스터(`ZF`, `CF`, `SF`, `OF`)로 리프팅하고, 최적화 단계에서 `cmp`/`test`와 조건 분기를 하나의 비교식으로 합친다.
+- 구현 메모(단계 1): 위 목록 외에 `Extract`(상위 바이트 레지스터 등), `Ite`(cmov), `Intrinsic`(parity, SIMD 등 정밀하게 모델링하지 않는 연산), `Effect`(hlt, syscall 등) 를 추가했다. `PF`도 1비트 레지스터로 둔다. 명령어가 정의하지 않는(undefined) 플래그는 대입하지 않는다.
+- 오버플로 플래그는 `carry`/`scarry`/`sborrow` 연산자로 표현해서 `cmp a, b; jl` 의 `SF != OF` 를 나중에 `a <s b` 로 접을 수 있게 한다.
 
 ## 2. 리프팅
 

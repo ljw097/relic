@@ -28,3 +28,8 @@ def test_checksec_and_xrefs(capsys, vuln64):
 def test_cfg_dot(capsys, vuln64):
     out = run(capsys, "cfg", vuln64, "classify")
     assert out.startswith('digraph "classify"') and out.count("->") >= 8
+
+
+def test_ir(capsys, vuln64):
+    out = run(capsys, "ir", vuln64, "classify")
+    assert out.startswith("function classify @") and "goto *rax" in out and "__asm" not in out
