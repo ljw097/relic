@@ -15,7 +15,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 
 from .arch import ArchInfo
-from .ir import (Assign, BinOp, CallStmt, Const, Expr, IRFunction, Load, Reg, Return, Store, Var,
+from .ir import (Assign, BinOp, CallStmt, Const, Expr, IRFunction, Load, Phi, Reg, Return, Store, Var,
                  stmt_exprs, walk)
 
 _CANARY_OFF = 0x28  # glibc thread-pointer offset of the stack guard
@@ -53,11 +53,20 @@ class Frame:
     spoff: dict[Var, int] = field(default_factory=dict)   # sp-derived var -> offset from entry sp
     slots: dict[int, Slot] = field(default_factory=dict)
     canary: int | None = None
+    realigned: bool = False   # `and esp, -16` seen: offsets below it are approximate
 
     def offset_of(self, e: Expr) -> int | None:
         """Signed frame offset if `e` is a stack address, else None."""
         if isinstance(e, Var):
             return self.spoff.get(e)
+        if isinstance(e, BinOp) and e.op == "&" and isinstance(e.b, Const) and e.b.signed < 0 \
+                and (-e.b.signed) & (-e.b.signed - 1) == 0:
+            # stack realignment (`and esp, -16`, 32-bit main): the padding it adds is unknown
+            # (0..15 bytes); count it as none so the frame stays analysable
+            base = self.offset_of(e.a)
+            if base is not None:
+                self.realigned = True
+            return base
         if isinstance(e, BinOp) and e.op in ("+", "-"):
             if isinstance(e.b, Const):
                 base = self.offset_of(e.a)
@@ -87,6 +96,11 @@ def _is_canary(e: Expr) -> bool:
 
 
 def _build_spoff(fn: IRFunction, arch: ArchInfo) -> dict[Var, int]:
+    return build_frame(fn, arch).spoff
+
+
+def build_frame(fn: IRFunction, arch: ArchInfo) -> Frame:
+    """A frame with every stack-pointer-derived variable's offset (no slots yet)."""
     spoff: dict[Var, int] = {}
     for s in fn.stmts():
         for top in stmt_exprs(s):
@@ -99,15 +113,31 @@ def _build_spoff(fn: IRFunction, arch: ArchInfo) -> dict[Var, int]:
         changed = False
         for s in fn.stmts():
             if isinstance(s, Assign) and isinstance(s.dst, Var) and s.dst not in spoff:
-                off = frame.offset_of(s.src)
+                if isinstance(s.src, Phi):
+                    # the stack pointer merged at a join (loop header): balanced paths agree.
+                    # Optimistic -- a source still unknown (computed from this phi around the
+                    # loop) is assumed to agree with the known ones
+                    offs = {frame.offset_of(v) for _, v in s.src.sources} - {None}
+                    off = offs.pop() if len(offs) == 1 else None
+                else:
+                    off = frame.offset_of(s.src)
                 if off is not None:
                     spoff[s.dst] = off
                     changed = True
-    return spoff
+    return frame
+
+
+def _frame_bookkeeping(frame: Frame, value: Expr) -> bool:
+    """The return address, or a pointer into the caller's frame (the incoming stack pointer)."""
+    if isinstance(value, Load) and frame.offset_of(value.addr) == 0:
+        return True
+    off = frame.offset_of(value)
+    return off is not None and off > 0
 
 
 def analyze_frame(fn: IRFunction, arch: ArchInfo) -> Frame:
-    frame = Frame(arch, _build_spoff(fn, arch))
+    frame = build_frame(fn, arch)
+    realign_entry = frame.realigned
     saved = _callee_saved(arch)
 
     def slot(off: int) -> Slot:
@@ -132,6 +162,10 @@ def analyze_frame(fn: IRFunction, arch: ArchInfo) -> Frame:
                     sl.kind, frame.canary = "canary", off
                 elif isinstance(s.src, Var) and s.src.version == 0 and s.src.name in saved and sl.kind == "local":
                     sl.kind, sl.saved_reg = "saved", s.src.name
+                elif realign_entry and sl.kind == "local" and _frame_bookkeeping(frame, s.src):
+                    # realigning prologue: keeps a copy of the return address and of the
+                    # incoming stack pointer (`push [ecx-4]`, `push ecx`)
+                    sl.kind, sl.saved_reg = "saved", "frame"
         # escaping addresses: call arguments, stored pointers, returned pointers
         escaped: list[Expr] = []
         if isinstance(s, CallStmt):

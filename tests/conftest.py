@@ -18,8 +18,13 @@ VARIANTS = {
     # control-flow sample, unoptimised and optimised (no vectorising: SIMD is not modelled precisely)
     "flow_O0": ["-O0", "-no-pie"],
     "flow_O2": ["-O2", "-fno-tree-vectorize", "-no-pie"],
+    # x86-32 (cdecl, PC thunks); skipped where no -m32 toolchain is installed
+    "vuln32": ["-m32", "-O0", "-fno-stack-protector", "-no-pie"],
+    "vuln32_pie": ["-m32", "-O1", "-fstack-protector-strong", "-pie", "-fPIE"],
+    "flow32_O0": ["-m32", "-O0", "-no-pie"],
+    "flow32_O2": ["-m32", "-O2", "-fno-tree-vectorize", "-no-pie"],
 }
-SOURCES = {"flow_O0": FLOW_SRC, "flow_O2": FLOW_SRC}
+SOURCES = {"flow_O0": FLOW_SRC, "flow_O2": FLOW_SRC, "flow32_O0": FLOW_SRC, "flow32_O2": FLOW_SRC}
 
 
 def _build(name: str) -> str:
@@ -68,3 +73,16 @@ def flow_O0() -> str:
 @pytest.fixture(scope="session")
 def flow_O2() -> str:
     return _build("flow_O2")
+
+
+def _fixture(name):
+    def f() -> str:
+        return _build(name)
+    f.__name__ = name
+    return pytest.fixture(scope="session")(f)
+
+
+vuln32 = _fixture("vuln32")
+vuln32_pie = _fixture("vuln32_pie")
+flow32_O0 = _fixture("flow32_O0")
+flow32_O2 = _fixture("flow32_O2")

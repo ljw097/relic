@@ -196,11 +196,6 @@ def _divisibility(full: Expr, x: Expr) -> Expr | None:
 
 def recover_division(fn: IRFunction) -> int:
     """Rewrite division / remainder sequences by constants (non-SSA input, in place)."""
-    defs: dict[str, int] = {}
-    for st in fn.stmts():
-        for d in stmt_defs(st):
-            if isinstance(d, (Var, StackVar)):
-                defs[d.name] = defs.get(d.name, 0) + 1
     count = 0
     for b in fn.blocks.values():
         avail: dict[Expr, Expr] = {}        # single-def variable -> its definition (one level)
@@ -259,8 +254,10 @@ def recover_division(fn: IRFunction) -> int:
                 lv = _leaves(avail[k])
                 if k in written or lv & written or (clobbers_memory and any(isinstance(n, StackVar) for n in lv)):
                     del avail[k]
-            if isinstance(st, Assign) and isinstance(st.dst, Var) and defs.get(st.dst.name) == 1 \
-                    and _pure(st.src):
+            # a definition stays usable until something it reads (or its target) is written again;
+            # one that reads its own target (`x = x / 10`) cannot be substituted for it
+            if isinstance(st, Assign) and isinstance(st.dst, Var) and _pure(st.src) \
+                    and st.dst not in _leaves(st.src):
                 avail[st.dst] = st.src
     return count
 

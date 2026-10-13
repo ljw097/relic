@@ -617,3 +617,29 @@ def _resolve_const(e: Expr, defs: dict, depth: int = 4):
         if isinstance(d, Expr):
             return _resolve_const(d, defs, depth - 1)
     return None
+
+
+def drop_stack_pointer_chains(fn: IRFunction, frame: Frame) -> int:
+    """Remove stack-pointer arithmetic nothing but more stack-pointer arithmetic reads (SSA input).
+
+    Once arguments and locals are named, `esp` bookkeeping around calls survives
+    only as a cycle through the loop-header phi (`v2 = v5 + 16`), which plain
+    DCE keeps alive. Liveness here starts from every other statement.
+    """
+    sp_defs = {s.dst: s for s in fn.stmts() if isinstance(s, Assign) and s.dst in frame.spoff}
+    live: set = set()
+    for s in fn.stmts():
+        if isinstance(s, Assign) and s.dst in sp_defs:
+            continue
+        live |= {x for e in stmt_exprs(s) for x in walk(e) if isinstance(x, Var)}
+    work = [v for v in live if v in sp_defs]
+    while work:
+        for x in walk(sp_defs[work.pop()].src):
+            if isinstance(x, Var) and x not in live:
+                live.add(x)
+                if x in sp_defs:
+                    work.append(x)
+    dead = {v for v in sp_defs if v not in live}
+    for b in fn.blocks.values():
+        b.stmts = [s for s in b.stmts if not (isinstance(s, Assign) and s.dst in dead)]
+    return len(dead)

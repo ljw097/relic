@@ -148,6 +148,17 @@ def _simp_node(e: Expr) -> Expr:
         return e.a
     elif isinstance(e, Cast) and e.a.bits == e.bits:
         return e.a
+    elif isinstance(e, Cast) and e.kind == "low" and isinstance(e.a, BinOp) and e.a.op in ("|", "^", "+"):
+        # low_n((x & C) | y) == low_n(y) when C keeps none of the low n bits (a partial register
+        # write such as `setle bl` merging into ebx)
+        def high_only(t):
+            return isinstance(t, BinOp) and t.op == "&" and _droppable(t) and \
+                any(isinstance(k, Const) and k.value & mask(e.bits) == 0 for k in (t.a, t.b))
+        a, b = e.a.a, e.a.b
+        if high_only(a):
+            return Cast("low", b, e.bits) if b.bits > e.bits else b
+        if high_only(b):
+            return Cast("low", a, e.bits) if a.bits > e.bits else a
     elif isinstance(e, Cast) and e.kind == "low" and isinstance(e.a, Cast) and e.bits <= e.a.a.bits:
         # low_n(cast_m(x)) == low_n(x) when x is at least n bits wide
         return Cast("low", e.a.a, e.bits)

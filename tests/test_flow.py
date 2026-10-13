@@ -78,7 +78,7 @@ int main(void) {
 """
 
 
-@pytest.fixture(scope="module", params=["flow_O0", "flow_O2"])
+@pytest.fixture(scope="module", params=["flow_O0", "flow_O2", "flow32_O0", "flow32_O2"])
 def flow(request):
     path = request.getfixturevalue(request.param)
     return request.param, analyze(path)
@@ -103,7 +103,8 @@ def test_flow_recompiles_and_matches_source(flow, tmp_path):
     src = tmp_path / "re.c"
     src.write_text(_HARNESS % {"code": code, "defines": defines, "src": os.path.join(HERE, "src", "flow.c")})
     exe = tmp_path / "re"
-    r = subprocess.run([cc, "-w", "-fwrapv", "-o", str(exe), str(src)], capture_output=True, text=True)
+    m32 = ["-m32"] if name.startswith("flow32") else []
+    r = subprocess.run([cc, *m32, "-w", "-fwrapv", "-o", str(exe), str(src)], capture_output=True, text=True)
     assert r.returncode == 0, f"{name}: pseudocode does not compile:\n{r.stderr[:3000]}\n{code}"
     r = subprocess.run([str(exe)], capture_output=True, text=True, timeout=60)
     assert r.stdout.strip().endswith("ok"), f"{name}: mismatches:\n{r.stdout[:3000]}\n{code}"

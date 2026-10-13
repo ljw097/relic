@@ -159,6 +159,11 @@ class CWriter:
             sym = self.symbol(addr.value)
             if sym:
                 return sym
+        if isinstance(addr, Load) and isinstance(addr.addr, Const):
+            # through a GOT slot: `*(*(stdout@got))` is the imported object itself
+            imp = self.an.bin.imports_by_got.get(addr.addr.value)
+            if imp is not None and imp.name:
+                return base_name(imp.name)
         idx = self._indexed(addr, size)
         if idx is not None:
             base, i = idx
@@ -470,7 +475,11 @@ class CWriter:
         used = {x.name for s in self.p.fn.stmts() for top in ir.stmt_exprs(s) for x in ir.walk(top)
                 if isinstance(x, (StackVar, StackAddr))}
         used |= {d.name for s in self.p.fn.stmts() for d in ir.stmt_defs(s) if isinstance(d, StackVar)}
+        if frame.realigned:
+            self.emit("// stack realigned on entry: ret-relative offsets are approximate", None, depth)
         for slot in frame.locals():
+            if slot.name() in self.p.params:
+                continue                       # a stack parameter: declared in the signature
             if slot.kind == "canary":
                 self.emit(f"// stack canary at ret-{-slot.offset:#x} (check hidden)", None, depth)
                 continue
@@ -484,7 +493,8 @@ class CWriter:
             else:
                 t = self.types.get(gen) or CType(int_type(slot.width * 8))
                 self.emit(f"{t.decl(name)};  {where}", None, depth)
-        regs = sorted({v for v in self.names if v.startswith("v")}, key=lambda n: int(self.names[n][1:]))
+        regs = sorted({v for v in self.names if v.startswith("v") and v not in self.p.params},
+                      key=lambda n: int(self.names[n][1:]))
         for v in regs:
             t = self.types.get(v)
             if t is not None:

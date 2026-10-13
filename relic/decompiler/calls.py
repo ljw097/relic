@@ -114,6 +114,88 @@ def _set_before_call(fn: IRFunction, argregs, uses: dict, params=()) -> list[str
     return out
 
 
+# ------------------------------------------------------------------ cdecl (x86-32)
+def stack_param_count(an: "Analysis", arch: ArchInfo, target: int) -> int:
+    """How many 4-byte stack parameters an internal cdecl callee reads (`[esp_0 + 4k]`)."""
+    cache = getattr(an, "_stack_params", None)
+    if cache is None:
+        cache = an._stack_params = {}
+    if target in cache:
+        return cache[target]
+    cache[target] = 0          # recursion guard
+    f = an.functions.get(target)
+    if f is None or f.is_import:
+        return 0
+    from .lift import lift_function
+    from .ssa import to_ssa
+    from .stack import _build_spoff, Frame
+    try:
+        ssa = to_ssa(lift_function(an, f), arch)
+    except Exception:
+        return 0
+    frame = Frame(arch, _build_spoff(ssa, arch))
+    from .ir import Load
+    word = arch.bits // 8
+    top = 0
+    for st in ssa.stmts():
+        for e in stmt_exprs(st):
+            for x in walk(e):
+                if isinstance(x, Load):
+                    off = frame.offset_of(x.addr)
+                    if off is not None and off > 0:
+                        top = max(top, (off + x.bits // 8 + word - 1) // word - 1)
+    cache[target] = top
+    return top
+
+
+def _recover_cdecl(fn: IRFunction, an: "Analysis", arch: ArchInfo):
+    """Arguments of x86-32 calls: the values stored at [esp], [esp+4], ... before the call."""
+    from .ir import Store
+    from .stack import Frame, _build_spoff
+    frame = Frame(arch, _build_spoff(fn, arch))
+    word = arch.bits // 8
+    for b in fn.blocks.values():
+        consumed: set[int] = set()
+        for k, s in enumerate(b.stmts):
+            if not isinstance(s, CallStmt) or s.call.args:
+                continue
+            sp = dict(s.uses).get(arch.sp)
+            base = frame.offset_of(sp) if sp is not None else None
+            if base is None:
+                continue
+            # most recent store to each argument slot since the previous call in this block
+            stores: dict[int, int] = {}
+            for j in range(k - 1, -1, -1):
+                t = b.stmts[j]
+                if isinstance(t, CallStmt):
+                    break
+                if isinstance(t, Store):
+                    off = frame.offset_of(t.dst)
+                    if off is not None and off >= base and (off - base) % word == 0 and off not in stores:
+                        stores[off] = j
+            tgt = s.call.target.value if isinstance(s.call.target, Const) else None
+            sig = lookup(s.name or (an.name(tgt) if tgt is not None else None))
+            f = an.functions.get(tgt) if tgt is not None else None
+            if sig is not None:
+                fmt_val = b.stmts[stores[base + sig.fmt * word]].src \
+                    if sig.fmt is not None and base + sig.fmt * word in stores else None
+                n = arg_count(sig, _read_format(an, fmt_val))
+            elif f is not None and not f.is_import:
+                n = stack_param_count(an, arch, tgt)
+            else:
+                n = 0
+                while base + n * word in stores:
+                    n += 1
+            idx = [stores.get(base + a * word) for a in range(n)]
+            if any(i is None for i in idx):
+                idx = idx[:idx.index(None)]
+            s.call = Call(s.call.target, tuple(b.stmts[i].src for i in idx), s.call.bits)
+            s.uses = []          # the stack pointer only located the arguments
+            consumed |= set(idx)
+        if consumed:
+            b.stmts = [t for j, t in enumerate(b.stmts) if j not in consumed]
+
+
 def recover_calls(fn: IRFunction, an: "Analysis", arch: ArchInfo) -> IRFunction:
     """Fill in `Call.args` for every call (mutates and returns `fn`).
 
@@ -121,6 +203,9 @@ def recover_calls(fn: IRFunction, an: "Analysis", arch: ArchInfo) -> IRFunction:
     argument registers, and calls with neither (unknown imports, function
     pointers) the registers the caller visibly set up for them.
     """
+    if arch.name == "x86-cdecl":
+        _recover_cdecl(fn, an, arch)
+        return fn
     argregs = int_arg_regs(arch)
     own: list[str] | None = None
     for b in fn.blocks.values():
