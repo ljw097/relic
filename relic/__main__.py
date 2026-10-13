@@ -11,6 +11,7 @@
     relic xrefs FILE WHERE        cross references to an address or symbol
     relic vulns FILE              pwnable heuristics (dangerous calls, format strings, ...)
     relic ir FILE [WHERE]         decompiler IR of a function (debugging aid)
+    relic opt FILE [WHERE]        optimised SSA IR, with strings/xrefs resolved
 """
 from __future__ import annotations
 
@@ -19,7 +20,8 @@ import sys
 
 from . import __version__
 
-COMMANDS = ("info", "checksec", "funcs", "disasm", "cfg", "strings", "imports", "xrefs", "vulns", "ir", "gui")
+COMMANDS = ("info", "checksec", "funcs", "disasm", "cfg", "strings", "imports", "xrefs", "vulns", "ir", "opt",
+            "gui")
 
 
 def _parser() -> argparse.ArgumentParser:
@@ -46,10 +48,14 @@ def _parser() -> argparse.ArgumentParser:
     add("cfg", "control-flow graph (Graphviz dot)", where=True, where_required=True)
     s = add("strings", "strings in data sections")
     s.add_argument("-m", "--min", type=int, default=4)
+    s.add_argument("-g", "--grep", help="only strings containing this substring (case-insensitive)")
     add("imports", "imported and exported symbols")
     add("xrefs", "cross references to an address/symbol", where=True, where_required=True)
     add("vulns", "pwnable heuristics")
     add("ir", "decompiler IR of a function", where=True)
+    s = add("opt", "optimised SSA IR with strings/xrefs resolved", where=True)
+    s.add_argument("--no-opt", action="store_true", help="show SSA before the optimisation passes")
+    s.add_argument("--xrefs", action="store_true", help="also list the function's constant references")
     g = sub.add_parser("gui", help="open the GUI")
     g.add_argument("file", nargs="?")
     g.add_argument("--arch", help="architecture for raw blobs (x86, x64, arm, arm64, mips, ...)")
@@ -146,7 +152,10 @@ def cmd_strings(args):
     from .analysis.strings import escape, find_strings
     from .loader import load
     b = load(args.file, args.arch, args.base)
+    needle = args.grep.lower() if args.grep else None
     for s in find_strings(b, args.min):
+        if needle is not None and needle not in s.value.lower():
+            continue
         enc = "" if s.encoding == "ascii" else f" ({s.encoding})"
         print(f"{s.addr:#x}  {s.section:12} \"{escape(s.value, 200)}\"{enc}")
 
@@ -198,6 +207,27 @@ def cmd_ir(args):
         print(lift(an, f))
     except NotImplementedError as e:
         sys.exit(f"relic: {e}")
+
+
+def cmd_opt(args):
+    from .decompiler import decompile_ir
+    from .decompiler.refs import format_ir, ir_xrefs
+    an = _analyze(args)
+    f = an.function_at(_where(an, args.where))
+    if f is None:
+        sys.exit("relic: no function there")
+    if f.is_import:
+        sys.exit(f"relic: {an.name(f.addr)} is an imported function")
+    try:
+        fn = decompile_ir(an, f, optimize=not args.no_opt)
+    except NotImplementedError as e:
+        sys.exit(f"relic: {e}")
+    print(format_ir(fn, an))
+    if args.xrefs:
+        refs = ir_xrefs(fn, an)
+        print("\n; references:" if refs else "\n; no constant references")
+        for r in refs:
+            print(f";   {r.frm:#x}  {r.kind:6} -> {an.label(r.to)}")
 
 
 def cmd_gui(args):

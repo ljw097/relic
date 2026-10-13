@@ -1,6 +1,6 @@
 # 디컴파일러 계획
 
-상태: 단계 1 완료 (IR + x86/x64 리프터, `relic/decompiler/`). 이 문서는 구현 순서와 모듈 경계를 정한다.
+상태: 단계 2 완료 (SSA + 최적화 패스 + 인터프리터 SSA 실행, `relic/decompiler/`). 이 문서는 구현 순서와 모듈 경계를 정한다.
 
 ## 목표
 
@@ -47,7 +47,8 @@ relic/decompiler/
     __init__.py   리프터 선택
     x86.py        x86 / x64
   ssa.py          지배자, phi 삽입, 이름 부여
-  passes.py       상수/복사 전파, DCE, 조건식 결합
+  passes.py       상수/복사 전파, load 전달, 조건식 복원, DCE (구현됨)
+  refs.py         IR 문자열/교차참조 추출, 주석 포함 출력 (구현됨)
   calls.py        호출 규약, 인자/반환값
   stack.py        스택 프레임 → 지역 변수
   structure.py    제어 흐름 구조화
@@ -83,6 +84,13 @@ relic/decompiler/
 - phi 삽입: 지배 경계 기반, 이름 부여는 지배자 트리 순회.
 - 패스(고정점까지 반복): 상수 전파, 복사 전파, 식 단순화(`x ^ x → 0`, `x + 0 → x`), 플래그 결합, 죽은 코드 제거.
 - 메모리는 처음에는 단일 메모리 상태로 보고, 스택 슬롯만 분리한다(4단계).
+- 구현 메모(단계 2, `passes.py`):
+  - 전파는 SSA 지배 성질을 이용한다. 순수(load·call 없음) 정의는 어디에나 치환하고, load를 포함한 단일 사용 정의는 같은 블록 안에서 메모리 장벽(Store/Call/Effect/Unknown)을 넘지 않을 때만 사용처로 끌어온다(`_forward_loads`).
+  - 플래그 복원: `cmp a, b`가 남긴 `SF = (a-b) <s 0`, `OF = sborrow(a, b)`, `ZF = (a-b) == 0`, `CF = a <u b` 패턴을 인식해 조건식(`jcc`/`setcc`)을 `a <s b`, `a <=u b` 등으로 접는다. `!`는 비교식 안으로 밀어 넣어 `!(a < b) → b <= a`로 읽기 쉽게 만든다.
+  - 상수 폴딩과 인터프리터는 `apply_binop`/`apply_unop`/`apply_cast`를 공유해 의미가 어긋나지 않게 한다.
+  - DCE는 순수한 죽은 대입만 제거하고(Store/Call/Effect/Unknown은 유지), 부작용 있는 문장은 죽은 def 항목만 떼어낸다.
+- 검증: 인터프리터가 SSA(phi, 호출 use/def, version-0 → 진입 레지스터)를 실행한다. 패스 전후의 함수를 같은 입력으로 돌려 결과·메모리를 비교한다(`tests/test_passes.py`).
+- 문자열·교차참조: 최적화된 IR에서도 상수가 가리키는 문자열·심볼을 그대로 보이게 한다(`refs.py`의 `ir_xrefs`, `format_ir`; CLI `relic opt`).
 
 ## 4. 호출과 스택
 
@@ -112,8 +120,8 @@ relic/decompiler/
 
 | 단계 | 내용 | 완료 조건 |
 |---|---|---|
-| 1 | IR + x86-64 리프터 | `vuln64.out`의 모든 함수가 `Unknown` 없이 리프팅됨 |
-| 2 | SSA + 최적화 패스 | `checksum` 루프의 계산식이 `h = h * 31 + s[i]` 형태로 접힘 |
+| 1 | IR + x86-64 리프터 | `vuln64.out`의 모든 함수가 `Unknown` 없이 리프팅됨 ✅ |
+| 2 | SSA + 최적화 패스 | `checksum` 루프의 계산식이 `h = h * 31 + s[i]`((h<<5)-h + sext(s[i])) 형태로 접힘 ✅ |
 | 3 | 호출·스택 | `vuln`에서 `gets(buf)`와 `char buf[...]` 크기, `printf("hello %s (%d)\n", buf, checksum(buf))` 복원 |
 | 4 | 구조화 | `main`의 `for (;;)` 메뉴 루프, `classify`의 `switch`가 goto 없이 출력 |
 | 5 | 타입·출력 정리 | `-O0`/`-O1`/PIE 변형 모두에서 위 결과 유지 |
