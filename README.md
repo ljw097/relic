@@ -2,7 +2,7 @@
 
 리버싱과 포너블을 위한 디스어셈블러 / 디컴파일러 (WIP).
 
-현재는 **분석 엔진과 CLI**가 동작하고, GUI와 디컴파일러는 개발 중입니다.
+현재는 **분석 엔진, CLI, GUI**가 동작하고, 디컴파일러는 개발 중입니다.
 진행 상황은 [TODO.md](TODO.md), 디컴파일러 설계는 [docs/decompiler-plan.md](docs/decompiler-plan.md)를 참고하세요.
 
 ## 기능
@@ -17,7 +17,7 @@
 | checksec | ELF: RELRO / Canary / NX / PIE / FORTIFY / RPATH, PE: ASLR / DEP / CFG / SEH / GS |
 | 포너블 휴리스틱 | `gets`·`strcpy` 등 위험 함수, 비상수 포맷 스트링, 폭 없는 `scanf("%s")`, ret2win 후보 |
 | 프로젝트 | 이름 변경·주석을 `<binary>.relic.json`에 저장 |
-| GUI | 뷰 위젯(디스어셈블리 / CFG 그래프 / 헥스)만 있음, 메인 윈도우 미구현 |
+| GUI | 함수 목록, 디스어셈블리 / CFG 그래프 / 헥스, xref·문자열·import·vulns·checksec 패널 |
 | 디컴파일러 | 설계 단계 |
 
 > 인자 추적 기반 탐지(포맷 스트링, ret2win)와 점프 테이블 복원은 현재 **x86-64에서만** 동작합니다.
@@ -58,6 +58,27 @@ $ relic vulns vuln64.out
 [info  ] 0x401296 win                  win-function    win runs system("/bin/sh") - ret2win target?
 ```
 
+## GUI
+
+```sh
+relic ./chall                        # 또는 relic gui ./chall
+relic sc.bin --arch x64 --base 0x1000
+```
+
+| 키 | 동작 |
+|---|---|
+| `G` | 주소 / 심볼로 이동 |
+| `Esc`, `Alt+←` / `Ctrl+Enter`, `Alt+→` | 뒤로 / 앞으로 |
+| `Space` | 리스팅 ↔ 그래프 전환 |
+| `Ctrl+H` | 헥스 뷰 |
+| `Ctrl+F` | 함수 필터 |
+| `N` | 이름 변경 (함수·라벨, 또는 커서 줄의 호출 대상) |
+| `;` | 주석 |
+| `X` | xref 패널 |
+| `Ctrl+S` | 프로젝트 저장 (`<binary>.relic.json`) |
+
+더블클릭으로 분기 대상·심볼을 따라갑니다. 문자열 테이블에서 더블클릭하면 그 문자열을 참조하는 코드로 이동합니다.
+
 ## 라이브러리로 사용
 
 ```python
@@ -80,7 +101,7 @@ relic/
   disasm.py    capstone 래퍼, 명령어 분류(call/jmp/cjmp/ret/halt), 분기 대상·데이터 참조 추출
   analysis/    함수 탐색·CFG(functions), 문자열, checksec, 취약점 휴리스틱, xref, 프로젝트 저장
   listing.py   심볼/문자열 주석이 붙은 디스어셈블리 리스팅 (CLI·GUI 공용)
-  gui/         PySide6 뷰 위젯
+  gui/         PySide6 메인 윈도우와 뷰 위젯
   __main__.py  CLI
 tests/
   src/vuln.c   테스트용 포너블 샘플 (테스트 실행 시 tests/bins/에 빌드)
@@ -92,7 +113,7 @@ tests/
 .venv/bin/pytest -q
 ```
 
-gcc가 있으면 `tests/src/vuln.c`를 여러 변형(no-PIE, PIE+보호기법, strip)으로 빌드해 검증합니다. 컴파일러가 없으면 해당 테스트는 skip됩니다.
+gcc가 있으면 `tests/src/vuln.c`를 여러 변형(no-PIE, PIE+보호기법, strip)으로 빌드해 검증합니다. 컴파일러가 없으면 해당 테스트는 skip됩니다. GUI 테스트는 `QT_QPA_PLATFORM=offscreen`으로 실행되며, Qt 시스템 라이브러리(libEGL 등)가 없으면 skip됩니다.
 
 ## 라이선스
 

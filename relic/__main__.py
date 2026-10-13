@@ -50,6 +50,8 @@ def _parser() -> argparse.ArgumentParser:
     add("vulns", "pwnable heuristics")
     g = sub.add_parser("gui", help="open the GUI")
     g.add_argument("file", nargs="?")
+    g.add_argument("--arch", help="architecture for raw blobs (x86, x64, arm, arm64, mips, ...)")
+    g.add_argument("--base", type=lambda v: int(v, 0), default=0, help="load address for raw blobs")
     return p
 
 
@@ -187,7 +189,7 @@ def cmd_gui(args):
         from .gui import run
     except ImportError as e:
         sys.exit(f"relic: GUI unavailable ({e}). Install PySide6.")
-    return run(getattr(args, "file", None))
+    return run(args.file, args.arch, args.base)
 
 
 def main(argv: list[str] | None = None) -> int:
