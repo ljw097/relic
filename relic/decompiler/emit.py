@@ -356,8 +356,20 @@ class CWriter:
 
     def node(self, n, depth: int):
         if isinstance(n, Seq):
-            for it in _tidy(_flatten(n)):
+            items = _tidy(_flatten(n))
+            k = 0
+            while k < len(items):
+                it = items[k]
+                nxt = items[k + 1] if k + 1 < len(items) else None
+                parts = _for_parts(it, nxt, self.p.gotos) if isinstance(nxt, Loop) else None
+                if parts is not None:
+                    prev, init, step, body = parts
+                    self.node(prev, depth)
+                    self._for(nxt, init, step, body, depth)
+                    k += 2
+                    continue
                 self.node(it, depth)
+                k += 1
         elif isinstance(n, Block):
             if n.addr in self.p.gotos and not n.copy:
                 self.emit(f"loc_{n.addr:x}:", n.addr, max(depth - 1, 0))
@@ -419,6 +431,12 @@ class CWriter:
                     self.emit(f"{label}:", case.addr, depth)
                 self.node(case.body, depth + 1)
             self.emit("}", None, depth)
+
+    def _for(self, loop: Loop, init, step, body, depth: int):
+        text = lambda st: self.stmt(st).rstrip(";")
+        self.emit(f"for ({text(init)}; {self.expr(loop.cond)}; {text(step)}) {{", init.addr, depth)
+        self.node(body, depth + 1)
+        self.emit("}", None, depth)
 
     def _term_addr(self, block_addr: int) -> int | None:
         b = self.p.fn.blocks.get(block_addr)
@@ -554,6 +572,50 @@ def _flatten(n) -> list:
     if isinstance(n, Seq):
         return [x for it in n.items for x in _flatten(it)]
     return [n]
+
+
+def _for_parts(prev, loop, gotos):
+    """Split `X = init; while (c(X)) { ...; X += k; }` into for-loop parts.
+
+    Returns (block without the init, init statement, step statement, body
+    without the step) or None. A `continue` of this loop in the body rules it
+    out: in a `while` it skips the step, in a `for` it would run it.
+    """
+    if loop.kind != "while" or loop.header in gotos or not isinstance(prev, Block) or not prev.stmts:
+        return None
+    init = prev.stmts[-1]
+    if not isinstance(init, Assign) or not isinstance(init.dst, (Var, StackVar)):
+        return None
+    x = init.dst
+    if not any(v == x for v in ir.walk(loop.cond)):
+        return None
+    items = _flatten(_loop_body(loop.body))
+    last = items[-1] if items else None
+    if not isinstance(last, Block) or not last.stmts or (last.addr in gotos and not last.copy):
+        return None
+    step = last.stmts[-1]
+    if not (isinstance(step, Assign) and step.dst == x and isinstance(step.src, BinOp)
+            and step.src.op in ("+", "-") and step.src.a == x and isinstance(step.src.b, Const)):
+        return None
+    if _has_continue(Seq(items)):
+        return None
+    body = Seq(items[:-1] + ([Block(last.addr, last.stmts[:-1], last.copy)] if last.stmts[:-1] else []))
+    return Block(prev.addr, prev.stmts[:-1], prev.copy), init, step, body
+
+
+def _has_continue(n) -> bool:
+    """A `continue` that belongs to the enclosing loop (not to a nested one)."""
+    if isinstance(n, Jump1):
+        return n.kind == "continue"
+    if isinstance(n, Loop):
+        return False
+    if isinstance(n, Seq):
+        return any(_has_continue(x) for x in n.items)
+    if isinstance(n, If):
+        return _has_continue(n.then) or _has_continue(n.els)
+    if isinstance(n, Switch):
+        return any(_has_continue(c.body) for c in n.cases)
+    return False
 
 
 def _tidy(items):

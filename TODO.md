@@ -59,7 +59,8 @@
   - [x] switch case 값(점프 테이블 인덱스), bounds check → `default`, case 끝 `break`
   - [x] 루프 밖 합류점 → 명시적 `break`, 작은 공유 꼬리 블록·반환 블록은 goto 대신 복제
   - [x] 모든 도달 가능 블록이 정확히 한 번 출력되는지 구조 불변식으로 검증
-  - [ ] **P2** 루프 유도 변수 → `for`, if-else-if 사슬 → switch
+  - [x] `X = init; while (c) { ...; X += k; }` → `for` (본문에 그 루프의 `continue`가 있으면 만들지 않음)
+  - [ ] **P2** if-else-if 사슬 → switch
   - [x] `-O2` goto 줄이기 1차: 단락 평가 `&&`/`||` 결합, 후지배자 없는 if의 합류점 선택, 작은 비순환 꼬리 영역 복제(6블록/12문장) — `/usr/bin/{true,cat,gzip}` goto 1911 → 1469
   - [ ] **P2** 남은 goto는 대부분 370–480블록 상태 기계 함수(gnulib `quotearg`, gzip deflate/inflate)에 몰려 있음 — 조건 기반 구조화(DREAM 계열) 검토
   - [ ] **P2** `x % 7 == 3`처럼 곱셈 역원으로 바뀐 나눗셈·나머지 복원
