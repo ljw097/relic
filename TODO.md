@@ -27,7 +27,7 @@
 
 ## 테스트 / 인프라
 
-- [ ] **P0** GitHub Actions CI (pytest, gcc 설치)
+- [x] **P0** GitHub Actions CI (pytest, gcc 설치, Python 3.10 / 3.12 / 3.13)
 - [ ] **P1** 멀티 아키텍처 샘플: `-m32`, `aarch64-linux-gnu-gcc`, `arm-linux-gnueabi-gcc`, `mipsel-linux-gnu-gcc` (툴체인 없으면 skip)
 - [ ] **P1** case마다 함수를 호출하는 `switch` 샘플 추가 — 지금 `classify`는 `-O2`에서 값 배열 조회로 바뀌어 점프 테이블 테스트가 안 됨
 - [ ] **P1** PE 테스트: 로더, IAT 호출 이름 해석, checksec (mingw 또는 커밋된 작은 샘플)
