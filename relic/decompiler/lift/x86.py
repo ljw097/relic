@@ -769,9 +769,10 @@ class X86Lifter:
         if table:
             seen: list[int] = []
             for t in table:
-                if t not in seen:
+                # entries past the real table end can point anywhere: keep function blocks only
+                if t not in seen and t in func.blocks:
                     seen.append(t)
-            self.emit(IndirectJump(i.addr, expr, seen))
+            self.emit(IndirectJump(i.addr, expr, seen, list(table)))
         elif i.mem_target is not None and self.an.bin.imports_by_got.get(i.mem_target):
             self.emit(CallStmt(i.addr, Call(expr, (), self.bits), tail=True, name=self.an.call_name(i)))
             self.emit(Return(i.addr))

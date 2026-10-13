@@ -57,7 +57,9 @@ def _parser() -> argparse.ArgumentParser:
     s = add("opt", "optimised SSA IR with strings/xrefs resolved", where=True)
     s.add_argument("--no-opt", action="store_true", help="show SSA before the optimisation passes")
     s.add_argument("--xrefs", action="store_true", help="also list the function's constant references")
-    add("decompile", "structured C-like pseudocode", where=True)
+    s = add("decompile", "C-like pseudocode", where=True)
+    s.add_argument("-a", "--all", action="store_true", help="every function in the binary")
+    s.add_argument("--addrs", action="store_true", help="prefix each line with its instruction address")
     g = sub.add_parser("gui", help="open the GUI")
     g.add_argument("file", nargs="?")
     g.add_argument("--arch", help="architecture for raw blobs (x86, x64, arm, arm64, mips, ...)")
@@ -249,19 +251,30 @@ def cmd_opt(args):
 
 
 def cmd_decompile(args):
-    from .decompiler import decompile_ir
-    from .decompiler.structure import to_pseudocode
+    from .decompiler.emit import decompile
     an = _analyze(args)
-    f = an.function_at(_where(an, args.where))
-    if f is None:
-        sys.exit("relic: no function there")
-    if f.is_import:
-        sys.exit(f"relic: {an.name(f.addr)} is an imported function")
-    try:
-        fn = decompile_ir(an, f)
-    except NotImplementedError as e:
-        sys.exit(f"relic: {e}")
-    print(to_pseudocode(fn, an))
+    if args.all:
+        funcs = [f for f in sorted(an.functions.values(), key=lambda f: f.addr) if not f.is_import]
+    else:
+        f = an.function_at(_where(an, args.where))
+        if f is None:
+            sys.exit("relic: no function there")
+        if f.is_import:
+            sys.exit(f"relic: {an.name(f.addr)} is an imported function")
+        funcs = [f]
+    for k, f in enumerate(funcs):
+        try:
+            d = decompile(an, f)
+        except NotImplementedError as e:
+            sys.exit(f"relic: {e}")
+        if k:
+            print()
+        if args.addrs:
+            for ln in d.lines:
+                tag = f"{ln.addr:8x}" if ln.addr is not None else " " * 8
+                print(f"{tag}  {'    ' * ln.depth}{ln.text}".rstrip())
+        else:
+            print(d.text)
 
 
 def cmd_gui(args):

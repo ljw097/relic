@@ -50,16 +50,31 @@
   - [x] 최적화 패스(`passes.py`): 상수 폴딩·대수 단순화, 상수/복사 전파, 단일 사용 load 전달, 플래그→비교식 복원, DCE
   - [x] 인터프리터의 SSA 실행 지원(phi, 호출 use/def, version-0 → 진입 레지스터)
   - [x] 최적화 IR의 문자열/교차참조(`refs.py`: `ir_xrefs`, `format_ir`), `relic opt` 커맨드
-- [ ] **P1** 단계 3 — 호출 인자/반환값 복원, 스택 변수
-  - [x] 호출 인자 복원(`calls.py`, `sigs.py`): libc 시그니처 + 포맷 문자열 인자 수, `_chk` 변형, 내부 함수는 live-in 레지스터 프리픽스
+- [x] **P1** 단계 3 — 호출 인자/반환값 복원, 스택 변수
+  - [x] 호출 인자 복원(`calls.py`, `sigs.py`): libc 시그니처 + 포맷 문자열 인자 수, `_chk` 변형, 내부 함수는 live-in 레지스터 프리픽스, 시그니처 없는 import·함수 포인터는 호출 직전에 설정된 인자 레지스터
   - [x] 스택 프레임 분석(`stack.py`): rsp_0 기준 오프셋, 슬롯 분류(retaddr/saved/canary/buffer/local), 버퍼 크기, 카나리 탐지, `relic opt` 프레임 요약
-  - [ ] 스택 슬롯을 IR의 지역 변수로 치환(출력 단계), 카나리 검사 숨김(단계 5)
-- [x] **P1** 단계 4 — 제어 흐름 구조화(if/while/switch) (`structure.py`, `relic decompile`)
-  - [x] 지배자/후지배자, 자연 루프, if/else, while, while(1)+break/continue, switch, goto 폴백
+  - [x] 스택 슬롯 → 지역 변수(`var_c`, `buf_48`), 프롤로그 저장·카나리 검사 숨김(`cleanup.py`)
+- [x] **P1** 단계 4 — 제어 흐름 구조화(if/while/switch) (`structure.py`)
+  - [x] 지배자/후지배자, 자연 루프, if/else, while, do-while, while(1)+break/continue, switch, goto 폴백
+  - [x] switch case 값(점프 테이블 인덱스), bounds check → `default`, case 끝 `break`
+  - [x] 루프 밖 합류점 → 명시적 `break`, 작은 공유 꼬리 블록·반환 블록은 goto 대신 복제
   - [x] 모든 도달 가능 블록이 정확히 한 번 출력되는지 구조 불변식으로 검증
-  - [ ] **P2** do-while 조건 복원, if-else-if 사슬을 switch로, 루프 유도 변수 → for
-- [ ] **P2** 단계 5 — 타입 추론, C 출력 정리
-- [ ] **P2** 단계 6 — GUI 디컴파일 뷰, 다른 아키텍처 리프터
+  - [ ] **P2** 루프 유도 변수 → `for`, if-else-if 사슬 → switch
+  - [ ] **P2** `-O2` 대형 함수의 goto 줄이기 (노드 복제 확대, 조건 기반 구조화) — `/usr/bin/grep` 168개 함수에서 goto 3020개
+- [x] **P1** 단계 5 — out-of-SSA, 타입, C 출력 (`outssa.py`, `vartypes.py`, `pipeline.py`, `emit.py`)
+  - [x] phi → 복사 + 간섭 기반 병합(인터프리터로 검증), 단일 사용 임시 변수 인라인
+  - [x] void / 반환 폭(호출자가 읽는 폭), 변수 폭 축소(`low32` 제거), 포인터·unsigned 추론, 복사로 포인터 타입 전파
+  - [x] 시그니처·지역 변수 선언, 문자열·심볼·배열 인덱스, 포인터 산술 원소 단위, `&&` 조건, else-if, early return
+  - [x] 줄 ↔ 주소 매핑(`Decompiled.lines`, `relic decompile --addrs`)
+  - [x] 재컴파일 테스트: `checksum`/`classify` 디컴파일 결과를 gcc로 다시 컴파일해 원본과 비교
+  - [ ] **P1** 사용자 이름 변경(`Analysis.renames`)·주석을 의사 코드에 반영, 변수 이름 변경
+  - [ ] **P2** 구조체 필드 복원(`notes[i]->size` 대신 `*(int *)(notes[i] + 8)`), libc 인자 타입으로 매개변수 타입 지정
+  - [ ] **P2** 대형 바이너리 성능: `/usr/bin/grep` 168개 함수 71초 — 함수 단위 지연 디컴파일 결과 캐시, `_count_uses` 증분화
+- [ ] **P1** 단계 6 — GUI 디컴파일 뷰, 다른 아키텍처
+  - [x] GUI Pseudocode 탭(`Tab`/`F5`): 지연 디컴파일·캐시, 리스팅과 커서 주소 동기화, 이름 변경 반영, 더블클릭 이동
+  - [ ] **P1** 큰 함수 디컴파일을 백그라운드 스레드로 (지금은 GUI 스레드에서 실행)
+  - [ ] **P1** 의사 코드에서 변수 이름 변경(`N`), 주석 표시
+  - [ ] **P1** x86-32 리프터 검증·cdecl 스택 인자 복원
 
 ## 완료
 
@@ -73,3 +88,4 @@
 - [x] GUI 뷰 위젯(디스어셈블리 / CFG / 헥스)
 - [x] GUI 메인 윈도우: 함수 목록, 백그라운드 분석, 이동 히스토리, 이름 변경·주석·xref, 정보 테이블, 스모크 테스트
 - [x] ELF 재배치 타입 이름 기록 (GLOB_DAT import 해석)
+- [x] x86-64 디컴파일러 단계 1–5 (`relic decompile`)

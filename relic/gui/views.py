@@ -391,3 +391,167 @@ class HexView(QPlainTextEdit):
         cur = QTextCursor(self.document().findBlockByNumber(row))
         self.setTextCursor(cur)
         self.centerCursor()
+
+
+# ---------------------------------------------------------------- pseudocode
+_C_KEYWORDS = ("if", "else", "while", "do", "for", "switch", "case", "default", "break", "continue", "return",
+               "goto", "sizeof")
+_C_TYPES = ("void", "char", "short", "int", "long", "unsigned", "signed", "bool", "int8_t", "int16_t", "int32_t",
+            "int64_t", "uint8_t", "uint16_t", "uint32_t", "uint64_t", "__int128")
+
+
+class PseudocodeHighlighter(QSyntaxHighlighter):
+    """C colouring: keywords, types, literals, comments, called functions."""
+
+    def __init__(self, doc):
+        super().__init__(doc)
+        import re
+        self.rules = [
+            (re.compile(r"\b(" + "|".join(_C_TYPES) + r")\b"), _fmt(THEME["ret"])),
+            (re.compile(r"\b(" + "|".join(_C_KEYWORDS) + r")\b"), _fmt(THEME["jump"])),
+            (re.compile(r"\b[A-Za-z_][A-Za-z0-9_]*(?=\()"), _fmt(THEME["call"])),
+            (re.compile(r"\b(0x[0-9a-fA-F]+|\d+)\b"), _fmt(THEME["mnem"])),
+            (re.compile(r"\bloc_[0-9a-f]+\b"), _fmt(THEME["label"])),
+            (re.compile(r'"(?:[^"\\]|\\.)*"'), _fmt(THEME["label"])),
+            (re.compile(r"//.*$"), _fmt(THEME["comment"])),
+        ]
+
+    def highlightBlock(self, text: str):
+        for rx, f in self.rules:
+            for m in rx.finditer(text):
+                self.setFormat(m.start(), m.end() - m.start(), f)
+
+
+class PseudocodeView(QPlainTextEdit):
+    """Decompiled C of one function, synchronised with the listing by instruction address.
+
+    Decompilation runs on demand (when the view is shown) and is cached per
+    function until `invalidate` is called (after a rename, say).
+    """
+
+    navigate = Signal(int)
+    cursor_addr = Signal(int)
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setReadOnly(True)
+        self.setLineWrapMode(QPlainTextEdit.LineWrapMode.NoWrap)
+        self.setFont(mono_font())
+        self.setStyleSheet(f"QPlainTextEdit {{ background: {THEME['bg']}; color: {THEME['fg']}; }}")
+        self.highlighter = PseudocodeHighlighter(self.document())
+        self.an: Analysis | None = None
+        self.func: Function | None = None
+        self.result = None                      # emit.Decompiled of the shown function
+        self.cache: dict[int, object] = {}
+        self.pending: int | None = None         # address to show once decompiled
+        self._syncing = False
+        self.cursorPositionChanged.connect(self._moved)
+
+    def show_function(self, an: Analysis, f: Function, addr: int | None = None):
+        if an is not self.an:
+            self.cache.clear()
+        self.an = an
+        if f is not self.func or f.addr not in self.cache:
+            self.func = f
+            self.reload()
+        self.goto(addr if addr is not None else f.addr)
+
+    def invalidate(self, reload: bool = True):
+        """Forget cached output (names changed); re-render now if `reload`, else when next shown."""
+        self.cache.clear()
+        self.result = None
+        if reload and self.func is not None and self.an is not None:
+            self.reload()
+
+    def symbol_under_cursor(self) -> int | None:
+        """Address of the function / global named by the word under the cursor."""
+        cur = self.textCursor()
+        cur.select(QTextCursor.SelectionType.WordUnderCursor)
+        word = cur.selectedText()
+        import re
+        # local names (v1, a2, var_c, buf_48) and numbers are not symbols ("a1" would parse as hex)
+        if self.an is None or not word or re.fullmatch(r"[va]\d+|(var|buf)_[0-9a-f]+|\d.*", word):
+            return None
+        a = self.an.resolve(word)
+        return a if a is not None and self.an.name(a) else None
+
+    def reload(self):
+        if self.an is None or self.func is None:
+            return
+        f = self.func
+        res = self.cache.get(f.addr)
+        if res is None:
+            try:
+                from ..decompiler.emit import decompile
+                res = decompile(self.an, f)
+            except NotImplementedError as e:
+                res = str(e)
+            except Exception as e:  # never take the GUI down with a decompiler bug
+                res = f"// decompilation failed: {type(e).__name__}: {e}"
+            self.cache[f.addr] = res
+        self.result = res if not isinstance(res, str) else None
+        self._syncing = True
+        self.setPlainText(res if isinstance(res, str) else res.text)
+        self._syncing = False
+
+    def line_for(self, addr: int) -> int | None:
+        """The line for `addr`: exact, else the closest line from an earlier instruction."""
+        if self.result is None:
+            return None
+        best, best_addr = None, -1
+        for k, ln in enumerate(self.result.lines):
+            if ln.addr is None:
+                continue
+            if ln.addr == addr:
+                return k
+            if best_addr < ln.addr <= addr:
+                best, best_addr = k, ln.addr
+        return best
+
+    def goto(self, addr: int) -> bool:
+        row = self.line_for(addr)
+        if row is None:
+            return False
+        self._syncing = True
+        self.setTextCursor(QTextCursor(self.document().findBlockByNumber(row)))
+        self._syncing = False
+        self.centerCursor()
+        self._highlight_row(row)
+        return True
+
+    def current_addr(self) -> int | None:
+        if self.result is None:
+            return None
+        row = self.textCursor().blockNumber()
+        lines = self.result.lines
+        return lines[row].addr if 0 <= row < len(lines) else None
+
+    def _highlight_row(self, row: int):
+        sel = QTextEdit.ExtraSelection()
+        sel.format.setBackground(QColor(THEME["current"]))
+        sel.format.setProperty(QTextCharFormat.Property.FullWidthSelection, True)
+        sel.cursor = QTextCursor(self.document().findBlockByNumber(row))
+        self.setExtraSelections([sel])
+
+    def _moved(self):
+        self._highlight_row(self.textCursor().blockNumber())
+        if self._syncing:
+            return
+        a = self.current_addr()
+        if a is not None:
+            self.cursor_addr.emit(a)
+
+    def mouseDoubleClickEvent(self, e):
+        super().mouseDoubleClickEvent(e)
+        word = self.textCursor().selectedText()
+        if self.an is None or not word or word.isdigit():
+            return
+        if word.startswith("loc_"):
+            try:
+                self.goto(int(word[4:], 16))
+            except ValueError:
+                pass
+            return
+        a = self.an.resolve(word)
+        if a is not None and self.an.bin.is_mapped(a):
+            self.navigate.emit(a)
