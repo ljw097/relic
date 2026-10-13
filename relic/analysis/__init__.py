@@ -77,8 +77,14 @@ class Analysis:
         return None
 
     def function_by_name(self, name: str) -> Function | None:
+        """By raw symbol, display name, or -- for C++ -- the name without its argument list."""
+        from ..demangle import short_name
         for f in self.functions.values():
             if self.name(f.addr) == name or f.name == name:
+                return f
+        for f in self.functions.values():
+            shown = self.name(f.addr)
+            if shown and "(" in shown and short_name(shown) == name:
                 return f
         return None
 
@@ -100,12 +106,15 @@ class Analysis:
             return None
 
     def name(self, addr: int) -> str | None:
+        """Display name: the user's rename, else the symbol (C++ names demangled)."""
         if addr in self.renames:
             return self.renames[addr]
         f = self.functions.get(addr)
-        if f is not None:
-            return f.name
-        return self.bin.name_of(addr)
+        n = f.name if f is not None else self.bin.name_of(addr)
+        if n and n.startswith("_Z"):
+            from ..demangle import demangle
+            return demangle(n) or n
+        return n
 
     def label(self, addr: int) -> str:
         """Best human-readable name for an address (`sym`, `sym+0x4`, or hex)."""

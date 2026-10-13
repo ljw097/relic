@@ -117,6 +117,9 @@ class CWriter:
         if not v:
             return None
         n = self.an.name(v)
+        if n and "(" in n:                      # demangled C++: `Cls::method(int)` -> `Cls::method`
+            from ..demangle import short_name
+            n = short_name(n)
         return base_name(n) if n else None
 
     def const(self, c: Const) -> str:
@@ -453,6 +456,9 @@ class CWriter:
     def signature(self) -> str:
         fn = self.p.fn
         name = base_name(self.an.name(fn.addr) or fn.name)
+        if "(" in name:
+            from ..demangle import short_name
+            name = short_name(name)
         params = []
         for r in self.p.params:
             t = self.types.get(r) or CType(int_type(self.ptr_bits))

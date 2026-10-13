@@ -14,6 +14,7 @@
 | 함수 탐색 / CFG | 재귀 하강, noreturn 처리, tail call, x86-64 점프 테이블 복원 |
 | stripped 바이너리 | `__libc_start_main` 인자로 `main` 복구, 프롤로그 스캔, `.init_array` 시드 |
 | 참조 | 코드/데이터 xref, 문자열(ASCII, PE는 UTF-16LE) |
+| C++ | Itanium 심볼 디맹글링 (`geo::Rect::area() const`), 짧은 이름으로 이동·디컴파일 (`relic decompile ./a.out geo::total`) |
 | checksec | ELF: RELRO / Canary / NX / PIE / FORTIFY / RPATH, PE: ASLR / DEP / CFG / SEH / GS |
 | 포너블 휴리스틱 | `gets`·`strcpy` 등 위험 함수, 비상수 포맷 스트링, 폭 없는 `scanf("%s")`, ret2win 후보 |
 | 프로젝트 | 이름 변경·주석·디컴파일러 변수 이름을 `<binary>.relic.json`에 저장 (CLI 출력에도 반영) |
