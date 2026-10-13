@@ -15,7 +15,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 
-from .ir import (BinOp, Branch, CallStmt, IndirectJump, IRFunction, Jump, Return, Stmt, UnOp, fmt, fmt_stmt)
+from .ir import (BinOp, Branch, IndirectJump, IRFunction, Jump, Reg, Return, Stmt, UnOp, fmt, fmt_stmt, walk)
 
 EXIT = -1
 
@@ -48,10 +48,18 @@ class Loop:
 
 
 @dataclass
+class Case:
+    addr: int          # first block of the case body
+    values: list       # case labels (empty when the index could not be recovered)
+    default: bool
+    body: object
+
+
+@dataclass
 class Switch:
     addr: int
-    expr: object
-    cases: list        # list of (target_addr, node)
+    expr: object       # the switch index (or the raw table address when unrecognised)
+    cases: list        # list of Case
 
 
 @dataclass
@@ -133,19 +141,48 @@ def _terminator(blk):
 
 
 # ------------------------------------------------------------------- structurer
+def _switch_index(expr):
+    """(index expression, bias) of a jump-table address `table[idx - bias]`, if recognisable."""
+    from .ir import Cast, Const
+    for x in walk(expr):
+        if isinstance(x, BinOp) and isinstance(x.b, Const) and (
+                (x.op == "*" and x.b.value in (1, 2, 4, 8)) or (x.op == "<<" and x.b.value in (0, 1, 2, 3))):
+            idx = x.a
+            while isinstance(idx, Cast) and idx.kind in ("zext", "sext"):
+                idx = idx.a
+            bias = 0
+            if isinstance(idx, BinOp) and idx.op in ("+", "-") and isinstance(idx.b, Const):
+                bias = -idx.b.signed if idx.op == "+" else idx.b.signed
+                idx = idx.a
+            return idx, bias
+    return None, 0
+
+
+def _small_return(blk) -> bool:
+    """A block that only returns a constant / variable: cheap to duplicate instead of a goto."""
+    from .ir import Const, Var
+    return len(blk.stmts) == 1 and isinstance(blk.stmts[0], Return) and \
+        (blk.stmts[0].value is None or isinstance(blk.stmts[0].value, (Const, Var, Reg)))
+
+
+class _Ctx:
+    """One level of the break/continue context: a loop or a switch."""
+    __slots__ = ("kind", "header", "follow", "body", "latch", "latch_cond")
+
+    def __init__(self, kind, header, follow, body=frozenset()):
+        self.kind, self.header, self.follow, self.body = kind, header, follow, body
+        self.latch = self.latch_cond = None
+
+
 class Structurer:
     def __init__(self, fn: IRFunction):
         self.fn = fn
         self.blocks = fn.blocks
-        self.succ = {a: list(b.succs) for a, b in self.blocks.items()}
-        self.pred = {a: list(b.preds) for a, b in self.blocks.items()}
+        self.succ = {a: [s for s in b.succs if s in fn.blocks] for a, b in self.blocks.items()}
+        self.pred = {a: [p for p in b.preds if p in fn.blocks] for a, b in self.blocks.items()}
         self.idom = _domtree(fn.addr, lambda a: self.succ.get(a, []), lambda a: self.pred.get(a, []))
         self.ipdom = self._post_idom()
-        self.loops = self._find_loops()        # header -> dict(body, follow, kind)
-        self.loop_of = {}                       # node -> header it most tightly belongs to
-        for h, info in self.loops.items():
-            for n in info["body"]:
-                self.loop_of.setdefault(n, h)
+        self.loops = self._find_loops()        # header -> dict(body, follow, kind, latches)
         self.emitted: set[int] = set()
         self.gotos: set[int] = set()
 
@@ -179,6 +216,8 @@ class Structurer:
     def _find_loops(self):
         loops = {}
         for u in self.blocks:
+            if u not in self.idom:
+                continue
             for h in self.succ[u]:
                 if self._dominates(h, u):             # back edge u -> h
                     loops.setdefault(h, []).append(u)
@@ -190,15 +229,23 @@ class Structurer:
                 n = stack.pop()
                 if n not in body:
                     body.add(n)
-                    stack += [p for p in self.pred[n] if p != h]
-            exits = [s for n in body for s in self.succ[n] if s not in body]
-            follow = exits[0] if exits else None
-            # pre-tested loop: the header itself is the conditional that exits
+                    stack += [p for p in self.pred[n] if p != h and p in self.idom]
+            exits = [s for n in sorted(body) for s in self.succ[n] if s not in body]
+            follow = None
+            latch = latches[0] if len(latches) == 1 else None
+            lterm = _terminator(self.blocks[latch])[1] if latch is not None else None
             if len(self.succ[h]) == 2 and any(s not in body for s in self.succ[h]):
+                # pre-tested loop: the header itself is the conditional that exits
                 kind, follow = "while", next(s for s in self.succ[h] if s not in body)
+            elif latch is not None and latch != h and isinstance(lterm, Branch) and \
+                    any(s not in body for s in self.succ[latch]):
+                # post-tested loop: the single latch tests and either repeats or leaves
+                kind, follow = "dowhile", next(s for s in self.succ[latch] if s not in body)
             else:
-                kind = "inf"   # post-tested / endless: rendered while(1) with explicit break/continue
-            out[h] = {"body": body, "follow": follow, "kind": kind, "latches": set(latches)}
+                kind = "inf"   # endless: rendered while(1) with explicit break/continue
+                # leave to the exit most body blocks agree on (the first in layout order)
+                follow = exits[0] if exits else None
+            out[h] = {"body": frozenset(body), "follow": follow, "kind": kind, "latch": latch}
         return out
 
     # -- code generation -----------------------------------------------------
@@ -212,36 +259,48 @@ class Structurer:
                 tree.items.append(self._region(a, None, []))
         return tree
 
-    def _region(self, n, stop, loopstack):
+    def _goto(self, n):
+        self.gotos.add(n)
+        return Jump1("goto", n)
+
+    def _region(self, n, stop, ctx):
         seq = Seq()
-        while n is not None and n != stop and n != EXIT:
+        stops = stop if isinstance(stop, (set, frozenset)) else {stop}
+        while n is not None and n not in stops and n != EXIT:
             if n in self.emitted:
-                seq.items.append(Jump1("goto", n))
-                self.gotos.add(n)
+                edge = self._edge(n, ctx)
+                if edge is not None:
+                    seq.items.append(edge)
+                elif _small_return(self.blocks[n]):
+                    seq.items.append(Ret(self.blocks[n].stmts[0]))   # duplicate, no goto
+                else:
+                    seq.items.append(self._goto(n))
                 break
             # a loop header we are not already inside -> emit the whole loop
-            if n in self.loops and (not loopstack or loopstack[-1][0] != n):
-                node, follow = self._loop(n, loopstack)
+            if n in self.loops and not any(c.kind == "loop" and c.header == n for c in ctx):
+                node, follow = self._loop(n, ctx)
                 seq.items.append(node)
                 n = follow
                 continue
             self.emitted.add(n)
             blk = self.blocks[n]
             body, term = _terminator(blk)
-            if body:
-                seq.items.append(Block(n, body))
+            seq.items.append(Block(n, body))
+            inner = next((c for c in reversed(ctx) if c.kind == "loop"), None)
+            if inner is not None and inner.latch_cond is not None and n == inner.latch:
+                break  # do-while latch: its test is the loop condition
             if isinstance(term, Return):
                 seq.items.append(Ret(term))
                 n = None
             elif isinstance(term, IndirectJump):
-                seq.items.append(self._switch(n, term, loopstack))
-                n = None
+                node, n = self._switch(n, term, None, ctx, self._postdom(n))
+                seq.items.append(node)
             elif isinstance(term, Branch):
-                node, n = self._if(n, term, stop, loopstack)
+                node, n = self._if(n, term, stops, ctx)
                 seq.items.append(node)
             else:  # Jump or fall-through
                 nxt = self.succ[n][0] if self.succ[n] else None
-                edge = self._loop_edge(nxt, loopstack)
+                edge = self._edge(nxt, ctx)
                 if edge is not None:
                     seq.items.append(edge)
                     n = None
@@ -249,21 +308,27 @@ class Structurer:
                     n = nxt
         return seq
 
-    def _loop_edge(self, target, loopstack):
-        """break / continue if `target` leaves or restarts the innermost loop."""
-        if not loopstack or target is None:
+    def _edge(self, target, ctx):
+        """break / continue (or goto) if `target` leaves or restarts an enclosing construct."""
+        if not ctx or target is None:
             return None
-        header, follow = loopstack[-1]
-        if target == header:
-            return Jump1("continue")
-        if target == follow:
+        top = ctx[-1]
+        if top.kind == "switch" and target == top.follow:
             return Jump1("break")
+        loop = next((c for c in reversed(ctx) if c.kind == "loop"), None)
+        if loop is None:
+            return None
+        if target == loop.header and loop.latch_cond is None:
+            return Jump1("continue")
+        if target == loop.follow:
+            return Jump1("break") if top is loop else self._goto(target)
         return None
 
-    def _loop(self, h, loopstack):
+    def _loop(self, h, ctx):
         info = self.loops[h]
         follow = info["follow"]
-        ls = loopstack + [(h, follow)]
+        c = _Ctx("loop", h, follow, info["body"])
+        c.latch, c.latch_cond = info["latch"], None
         blk = self.blocks[h]
         body_stmts, term = _terminator(blk)
         if info["kind"] == "while" and isinstance(term, Branch):
@@ -273,27 +338,51 @@ class Structurer:
             cond = term.cond if term.false == follow else _negate(term.cond)
             inner = Seq()
             if body_stmts:
+                # statements before the test run on every iteration; keep them visible
+                # inside the loop (rendered as a comment-free prefix of the body)
                 inner.items.append(Block(h, body_stmts))
-            inner.items.append(self._region(stay, h, ls))
+            inner.items.append(self._region(stay, h, ctx + [c]))
             return Loop("while", cond, inner), follow
-        # endless / post-tested: structure the whole body starting at the header
-        # (ls has (h, follow) on top, so _region treats h as an ordinary block, not a new loop)
-        return Loop("inf", None, self._region(h, follow, ls)), follow
+        if info["kind"] == "dowhile":
+            lterm = _terminator(self.blocks[c.latch])[1]
+            cond = lterm.cond if lterm.true == h else _negate(lterm.cond)
+            c.latch_cond = cond
+            body = self._region(h, follow, ctx + [c])
+            return Loop("dowhile", cond, body), follow
+        # endless: structure the whole body starting at the header
+        return Loop("inf", None, self._region(h, follow, ctx + [c])), follow
 
-    def _if(self, n, term: Branch, stop, loopstack):
+    def _if(self, n, term: Branch, stops, ctx):
         follow = self._postdom(n)
+        loop = next((c for c in reversed(ctx) if c.kind == "loop"), None)
+        if loop is not None and follow is not None and follow not in loop.body:
+            follow = None   # the join lies outside the loop: each side leaves on its own
+        sw = ctx[-1] if ctx and ctx[-1].kind == "switch" else None
+        if sw is not None and follow is not None and follow == sw.follow:
+            follow = None
         cond, t, f = term.cond, term.true, term.false
 
+        # bounds check guarding a jump table -> switch with a default
+        for tgt, other, c in ((f, t, cond), (t, f, _negate(cond))):
+            sb = self.blocks.get(tgt)
+            if sb is not None and tgt not in self.emitted and self.pred.get(tgt) == [n] and \
+                    len(sb.stmts) == 1 and isinstance(sb.stmts[0], IndirectJump) and sb.stmts[0].targets:
+                self.emitted.add(tgt)
+                return self._switch(tgt, sb.stmts[0], other, ctx, follow)
+
         def branch(target):
-            if target == follow or target == stop:
+            if target == follow:
                 return None
-            edge = self._loop_edge(target, loopstack)
+            edge = self._edge(target, ctx)
             if edge is not None:
                 return edge
+            if target in stops:
+                return None
             if target in self.emitted:
-                self.gotos.add(target)
-                return Jump1("goto", target)
-            return self._region(target, follow, loopstack)
+                if _small_return(self.blocks[target]):
+                    return Seq([Ret(self.blocks[target].stmts[0])])
+                return self._goto(target)
+            return self._region(target, follow if follow is not None else stops, ctx)
 
         then = branch(t)
         els = branch(f)
@@ -301,18 +390,61 @@ class Structurer:
             cond, then, els = _negate(cond), els, None
         return If(n, cond, then, els), follow
 
-    def _switch(self, n, term: IndirectJump, loopstack):
-        follow = self._postdom(n)
+    def _switch(self, n, term: IndirectJump, default, ctx, follow):
+        """Switch on `term`'s jump table; `follow` is where every case ends up (or None)."""
+        loop = next((c for c in reversed(ctx) if c.kind == "loop"), None)
+        if loop is not None and follow is not None and follow not in loop.body:
+            follow = None
+        c = _Ctx("switch", n, follow)
+        inner = ctx + [c]
+        idx, bias = _switch_index(term.expr)
+        values: dict[int, list[int]] = {}
+        for k, t in enumerate(term.table or term.targets):
+            values.setdefault(t, []).append(k + bias)
+        targets = list(dict.fromkeys(term.targets))
+        if default is not None and default not in targets:
+            targets.append(default)
+        # case order: by smallest label, default last -- unless a case falls through into
+        # another, in which case code layout order is the one that keeps the fall-through
+        layout = sorted(targets)
+        targets.sort(key=lambda t: (t == default and not values.get(t), min(values.get(t, [1 << 62]))))
+        if any(self.succ.get(t) and len(self.succ[t]) == 1 and self.succ[t][0] in values for t in targets):
+            targets = layout
         cases = []
-        for t in dict.fromkeys(term.targets):
+        for i, t in enumerate(targets):
+            labels = values.get(t, []) if idx is not None else []
+            is_default = t == default
+            stops = {follow} | set(targets[i + 1:i + 2])
             if t == follow:
-                cases.append((t, None))
+                body = Seq([Jump1("break")])
             elif t in self.emitted:
-                self.gotos.add(t)
-                cases.append((t, Jump1("goto", t)))
+                body = Seq([self._edge(t, inner) or (Ret(self.blocks[t].stmts[0]) if _small_return(self.blocks[t])
+                                                      else self._goto(t))])
             else:
-                cases.append((t, self._region(t, follow, loopstack)))
-        return Switch(n, term.expr, cases)
+                body = self._region(t, stops, inner)
+                last = body.items[-1] if body.items else None
+                if not isinstance(last, (Ret, Jump1)):
+                    nxt = targets[i + 1] if i + 1 < len(targets) else None
+                    # fell off the end: into the next case (fall-through) or out of the switch
+                    if not (nxt is not None and self._falls_into(body, nxt)):
+                        body.items.append(Jump1("break"))
+            cases.append(Case(t, labels, is_default, body))
+        return Switch(n, idx if idx is not None else term.expr, cases), follow
+
+    def _falls_into(self, body, nxt):
+        """Whether the last block structured in `body` continues straight into `nxt`."""
+        last = None
+        for node in _iter_blocks(body):
+            last = node
+        return last is not None and self.succ.get(last.addr) == [nxt]
+
+
+def _iter_blocks(node):
+    if isinstance(node, Seq):
+        for it in node.items:
+            yield from _iter_blocks(it)
+    elif isinstance(node, Block):
+        yield node
 
 
 # ------------------------------------------------------------------- rendering
@@ -387,14 +519,23 @@ def _render(node, depth, out, gotos):
             out.append(f"{_ind(depth)}while (1) {{")
         _trim_continue(node.body)
         _render(node.body, depth + 1, out, gotos)
-        out.append(f"{_ind(depth)}}}")
+        out.append(f"{_ind(depth)}}} while ({fmt(node.cond)});" if node.kind == "dowhile" else f"{_ind(depth)}}}")
     elif isinstance(node, Switch):
         out.append(f"{_ind(depth)}switch ({fmt(node.expr)}) {{")
-        for target, body in node.cases:
-            out.append(f"{_ind(depth)}case loc_{target:x}:")
-            if body is not None:
-                _render(body, depth + 1, out, gotos)
+        for case in node.cases:
+            for label in case_labels(case):
+                out.append(f"{_ind(depth)}{label}:")
+            _render(case.body, depth + 1, out, gotos)
         out.append(f"{_ind(depth)}}}")
 
 
-__all__ = ["Structurer", "structure", "to_pseudocode"]
+def case_labels(case: Case, fmt_value=str) -> list[str]:
+    labels = [f"case {fmt_value(v)}" for v in case.values]
+    if case.default:
+        labels.append("default")
+    if not labels:
+        labels.append(f"case loc_{case.addr:x}")
+    return labels
+
+
+__all__ = ["Structurer", "structure", "to_pseudocode", "case_labels"]

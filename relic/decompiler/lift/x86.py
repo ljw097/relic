@@ -771,7 +771,7 @@ class X86Lifter:
             for t in table:
                 if t not in seen:
                     seen.append(t)
-            self.emit(IndirectJump(i.addr, expr, seen))
+            self.emit(IndirectJump(i.addr, expr, seen, list(table)))
         elif i.mem_target is not None and self.an.bin.imports_by_got.get(i.mem_target):
             self.emit(CallStmt(i.addr, Call(expr, (), self.bits), tail=True, name=self.an.call_name(i)))
             self.emit(Return(i.addr))

@@ -51,6 +51,22 @@ class Var(Expr):
 
 
 @dataclass(frozen=True, slots=True)
+class StackVar(Expr):
+    """A stack slot read as a local variable (`var_14`), produced for output from `Load`s."""
+    name: str
+    offset: int  # signed offset from the entry stack pointer
+    bits: int
+
+
+@dataclass(frozen=True, slots=True)
+class StackAddr(Expr):
+    """Address of a stack slot (`&var_14`, or just `buf_48` for an array)."""
+    name: str
+    offset: int
+    bits: int
+
+
+@dataclass(frozen=True, slots=True)
 class Load(Expr):
     addr: Expr
     bits: int
@@ -164,6 +180,7 @@ class Jump(Stmt):
 class IndirectJump(Stmt):
     expr: Expr
     targets: list[int] = field(default_factory=list)  # empty when unresolved
+    table: list[int] = field(default_factory=list)    # jump table in index order (with repeats)
 
 
 @dataclass(slots=True)
@@ -204,7 +221,7 @@ BARRIERS = (Store, CallStmt, Effect, Unknown)  # statements that may write memor
 
 # ------------------------------------------------------------------ traversal
 def children(e: Expr) -> tuple[Expr, ...]:
-    if isinstance(e, (Const, Reg, Var)):
+    if isinstance(e, (Const, Reg, Var, StackVar, StackAddr)):
         return ()
     if isinstance(e, (Load, UnOp, Cast, Extract)):
         return (e.addr,) if isinstance(e, Load) else (e.a,)
@@ -369,6 +386,10 @@ def fmt(e: Expr, prec: int = 0) -> str:
         return e.name
     if isinstance(e, Var):
         return f"{e.name}_{e.version}"
+    if isinstance(e, StackVar):
+        return e.name
+    if isinstance(e, StackAddr):
+        return f"&{e.name}"
     if isinstance(e, Load):
         return f"[{fmt(e.addr)}]:{e.bits}"
     if isinstance(e, BinOp):

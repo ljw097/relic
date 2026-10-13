@@ -55,7 +55,7 @@ def test_checksum_is_a_loop_with_if(vuln64):
 
 def test_classify_is_a_switch(vuln64):
     code = _pseudo(analyze(vuln64), "classify")
-    assert "switch (" in code and "case loc_" in code
+    assert "switch (" in code and "case 0:" in code and "default:" in code
 
 
 def test_main_has_infinite_menu_loop(vuln64):
@@ -74,3 +74,16 @@ def test_condition_negation_reads_naturally(vuln64):
     # the `h > 100000` test should not print as `!(... <=s ...)`
     code = _pseudo(analyze(vuln64), "checksum")
     assert "!(" not in code
+
+
+def test_menu_loop_breaks_out(vuln64):
+    """The `else break` leaving main's menu loop is explicit, not a fall-through."""
+    from relic.decompiler.outssa import out_of_ssa
+    an = analyze(vuln64)
+    code = to_pseudocode(out_of_ssa(decompile_ir(an, an.function_by_name("main"))), an)
+    assert "break;" in code and "goto" not in code
+
+
+def test_pie_classify_switch_has_default(vuln64_pie):
+    code = _pseudo(analyze(vuln64_pie), "classify")
+    assert "default:" in code and "case 5:" in code and "goto" not in code
