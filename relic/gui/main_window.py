@@ -4,7 +4,7 @@ from __future__ import annotations
 import os
 import traceback
 
-from PySide6.QtCore import QSortFilterProxyModel, Qt, QThread, Signal
+from PySide6.QtCore import QSettings, QSortFilterProxyModel, Qt, QThread, Signal
 from PySide6.QtGui import QAction, QColor, QKeySequence, QPalette, QStandardItem, QStandardItemModel
 from PySide6.QtWidgets import (QAbstractItemView, QApplication, QDockWidget, QFileDialog, QHeaderView,
                                QInputDialog, QLabel, QLineEdit, QMainWindow, QMessageBox, QTableView,
@@ -203,6 +203,7 @@ class MainWindow(QMainWindow):
         self.statusBar().addPermanentWidget(self.status, 1)
         self._actions()
         self._update_actions()
+        self._restore_layout()
 
     # ---------------------------------------------------------------- setup
     def _dock(self, title: str, w: QWidget, area) -> QDockWidget:
@@ -227,6 +228,8 @@ class MainWindow(QMainWindow):
         mb = self.menuBar()
         m = mb.addMenu("&File")
         act(m, "&Open...", QKeySequence.StandardKey.Open, self.open_dialog, False)
+        self.recent_menu = m.addMenu("Open &Recent")
+        self._fill_recent_menu()
         act(m, "&Save project", QKeySequence.StandardKey.Save, self.save_project)
         m.addSeparator()
         act(m, "&Quit", QKeySequence.StandardKey.Quit, self.close, False)
@@ -261,6 +264,54 @@ class MainWindow(QMainWindow):
         if path:
             self.open_file(path)
 
+    # ----------------------------------------------------------- settings
+    MAX_RECENT = 10
+
+    @staticmethod
+    def settings() -> QSettings:
+        """Per-user settings; RELIC_SETTINGS points them at an ini file (tests, portable use)."""
+        path = os.environ.get("RELIC_SETTINGS")
+        return QSettings(path, QSettings.Format.IniFormat) if path else QSettings("relic", "relic")
+
+    def recent_files(self) -> list[dict]:
+        import json
+        try:
+            items = json.loads(self.settings().value("recent", "[]") or "[]")
+        except (TypeError, ValueError):
+            return []
+        return [r for r in items if isinstance(r, dict) and isinstance(r.get("path"), str)]
+
+    def _remember(self, path: str, arch: str | None, base: int):
+        import json
+        path = os.path.abspath(path)
+        items = [r for r in self.recent_files() if r["path"] != path]
+        items.insert(0, {"path": path, "arch": arch, "base": base})
+        self.settings().setValue("recent", json.dumps(items[:self.MAX_RECENT]))
+        self._fill_recent_menu()
+
+    def _fill_recent_menu(self):
+        self.recent_menu.clear()
+        items = self.recent_files()
+        for r in items:
+            label = r["path"] + (f"  [{r['arch']} @ {r.get('base', 0):#x}]" if r.get("arch") else "")
+            a = self.recent_menu.addAction(label)
+            a.triggered.connect(lambda _=False, r=r: self.open_file(r["path"], r.get("arch"), r.get("base") or 0))
+        self.recent_menu.setEnabled(bool(items))
+
+    def _restore_layout(self):
+        st = self.settings()
+        geo, state = st.value("geometry"), st.value("windowState")
+        if geo is not None:
+            self.restoreGeometry(geo)
+        if state is not None:
+            self.restoreState(state)
+
+    def _save_layout(self):
+        st = self.settings()
+        st.setValue("geometry", self.saveGeometry())
+        st.setValue("windowState", self.saveState())
+        st.sync()
+
     def open_file(self, path: str, arch: str | None = None, base: int = 0):
         if not self._confirm_discard():
             return
@@ -270,7 +321,8 @@ class MainWindow(QMainWindow):
         self.statusBar().showMessage(f"analysing {path} ...")
         self.setWindowTitle(f"Relic - {os.path.basename(path)} (analysing)")
         self.thread = AnalysisThread(path, arch, base, self)
-        self.thread.done.connect(self.set_analysis)
+        self.thread.done.connect(lambda an, extra, p=path, a=arch, b=base: (self._remember(p, a, b),
+                                                                             self.set_analysis(an, extra)))
         self.thread.failed.connect(self._failed)
         self.thread.start()
 
@@ -611,6 +663,7 @@ class MainWindow(QMainWindow):
         if self.vulns_thread is not None:
             self.vulns_thread.wait()
         self.decomp.shutdown()
+        self._save_layout()
         super().closeEvent(e)
 
     # ---------------------------------------------------------------- xrefs

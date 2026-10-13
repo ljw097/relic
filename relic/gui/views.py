@@ -15,7 +15,7 @@ THEME = {
     "bg": "#1e1f22", "fg": "#d4d4d4", "addr": "#6c7086", "bytes": "#585b70", "mnem": "#89b4fa",
     "call": "#f9e2af", "jump": "#f38ba8", "ret": "#cba6f7", "comment": "#7fb77e", "label": "#fab387",
     "func": "#a6e3a1", "current": "#2d2f36", "node": "#26272b", "node_border": "#45475a",
-    "edge_true": "#7fb77e", "edge_false": "#f38ba8", "edge": "#89b4fa",
+    "edge_true": "#7fb77e", "edge_false": "#f38ba8", "edge": "#89b4fa", "word": "#3e4452",
 }
 
 
@@ -31,6 +31,53 @@ def _fmt(color: str, bold: bool = False) -> QTextCharFormat:
     if bold:
         f.setFontWeight(QFont.Weight.Bold)
     return f
+
+
+_WORD_LIMIT = 2000          # occurrences highlighted at most (huge functions)
+
+
+def _word_under_cursor(edit: QPlainTextEdit) -> str:
+    cur = edit.textCursor()
+    cur.select(QTextCursor.SelectionType.WordUnderCursor)
+    return cur.selectedText()
+
+
+def _same_words(word: str) -> list[str]:
+    """`word` and the names of the same thing: a register's other widths (rax, eax, ax, al)."""
+    from ..analysis.vulns import canon
+    base = canon(word)
+    if base == word and not word.startswith("r"):
+        return [word]
+    from ..analysis.vulns import _ALIAS
+    return sorted({base, *(k for k, v in _ALIAS.items() if v == base)} | {word})
+
+
+def _row_and_word_selections(edit: QPlainTextEdit, row: int) -> list:
+    """The current-line band plus every occurrence of the word under the cursor."""
+    import re
+    sel = QTextEdit.ExtraSelection()
+    sel.format.setBackground(QColor(THEME["current"]))
+    sel.format.setProperty(QTextCharFormat.Property.FullWidthSelection, True)
+    sel.cursor = QTextCursor(edit.document().findBlockByNumber(row))
+    out = [sel]
+    word = _word_under_cursor(edit)
+    if len(word) < 2 or not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_.]*", word):
+        return out
+    rx = re.compile(r"(?<![A-Za-z0-9_.])(" + "|".join(map(re.escape, _same_words(word))) + r")(?![A-Za-z0-9_])")
+    fmt = QTextCharFormat()
+    fmt.setBackground(QColor(THEME["word"]))
+    block = edit.document().firstBlock()
+    while block.isValid() and len(out) < _WORD_LIMIT:
+        for m in rx.finditer(block.text()):
+            ws = QTextEdit.ExtraSelection()
+            ws.format = fmt
+            c = QTextCursor(block)
+            c.setPosition(block.position() + m.start())
+            c.setPosition(block.position() + m.end(), QTextCursor.MoveMode.KeepAnchor)
+            ws.cursor = c
+            out.append(ws)
+        block = block.next()
+    return out
 
 
 class ListingHighlighter(QSyntaxHighlighter):
@@ -141,11 +188,7 @@ class DisasmView(QPlainTextEdit):
         return ln.addr if ln else None
 
     def _highlight_row(self, row: int):
-        sel = QTextEdit.ExtraSelection()
-        sel.format.setBackground(QColor(THEME["current"]))
-        sel.format.setProperty(QTextCharFormat.Property.FullWidthSelection, True)
-        sel.cursor = QTextCursor(self.document().findBlockByNumber(row))
-        self.setExtraSelections([sel])
+        self.setExtraSelections(_row_and_word_selections(self, row))
 
     def _moved(self):
         row = self.textCursor().blockNumber()
@@ -631,11 +674,7 @@ class PseudocodeView(QPlainTextEdit):
         return lines[row].addr if 0 <= row < len(lines) else None
 
     def _highlight_row(self, row: int):
-        sel = QTextEdit.ExtraSelection()
-        sel.format.setBackground(QColor(THEME["current"]))
-        sel.format.setProperty(QTextCharFormat.Property.FullWidthSelection, True)
-        sel.cursor = QTextCursor(self.document().findBlockByNumber(row))
-        self.setExtraSelections([sel])
+        self.setExtraSelections(_row_and_word_selections(self, row))
 
     def _moved(self):
         self._highlight_row(self.textCursor().blockNumber())

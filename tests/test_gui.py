@@ -5,6 +5,8 @@ import shutil
 import pytest
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+# keep the tests away from the user's real settings (recent files, window layout)
+os.environ["RELIC_SETTINGS"] = os.path.join(__import__("tempfile").mkdtemp(), "relic-test.ini")
 pytest.importorskip("PySide6.QtWidgets", exc_type=ImportError)  # also missing libEGL etc.
 
 from PySide6.QtWidgets import QApplication  # noqa: E402
@@ -217,3 +219,43 @@ def test_comment_shows_in_pseudocode(win):
     win.comment(win.decomp.result.lines[row].addr, "overflow here")
     assert win.decomp.wait_idle()
     assert "gets(buf_48);  // overflow here" in win.decomp.toPlainText()
+
+
+def test_word_under_cursor_is_highlighted_with_register_aliases(win):
+    from PySide6.QtGui import QTextCursor
+    win.goto_text("checksum")
+    view = win.disasm
+    doc = view.document()
+    row = next(k for k in range(doc.blockCount()) if " eax" in doc.findBlockByNumber(k).text())
+    text = doc.findBlockByNumber(row).text()
+    cur = QTextCursor(doc.findBlockByNumber(row))
+    cur.movePosition(QTextCursor.MoveOperation.Right, n=text.index(" eax") + 2)
+    view.setTextCursor(cur)
+    words = {s.cursor.selectedText() for s in view.extraSelections()[1:]}
+    assert "eax" in words and ("rax" in words or "al" in words or len(words) == 1)
+    assert len(view.extraSelections()) > 2           # several occurrences, plus the line band
+    # pseudocode: a variable
+    win.tabs.setCurrentIndex(win.TAB_DECOMP)
+    assert win.decomp.wait_idle()
+    _cursor_on(win.decomp, "var_c = 0")
+    assert {s.cursor.selectedText() for s in win.decomp.extraSelections()[1:]} == {"var_c"}
+    assert len(win.decomp.extraSelections()) >= 4
+
+
+
+def test_recent_files_and_layout_are_remembered(app, win):
+    path = os.path.abspath(win.an.bin.path)
+    assert win.recent_files()[0]["path"] == path
+    labels = [a.text() for a in win.recent_menu.actions()]
+    assert labels and labels[0].startswith(path)
+    # the dock layout survives a restart
+    xr = win.xrefs_dock
+    xr.hide()
+    win.dirty = False
+    win.close()
+    w2 = MainWindow()
+    try:
+        assert w2.recent_files()[0]["path"] == path
+        assert w2.xrefs_dock.isHidden()
+    finally:
+        w2.close()
