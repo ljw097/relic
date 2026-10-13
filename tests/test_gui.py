@@ -122,3 +122,22 @@ def test_pseudocode_shows_renames(win):
     win.tabs.setCurrentIndex(win.TAB_DECOMP)
     win.rename(win.an.function_by_name("checksum").addr, "hash_name")
     assert "hash_name(buf_48)" in win.decomp.toPlainText()
+
+
+def test_pseudocode_rename_subject_is_word_under_cursor(win):
+    win.goto_text("vuln")
+    win.tabs.setCurrentIndex(win.TAB_DECOMP)
+    doc = win.decomp.document()
+    row = next(k for k, ln in enumerate(win.decomp.result.lines) if "checksum(" in ln.text)
+    col = doc.findBlockByNumber(row).text().index("checksum") + 2
+    from PySide6.QtGui import QTextCursor
+    cur = QTextCursor(doc.findBlockByNumber(row))
+    cur.movePosition(QTextCursor.MoveOperation.Right, n=col)
+    win.decomp.setTextCursor(cur)
+    assert win._rename_subject() == win.an.function_by_name("checksum").addr
+    # a local variable is not a symbol: fall back to the current function
+    row = next(k for k, ln in enumerate(win.decomp.result.lines) if "char buf_48" in ln.text)
+    cur = QTextCursor(doc.findBlockByNumber(row))
+    cur.movePosition(QTextCursor.MoveOperation.Right, n=10)
+    win.decomp.setTextCursor(cur)
+    assert win._rename_subject() == win.an.function_by_name("vuln").addr
