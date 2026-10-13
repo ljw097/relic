@@ -84,3 +84,41 @@ def test_xrefs_panel(win):
     win._fill_xrefs(win.an.function_by_name("menu").addr)
     rows = _rows(win.xrefs)
     assert rows and any(r[2].startswith("main") for r in rows)
+
+
+def test_pseudocode_tab_follows_navigation(win):
+    vuln = win.an.function_by_name("vuln").addr
+    win.goto(vuln)
+    win.toggle_decompile()
+    assert win.tabs.currentIndex() == win.TAB_DECOMP
+    text = win.decomp.toPlainText()
+    assert text.startswith("void vuln(void)") and "gets(buf_48);" in text
+    # navigating while the tab is shown re-decompiles the new function
+    win.goto_text("checksum")
+    assert win.decomp.toPlainText().startswith("int checksum(char *a1)")
+    win.toggle_decompile()
+    assert win.tabs.currentIndex() == win.TAB_DISASM
+
+
+def test_pseudocode_cursor_syncs_with_listing(win):
+    vuln = win.an.function_by_name("vuln")
+    win.goto(vuln.addr)
+    win.tabs.setCurrentIndex(win.TAB_DECOMP)
+    # put the pseudocode cursor on the gets() line: the window's current address follows
+    row = next(k for k, ln in enumerate(win.decomp.result.lines) if "gets(" in ln.text)
+    from PySide6.QtGui import QTextCursor
+    win.decomp.setTextCursor(QTextCursor(win.decomp.document().findBlockByNumber(row)))
+    gets_addr = win.decomp.result.lines[row].addr
+    assert win.cur == gets_addr
+    win.tabs.setCurrentIndex(win.TAB_DISASM)
+    assert win.disasm.current_line().mnemonic == "call" and win.disasm.current_addr() == gets_addr
+    # and back: a listing address maps to the pseudocode line it produced
+    win.tabs.setCurrentIndex(win.TAB_DECOMP)
+    assert win.decomp.textCursor().blockNumber() == row
+
+
+def test_pseudocode_shows_renames(win):
+    win.goto_text("vuln")
+    win.tabs.setCurrentIndex(win.TAB_DECOMP)
+    win.rename(win.an.function_by_name("checksum").addr, "hash_name")
+    assert "hash_name(buf_48)" in win.decomp.toPlainText()

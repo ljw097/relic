@@ -17,7 +17,7 @@
 | checksec | ELF: RELRO / Canary / NX / PIE / FORTIFY / RPATH, PE: ASLR / DEP / CFG / SEH / GS |
 | 포너블 휴리스틱 | `gets`·`strcpy` 등 위험 함수, 비상수 포맷 스트링, 폭 없는 `scanf("%s")`, ret2win 후보 |
 | 프로젝트 | 이름 변경·주석을 `<binary>.relic.json`에 저장 |
-| GUI | 함수 목록, 디스어셈블리 / CFG 그래프 / 헥스, xref·문자열·import·vulns·checksec 패널 |
+| GUI | 함수 목록, 디스어셈블리 / CFG 그래프 / 의사 코드 / 헥스, xref·문자열·import·vulns·checksec 패널 |
 | 디컴파일러 (x86-64) | 리프팅 → SSA·최적화 → 호출 인자·스택 버퍼·카나리 → out-of-SSA → 구조화 → C 출력(`relic decompile`) |
 
 > 인자 추적 기반 탐지(포맷 스트링, ret2win)와 점프 테이블 복원은 현재 **x86-64에서만** 동작합니다.
@@ -91,6 +91,7 @@ relic sc.bin --arch x64 --base 0x1000
 | `G` | 주소 / 심볼로 이동 |
 | `Esc`, `Alt+←` / `Ctrl+Enter`, `Alt+→` | 뒤로 / 앞으로 |
 | `Space` | 리스팅 ↔ 그래프 전환 |
+| `Tab`, `F5` | 리스팅 ↔ 의사 코드 전환 (커서 위치 동기화) |
 | `Ctrl+H` | 헥스 뷰 |
 | `Ctrl+F` | 함수 필터 |
 | `N` | 이름 변경 (함수·라벨, 또는 커서 줄의 호출 대상) |
@@ -98,7 +99,7 @@ relic sc.bin --arch x64 --base 0x1000
 | `X` | xref 패널 |
 | `Ctrl+S` | 프로젝트 저장 (`<binary>.relic.json`) |
 
-더블클릭으로 분기 대상·심볼을 따라갑니다. 문자열 테이블에서 더블클릭하면 그 문자열을 참조하는 코드로 이동합니다.
+더블클릭으로 분기 대상·심볼(의사 코드에서는 함수·전역 이름, `loc_` 레이블)을 따라갑니다. 의사 코드는 탭을 열 때 함수 단위로 디컴파일하고 캐시하며, 이름 변경은 바로 반영됩니다. 문자열 테이블에서 더블클릭하면 그 문자열을 참조하는 코드로 이동합니다.
 
 ## 라이브러리로 사용
 

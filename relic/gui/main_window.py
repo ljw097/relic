@@ -12,7 +12,7 @@ from PySide6.QtWidgets import (QAbstractItemView, QApplication, QDockWidget, QFi
 
 from ..analysis import Analysis
 from ..analysis.strings import escape
-from .views import THEME, DisasmView, GraphView, HexView, mono_font
+from .views import THEME, DisasmView, GraphView, HexView, PseudocodeView, mono_font
 
 ADDR_ROLE = Qt.ItemDataRole.UserRole + 1
 
@@ -123,7 +123,7 @@ class FilteredTable(QWidget):
 
 
 class MainWindow(QMainWindow):
-    TAB_DISASM, TAB_GRAPH, TAB_HEX = range(3)
+    TAB_DISASM, TAB_GRAPH, TAB_DECOMP, TAB_HEX = range(4)
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -137,14 +137,16 @@ class MainWindow(QMainWindow):
 
         self.disasm = DisasmView()
         self.graph = GraphView()
+        self.decomp = PseudocodeView()
         self.hex = HexView()
         self.tabs = QTabWidget()
         self.tabs.addTab(self.disasm, "Disassembly")
         self.tabs.addTab(self.graph, "Graph")
+        self.tabs.addTab(self.decomp, "Pseudocode")
         self.tabs.addTab(self.hex, "Hex")
         self.tabs.currentChanged.connect(self._tab_changed)
         self.setCentralWidget(self.tabs)
-        for v in (self.disasm, self.graph):
+        for v in (self.disasm, self.graph, self.decomp):
             v.navigate.connect(self.goto)
             v.cursor_addr.connect(self._cursor_moved)
 
@@ -212,6 +214,7 @@ class MainWindow(QMainWindow):
         self.fwd_act = act(m, "&Forward", ("Ctrl+Return", "Alt+Right"), self.go_forward)
         m.addSeparator()
         act(m, "Toggle &graph / listing", "Space", self.toggle_graph)
+        act(m, "Toggle &pseudocode / listing", ("Tab", "F5"), self.toggle_decompile)
         act(m, "&Hex view", "Ctrl+H", lambda: self.tabs.setCurrentIndex(self.TAB_HEX))
         act(m, "&Functions", "Ctrl+F", self._focus_functions)
         m = mb.addMenu("&Edit")
@@ -353,6 +356,8 @@ class MainWindow(QMainWindow):
         if f is not None:
             self.disasm.show_function(an, f, addr)
             self.graph.show_function(an, f, addr)
+            if self.tabs.currentIndex() == self.TAB_DECOMP:   # decompiled on demand only
+                self.decomp.show_function(an, f, addr)
             if self.tabs.currentIndex() == self.TAB_HEX:
                 self.tabs.setCurrentIndex(self.TAB_DISASM)
         else:
@@ -397,10 +402,19 @@ class MainWindow(QMainWindow):
     def toggle_graph(self):
         self.tabs.setCurrentIndex(self.TAB_GRAPH if self.tabs.currentIndex() != self.TAB_GRAPH else self.TAB_DISASM)
 
+    def toggle_decompile(self):
+        self.tabs.setCurrentIndex(self.TAB_DECOMP if self.tabs.currentIndex() != self.TAB_DECOMP
+                                  else self.TAB_DISASM)
+
     def _tab_changed(self, idx: int):
         if self.an is None or self.cur is None:
             return
-        if idx == self.TAB_DISASM:
+        if idx == self.TAB_DECOMP:
+            f = self.an.function_at(self.cur)
+            if f is not None:
+                self.decomp.show_function(self.an, f, self.cur)
+            self.decomp.setFocus()
+        elif idx == self.TAB_DISASM:
             self.disasm.goto(self.cur)
             self.disasm.setFocus()
         elif idx == self.TAB_GRAPH:
@@ -436,9 +450,17 @@ class MainWindow(QMainWindow):
             ln = self.disasm.current_line()
             if ln is not None:
                 return ln.addr
+        if self.tabs.currentIndex() == self.TAB_DECOMP:
+            a = self.decomp.current_addr()
+            if a is not None:
+                return a
         return self.cur
 
     def _rename_subject(self) -> int | None:
+        if self.tabs.currentIndex() == self.TAB_DECOMP:
+            a = self.decomp.symbol_under_cursor()
+            if a is not None:
+                return a
         if self.tabs.currentIndex() == self.TAB_DISASM:
             ln = self.disasm.current_line()
             if ln is not None:
@@ -488,6 +510,7 @@ class MainWindow(QMainWindow):
         keep = self.cur
         self.disasm.reload()
         self.graph.reload()
+        self.decomp.invalidate(reload=self.tabs.currentIndex() == self.TAB_DECOMP)
         if keep is not None:
             self.disasm.goto(keep)
             self.graph.goto(keep)

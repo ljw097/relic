@@ -1,6 +1,6 @@
 # 디컴파일러 계획
 
-상태: 단계 5 완료 — x86-64에서 `relic decompile`이 C 유사 코드를 출력한다(out-of-SSA, 타입, 출력 정리). 단계 6(GUI 디컴파일 뷰, x86-32)이 다음. 이 문서는 구현 순서와 모듈 경계를 정한다.
+상태: 단계 5 완료 — x86-64에서 `relic decompile`이 C 유사 코드를 출력한다(out-of-SSA, 타입, 출력 정리). GUI Pseudocode 탭(단계 6 일부)도 동작한다. 남은 단계 6 작업은 x86-32 리프터 검증과 GUI 백그라운드 디컴파일. 이 문서는 구현 순서와 모듈 경계를 정한다.
 
 ## 목표
 
@@ -138,7 +138,7 @@ relic/decompiler/
 | 3 | 호출·스택 | `vuln`에서 `gets(buf)`와 `char buf[0x40]`(PIE 0x48) 크기, 카나리 식별, `printf("hello %s (%d)\n", buf, checksum(buf))` 복원 ✅ |
 | 4 | 구조화 | `main`의 `while(1)` 메뉴 루프, `classify`의 `switch`가 goto 없이 출력 ✅ |
 | 5 | 타입·출력 정리 | `-O0`/`-O1`/PIE 변형 모두에서 위 결과 유지, 재컴파일 결과가 원본과 일치 ✅ |
-| 6 | GUI 디컴파일 탭, x86-32 리프터 (CLI `relic decompile`은 단계 5에서 완료) | GUI 스모크 테스트 통과 |
+| 6 | GUI 디컴파일 탭 ✅, x86-32 리프터 (CLI `relic decompile`은 단계 5에서 완료) | GUI 스모크 테스트 통과 ✅, x86-32 샘플 재컴파일 테스트 |
 
 각 단계는 `tests/src/vuln.c` 기반의 골든 테스트를 추가한다. 출력 문자열 전체 비교 대신 핵심 구문(호출, 조건, 루프 형태)의 포함 여부로 검증해 출력 형식 변경에 덜 민감하게 한다.
 
