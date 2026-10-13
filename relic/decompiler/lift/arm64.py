@@ -481,6 +481,103 @@ class Arm64Lifter:
     def _i_udiv(self, i, ops):
         self._arith(ops, "/u")
 
+    # ------------------------------------------------- carries, bit tricks, moves
+    def _with_carry(self, ops, sub: bool, flags: bool, neg=False):
+        """adc / sbc / ngc (and the flag-setting forms): `a + b + C`, `a - b - !C = a + ~b + C`."""
+        w = self.width(ops[0])
+        if neg:                                   # ngc: 0 - b - !C
+            a, b = Const(0, w), self.operand(ops[1], w)
+        else:
+            a, b = self.operand(ops[1], w), self.operand(ops[2], w)
+        if sub:
+            b = UnOp("~", b, w)
+        c = cast("zext", CF, w)
+        res = BinOp("+", BinOp("+", a, b, w), c, w)
+        if flags:
+            t = self.tmp(res)
+            self._nz(t)
+            self.assign(CF, Intrinsic("carry3", (a, b, c), 1))
+            self.assign(OF, Intrinsic("scarry3", (a, b, c), 1))
+            res = t
+        self.write_reg(self.name(ops[0]), res)
+
+    def _i_adc(self, i, ops):
+        self._with_carry(ops, False, False)
+
+    def _i_adcs(self, i, ops):
+        self._with_carry(ops, False, True)
+
+    def _i_sbc(self, i, ops):
+        self._with_carry(ops, True, False)
+
+    def _i_sbcs(self, i, ops):
+        self._with_carry(ops, True, True)
+
+    def _i_ngc(self, i, ops):
+        self._with_carry(ops, True, False, neg=True)
+
+    def _i_ngcs(self, i, ops):
+        self._with_carry(ops, True, True, neg=True)
+
+    def _unary_intrinsic(self, i, ops, name):
+        w = self.width(ops[0])
+        self.write_reg(self.name(ops[0]), Intrinsic(name, (self.operand(ops[1], w),), w))
+
+    def _i_clz(self, i, ops):
+        self._unary_intrinsic(i, ops, "clz")
+
+    def _i_cls(self, i, ops):
+        self._unary_intrinsic(i, ops, "cls")
+
+    def _i_rbit(self, i, ops):
+        self._unary_intrinsic(i, ops, "rbit")
+
+    def _i_rev(self, i, ops):
+        self._unary_intrinsic(i, ops, "bswap")
+
+    def _i_rev16(self, i, ops):
+        self._unary_intrinsic(i, ops, "rev16")
+
+    def _i_rev32(self, i, ops):
+        self._unary_intrinsic(i, ops, "rev32")
+
+    def _i_extr(self, i, ops):
+        """`extr d, a, b, #lsb`: bits [lsb, lsb+w) of the 2w-bit value a:b (ror when a == b)."""
+        w = self.width(ops[0])
+        a, b, lsb = self.operand(ops[1], w), self.operand(ops[2], w), ops[3].imm
+        if a == b:
+            v = BinOp("ror", a, Const(lsb, 8), w)
+        elif lsb == 0:
+            v = b
+        else:
+            v = BinOp("|", BinOp(">>u", b, Const(lsb, 8), w), BinOp("<<", a, Const(w - lsb, 8), w), w)
+        self.write_reg(self.name(ops[0]), v)
+
+    def _i_fmov(self, i, ops):
+        """Bit-exact moves between general and FP registers; FP constants stay opaque."""
+        dst, src = ops[0], ops[1]
+        dn = self.name(dst)
+        dv = _REGS.get(dn, ("x",))[0].startswith("v")
+        if src.type == OP_REG:
+            sv = _REGS.get(self.name(src), ("x",))[0].startswith("v")
+            if dv != sv or not dv:                 # GPR <-> FP: the same bits
+                self.write_reg(dn, self.resize(self.read_reg(self.name(src)), self.width(dst)))
+                return
+        self.write_reg(dn, Intrinsic("fmov", tuple(self.operand(o, self.width(dst)) for o in ops[1:]
+                                                   if o.type in (OP_REG, OP_IMM)), self.width(dst)))
+
+    def _i_mrs(self, i, ops):
+        """System register read (`tpidr_el0` is the thread pointer)."""
+        sysreg = i.op_str.split(",", 1)[1].strip() if "," in i.op_str else "sysreg"
+        self.write_reg(self.name(ops[0]), Intrinsic(f"mrs_{sysreg}", (), 64))
+
+    def _i_umov(self, i, ops):
+        w = self.width(ops[0])
+        src = Reg(_REGS[self.name(ops[1])][0], 128) if ops[1].type == OP_REG else Const(0, 128)
+        self.write_reg(self.name(ops[0]), Intrinsic("umov", (src,), w))
+
+    _i_mov_vec = _i_umov
+
     # ------------------------------------------------------------ bitfields
     def _field(self, ops):
         w = self.width(ops[0])
