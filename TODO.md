@@ -20,7 +20,7 @@
 - [ ] **P0** 호출 규약별 인자 추출을 `vulns`에서 공통 사용
   - [x] x64 SysV / Win64, x86 cdecl: 디컴파일러가 복원한 호출 인자 사용 (x64는 블록 안 역추적으로 결론이 안 날 때만; GUI는 창을 먼저 띄우고 백그라운드에서 스캔)
   - [ ] AArch64 x0–x7, ARM r0–r3, MIPS a0–a3, RISC-V a0–a7, PPC r3–r10 (해당 리프터가 생기면 같은 경로로)
-- [ ] **P1** 점프 테이블: x86-32 PIC(GOT 기준 오프셋), AArch64(`ldrb/ldrh` + `adr` + `add ..., lsl`), ARM(`ldrls pc, [pc, rN, lsl #2]`)
+- [ ] **P1** 점프 테이블: ~~x86-32 PIC(GOT 기준 오프셋)~~ (완료), AArch64(`ldrb/ldrh` + `adr` + `add ..., lsl`), ARM(`ldrls pc, [pc, rN, lsl #2]`)
   - 상대 테이블은 후보 기준 주소들을 검증해서 선택
 - [ ] **P1** MIPS: `.MIPS.stubs` / GOT(`DT_MIPS_GOTSYM`, `DT_MIPS_LOCAL_GOTNO`) 기반 import 이름 해석, 지연 슬롯을 블록에 포함
 - [ ] **P1** ARM Thumb 모드 (심볼 LSB, `blx` 모드 전환)
@@ -30,7 +30,7 @@
 
 - [x] **P0** GitHub Actions CI (pytest, gcc 설치, Python 3.10 / 3.12 / 3.13)
 - [ ] **P1** 멀티 아키텍처 샘플: `-m32`(완료: vuln32·flow32, CI에 gcc-multilib), `aarch64-linux-gnu-gcc`, `arm-linux-gnueabi-gcc`, `mipsel-linux-gnu-gcc` (툴체인 없으면 skip)
-- [ ] **P1** case마다 함수를 호출하는 `switch` 샘플 추가 — 지금 `classify`는 `-O2`에서 값 배열 조회로 바뀌어 점프 테이블 테스트가 안 됨
+- [x] case마다 함수를 호출하는 `switch` 샘플(`flow.c`의 `sw_calls`): x86-64/x86-32 × -O0/-O2 모두 점프 테이블 → `switch`, 재컴파일 검증
 - [x] PE 테스트: MinGW x64/x86 샘플로 로더·COFF 심볼·IAT 호출 이름·checksec·vulns·디컴파일 (CI에 mingw 설치, 없으면 skip)
 - [ ] **P2** ruff 린트 / 포맷 설정
 

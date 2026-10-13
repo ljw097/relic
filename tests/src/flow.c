@@ -129,4 +129,21 @@ F int digsum(unsigned x) {
     return s;
 }
 
+// a dense switch whose cases call different functions: compiled to a jump table even at -O2
+F int sw_calls(int x, int y) {
+    int r;
+    switch (x) {
+    case 0: r = sc_or(y, 2); break;
+    case 1: r = gcd(y, 12); break;
+    case 2: r = clamp(y, 0, 10) * 3; break;
+    case 3: r = dowhile(y & 15); break;
+    case 4: r = collatz(y & 63); break;
+    case 5: r = div3(y) + 1; break;
+    case 6: return mod10(y);
+    case 8: r = y * y; break;
+    default: r = -y;
+    }
+    return r + x;
+}
+
 int main(void) { return 0; }

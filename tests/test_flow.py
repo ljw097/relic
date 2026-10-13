@@ -20,7 +20,7 @@ from relic.decompiler.emit import decompile
 
 HERE = os.path.dirname(__file__)
 FUNCS = ["sc_or", "sc_and3", "find", "collatz", "nested", "sw_fall", "dowhile", "clamp", "gcd", "classify2", "scan",
-         "div3", "udiv10", "mod10", "ldiv1000", "div_neg7", "is_mult6", "digsum", "div16", "mod8"]
+         "div3", "udiv10", "mod10", "ldiv1000", "div_neg7", "is_mult6", "digsum", "div16", "mod8", "sw_calls"]
 
 _HARNESS = r"""
 #include <stdint.h>
@@ -58,6 +58,7 @@ int main(void) {
 #define CHK2(f, x, y) if (f(x, y) != ref_##f(x, y)) { printf(#f "(%%d,%%d) = %%d, want %%d\n", x, y, (int)f(x, y), ref_##f(x, y)); bad++; }
             CHK2(sc_or, a, b)
             CHK2(classify2, a, b)
+            if (b > -100000 && b < 100000 && b != 0 && b != -2147483647 - 1) { CHK2(sw_calls, a & 15, b) }
             if (a > 0 && b > 0 && a < 60 && b < 60) { CHK2(nested, a, b) }
             if (b != 0 && a != -2147483647 - 1 && b != -2147483647 - 1) { CHK2(gcd, a, b) }
             for (int k = 0; k < nv; k += 3) {
@@ -119,3 +120,13 @@ def test_division_by_constant_recovered(flow, fn, shape):
     assert shape in text, f"{name}/{fn}:\n{text}"
     body = "\n".join(ln.split("//")[0] for ln in text.split("{", 1)[1].splitlines())
     assert "0x" not in body, f"{name}/{fn}: magic constant left\n{text}"
+
+
+def test_jump_table_switch(flow):
+    """sw_calls is a dense switch: a jump table at every optimisation level."""
+    name, an = flow
+    text = decompile(an, an.function_by_name("sw_calls")).text
+    assert "switch (" in text and "default:" in text, f"{name}:\n{text}"
+    for callee in ("sc_or(", "gcd(", "clamp(", "collatz(", "mod10("):
+        assert callee in text, f"{name}: {callee}\n{text}"
+    assert "goto" not in text, f"{name}:\n{text}"

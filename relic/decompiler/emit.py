@@ -340,6 +340,8 @@ class CWriter:
             if ret is not None:
                 text = f"{self.expr(ret)} = {text}"
             return text + ";"
+        if isinstance(s, ir.IndirectJump):
+            return f"goto *{self.expr(s.expr, PREC_UNARY)};  // unresolved jump"
         if isinstance(s, Effect):
             return f"__{s.name}({', '.join(self.expr(a) for a in s.args)});"
         if isinstance(s, Unknown):

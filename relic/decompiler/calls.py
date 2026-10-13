@@ -160,9 +160,12 @@ def _recover_cdecl(fn: IRFunction, an: "Analysis", arch: ArchInfo):
             if not isinstance(s, CallStmt) or s.call.args:
                 continue
             sp = dict(s.uses).get(arch.sp)
-            base = frame.offset_of(sp) if sp is not None else None
-            if base is None:
+            sp_off = frame.offset_of(sp) if sp is not None else None
+            if sp_off is None:
                 continue
+            # a tail call (`jmp f`) pushes no return address: its arguments start one word up,
+            # in the caller's own parameter slots
+            base = sp_off + word if s.tail else sp_off
             # most recent store to each argument slot since the previous call in this block
             stores: dict[int, int] = {}
             for j in range(k - 1, -1, -1):
@@ -187,9 +190,19 @@ def _recover_cdecl(fn: IRFunction, an: "Analysis", arch: ArchInfo):
                 while base + n * word in stores:
                     n += 1
             idx = [stores.get(base + a * word) for a in range(n)]
-            if any(i is None for i in idx):
-                idx = idx[:idx.index(None)]
-            s.call = Call(s.call.target, tuple(b.stmts[i].src for i in idx), s.call.bits)
+            from .ir import BinOp, Load
+            args = []
+            for a, i in enumerate(idx):
+                if i is not None:
+                    args.append(b.stmts[i].src)
+                elif s.tail:
+                    # passed straight through: the caller's own parameter slot, unchanged
+                    delta = base + a * word - sp_off
+                    args.append(Load(BinOp("+", sp, Const(delta, arch.bits), arch.bits), arch.bits))
+                else:
+                    break
+            idx = [i for i in idx[:len(args)] if i is not None]
+            s.call = Call(s.call.target, tuple(args), s.call.bits)
             s.uses = []          # the stack pointer only located the arguments
             consumed |= set(idx)
         if consumed:

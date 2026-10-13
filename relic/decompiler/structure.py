@@ -394,6 +394,9 @@ class Structurer:
             if isinstance(term, Return):
                 seq.items.append(Ret(term))
                 n = None
+            elif isinstance(term, IndirectJump) and not term.targets:
+                seq.items.append(Block(n, [term], copy=True))   # unresolved: `goto *expr`
+                n = None
             elif isinstance(term, IndirectJump):
                 node, n = self._switch(n, term, None, ctx, self._postdom(n))
                 seq.items.append(node)
