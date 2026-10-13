@@ -280,7 +280,8 @@ class X86Lifter:
             elif m in _NOPS:
                 pass
             elif m in _EFFECTS:
-                self.emit(Effect(i.addr, m, tuple(self.read(o) for o in i.cs.operands)))
+                uses, defs = self.reg_traffic(i, m)
+                self.emit(Effect(i.addr, m, tuple(self.read(o) for o in i.cs.operands), uses, defs))
             elif m.startswith("cmov"):
                 self._cmov(i, i.cs.operands, m[4:])
             elif m.startswith("set") and m[3:] in _CC:
@@ -297,10 +298,37 @@ class X86Lifter:
                 dst = ops[0]
                 self.write(dst, Intrinsic(m, srcs, dst.size * 8))
             else:
-                self.out = [Unknown(i.addr, f"{i.mnemonic} {i.op_str}".strip())]
+                self.out = [self.unknown(i)]
         except LiftError:
-            self.out = [Unknown(i.addr, f"{i.mnemonic} {i.op_str}".strip())]
+            self.out = [self.unknown(i)]
         return self.out
+
+    def unknown(self, i: Insn) -> Unknown:
+        uses, defs = self.reg_traffic(i, None)
+        return Unknown(i.addr, f"{i.mnemonic} {i.op_str}".strip(), uses, defs)
+
+    def reg_traffic(self, i: Insn, effect: str | None):
+        """Full registers an opaque instruction reads and writes (from capstone's access info)."""
+        from ..arch import FLAGS, arch_for
+        if effect == "syscall":
+            try:
+                a = arch_for(self.an.bin)
+                return ([(r, self.full(r)) for r in a.syscall_reads],
+                        [(r, self.full(r)) for r in a.syscall_clobbers])
+            except NotImplementedError:
+                pass
+
+        def regs(names):
+            out: dict[str, Reg] = {}
+            for n in names:
+                if n in ("rflags", "eflags", "flags"):
+                    for f in FLAGS:
+                        out[f] = Reg(f, 1)
+                elif n in self.regs:
+                    r = self.full(n)
+                    out[r.name] = r
+            return list(out.items())
+        return regs(i.regs_read), regs(i.regs_write)
 
     # ------------------------------------------------------- data movement
     def _i_mov(self, i, ops):
@@ -670,7 +698,7 @@ class X86Lifter:
         """`rep stos` / `rep movs` as memset / memcpy-like effects (DF assumed clear)."""
         size = {"b": 1, "w": 2, "d": 4, "q": 8}.get(m[-1])
         if not m.startswith(("stos", "movs")) or size is None or rep not in ("rep",):
-            self.out = [Unknown(i.addr, f"{i.mnemonic} {i.op_str}".strip())]
+            self.out = [self.unknown(i)]
             return self.out
         r = "r" if self.bits == 64 else "e"
         di, si, cx = (self.read_reg(r + n) for n in ("di", "si", "cx"))
@@ -736,7 +764,7 @@ class X86Lifter:
         try:
             expr = self.read(i.cs.operands[0])
         except LiftError:
-            return [Unknown(i.addr, f"{i.mnemonic} {i.op_str}".strip())]
+            return [self.unknown(i)]
         table = func.jump_tables.get(i.addr)
         if table:
             seen: list[int] = []

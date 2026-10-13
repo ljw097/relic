@@ -172,6 +172,9 @@ class CallStmt(Stmt):
     tail: bool = False  # `jmp func` lifted as call + return
     noreturn: bool = False
     name: str | None = None  # callee name when known (display only)
+    # implicit register traffic: (architectural name, value read / variable written)
+    uses: list[tuple[str, Expr]] = field(default_factory=list)
+    defs: list[tuple[str, Expr]] = field(default_factory=list)
 
 
 @dataclass(slots=True)
@@ -184,14 +187,136 @@ class Effect(Stmt):
     """Side effect without a result (hlt, ud2, int3, syscall, ...)."""
     name: str
     args: tuple[Expr, ...] = ()
+    uses: list[tuple[str, Expr]] = field(default_factory=list)
+    defs: list[tuple[str, Expr]] = field(default_factory=list)
 
 
 @dataclass(slots=True)
 class Unknown(Stmt):
     text: str  # original instruction text
+    uses: list[tuple[str, Expr]] = field(default_factory=list)
+    defs: list[tuple[str, Expr]] = field(default_factory=list)
 
 
 TERMINATORS = (Branch, Jump, IndirectJump, Return)
+BARRIERS = (Store, CallStmt, Effect, Unknown)  # statements that may write memory
+
+
+# ------------------------------------------------------------------ traversal
+def children(e: Expr) -> tuple[Expr, ...]:
+    if isinstance(e, (Const, Reg, Var)):
+        return ()
+    if isinstance(e, (Load, UnOp, Cast, Extract)):
+        return (e.addr,) if isinstance(e, Load) else (e.a,)
+    if isinstance(e, BinOp):
+        return (e.a, e.b)
+    if isinstance(e, Ite):
+        return (e.cond, e.a, e.b)
+    if isinstance(e, Intrinsic):
+        return e.args
+    if isinstance(e, Call):
+        return (e.target, *e.args)
+    if isinstance(e, Phi):
+        return tuple(v for _, v in e.sources)
+    raise TypeError(e)
+
+
+def rebuild(e: Expr, kids: tuple[Expr, ...]) -> Expr:
+    if isinstance(e, Load):
+        return Load(kids[0], e.bits)
+    if isinstance(e, UnOp):
+        return UnOp(e.op, kids[0], e.bits)
+    if isinstance(e, Cast):
+        return Cast(e.kind, kids[0], e.bits)
+    if isinstance(e, Extract):
+        return Extract(kids[0], e.lo, e.bits)
+    if isinstance(e, BinOp):
+        return BinOp(e.op, kids[0], kids[1], e.bits)
+    if isinstance(e, Ite):
+        return Ite(kids[0], kids[1], kids[2], e.bits)
+    if isinstance(e, Intrinsic):
+        return Intrinsic(e.name, tuple(kids), e.bits)
+    if isinstance(e, Call):
+        return Call(kids[0], tuple(kids[1:]), e.bits)
+    if isinstance(e, Phi):
+        return Phi(tuple((a, k) for (a, _), k in zip(e.sources, kids)), e.bits)
+    return e
+
+
+def transform(e: Expr, f) -> Expr:
+    """Rebuild `e` bottom-up, applying `f` to every node after its children."""
+    kids = children(e)
+    if kids:
+        new = tuple(transform(k, f) for k in kids)
+        if any(a is not b for a, b in zip(new, kids)):
+            e = rebuild(e, new)
+    return f(e)
+
+
+def walk(e: Expr):
+    yield e
+    for k in children(e):
+        yield from walk(k)
+
+
+def size(e: Expr) -> int:
+    return 1 + sum(size(k) for k in children(e))
+
+
+def has_load(e: Expr) -> bool:
+    return any(isinstance(x, (Load, Call)) for x in walk(e))
+
+
+def stmt_exprs(s: Stmt) -> list[Expr]:
+    """Expressions a statement reads (not including the register/variable it assigns)."""
+    if isinstance(s, Assign):
+        return [s.src]
+    if isinstance(s, Store):
+        return [s.dst, s.src]
+    if isinstance(s, Branch):
+        return [s.cond]
+    if isinstance(s, IndirectJump):
+        return [s.expr]
+    if isinstance(s, CallStmt):
+        return [s.call, *(v for _, v in s.uses)]
+    if isinstance(s, Return):
+        return [s.value] if s.value is not None else []
+    if isinstance(s, Effect):
+        return [*s.args, *(v for _, v in s.uses)]
+    if isinstance(s, Unknown):
+        return [v for _, v in s.uses]
+    return []
+
+
+def map_stmt(s: Stmt, f):
+    """Replace every expression a statement reads by `f(expr)` (in place)."""
+    if isinstance(s, Assign):
+        s.src = f(s.src)
+    elif isinstance(s, Store):
+        s.dst, s.src = f(s.dst), f(s.src)
+    elif isinstance(s, Branch):
+        s.cond = f(s.cond)
+    elif isinstance(s, IndirectJump):
+        s.expr = f(s.expr)
+    elif isinstance(s, CallStmt):
+        s.call = f(s.call)
+        s.uses = [(r, f(v)) for r, v in s.uses]
+    elif isinstance(s, Return):
+        if s.value is not None:
+            s.value = f(s.value)
+    elif isinstance(s, Effect):
+        s.args = tuple(f(a) for a in s.args)
+        s.uses = [(r, f(v)) for r, v in s.uses]
+    elif isinstance(s, Unknown):
+        s.uses = [(r, f(v)) for r, v in s.uses]
+
+
+def stmt_defs(s: Stmt) -> list[Expr]:
+    if isinstance(s, Assign):
+        return [s.dst]
+    if isinstance(s, (CallStmt, Effect, Unknown)):
+        return [v for _, v in s.defs]
+    return []
 
 
 # ----------------------------------------------------------------- containers
@@ -284,11 +409,18 @@ def fmt_stmt(s: Stmt) -> str:
         return f"goto *{fmt(s.expr, 11)}  ; {tg}"
     if isinstance(s, CallStmt):
         tags = [t for t, on in ((s.name, s.name), ("tail call", s.tail), ("noreturn", s.noreturn)) if on]
-        return fmt(s.call) + (f"  ; {', '.join(tags)}" if tags else "")
+        lhs = ", ".join(fmt(v) for _, v in s.defs)
+        uses = [f"{r}={fmt(v)}" for r, v in s.uses
+                if not (isinstance(v, Var) and v.version == 0 and v.name == r)]
+        if uses:
+            tags.append("uses " + ", ".join(uses))
+        return (f"{lhs} = " if lhs else "") + fmt(s.call) + (f"  ; {'; '.join(tags)}" if tags else "")
     if isinstance(s, Return):
         return "return" + (f" {fmt(s.value)}" if s.value is not None else "")
     if isinstance(s, Effect):
-        return f"{s.name}({', '.join(fmt(a) for a in s.args)})"
+        lhs = ", ".join(fmt(v) for _, v in s.defs)
+        return (f"{lhs} = " if lhs else "") + f"{s.name}({', '.join(fmt(a) for a in s.args)})"
     if isinstance(s, Unknown):
-        return f'__asm("{s.text}")'
+        lhs = ", ".join(fmt(v) for _, v in s.defs)
+        return (f"{lhs} = " if lhs else "") + f'__asm("{s.text}")'
     return repr(s)
