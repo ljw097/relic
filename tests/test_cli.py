@@ -50,6 +50,13 @@ def test_opt_frame(capsys, vuln64):
     assert "char[0x40]" in out                          # overflow-to-saved distance
 
 
+def test_decompile(capsys, vuln64):
+    out = run(capsys, "decompile", vuln64, "main")
+    assert out.startswith("main()")
+    assert "while (1) {" in out                         # structured menu loop
+    assert "if (" in out and "; menu" in out
+
+
 def test_strings_grep(capsys, vuln64):
     out = run(capsys, "strings", vuln64, "-g", "bin/sh")
     assert '"/bin/sh"' in out

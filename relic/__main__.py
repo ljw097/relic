@@ -12,6 +12,7 @@
     relic vulns FILE              pwnable heuristics (dangerous calls, format strings, ...)
     relic ir FILE [WHERE]         decompiler IR of a function (debugging aid)
     relic opt FILE [WHERE]        optimised SSA IR, with strings/xrefs resolved
+    relic decompile FILE [WHERE]  structured C-like pseudocode of a function
 """
 from __future__ import annotations
 
@@ -21,7 +22,7 @@ import sys
 from . import __version__
 
 COMMANDS = ("info", "checksec", "funcs", "disasm", "cfg", "strings", "imports", "xrefs", "vulns", "ir", "opt",
-            "gui")
+            "decompile", "gui")
 
 
 def _parser() -> argparse.ArgumentParser:
@@ -56,6 +57,7 @@ def _parser() -> argparse.ArgumentParser:
     s = add("opt", "optimised SSA IR with strings/xrefs resolved", where=True)
     s.add_argument("--no-opt", action="store_true", help="show SSA before the optimisation passes")
     s.add_argument("--xrefs", action="store_true", help="also list the function's constant references")
+    add("decompile", "structured C-like pseudocode", where=True)
     g = sub.add_parser("gui", help="open the GUI")
     g.add_argument("file", nargs="?")
     g.add_argument("--arch", help="architecture for raw blobs (x86, x64, arm, arm64, mips, ...)")
@@ -244,6 +246,22 @@ def cmd_opt(args):
         print("\n; references:" if refs else "\n; no constant references")
         for r in refs:
             print(f";   {r.frm:#x}  {r.kind:6} -> {an.label(r.to)}")
+
+
+def cmd_decompile(args):
+    from .decompiler import decompile_ir
+    from .decompiler.structure import to_pseudocode
+    an = _analyze(args)
+    f = an.function_at(_where(an, args.where))
+    if f is None:
+        sys.exit("relic: no function there")
+    if f.is_import:
+        sys.exit(f"relic: {an.name(f.addr)} is an imported function")
+    try:
+        fn = decompile_ir(an, f)
+    except NotImplementedError as e:
+        sys.exit(f"relic: {e}")
+    print(to_pseudocode(fn, an))
 
 
 def cmd_gui(args):
