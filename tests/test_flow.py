@@ -20,7 +20,7 @@ from relic.decompiler.emit import decompile
 
 HERE = os.path.dirname(__file__)
 FUNCS = ["sc_or", "sc_and3", "find", "collatz", "nested", "sw_fall", "dowhile", "clamp", "gcd", "classify2", "scan",
-         "div3", "udiv10", "mod10", "ldiv1000", "div_neg7", "is_mult6", "digsum"]
+         "div3", "udiv10", "mod10", "ldiv1000", "div_neg7", "is_mult6", "digsum", "div16", "mod8"]
 
 _HARNESS = r"""
 #include <stdint.h>
@@ -50,7 +50,7 @@ int main(void) {
         CHK1(collatz, a < 0 ? -a : a)
         CHK1(sw_fall, a)
         if (a > -100000 && a < 100000) { CHK1(dowhile, a) }   /* n/3 iterations */
-        CHK1(div3, a) CHK1(mod10, a) CHK1(div_neg7, a)
+        CHK1(div3, a) CHK1(mod10, a) CHK1(div_neg7, a) CHK1(div16, a) CHK1(mod8, a)
         CHK1(udiv10, (unsigned)a) CHK1(is_mult6, (unsigned)a) CHK1(digsum, (unsigned)a)
         if (ldiv1000((long)a * 1000003) != ref_ldiv1000((long)a * 1000003)) { printf("ldiv1000 %%d\n", a); bad++; }
         for (int j = 0; j < nv; j++) {
@@ -111,7 +111,7 @@ def test_flow_recompiles_and_matches_source(flow, tmp_path):
 
 @pytest.mark.parametrize("fn,shape", [("div3", "/ 3"), ("udiv10", "/ 10"), ("mod10", "% 10"),
                                       ("ldiv1000", "/ 1000"), ("is_mult6", "% 6 == 0"), ("digsum", "% 10"),
-                                      ("div_neg7", "/ -7")])
+                                      ("div_neg7", "/ -7"), ("div16", "/ 16"), ("mod8", "% 8")])
 def test_division_by_constant_recovered(flow, fn, shape):
     name, an = flow
     text = decompile(an, an.function_by_name(fn)).text

@@ -117,6 +117,8 @@ F int mod10(int x) { return x % 10; }
 F long ldiv1000(long x) { return x / 1000; }
 F int div_neg7(int x) { return x / -7; }
 F int is_mult6(unsigned x) { return x % 6 == 0; }
+F int div16(int x) { return x / 16; }
+F int mod8(int x) { return x % 8; }
 
 F int digsum(unsigned x) {
     int s = 0;

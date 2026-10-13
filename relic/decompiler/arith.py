@@ -76,6 +76,13 @@ def _interesting(e: Expr) -> bool:
                 return True
             if n.op in ("/s", "/u"):
                 return True
+            # signed division by 2^k rounds towards zero with the sign bit: `x >>s (w-1)`
+            if n.op in (">>s", ">>u") and isinstance(n.b, Const) and n.b.value == n.a.bits - 1:
+                return True
+        # ... or with a conditional add on negative inputs (`x < 0 ? x + 15 : x`)
+        if isinstance(n, Ite) and isinstance(n.cond, BinOp) and n.cond.op in ("<s", "<=s") and \
+                any(isinstance(k, Const) and k.value == 0 for k in (n.cond.a, n.cond.b)):
+            return True
     return False
 
 
@@ -136,6 +143,9 @@ def _recognise(full: Expr, x: Expr) -> Expr | None:
     # remainder: the divisor comes from a division already recovered inside
     divisors = {n.b.value for n in walk(full) if isinstance(n, BinOp) and n.op in ("/s", "/u")
                 and isinstance(n.b, Const)}
+    # a power of two: the remainder keeps the low bits (`& 7` for `% 8`)
+    divisors |= {n.b.value + 1 for n in walk(full) if isinstance(n, BinOp) and n.op == "&"
+                 and isinstance(n.b, Const) and n.b.value and (n.b.value + 1) & n.b.value == 0}
     for c in sorted(divisors):
         for signed in (True, False):
             f = (lambda v, c=c: _smod(v, c, w)) if signed else (lambda v, c=c: (v & mask(w)) % c)
