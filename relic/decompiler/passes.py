@@ -42,8 +42,13 @@ def _movable(e: Expr) -> bool:
 
 
 def _droppable(e: Expr) -> bool:
-    """Evaluating it has no observable effect, so it may be dropped or duplicated."""
+    """Safe to drop *or duplicate*: no loads (which could fault) and no calls."""
     return not _has(e, Load, Call)
+
+
+def _dead_removable(e: Expr) -> bool:
+    """Safe to drop when its result is unused: loads are side-effect-free, calls are not."""
+    return not _has(e, Call)
 
 
 def _count_uses(fn: IRFunction) -> Counter:
@@ -297,7 +302,7 @@ def _dce(fn: IRFunction) -> bool:
             kept = []
             for s in b.stmts:
                 if isinstance(s, Assign) and isinstance(s.dst, Var) \
-                        and uses.get(s.dst, 0) == 0 and _droppable(s.src):
+                        and uses.get(s.dst, 0) == 0 and _dead_removable(s.src):
                     removed = True
                     continue
                 if isinstance(s, (CallStmt, Effect, Unknown)):

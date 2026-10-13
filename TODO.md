@@ -54,7 +54,10 @@
   - [x] 호출 인자 복원(`calls.py`, `sigs.py`): libc 시그니처 + 포맷 문자열 인자 수, `_chk` 변형, 내부 함수는 live-in 레지스터 프리픽스
   - [x] 스택 프레임 분석(`stack.py`): rsp_0 기준 오프셋, 슬롯 분류(retaddr/saved/canary/buffer/local), 버퍼 크기, 카나리 탐지, `relic opt` 프레임 요약
   - [ ] 스택 슬롯을 IR의 지역 변수로 치환(출력 단계), 카나리 검사 숨김(단계 5)
-- [ ] **P1** 단계 4 — 제어 흐름 구조화(if/while/switch)
+- [x] **P1** 단계 4 — 제어 흐름 구조화(if/while/switch) (`structure.py`, `relic decompile`)
+  - [x] 지배자/후지배자, 자연 루프, if/else, while, while(1)+break/continue, switch, goto 폴백
+  - [x] 모든 도달 가능 블록이 정확히 한 번 출력되는지 구조 불변식으로 검증
+  - [ ] **P2** do-while 조건 복원, if-else-if 사슬을 switch로, 루프 유도 변수 → for
 - [ ] **P2** 단계 5 — 타입 추론, C 출력 정리
 - [ ] **P2** 단계 6 — GUI 디컴파일 뷰, 다른 아키텍처 리프터
 
