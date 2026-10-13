@@ -122,6 +122,11 @@ class FilteredTable(QWidget):
         lay.addWidget(self.table)
 
 
+_C_RESERVED = {"if", "else", "while", "do", "for", "switch", "case", "default", "break", "continue", "return",
+               "goto", "sizeof", "int", "char", "short", "long", "void", "unsigned", "signed", "struct", "union",
+               "enum", "typedef", "const", "static", "extern", "volatile", "float", "double"}
+
+
 class MainWindow(QMainWindow):
     TAB_DISASM, TAB_GRAPH, TAB_DECOMP, TAB_HEX = range(4)
 
@@ -475,6 +480,15 @@ class MainWindow(QMainWindow):
         return f.addr if f is not None else a
 
     def rename_dialog(self):
+        if self.tabs.currentIndex() == self.TAB_DECOMP:
+            var = self.decomp.variable_under_cursor()
+            if var is not None:
+                shown, gen = var
+                text, ok = QInputDialog.getText(self, "Rename variable",
+                                                f"Name for {shown} (empty to reset to {gen}):", text=shown)
+                if ok:
+                    self.rename_variable(gen, text.strip())
+                return
         a = self._rename_subject()
         if a is None:
             return
@@ -482,6 +496,24 @@ class MainWindow(QMainWindow):
         text, ok = QInputDialog.getText(self, "Rename", f"Name for {a:#x} (empty to reset):", text=cur)
         if ok:
             self.rename(a, text.strip())
+
+    def rename_variable(self, generated: str, name: str) -> bool:
+        """Rename a local / parameter of the function shown in the pseudocode."""
+        import keyword
+        import re
+        func = self.decomp.func
+        if func is None or self.an is None:
+            return False
+        taken = set(self.decomp.result.variables) if self.decomp.result is not None else set()
+        current = next((k for k, v in (self.decomp.result.variables.items() if self.decomp.result else ())
+                        if v == generated), generated)
+        if name and (not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", name) or keyword.iskeyword(name)
+                     or name in _C_RESERVED or (name in taken and name != current)):
+            self.statusBar().showMessage(f"'{name}' is not a free C identifier here", 3000)
+            return False
+        self.an.rename_var(func.addr, generated, name)
+        self._after_edit()
+        return True
 
     def rename(self, addr: int, name: str):
         if name and any(c.isspace() for c in name):

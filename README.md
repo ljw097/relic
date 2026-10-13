@@ -16,7 +16,7 @@
 | 참조 | 코드/데이터 xref, 문자열(ASCII, PE는 UTF-16LE) |
 | checksec | ELF: RELRO / Canary / NX / PIE / FORTIFY / RPATH, PE: ASLR / DEP / CFG / SEH / GS |
 | 포너블 휴리스틱 | `gets`·`strcpy` 등 위험 함수, 비상수 포맷 스트링, 폭 없는 `scanf("%s")`, ret2win 후보 |
-| 프로젝트 | 이름 변경·주석을 `<binary>.relic.json`에 저장 |
+| 프로젝트 | 이름 변경·주석·디컴파일러 변수 이름을 `<binary>.relic.json`에 저장 (CLI 출력에도 반영) |
 | GUI | 함수 목록, 디스어셈블리 / CFG 그래프 / 의사 코드 / 헥스, xref·문자열·import·vulns·checksec 패널 |
 | 디컴파일러 (x86-64) | 리프팅 → SSA·최적화 → 호출 인자·스택 버퍼·카나리 → out-of-SSA → 구조화 → C 출력(`relic decompile`) |
 
@@ -94,7 +94,7 @@ relic sc.bin --arch x64 --base 0x1000
 | `Tab`, `F5` | 리스팅 ↔ 의사 코드 전환 (커서 위치 동기화) |
 | `Ctrl+H` | 헥스 뷰 |
 | `Ctrl+F` | 함수 필터 |
-| `N` | 이름 변경 (함수·라벨, 또는 커서 줄의 호출 대상) |
+| `N` | 이름 변경 (함수·라벨, 커서 줄의 호출 대상; 의사 코드에서는 커서 아래 지역 변수·매개변수) |
 | `;` | 주석 |
 | `X` | xref 패널 |
 | `Ctrl+S` | 프로젝트 저장 (`<binary>.relic.json`) |

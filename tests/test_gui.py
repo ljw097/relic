@@ -168,3 +168,52 @@ def test_pseudocode_stale_result_is_not_shown(win):
     win.goto_text("classify")          # requested while add_note may still be decompiling
     assert win.decomp.wait_idle()
     assert win.decomp.toPlainText().startswith("int classify(")
+
+
+def _cursor_on(view, needle, offset=1):
+    from PySide6.QtGui import QTextCursor
+    doc = view.document()
+    row = next(k for k, ln in enumerate(view.result.lines) if needle in ln.text)
+    cur = QTextCursor(doc.findBlockByNumber(row))
+    cur.movePosition(QTextCursor.MoveOperation.Right, n=doc.findBlockByNumber(row).text().index(needle) + offset)
+    view.setTextCursor(cur)
+
+
+def test_rename_variable_in_pseudocode(win):
+    win.goto_text("checksum")
+    win.tabs.setCurrentIndex(win.TAB_DECOMP)
+    assert win.decomp.wait_idle()
+    _cursor_on(win.decomp, "var_c = 0")
+    assert win.decomp.variable_under_cursor() == ("var_c", "var_c")
+    assert win.rename_variable("var_c", "hash")
+    assert win.decomp.wait_idle()
+    text = win.decomp.toPlainText()
+    assert "int hash;" in text and "hash ^= 0x1337;" in text and "var_c" not in text
+    # the parameter, then an invalid / clashing name is refused
+    assert win.rename_variable("a1", "s")
+    assert win.decomp.wait_idle()
+    assert win.decomp.toPlainText().startswith("int checksum(char *s)")
+    assert not win.rename_variable("var_10", "hash")       # taken
+    assert not win.rename_variable("var_10", "while")      # keyword
+    assert not win.rename_variable("var_10", "2x")         # not an identifier
+    # persisted in the project file and restored on load
+    assert win.save_project()
+    from relic.analysis import Analysis
+    from relic.loader import load
+    an2 = Analysis(load(win.an.bin.path)).run()
+    f = an2.function_by_name("checksum")
+    assert an2.var_names[f.addr] == {"var_c": "hash", "a1": "s"}
+    # empty name resets
+    assert win.rename_variable("var_c", "")
+    assert win.decomp.wait_idle()
+    assert "var_c" in win.decomp.toPlainText()
+
+
+def test_comment_shows_in_pseudocode(win):
+    win.goto_text("vuln")
+    win.tabs.setCurrentIndex(win.TAB_DECOMP)
+    assert win.decomp.wait_idle()
+    row = next(k for k, ln in enumerate(win.decomp.result.lines) if "gets(" in ln.text)
+    win.comment(win.decomp.result.lines[row].addr, "overflow here")
+    assert win.decomp.wait_idle()
+    assert "gets(buf_48);  // overflow here" in win.decomp.toPlainText()

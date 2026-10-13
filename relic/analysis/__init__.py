@@ -30,6 +30,8 @@ class Analysis:
         self.xrefs_from: dict[int, list[Xref]] = defaultdict(list)
         self.comments: dict[int, str] = {}
         self.renames: dict[int, str] = {}
+        # decompiler variable names: function address -> {generated name: user name}
+        self.var_names: dict[int, dict[str, str]] = {}
         self._fstarts: list[int] = []
         self._strings_by_addr: dict[int, String] = {}
 
@@ -176,6 +178,16 @@ class Analysis:
         else:
             self.renames.pop(addr, None)
 
+    def rename_var(self, func: int, generated: str, name: str):
+        """Name a decompiler variable (`v3`, `a1`, `var_c`) of the function at `func`; empty resets."""
+        names = self.var_names.setdefault(func, {})
+        if name and name != generated:
+            names[generated] = name
+        else:
+            names.pop(generated, None)
+        if not names:
+            self.var_names.pop(func, None)
+
     def comment(self, addr: int, text: str):
         if text:
             self.comments[addr] = text
@@ -188,6 +200,7 @@ class Analysis:
             "binary": os.path.basename(self.bin.path),
             "renames": {f"{a:#x}": n for a, n in sorted(self.renames.items())},
             "comments": {f"{a:#x}": c for a, c in sorted(self.comments.items())},
+            "variables": {f"{a:#x}": dict(sorted(v.items())) for a, v in sorted(self.var_names.items())},
         }
         with open(path or self.project_path, "w") as fp:
             json.dump(data, fp, indent=2)
@@ -200,6 +213,7 @@ class Analysis:
             data = json.load(fp)
         self.renames = {int(a, 16): n for a, n in data.get("renames", {}).items()}
         self.comments = {int(a, 16): c for a, c in data.get("comments", {}).items()}
+        self.var_names = {int(a, 16): dict(v) for a, v in data.get("variables", {}).items()}
         return True
 
 

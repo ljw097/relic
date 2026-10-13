@@ -40,6 +40,7 @@ class Decompiled:
     name: str
     addr: int
     lines: list[Line] = field(default_factory=list)
+    variables: dict[str, str] = field(default_factory=dict)   # shown name -> generated name
 
     @property
     def text(self) -> str:
@@ -86,6 +87,10 @@ class CWriter:
         self.ptr_bits = prep.arch.bits
         self.types: dict[str, CType] = infer_types(prep.fn, self.ptr_bits, self.is_addr)
         self.names: dict[str, str] = {}
+        # user names for variables (Analysis.var_names), keyed by the generated name
+        self.user: dict[str, str] = dict(an.var_names.get(prep.fn.addr, {}))
+        self.shown: dict[str, str] = {}
+        self.commented: set[int] = set()
         self.out: list[Line] = []
         self._name_vars()
 
@@ -101,7 +106,11 @@ class CWriter:
                     self.names[d.name] = f"v{n}"
 
     def vname(self, name: str) -> str:
-        return self.names.get(name, name)
+        """Display name of a variable: the user's name, else the generated one (`v3`, `a1`, `var_c`)."""
+        gen = self.names.get(name, name)
+        shown = self.user.get(gen, gen)
+        self.shown[shown] = gen
+        return shown
 
     # -------------------------------------------------------- expressions
     def symbol(self, v: int) -> str | None:
@@ -186,7 +195,7 @@ class CWriter:
                 if t is not None and t.ptr == 1 and t.base == int_type(size * 8):
                     return self.vname(base.name), _bare(i)
             if isinstance(base, StackAddr):
-                return base.name, _bare(i)
+                return self.vname(base.name), _bare(i)
         return None
 
     def expr(self, e: Expr, prec: int = 0) -> str:
@@ -201,12 +210,12 @@ class CWriter:
         if isinstance(e, Reg):
             return e.name, PREC_POSTFIX
         if isinstance(e, StackVar):
-            return e.name, PREC_POSTFIX
+            return self.vname(e.name), PREC_POSTFIX
         if isinstance(e, StackAddr):
             slot = self.p.frame.slots.get(e.offset)
             if slot is not None and slot.kind == "buffer":
-                return e.name, PREC_POSTFIX
-            return f"&{e.name}", PREC_UNARY
+                return self.vname(e.name), PREC_POSTFIX
+            return f"&{self.vname(e.name)}", PREC_UNARY
         if isinstance(e, Load):
             text = self.mem(e.addr, e.bits)
             return text, PREC_UNARY if text.startswith("*") else PREC_POSTFIX
@@ -338,6 +347,11 @@ class CWriter:
 
     # ------------------------------------------------------------- blocks
     def emit(self, text: str, addr: int | None, depth: int):
+        # a user comment on the instruction shows once, on the first line it produced
+        note = self.an.comments.get(addr) if addr is not None and depth > 0 else None
+        if note and addr not in self.commented:
+            self.commented.add(addr)
+            text = f"{text}  // {note}"
         self.out.append(Line(text, addr, depth))
 
     def node(self, n, depth: int):
@@ -439,20 +453,21 @@ class CWriter:
             if slot.kind == "canary":
                 self.emit(f"// stack canary at ret-{-slot.offset:#x} (check hidden)", None, depth)
                 continue
-            name = slot.name()
-            if name not in used:
+            gen = slot.name()
+            if gen not in used:
                 continue
+            name = self.vname(gen)
             where = f"// ret-{-slot.offset:#x}" if slot.offset < 0 else f"// ret+{slot.offset:#x}"
             if slot.kind == "buffer":
                 self.emit(f"char {name}[{number(slot.size)}];  {where}", None, depth)
             else:
-                t = self.types.get(name) or CType(int_type(slot.width * 8))
+                t = self.types.get(gen) or CType(int_type(slot.width * 8))
                 self.emit(f"{t.decl(name)};  {where}", None, depth)
         regs = sorted({v for v in self.names if v.startswith("v")}, key=lambda n: int(self.names[n][1:]))
         for v in regs:
             t = self.types.get(v)
             if t is not None:
-                self.emit(f"{t.decl(self.names[v])};", None, depth)
+                self.emit(f"{t.decl(self.vname(v))};", None, depth)
         if self.out and self.out[-1].depth == depth:
             self.emit("", None, depth)
 
@@ -546,8 +561,9 @@ def _tidy(items):
 def decompile(an: "Analysis", func: "Function") -> Decompiled:
     from .pipeline import prepare
     prep = prepare(an, func)
-    lines = CWriter(an, prep).render()
-    return Decompiled(an.name(func.addr) or func.name, func.addr, lines)
+    w = CWriter(an, prep)
+    lines = w.render()
+    return Decompiled(an.name(func.addr) or func.name, func.addr, lines, dict(w.shown))
 
 
 __all__ = ["Decompiled", "Line", "decompile", "number"]

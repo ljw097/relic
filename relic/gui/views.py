@@ -501,6 +501,18 @@ class PseudocodeView(QPlainTextEdit):
             self.pending = keep
             self.reload()
 
+    def word_under_cursor(self) -> str:
+        cur = self.textCursor()
+        cur.select(QTextCursor.SelectionType.WordUnderCursor)
+        return cur.selectedText()
+
+    def variable_under_cursor(self) -> tuple[str, str] | None:
+        """(shown name, generated name) of the local / parameter under the cursor."""
+        word = self.word_under_cursor()
+        if self.result is None or word not in self.result.variables:
+            return None
+        return word, self.result.variables[word]
+
     def symbol_under_cursor(self) -> int | None:
         """Address of the function / global named by the word under the cursor."""
         cur = self.textCursor()
