@@ -49,8 +49,9 @@ relic/decompiler/
   ssa.py          지배자, phi 삽입, 이름 부여
   passes.py       상수/복사 전파, load 전달, 조건식 복원, DCE (구현됨)
   refs.py         IR 문자열/교차참조 추출, 주석 포함 출력 (구현됨)
-  calls.py        호출 규약, 인자/반환값
-  stack.py        스택 프레임 → 지역 변수
+  calls.py        호출 규약, 인자/반환값 (구현됨)
+  sigs.py         libc 시그니처 표, 포맷 문자열 인자 수 (구현됨)
+  stack.py        스택 프레임 분석: 오프셋 정규화, 슬롯 분류, 버퍼 크기, 카나리 (구현됨)
   structure.py    제어 흐름 구조화
   types.py        타입 추론
   emit.py         C 출력
@@ -122,7 +123,7 @@ relic/decompiler/
 |---|---|---|
 | 1 | IR + x86-64 리프터 | `vuln64.out`의 모든 함수가 `Unknown` 없이 리프팅됨 ✅ |
 | 2 | SSA + 최적화 패스 | `checksum` 루프의 계산식이 `h = h * 31 + s[i]`((h<<5)-h + sext(s[i])) 형태로 접힘 ✅ |
-| 3 | 호출·스택 | `vuln`에서 `gets(buf)`와 `char buf[...]` 크기, `printf("hello %s (%d)\n", buf, checksum(buf))` 복원 |
+| 3 | 호출·스택 | `vuln`에서 `gets(buf)`와 `char buf[0x40]`(PIE 0x48) 크기, 카나리 식별, `printf("hello %s (%d)\n", buf, checksum(buf))` 복원 ✅ |
 | 4 | 구조화 | `main`의 `for (;;)` 메뉴 루프, `classify`의 `switch`가 goto 없이 출력 |
 | 5 | 타입·출력 정리 | `-O0`/`-O1`/PIE 변형 모두에서 위 결과 유지 |
 | 6 | CLI(`relic decompile`) / GUI 탭, x86-32 리프터 | CLI 테스트와 GUI 스모크 테스트 통과 |

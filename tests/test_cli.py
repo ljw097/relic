@@ -43,6 +43,13 @@ def test_opt(capsys, vuln64):
     assert "call   -> puts" in out                     # xref listing
 
 
+def test_opt_frame(capsys, vuln64):
+    out = run(capsys, "opt", vuln64, "vuln")
+    assert "; gets" in out                              # resolved callee
+    assert "; frame:" in out and "buf_48" in out        # stack layout with buffer
+    assert "char[0x40]" in out                          # overflow-to-saved distance
+
+
 def test_strings_grep(capsys, vuln64):
     out = run(capsys, "strings", vuln64, "-g", "bin/sh")
     assert '"/bin/sh"' in out

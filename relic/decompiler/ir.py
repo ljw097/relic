@@ -412,7 +412,7 @@ def fmt_stmt(s: Stmt) -> str:
         lhs = ", ".join(fmt(v) for _, v in s.defs)
         uses = [f"{r}={fmt(v)}" for r, v in s.uses
                 if not (isinstance(v, Var) and v.version == 0 and v.name == r)]
-        if uses:
+        if uses and not s.call.args:  # args, once recovered, already show the real arguments
             tags.append("uses " + ", ".join(uses))
         return (f"{lhs} = " if lhs else "") + fmt(s.call) + (f"  ; {'; '.join(tags)}" if tags else "")
     if isinstance(s, Return):

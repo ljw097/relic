@@ -51,6 +51,9 @@
   - [x] 인터프리터의 SSA 실행 지원(phi, 호출 use/def, version-0 → 진입 레지스터)
   - [x] 최적화 IR의 문자열/교차참조(`refs.py`: `ir_xrefs`, `format_ir`), `relic opt` 커맨드
 - [ ] **P1** 단계 3 — 호출 인자/반환값 복원, 스택 변수
+  - [x] 호출 인자 복원(`calls.py`, `sigs.py`): libc 시그니처 + 포맷 문자열 인자 수, `_chk` 변형, 내부 함수는 live-in 레지스터 프리픽스
+  - [x] 스택 프레임 분석(`stack.py`): rsp_0 기준 오프셋, 슬롯 분류(retaddr/saved/canary/buffer/local), 버퍼 크기, 카나리 탐지, `relic opt` 프레임 요약
+  - [ ] 스택 슬롯을 IR의 지역 변수로 치환(출력 단계), 카나리 검사 숨김(단계 5)
 - [ ] **P1** 단계 4 — 제어 흐름 구조화(if/while/switch)
 - [ ] **P2** 단계 5 — 타입 추론, C 출력 정리
 - [ ] **P2** 단계 6 — GUI 디컴파일 뷰, 다른 아키텍처 리프터

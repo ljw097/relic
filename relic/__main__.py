@@ -223,6 +223,22 @@ def cmd_opt(args):
     except NotImplementedError as e:
         sys.exit(f"relic: {e}")
     print(format_ir(fn, an))
+    if not args.no_opt:
+        from .decompiler.arch import arch_for
+        from .decompiler.stack import analyze_frame
+        try:
+            frame = analyze_frame(fn, arch_for(an.bin))
+        except NotImplementedError:
+            frame = None
+        slots = [s for _, s in sorted(frame.slots.items())] if frame else []
+        locals_ = [s for s in slots if s.kind != "retaddr"]
+        if locals_:
+            print(f"\n; frame: {len(locals_)} slots"
+                  + (f", {len(frame.buffers())} buffer(s)" if frame.buffers() else ""))
+            for s in locals_:
+                desc = f"char[{s.size:#x}]" if s.kind == "buffer" else f"{s.width} bytes"
+                flags = " taken" if s.taken and s.kind != "buffer" else ""
+                print(f";   [rsp{s.offset:+#x}]  {s.name():12} {desc}{flags}")
     if args.xrefs:
         refs = ir_xrefs(fn, an)
         print("\n; references:" if refs else "\n; no constant references")

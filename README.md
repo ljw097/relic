@@ -18,7 +18,7 @@
 | 포너블 휴리스틱 | `gets`·`strcpy` 등 위험 함수, 비상수 포맷 스트링, 폭 없는 `scanf("%s")`, ret2win 후보 |
 | 프로젝트 | 이름 변경·주석을 `<binary>.relic.json`에 저장 |
 | GUI | 함수 목록, 디스어셈블리 / CFG 그래프 / 헥스, xref·문자열·import·vulns·checksec 패널 |
-| 디컴파일러 | 단계 1: x86/x64 → IR 리프팅 (`relic ir`), 단계 2: SSA + 최적화 패스 (`relic opt`) |
+| 디컴파일러 | 리프팅(`relic ir`) → SSA + 최적화 → 호출 인자·스택 버퍼·카나리 복원 (`relic opt`) |
 
 > 인자 추적 기반 탐지(포맷 스트링, ret2win)와 점프 테이블 복원은 현재 **x86-64에서만** 동작합니다.
 
