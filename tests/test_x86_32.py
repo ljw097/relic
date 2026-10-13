@@ -55,3 +55,12 @@ def test_every_function_decompiles(an32, an32_pie):
             if not f.is_import:
                 text = decompile(an, f).text
                 assert text.count("{") == text.count("}"), f.name
+
+
+def test_parameter_and_local_slots_do_not_share_a_name(flow32_O0):
+    """[esp0+8] (parameter y) and [esp0-8] (local r) once both printed as `var_8`, merging
+    two variables; the recompile check missed it because y is dead after the call."""
+    an = analyze(flow32_O0)
+    code = decompile(an, an.function_by_name("sw_calls")).text
+    assert "var_8 = sc_or(a2, 2);" in code
+    assert "a2 = sc_or(" not in code

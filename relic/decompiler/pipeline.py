@@ -60,7 +60,7 @@ def prepare(an: "Analysis", func: "Function") -> Prepared:
         from .calls import stack_param_count
         word = arch.bits // 8
         n = stack_param_count(an, arch, func.addr)
-        params = [frame.slots[o].name() if o in frame.slots else f"var_{o:x}"
+        params = [frame.slots[o].name() if o in frame.slots else f"arg_{o:x}"
                   for o in range(word, word * (n + 1), word)]
     else:
         params = _livein_arg_regs(an, arch, func.addr)

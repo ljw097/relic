@@ -43,6 +43,10 @@ class Slot:
             return f"saved_{self.saved_reg}" if self.saved_reg else "saved"
         if self.kind == "canary":
             return "canary"
+        # above the return address: the caller's argument area (stack parameters, Win64 home
+        # slots). A distinct prefix keeps +8 and -8 from sharing the name `var_8`
+        if self.offset > 0:
+            return f"arg_{self.offset:x}"
         tag = "buf" if self.kind == "buffer" else "var"
         return f"{tag}_{abs(self.offset):x}"
 

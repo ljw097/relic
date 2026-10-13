@@ -563,7 +563,7 @@ class PseudocodeView(QPlainTextEdit):
         word = cur.selectedText()
         import re
         # local names (v1, a2, var_c, buf_48) and numbers are not symbols ("a1" would parse as hex)
-        if self.an is None or not word or re.fullmatch(r"[va]\d+|(var|buf)_[0-9a-f]+|\d.*", word):
+        if self.an is None or not word or re.fullmatch(r"[va]\d+|(var|buf|arg)_[0-9a-f]+|\d.*", word):
             return None
         a = self.an.resolve(word)
         return a if a is not None and self.an.name(a) else None
