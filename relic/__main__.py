@@ -10,6 +10,7 @@
     relic imports FILE            imported / exported symbols
     relic xrefs FILE WHERE        cross references to an address or symbol
     relic vulns FILE              pwnable heuristics (dangerous calls, format strings, ...)
+    relic ir FILE [WHERE]         decompiler IR of a function (debugging aid)
 """
 from __future__ import annotations
 
@@ -18,7 +19,7 @@ import sys
 
 from . import __version__
 
-COMMANDS = ("info", "checksec", "funcs", "disasm", "cfg", "strings", "imports", "xrefs", "vulns", "gui")
+COMMANDS = ("info", "checksec", "funcs", "disasm", "cfg", "strings", "imports", "xrefs", "vulns", "ir", "gui")
 
 
 def _parser() -> argparse.ArgumentParser:
@@ -48,8 +49,11 @@ def _parser() -> argparse.ArgumentParser:
     add("imports", "imported and exported symbols")
     add("xrefs", "cross references to an address/symbol", where=True, where_required=True)
     add("vulns", "pwnable heuristics")
+    add("ir", "decompiler IR of a function", where=True)
     g = sub.add_parser("gui", help="open the GUI")
     g.add_argument("file", nargs="?")
+    g.add_argument("--arch", help="architecture for raw blobs (x86, x64, arm, arm64, mips, ...)")
+    g.add_argument("--base", type=lambda v: int(v, 0), default=0, help="load address for raw blobs")
     return p
 
 
@@ -182,12 +186,26 @@ def cmd_vulns(args):
         print(f"[{v.severity:6}] {v.addr:#x} {v.func:20} {v.kind:15} {v.message}")
 
 
+def cmd_ir(args):
+    from .decompiler import lift
+    an = _analyze(args)
+    f = an.function_at(_where(an, args.where))
+    if f is None:
+        sys.exit("relic: no function there")
+    if f.is_import:
+        sys.exit(f"relic: {an.name(f.addr)} is an imported function")
+    try:
+        print(lift(an, f))
+    except NotImplementedError as e:
+        sys.exit(f"relic: {e}")
+
+
 def cmd_gui(args):
     try:
         from .gui import run
     except ImportError as e:
         sys.exit(f"relic: GUI unavailable ({e}). Install PySide6.")
-    return run(getattr(args, "file", None))
+    return run(args.file, args.arch, args.base)
 
 
 def main(argv: list[str] | None = None) -> int:

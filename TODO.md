@@ -4,13 +4,8 @@
 
 ## GUI
 
-- [ ] **P0** 메인 윈도우 (`relic/gui/main_window.py`)와 `relic.gui.run(path)` — 현재 `relic`을 인자 없이 실행하면 "GUI unavailable"로 종료됨
-  - [ ] 함수 목록(필터), 디스어셈블리 / 그래프 / 헥스 탭 전환
-  - [ ] 분석을 백그라운드 스레드에서 실행
-  - [ ] 이동 히스토리(뒤로/앞으로), 주소 이동(G)
-  - [ ] 이름 변경(N), 주석(;), xref 패널(X), 프로젝트 저장
-  - [ ] 문자열 / import / checksec / vulns 테이블
-- [ ] **P1** GUI 스모크 테스트 (`QT_QPA_PLATFORM=offscreen`)
+- [ ] **P1** 디스어셈블리 뷰에서 커서 아래 단어(레지스터·심볼) 하이라이트
+- [ ] **P1** 최근 파일 목록, 창 배치(dock 상태) 저장
 - [ ] **P2** 테마 전환(라이트/다크), 폰트 크기 설정
 
 ## 아키텍처별 분석 보강
@@ -32,7 +27,7 @@
 
 ## 테스트 / 인프라
 
-- [ ] **P0** GitHub Actions CI (pytest, gcc 설치)
+- [x] **P0** GitHub Actions CI (pytest, gcc 설치, Python 3.10 / 3.12 / 3.13)
 - [ ] **P1** 멀티 아키텍처 샘플: `-m32`, `aarch64-linux-gnu-gcc`, `arm-linux-gnueabi-gcc`, `mipsel-linux-gnu-gcc` (툴체인 없으면 skip)
 - [ ] **P1** case마다 함수를 호출하는 `switch` 샘플 추가 — 지금 `classify`는 `-O2`에서 값 배열 조회로 바뀌어 점프 테이블 테스트가 안 됨
 - [ ] **P1** PE 테스트: 로더, IAT 호출 이름 해석, checksec (mingw 또는 커밋된 작은 샘플)
@@ -49,8 +44,10 @@
 
 설계: [docs/decompiler-plan.md](docs/decompiler-plan.md)
 
-- [ ] **P1** 단계 1 — IR 정의와 x86-64 리프팅
-- [ ] **P1** 단계 2 — SSA, 상수/복사 전파, 죽은 코드 제거
+- [x] **P1** 단계 1 — IR 정의와 x86-64 리프팅 (`relic ir`, IR 인터프리터로 의미 검증)
+- [ ] **P1** 단계 2 — SSA, 상수/복사 전파, 죽은 코드 제거 (패스 전후 결과를 `interp`로 비교)
+  - [x] 호출 규약 표(`arch.py`), SSA 구성(`ssa.py`: 지배자, phi, 이름 부여)
+  - [ ] 최적화 패스(`passes.py`), 인터프리터의 SSA 실행 지원
 - [ ] **P1** 단계 3 — 호출 인자/반환값 복원, 스택 변수
 - [ ] **P1** 단계 4 — 제어 흐름 구조화(if/while/switch)
 - [ ] **P2** 단계 5 — 타입 추론, C 출력 정리
@@ -66,4 +63,5 @@
 - [x] 프로젝트 저장(이름 변경·주석)
 - [x] CLI, pytest 스위트
 - [x] GUI 뷰 위젯(디스어셈블리 / CFG / 헥스)
+- [x] GUI 메인 윈도우: 함수 목록, 백그라운드 분석, 이동 히스토리, 이름 변경·주석·xref, 정보 테이블, 스모크 테스트
 - [x] ELF 재배치 타입 이름 기록 (GLOB_DAT import 해석)
