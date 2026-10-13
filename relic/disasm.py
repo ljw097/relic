@@ -201,6 +201,8 @@ class Disassembler:
         imms = [op.imm for op in c.operands if op.type == OP_IMM]
         if i.kind in (CALL, JMP, CJMP) and imms:
             i.target = imms[-1] & self._mask
+        elif m == "adrp":
+            pass  # a 4 KiB page, not an address: the `add`/`ldr` after it completes it
         else:
             for v in imms:
                 v &= self._mask

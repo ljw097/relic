@@ -4,8 +4,8 @@
 
 ## GUI
 
-- [ ] **P1** 디스어셈블리 뷰에서 커서 아래 단어(레지스터·심볼) 하이라이트
-- [ ] **P1** 최근 파일 목록, 창 배치(dock 상태) 저장
+- [x] 커서 아래 단어 하이라이트 (리스팅·의사 코드, 레지스터는 rax/eax/ax/al 별칭까지)
+- [x] 최근 파일 목록(File ▸ Open Recent), 창 크기·dock 배치 저장 (`QSettings`, `RELIC_SETTINGS`로 ini 경로 지정 가능)
 - [ ] **P2** 테마 전환(라이트/다크), 폰트 크기 설정
 
 ## 아키텍처별 분석 보강
@@ -18,8 +18,10 @@
   - ARM: 리터럴 풀 `ldr rN, [pc, #off]`, `add rN, pc, rN`
   - MIPS: `lui` + `addiu`, `$gp` 기준 접근
 - [ ] **P0** 호출 규약별 인자 추출을 `vulns`에서 공통 사용
-  - x64 SysV / Win64, x86 cdecl(스택 `push`, `mov [esp+N]`), AArch64 x0–x7, ARM r0–r3, MIPS a0–a3, RISC-V a0–a7, PPC r3–r10
-- [ ] **P1** 점프 테이블: x86-32 PIC(GOT 기준 오프셋), AArch64(`ldrb/ldrh` + `adr` + `add ..., lsl`), ARM(`ldrls pc, [pc, rN, lsl #2]`)
+  - [x] x64 SysV / Win64, x86 cdecl: 디컴파일러가 복원한 호출 인자 사용 (x64는 블록 안 역추적으로 결론이 안 날 때만; GUI는 창을 먼저 띄우고 백그라운드에서 스캔)
+  - [x] AArch64 x0–x7 (AArch64 리프터)
+  - [ ] ARM r0–r3, MIPS a0–a3, RISC-V a0–a7, PPC r3–r10 (해당 리프터가 생기면 같은 경로로)
+- [ ] **P1** 점프 테이블: ~~x86-32 PIC(GOT 기준 오프셋)~~ (완료), AArch64(`ldrb/ldrh` + `adr` + `add ..., lsl`), ARM(`ldrls pc, [pc, rN, lsl #2]`)
   - 상대 테이블은 후보 기준 주소들을 검증해서 선택
 - [ ] **P1** MIPS: `.MIPS.stubs` / GOT(`DT_MIPS_GOTSYM`, `DT_MIPS_LOCAL_GOTNO`) 기반 import 이름 해석, 지연 슬롯을 블록에 포함
 - [ ] **P1** ARM Thumb 모드 (심볼 LSB, `blx` 모드 전환)
@@ -28,15 +30,15 @@
 ## 테스트 / 인프라
 
 - [x] **P0** GitHub Actions CI (pytest, gcc 설치, Python 3.10 / 3.12 / 3.13)
-- [ ] **P1** 멀티 아키텍처 샘플: `-m32`, `aarch64-linux-gnu-gcc`, `arm-linux-gnueabi-gcc`, `mipsel-linux-gnu-gcc` (툴체인 없으면 skip)
-- [ ] **P1** case마다 함수를 호출하는 `switch` 샘플 추가 — 지금 `classify`는 `-O2`에서 값 배열 조회로 바뀌어 점프 테이블 테스트가 안 됨
-- [ ] **P1** PE 테스트: 로더, IAT 호출 이름 해석, checksec (mingw 또는 커밋된 작은 샘플)
+- [ ] **P1** 멀티 아키텍처 샘플: `-m32`(완료: vuln32·flow32, CI에 gcc-multilib), `aarch64-linux-gnu-gcc`(완료: vuln_a64·flow_a64), `arm-linux-gnueabi-gcc`, `mipsel-linux-gnu-gcc` (툴체인 없으면 skip)
+- [x] case마다 함수를 호출하는 `switch` 샘플(`flow.c`의 `sw_calls`): x86-64/x86-32 × -O0/-O2 모두 점프 테이블 → `switch`, 재컴파일 검증
+- [x] PE 테스트: MinGW x64/x86 샘플로 로더·COFF 심볼·IAT 호출 이름·checksec·vulns·디컴파일 (CI에 mingw 설치, 없으면 skip)
 - [ ] **P2** ruff 린트 / 포맷 설정
 
 ## 분석 정확도
 
-- [ ] **P1** C++ 심볼 디맹글링
-- [ ] **P1** PE: 예외 디렉터리(`.pdata`)로 함수 시작 시드, TLS 콜백
+- [x] C++ 심볼 디맹글링(`relic/demangle.py`: libstdc++ `__cxa_demangle`, 없으면 `c++filt`): 목록·리스팅은 전체 이름, 의사 코드 호출은 `ns::Cls::method`, 이름 해석은 원래·전체·짧은 이름 모두
+- [x] PE: 예외 디렉터리(`.pdata`)로 함수 시작 시드(chained 항목 제외), TLS 콜백 이름(`tls_callback_N`) — stripped MinGW x64에서 함수 130 → 174개
 - [ ] **P2** 함수 내부 데이터(점프 테이블, 리터럴 풀)를 코드로 오인하지 않도록 표시
 - [ ] **P2** 대형 바이너리 성능 측정 및 디코딩 캐시 개선
 
@@ -59,22 +61,28 @@
   - [x] switch case 값(점프 테이블 인덱스), bounds check → `default`, case 끝 `break`
   - [x] 루프 밖 합류점 → 명시적 `break`, 작은 공유 꼬리 블록·반환 블록은 goto 대신 복제
   - [x] 모든 도달 가능 블록이 정확히 한 번 출력되는지 구조 불변식으로 검증
-  - [ ] **P2** 루프 유도 변수 → `for`, if-else-if 사슬 → switch
-  - [ ] **P2** `-O2` 대형 함수의 goto 줄이기 (노드 복제 확대, 조건 기반 구조화) — `/usr/bin/grep` 168개 함수에서 goto 3020개
+  - [x] `X = init; while (c) { ...; X += k; }` → `for` (본문에 그 루프의 `continue`가 있으면 만들지 않음)
+  - [ ] **P2** if-else-if 사슬 → switch
+  - [x] `-O2` goto 줄이기 1차: 단락 평가 `&&`/`||` 결합, 후지배자 없는 if의 합류점 선택, 작은 비순환 꼬리 영역 복제(6블록/12문장) — `/usr/bin/{true,cat,gzip}` goto 1911 → 1469
+  - [ ] **P2** 남은 goto는 대부분 370–480블록 상태 기계 함수(gnulib `quotearg`, gzip deflate/inflate)에 몰려 있음 — 조건 기반 구조화(DREAM 계열) 검토
+  - [x] 상수 나눗셈·나머지 복원(`arith.py`): 매직 넘버 곱셈 → `x / c`, `x % c`, 곱셈 역원 비교 → `x % c == r` (부호·음수 제수·64비트, 평가로 검증)
+  - [x] 부호 있는 2의 거듭제곱 나눗셈·나머지(`(x < 0 ? x + 15 : x) >> 4` → `x / 16`, `% 8`)
 - [x] **P1** 단계 5 — out-of-SSA, 타입, C 출력 (`outssa.py`, `vartypes.py`, `pipeline.py`, `emit.py`)
   - [x] phi → 복사 + 간섭 기반 병합(인터프리터로 검증), 단일 사용 임시 변수 인라인
   - [x] void / 반환 폭(호출자가 읽는 폭), 변수 폭 축소(`low32` 제거), 포인터·unsigned 추론, 복사로 포인터 타입 전파
   - [x] 시그니처·지역 변수 선언, 문자열·심볼·배열 인덱스, 포인터 산술 원소 단위, `&&` 조건, else-if, early return
   - [x] 줄 ↔ 주소 매핑(`Decompiled.lines`, `relic decompile --addrs`)
   - [x] 재컴파일 테스트: `checksum`/`classify` 디컴파일 결과를 gcc로 다시 컴파일해 원본과 비교
-  - [ ] **P1** 사용자 이름 변경(`Analysis.renames`)·주석을 의사 코드에 반영, 변수 이름 변경
+  - [x] 사용자 이름 변경(`Analysis.renames`)·주석·변수 이름(`Analysis.var_names`)을 의사 코드에 반영
   - [ ] **P2** 구조체 필드 복원(`notes[i]->size` 대신 `*(int *)(notes[i] + 8)`), libc 인자 타입으로 매개변수 타입 지정
   - [ ] **P2** 대형 바이너리 성능: `/usr/bin/grep` 168개 함수 71초 — 함수 단위 지연 디컴파일 결과 캐시, `_count_uses` 증분화
 - [ ] **P1** 단계 6 — GUI 디컴파일 뷰, 다른 아키텍처
   - [x] GUI Pseudocode 탭(`Tab`/`F5`): 지연 디컴파일·캐시, 리스팅과 커서 주소 동기화, 이름 변경 반영, 더블클릭 이동
-  - [ ] **P1** 큰 함수 디컴파일을 백그라운드 스레드로 (지금은 GUI 스레드에서 실행)
-  - [ ] **P1** 의사 코드에서 변수 이름 변경(`N`), 주석 표시
-  - [ ] **P1** x86-32 리프터 검증·cdecl 스택 인자 복원
+  - [x] 디컴파일은 백그라운드 스레드에서(한 번에 하나, 진행 중 표시, 오래된 결과 폐기)
+  - [x] 의사 코드에서 변수·매개변수 이름 변경(`N`, 프로젝트 파일에 저장), 사용자 주석 표시
+  - [x] AArch64 리프터(`lift/arm64.py`): 시프트·확장 피연산자, pre/post-index, ldp/stp, csel/cset/ccmp, 비트필드, cbz/tbz, NZCV(C=no-borrow); AAPCS64, `__stack_chk_guard` 카나리, `adrp` 페이지를 코드 참조로 오인하지 않음
+  - [ ] **P1** AArch64 점프 테이블(`ldrb/ldrh` + `adr` + `add ..., lsl #2`) — gcc는 작은 switch를 비교 트리로 만들어 아직 샘플이 없음
+  - [x] x86-32: cdecl 스택 인자, 스택 매개변수(`a1`…), PC 썽크(`__x86.get_pc_thunk.*`, stripped는 본문으로 인식), `main`의 스택 재정렬, GOT 경유 전역(`stdout`)
 
 ## 완료
 

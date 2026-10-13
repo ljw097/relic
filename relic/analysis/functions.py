@@ -83,6 +83,7 @@ class FunctionAnalyzer:
         seeds = [b.entry] if b.entry and b.is_exec(b.entry) else []
         seeds += sorted(a for a, s in b.symbols.items() if s.kind == "func" and b.is_exec(a))
         seeds += self._elf_ctor_seeds()
+        seeds += [a for a in getattr(b, "function_starts", []) if b.is_exec(a)]   # PE .pdata
         self._queue.extend(seeds)
         self._drain()
         main = self._find_main()
@@ -263,6 +264,7 @@ class FunctionAnalyzer:
         hist = self._back(jmp.addr, 16)
         base = None
         relative = True
+        anchor = None          # relative tables: entries are offsets from here (default: the table)
         # jmp [table + reg*ptr]
         for op in jmp.cs.operands:
             if op.type == 3 and op.mem.index and op.mem.scale == ptr and op.mem.disp:
@@ -279,6 +281,19 @@ class FunctionAnalyzer:
                     break
                 if i.mnemonic == "lea" and i.refs:
                     base = i.refs[0]
+                    break
+        if base is None and self.bin.bits == 32:
+            # x86-32 PIC: `add/mov R, [G + idx*4 + d]` with G holding the GOT address, entries
+            # are offsets from the GOT (`add R, G; jmp R`)
+            got = self._got_base()
+            for i in [jmp, *hist]:
+                for op in i.cs.operands:
+                    # scale 4, or 1 when the index was scaled beforehand (`shl edx, 2` at -O0)
+                    if op.type == 3 and op.mem.base and op.mem.index and op.mem.scale in (1, 4) and \
+                            i.mnemonic in ("add", "mov") and got is not None:
+                        base, anchor = (got + op.mem.disp) & self.dis._mask, got
+                        break
+                if base is not None:
                     break
         if base is None:
             return []
@@ -298,7 +313,7 @@ class FunctionAnalyzer:
                 v = self.bin.read_int(base + 4 * n, 4, signed=True)
                 if v is None:
                     break
-                t = (base + v) & self.dis._mask
+                t = ((anchor if anchor is not None else base) + v) & self.dis._mask
             else:
                 t = self.bin.read_ptr(base + ptr * n)
                 if t is None:
@@ -309,6 +324,15 @@ class FunctionAnalyzer:
                 continue
             out.append(t)
         return out
+
+    def _got_base(self) -> int | None:
+        """The x86-32 PIC GOT pointer: `_GLOBAL_OFFSET_TABLE_`, else the start of .got.plt."""
+        b = self.bin
+        a = b.name_to_addr.get("_GLOBAL_OFFSET_TABLE_")
+        if a:
+            return a
+        sec = b.section(".got.plt") or b.section(".got")
+        return sec.addr if sec is not None else None
 
     def _find_main(self) -> int | None:
         """Recover `main` from the `__libc_start_main(main, ...)` call in `_start`."""

@@ -717,7 +717,29 @@ class X86Lifter:
     def _i_jmp(self, i, ops):
         pass  # resolved per block in `terminate`
 
+    def _pc_thunk(self, i) -> str | None:
+        """Register a `__x86.get_pc_thunk.REG` call loads with its own return address (x86-32 PIC).
+
+        Recognised by name, or for stripped binaries by the body `mov REG, [esp]; ret`."""
+        if self.bits != 32 or i.target is None:
+            return None
+        name = self.an.call_name(i) or ""
+        if name.startswith("__x86.get_pc_thunk.") or name.startswith("__i686.get_pc_thunk."):
+            return "e" + name.rsplit(".", 1)[1]
+        first = self.an.dis.decode(i.target)
+        if first is None or first.mnemonic != "mov" or len(first.cs.operands) != 2:
+            return None
+        dst, src = first.cs.operands
+        if dst.type != 1 or src.type != 3 or first.cs.reg_name(src.mem.base) != "esp" or src.mem.disp:
+            return None
+        nxt = self.an.dis.decode(first.end)
+        return first.cs.reg_name(dst.reg) if nxt is not None and nxt.mnemonic == "ret" else None
+
     def _i_call(self, i, ops):
+        thunk = self._pc_thunk(i)
+        if thunk is not None:
+            self.write_reg(thunk, Const(i.end, 32))      # the thunk returns its return address
+            return
         target = Const(i.target, self.bits) if i.target is not None else self.read(ops[0])
         name = self.an.call_name(i)
         self.emit(CallStmt(i.addr, Call(target, (), self.bits), noreturn=self._noreturn(i), name=name))

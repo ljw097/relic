@@ -14,7 +14,9 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
 from .arch import ArchInfo, arch_for
-from .cleanup import (cached_ir, drop_return_values, forward_empty_blocks, hide_canary, inline_single_use,
+from .arith import recover_division
+from .cleanup import (cached_ir, drop_return_values, drop_stack_pointer_chains, fold_short_circuits, forward_empty_blocks, hide_canary,
+                      inline_single_use,
                       narrow_library_results, narrow_returns, return_width, returns_value, rewrite_locals)
 from .ir import IRFunction
 from .outssa import out_of_ssa
@@ -43,16 +45,26 @@ def prepare(an: "Analysis", func: "Function") -> Prepared:
     from .calls import _livein_arg_regs
     arch = arch_for(an.bin)
     fn = copy.deepcopy(cached_ir(an, func))
-    frame = analyze_frame(fn, arch)
+    from .cleanup import stack_guards
+    frame = analyze_frame(fn, arch, stack_guards(an))
     hide_canary(fn, frame)
     rets = returns_value(an, func, fn, arch.ret)
     if not rets:
         drop_return_values(fn)
     rewrite_locals(fn, frame)
+    drop_stack_pointer_chains(fn, frame)
     _dce(fn)
     fn = out_of_ssa(fn)
     forward_empty_blocks(fn)
-    params = _livein_arg_regs(an, arch, func.addr)
+    if arch.name == "x86-cdecl":
+        # stack parameters: [esp_0 + 4], [esp_0 + 8], ... are a1, a2, ...
+        from .calls import stack_param_count
+        word = arch.bits // 8
+        n = stack_param_count(an, arch, func.addr)
+        params = [frame.slots[o].name() if o in frame.slots else f"arg_{o:x}"
+                  for o in range(word, word * (n + 1), word)]
+    else:
+        params = _livein_arg_regs(an, arch, func.addr)
     narrow_library_results(fn)
     w = None
     if rets:
@@ -62,6 +74,9 @@ def prepare(an: "Analysis", func: "Function") -> Prepared:
     narrow(fn)
     inline_single_use(fn)
     _fold_pass(fn)          # constants exposed by narrowing and inlining
+    recover_division(fn)    # magic-number multiplies -> x / c, x % c
+    _dce(fn)
+    fold_short_circuits(fn)
     st = Structurer(fn)
     tree = st.run()
     return Prepared(fn, arch, frame, params, rets, tree, st.gotos, w)

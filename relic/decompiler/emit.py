@@ -40,6 +40,7 @@ class Decompiled:
     name: str
     addr: int
     lines: list[Line] = field(default_factory=list)
+    variables: dict[str, str] = field(default_factory=dict)   # shown name -> generated name
 
     @property
     def text(self) -> str:
@@ -70,6 +71,8 @@ def _bare(e: Expr) -> Expr:
     return e
 
 
+_NUMERIC_OPS = {"*", "/u", "/s", "%u", "%s", "<<", ">>u", ">>s", "&", "|", "^"}
+
 # C precedence, larger binds tighter
 PREC_TERNARY, PREC_UNARY, PREC_POSTFIX = 3, 14, 15
 BIN = {"||": ("||", 4), "&&": ("&&", 5), "|": ("|", 6), "^": ("^", 7), "&": ("&", 8),
@@ -86,6 +89,10 @@ class CWriter:
         self.ptr_bits = prep.arch.bits
         self.types: dict[str, CType] = infer_types(prep.fn, self.ptr_bits, self.is_addr)
         self.names: dict[str, str] = {}
+        # user names for variables (Analysis.var_names), keyed by the generated name
+        self.user: dict[str, str] = dict(an.var_names.get(prep.fn.addr, {}))
+        self.shown: dict[str, str] = {}
+        self.commented: set[int] = set()
         self.out: list[Line] = []
         self._name_vars()
 
@@ -101,13 +108,20 @@ class CWriter:
                     self.names[d.name] = f"v{n}"
 
     def vname(self, name: str) -> str:
-        return self.names.get(name, name)
+        """Display name of a variable: the user's name, else the generated one (`v3`, `a1`, `var_c`)."""
+        gen = self.names.get(name, name)
+        shown = self.user.get(gen, gen)
+        self.shown[shown] = gen
+        return shown
 
     # -------------------------------------------------------- expressions
     def symbol(self, v: int) -> str | None:
         if not v:
             return None
         n = self.an.name(v)
+        if n and "(" in n:                      # demangled C++: `Cls::method(int)` -> `Cls::method`
+            from ..demangle import short_name
+            n = short_name(n)
         return base_name(n) if n else None
 
     def const(self, c: Const) -> str:
@@ -129,16 +143,24 @@ class CWriter:
         s = self.an.string_at(v)
         if s is not None:
             return f'"{escape(s.value)}"'
+        # other literals (short ones the string scan skips: "> ", "%d") must start a string:
+        # a NUL before them -- not the middle of one, which a small integer in a PIE often hits
+        prev = self.an.bin.read(v - 1, 1)
+        if prev != b"\0":
+            return None
         if _kind(self.an, v) == "string":
             return f'"{escape(self.an.bin.read_cstring(v, 256))}"'
-        # short literals the string scan skips ("> ", "%d"): NUL-preceded text in read-only data
         sec = self.an.bin.section_at(v)
         if sec is not None and sec.loaded and not sec.x and not getattr(sec, "w", False):
             text = self.an.bin.read_cstring(v, 256)
-            prev = self.an.bin.read(v - 1, 1)
-            if text and text.isprintable() and prev == b"\0":
+            if text and text.isprintable():
                 return f'"{escape(text)}"'
         return None
+
+    def _num(self, c: Const) -> str:
+        if c.bits >= 8 and c.value >> (c.bits - 1) and c.signed > -0x10000:
+            return "-" + number(-c.signed)
+        return number(c.value)
 
     def is_addr(self, v: int) -> bool:
         return bool(v) and self.an.bin.is_mapped(v) and v >= 0x100
@@ -150,6 +172,11 @@ class CWriter:
             sym = self.symbol(addr.value)
             if sym:
                 return sym
+        if isinstance(addr, Load) and isinstance(addr.addr, Const):
+            # through a GOT slot: `*(*(stdout@got))` is the imported object itself
+            imp = self.an.bin.imports_by_got.get(addr.addr.value)
+            if imp is not None and imp.name:
+                return base_name(imp.name)
         idx = self._indexed(addr, size)
         if idx is not None:
             base, i = idx
@@ -186,7 +213,7 @@ class CWriter:
                 if t is not None and t.ptr == 1 and t.base == int_type(size * 8):
                     return self.vname(base.name), _bare(i)
             if isinstance(base, StackAddr):
-                return base.name, _bare(i)
+                return self.vname(base.name), _bare(i)
         return None
 
     def expr(self, e: Expr, prec: int = 0) -> str:
@@ -201,12 +228,12 @@ class CWriter:
         if isinstance(e, Reg):
             return e.name, PREC_POSTFIX
         if isinstance(e, StackVar):
-            return e.name, PREC_POSTFIX
+            return self.vname(e.name), PREC_POSTFIX
         if isinstance(e, StackAddr):
             slot = self.p.frame.slots.get(e.offset)
             if slot is not None and slot.kind == "buffer":
-                return e.name, PREC_POSTFIX
-            return f"&{e.name}", PREC_UNARY
+                return self.vname(e.name), PREC_POSTFIX
+            return f"&{self.vname(e.name)}", PREC_UNARY
         if isinstance(e, Load):
             text = self.mem(e.addr, e.bits)
             return text, PREC_UNARY if text.startswith("*") else PREC_POSTFIX
@@ -226,6 +253,9 @@ class CWriter:
         if isinstance(e, Extract):
             inner = self.expr(e.a, 11)
             return f"({int_type(e.bits, True)})({inner} >> {e.lo})", PREC_UNARY
+        if isinstance(e, Ite) and e.bits == 1 and (isinstance(e.a, Const) or isinstance(e.b, Const)):
+            from .passes import bool_ite
+            return self._expr(bool_ite(e))            # `c ? x : 0` reads `c && x`
         if isinstance(e, Ite):
             return (f"{self.expr(e.cond, PREC_TERNARY + 1)} ? {self.expr(e.a, PREC_TERNARY + 1)} : "
                     f"{self.expr(e.b, PREC_TERNARY)}"), PREC_TERNARY
@@ -238,6 +268,15 @@ class CWriter:
     def _binop(self, e: BinOp) -> tuple[str, int]:
         if e.op not in BIN:                       # carry / sborrow ... : flag helpers
             return f"__{e.op}({self.expr(e.a)}, {self.expr(e.b)})", PREC_POSTFIX
+        if e.op in _NUMERIC_OPS:
+            # operands of *, /, %, shifts and bit operations are numbers, never addresses
+            a = Const(e.a.value, e.a.bits) if isinstance(e.a, Const) else e.a
+            b = e.b
+            if isinstance(a, Const) or isinstance(b, Const):
+                op, p = BIN[e.op]
+                ta = self._num(a) if isinstance(a, Const) else self.expr(a, p)
+                tb = self._num(b) if isinstance(b, Const) else self.expr(b, p + 1)
+                return f"{ta} {op} {tb}", p
         op, p = BIN[e.op]
         a, b = e.a, e.b
         if p == 10:
@@ -326,6 +365,8 @@ class CWriter:
             if ret is not None:
                 text = f"{self.expr(ret)} = {text}"
             return text + ";"
+        if isinstance(s, ir.IndirectJump):
+            return f"goto *{self.expr(s.expr, PREC_UNARY)};  // unresolved jump"
         if isinstance(s, Effect):
             return f"__{s.name}({', '.join(self.expr(a) for a in s.args)});"
         if isinstance(s, Unknown):
@@ -338,12 +379,29 @@ class CWriter:
 
     # ------------------------------------------------------------- blocks
     def emit(self, text: str, addr: int | None, depth: int):
+        # a user comment on the instruction shows once, on the first line it produced
+        note = self.an.comments.get(addr) if addr is not None and depth > 0 else None
+        if note and addr not in self.commented:
+            self.commented.add(addr)
+            text = f"{text}  // {note}"
         self.out.append(Line(text, addr, depth))
 
     def node(self, n, depth: int):
         if isinstance(n, Seq):
-            for it in _tidy(_flatten(n)):
+            items = _tidy(_flatten(n))
+            k = 0
+            while k < len(items):
+                it = items[k]
+                nxt = items[k + 1] if k + 1 < len(items) else None
+                parts = _for_parts(it, nxt, self.p.gotos) if isinstance(nxt, Loop) else None
+                if parts is not None:
+                    prev, init, step, body = parts
+                    self.node(prev, depth)
+                    self._for(nxt, init, step, body, depth)
+                    k += 2
+                    continue
                 self.node(it, depth)
+                k += 1
         elif isinstance(n, Block):
             if n.addr in self.p.gotos and not n.copy:
                 self.emit(f"loc_{n.addr:x}:", n.addr, max(depth - 1, 0))
@@ -360,10 +418,10 @@ class CWriter:
             addr = self._term_addr(n.addr)
             cond, then, els = n.cond, n.then, n.els
             # if (a) { if (b) { X } }  ->  if (a && b) { X }
-            inner = _only_if(then) if els is None else None
+            inner = _only_if(then, self.p.gotos) if els is None else None
             while inner is not None and inner.els is None:
                 cond, then = BinOp("&&", cond, inner.cond, 1), inner.then
-                inner = _only_if(then)
+                inner = _only_if(then, self.p.gotos)
             # if (c) { ...; return; } else { Y }  ->  if (c) { ...; return; } Y
             if els is not None and _exits(then):
                 self.node(If(n.addr, cond, then), depth)
@@ -376,7 +434,7 @@ class CWriter:
             self.emit(f"if ({self.expr(cond)}) {{", addr, depth)
             self.node(then or Seq(), depth + 1)
             while els is not None:
-                inner = _only_if(els)
+                inner = _only_if(els, self.p.gotos)
                 if inner is None:
                     self.emit("} else {", None, depth)
                     self.node(els, depth + 1)
@@ -387,6 +445,9 @@ class CWriter:
             self.emit("}", None, depth)
         elif isinstance(n, Loop):
             body = n.body
+            if n.kind == "while" and n.header in self.p.gotos:
+                # the header is only the test: a jump to it re-enters the loop before the test
+                self.emit(f"loc_{n.header:x}:", n.header, max(depth - 1, 0))
             if n.kind == "while":
                 self.emit(f"while ({self.expr(n.cond)}) {{", None, depth)
             elif n.kind == "dowhile":
@@ -403,6 +464,12 @@ class CWriter:
                 self.node(case.body, depth + 1)
             self.emit("}", None, depth)
 
+    def _for(self, loop: Loop, init, step, body, depth: int):
+        text = lambda st: self.stmt(st).rstrip(";")
+        self.emit(f"for ({text(init)}; {self.expr(loop.cond)}; {text(step)}) {{", init.addr, depth)
+        self.node(body, depth + 1)
+        self.emit("}", None, depth)
+
     def _term_addr(self, block_addr: int) -> int | None:
         b = self.p.fn.blocks.get(block_addr)
         return b.stmts[-1].addr if b is not None and b.stmts else block_addr
@@ -411,6 +478,9 @@ class CWriter:
     def signature(self) -> str:
         fn = self.p.fn
         name = base_name(self.an.name(fn.addr) or fn.name)
+        if "(" in name:
+            from ..demangle import short_name
+            name = short_name(name)
         params = []
         for r in self.p.params:
             t = self.types.get(r) or CType(int_type(self.ptr_bits))
@@ -430,29 +500,41 @@ class CWriter:
             return str(self.types[v.name])
         return int_type(v.bits) if v.bits != 1 else "bool"
 
+    @property
+    def _base(self) -> str:
+        """What stack offsets are relative to: the return address on x86 (it is on the stack
+        at entry), the entry stack pointer elsewhere (the return address is in a register)."""
+        return "ret" if self.p.arch.name.startswith(("x64", "x86")) else "sp0"
+
     def declarations(self, depth: int):
         frame = self.p.frame
         used = {x.name for s in self.p.fn.stmts() for top in ir.stmt_exprs(s) for x in ir.walk(top)
                 if isinstance(x, (StackVar, StackAddr))}
         used |= {d.name for s in self.p.fn.stmts() for d in ir.stmt_defs(s) if isinstance(d, StackVar)}
+        if frame.realigned:
+            self.emit("// stack realigned on entry: ret-relative offsets are approximate", None, depth)
         for slot in frame.locals():
+            if slot.name() in self.p.params:
+                continue                       # a stack parameter: declared in the signature
             if slot.kind == "canary":
-                self.emit(f"// stack canary at ret-{-slot.offset:#x} (check hidden)", None, depth)
+                self.emit(f"// stack canary at {self._base}-{-slot.offset:#x} (check hidden)", None, depth)
                 continue
-            name = slot.name()
-            if name not in used:
+            gen = slot.name()
+            if gen not in used:
                 continue
-            where = f"// ret-{-slot.offset:#x}" if slot.offset < 0 else f"// ret+{slot.offset:#x}"
+            name = self.vname(gen)
+            where = f"// {self._base}-{-slot.offset:#x}" if slot.offset < 0 else f"// {self._base}+{slot.offset:#x}"
             if slot.kind == "buffer":
                 self.emit(f"char {name}[{number(slot.size)}];  {where}", None, depth)
             else:
-                t = self.types.get(name) or CType(int_type(slot.width * 8))
+                t = self.types.get(gen) or CType(int_type(slot.width * 8))
                 self.emit(f"{t.decl(name)};  {where}", None, depth)
-        regs = sorted({v for v in self.names if v.startswith("v")}, key=lambda n: int(self.names[n][1:]))
+        regs = sorted({v for v in self.names if v.startswith("v") and v not in self.p.params},
+                      key=lambda n: int(self.names[n][1:]))
         for v in regs:
             t = self.types.get(v)
             if t is not None:
-                self.emit(f"{t.decl(self.names[v])};", None, depth)
+                self.emit(f"{t.decl(self.vname(v))};", None, depth)
         if self.out and self.out[-1].depth == depth:
             self.emit("", None, depth)
 
@@ -472,9 +554,15 @@ class CWriter:
 
 
 # ------------------------------------------------------------- tree tidying
-def _only_if(n):
-    """`n` if it is (a Seq of) exactly one If node -- an `else if` / `&&` candidate."""
-    items = [x for x in _flatten(n) if not (isinstance(x, Block) and not x.stmts)] if n is not None else []
+def _only_if(n, gotos=()):
+    """`n` if it is (a Seq of) exactly one If node -- an `else if` / `&&` candidate.
+
+    Empty blocks are ignored unless they carry a label some `goto` jumps to:
+    folding the If into `else if` / `&&` would lose that label.
+    """
+    items = [x for x in _flatten(n)
+             if not (isinstance(x, Block) and not x.stmts and (x.copy or x.addr not in gotos))] \
+        if n is not None else []
     return items[0] if len(items) == 1 and isinstance(items[0], If) else None
 
 
@@ -532,6 +620,50 @@ def _flatten(n) -> list:
     return [n]
 
 
+def _for_parts(prev, loop, gotos):
+    """Split `X = init; while (c(X)) { ...; X += k; }` into for-loop parts.
+
+    Returns (block without the init, init statement, step statement, body
+    without the step) or None. A `continue` of this loop in the body rules it
+    out: in a `while` it skips the step, in a `for` it would run it.
+    """
+    if loop.kind != "while" or loop.header in gotos or not isinstance(prev, Block) or not prev.stmts:
+        return None
+    init = prev.stmts[-1]
+    if not isinstance(init, Assign) or not isinstance(init.dst, (Var, StackVar)):
+        return None
+    x = init.dst
+    if not any(v == x for v in ir.walk(loop.cond)):
+        return None
+    items = _flatten(_loop_body(loop.body))
+    last = items[-1] if items else None
+    if not isinstance(last, Block) or not last.stmts or (last.addr in gotos and not last.copy):
+        return None
+    step = last.stmts[-1]
+    if not (isinstance(step, Assign) and step.dst == x and isinstance(step.src, BinOp)
+            and step.src.op in ("+", "-") and step.src.a == x and isinstance(step.src.b, Const)):
+        return None
+    if _has_continue(Seq(items)):
+        return None
+    body = Seq(items[:-1] + ([Block(last.addr, last.stmts[:-1], last.copy)] if last.stmts[:-1] else []))
+    return Block(prev.addr, prev.stmts[:-1], prev.copy), init, step, body
+
+
+def _has_continue(n) -> bool:
+    """A `continue` that belongs to the enclosing loop (not to a nested one)."""
+    if isinstance(n, Jump1):
+        return n.kind == "continue"
+    if isinstance(n, Loop):
+        return False
+    if isinstance(n, Seq):
+        return any(_has_continue(x) for x in n.items)
+    if isinstance(n, If):
+        return _has_continue(n.then) or _has_continue(n.els)
+    if isinstance(n, Switch):
+        return any(_has_continue(c.body) for c in n.cases)
+    return False
+
+
 def _tidy(items):
     """Drop an empty `else`, and an unreachable `break` right after a `return`."""
     out = []
@@ -546,8 +678,9 @@ def _tidy(items):
 def decompile(an: "Analysis", func: "Function") -> Decompiled:
     from .pipeline import prepare
     prep = prepare(an, func)
-    lines = CWriter(an, prep).render()
-    return Decompiled(an.name(func.addr) or func.name, func.addr, lines)
+    w = CWriter(an, prep)
+    lines = w.render()
+    return Decompiled(an.name(func.addr) or func.name, func.addr, lines, dict(w.shown))
 
 
 __all__ = ["Decompiled", "Line", "decompile", "number"]

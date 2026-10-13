@@ -15,6 +15,9 @@ def lifter_for(an: Analysis):
     if an.bin.arch in ("x86", "x64"):
         from .x86 import X86Lifter
         return X86Lifter(an)
+    if an.bin.arch == "arm64":
+        from .arm64 import Arm64Lifter
+        return Arm64Lifter(an)
     raise NotImplementedError(f"no lifter for {an.bin.arch} yet")
 
 

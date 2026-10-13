@@ -70,7 +70,8 @@ def resolve_reg(insns: list[Insn], idx: int, reg: str, depth: int = 4) -> tuple[
     for k in range(idx - 1, -1, -1):
         i = insns[k]
         if i.kind == CALL:
-            return "unknown", None
+            # the previous call's result (`mov rdi, rax` after it) is certainly not a constant
+            return ("var", None) if reg in ("rax", "eax") else ("unknown", None)
         if reg not in (canon(r) for r in i.regs_write):
             continue
         ops = i.cs.operands
@@ -88,9 +89,42 @@ def resolve_reg(insns: list[Insn], idx: int, reg: str, depth: int = 4) -> tuple[
     return "unknown", None
 
 
+def _ir_args(an: "Analysis", f, cache: dict) -> dict[int, tuple] | None:
+    """Call arguments of `f` as the decompiler recovered them: call address -> args.
+
+    Works for every calling convention the decompiler models (x64 SysV/Win64,
+    x86 cdecl), seeing through register copies, stack slots and PIC thunks.
+    None when the architecture has no lifter yet (the caller falls back to
+    the in-block register walk).
+    """
+    if f.addr in cache:
+        return cache[f.addr]
+    res = None
+    if an.bin.arch in ("x64", "x86", "arm64"):
+        try:
+            from ..decompiler.cleanup import cached_ir
+            from ..decompiler.ir import CallStmt
+            res = {s.addr: s.call.args for s in cached_ir(an, f).stmts() if isinstance(s, CallStmt)}
+        except Exception:  # noqa: BLE001 - a decompiler failure must not hide the other findings
+            res = None
+    cache[f.addr] = res
+    return res
+
+
+def _arg_state(args: tuple, k: int) -> tuple[str, int | None]:
+    from ..decompiler.ir import Const
+    if k >= len(args):
+        return "unknown", None
+    a = args[k]
+    return ("const", a.value) if isinstance(a, Const) else ("var", None)
+
+
 def find_vulns(an: "Analysis") -> list[Finding]:
     b = an.bin
     out: list[Finding] = []
+    ir_cache: dict = {}
+    # integer argument registers of the binary's calling convention (SysV or Win64)
+    regs = ("rcx", "rdx", "r8", "r9") if b.format == "PE" else X64_ARGS
     for f in an.functions.values():
         if f.is_import:
             continue
@@ -106,11 +140,26 @@ def find_vulns(an: "Analysis") -> list[Finding]:
                 if base in DANGEROUS:
                     sev, msg = DANGEROUS[base]
                     out.append(Finding(i.addr, f.name, sev, "dangerous-call", msg))
-                if b.arch != "x64":
+                if b.arch not in ("x64", "x86", "arm64"):
                     continue
+
+                def arg(k, reg, f=f, i=i, insns=insns, idx=idx):
+                    # x64: the quick in-block register walk first; only when the value comes from
+                    # outside the block ask the decompiler, which follows it across blocks
+                    # (x86 passes arguments on the stack: always the decompiler)
+                    if b.arch == "x64":
+                        state, val = resolve_reg(insns, idx, reg)
+                        if state != "unknown":          # settled within the block
+                            return state, val
+                    ir = _ir_args(an, f, ir_cache)
+                    args = ir.get(i.addr) if ir else None
+                    if args is None:
+                        return resolve_reg(insns, idx, reg) if b.arch == "x64" else ("unknown", None)
+                    return _arg_state(args, k)
+
                 if base in FORMAT_ARG:
-                    reg = X64_ARGS[FORMAT_ARG[base]]
-                    state, val = resolve_reg(insns, idx, reg)
+                    k = FORMAT_ARG[base]
+                    state, val = arg(k, regs[k] if k < len(regs) else "")
                     fmt = b.read_cstring(val) if state == "const" and val else None
                     if state == "var" or (state == "const" and fmt is None):
                         if "scanf" not in base:
@@ -123,7 +172,7 @@ def find_vulns(an: "Analysis") -> list[Finding]:
                         out.append(Finding(i.addr, f.name, "medium", "format-string",
                                            f"{base}() format string lives in writable memory"))
                 if base in ("system", "execve", "execl", "execv", "popen"):
-                    state, val = resolve_reg(insns, idx, "rdi")
+                    state, val = arg(0, regs[0])
                     cmd = b.read_cstring(val) if state == "const" and val else None
                     if cmd and ("/sh" in cmd or "cat " in cmd or "flag" in cmd):
                         out.append(Finding(f.addr, f.name, "info", "win-function",

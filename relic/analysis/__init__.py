@@ -30,6 +30,8 @@ class Analysis:
         self.xrefs_from: dict[int, list[Xref]] = defaultdict(list)
         self.comments: dict[int, str] = {}
         self.renames: dict[int, str] = {}
+        # decompiler variable names: function address -> {generated name: user name}
+        self.var_names: dict[int, dict[str, str]] = {}
         self._fstarts: list[int] = []
         self._strings_by_addr: dict[int, String] = {}
 
@@ -75,8 +77,14 @@ class Analysis:
         return None
 
     def function_by_name(self, name: str) -> Function | None:
+        """By raw symbol, display name, or -- for C++ -- the name without its argument list."""
+        from ..demangle import short_name
         for f in self.functions.values():
             if self.name(f.addr) == name or f.name == name:
+                return f
+        for f in self.functions.values():
+            shown = self.name(f.addr)
+            if shown and "(" in shown and short_name(shown) == name:
                 return f
         return None
 
@@ -98,12 +106,15 @@ class Analysis:
             return None
 
     def name(self, addr: int) -> str | None:
+        """Display name: the user's rename, else the symbol (C++ names demangled)."""
         if addr in self.renames:
             return self.renames[addr]
         f = self.functions.get(addr)
-        if f is not None:
-            return f.name
-        return self.bin.name_of(addr)
+        n = f.name if f is not None else self.bin.name_of(addr)
+        if n and n.startswith("_Z"):
+            from ..demangle import demangle
+            return demangle(n) or n
+        return n
 
     def label(self, addr: int) -> str:
         """Best human-readable name for an address (`sym`, `sym+0x4`, or hex)."""
@@ -176,6 +187,16 @@ class Analysis:
         else:
             self.renames.pop(addr, None)
 
+    def rename_var(self, func: int, generated: str, name: str):
+        """Name a decompiler variable (`v3`, `a1`, `var_c`) of the function at `func`; empty resets."""
+        names = self.var_names.setdefault(func, {})
+        if name and name != generated:
+            names[generated] = name
+        else:
+            names.pop(generated, None)
+        if not names:
+            self.var_names.pop(func, None)
+
     def comment(self, addr: int, text: str):
         if text:
             self.comments[addr] = text
@@ -188,6 +209,7 @@ class Analysis:
             "binary": os.path.basename(self.bin.path),
             "renames": {f"{a:#x}": n for a, n in sorted(self.renames.items())},
             "comments": {f"{a:#x}": c for a, c in sorted(self.comments.items())},
+            "variables": {f"{a:#x}": dict(sorted(v.items())) for a, v in sorted(self.var_names.items())},
         }
         with open(path or self.project_path, "w") as fp:
             json.dump(data, fp, indent=2)
@@ -200,6 +222,7 @@ class Analysis:
             data = json.load(fp)
         self.renames = {int(a, 16): n for a, n in data.get("renames", {}).items()}
         self.comments = {int(a, 16): c for a, c in data.get("comments", {}).items()}
+        self.var_names = {int(a, 16): dict(v) for a, v in data.get("variables", {}).items()}
         return True
 
 

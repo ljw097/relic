@@ -19,6 +19,8 @@ from .ir import (BinOp, Branch, IndirectJump, IRFunction, Jump, Reg, Return, Stm
 
 EXIT = -1
 SMALL_TAIL = 3   # statements a block may have and still be duplicated instead of reached by goto
+DUP_BLOCKS = 6   # a tail region of at most this many blocks ...
+DUP_STMTS = 12   # ... and statements is copied rather than reached by goto
 
 
 # ------------------------------------------------------------------- AST nodes
@@ -47,6 +49,7 @@ class Loop:
     kind: str          # while | dowhile | inf
     cond: object       # None for `inf`
     body: object
+    header: int | None = None   # header block (a `goto` may target it: the label goes before `while`)
 
 
 @dataclass
@@ -132,6 +135,8 @@ def _negate(c):
         swap = {"<u": "<=u", "<=u": "<u", "<s": "<=s", "<=s": "<s"}
         if c.op in swap:
             return BinOp(swap[c.op], c.b, c.a, 1)
+        if c.op in ("&&", "||") and c.bits == 1:      # De Morgan
+            return BinOp("||" if c.op == "&&" else "&&", _negate(c.a), _negate(c.b), 1)
     return UnOp("!", c, 1)
 
 
@@ -187,6 +192,8 @@ class Structurer:
         self.loops = self._find_loops()        # header -> dict(body, follow, kind, latches)
         self.emitted: set[int] = set()
         self.gotos: set[int] = set()
+        self.rpo_index = {a: k for k, a in enumerate(_rpo(fn.addr, lambda a: self.succ.get(a, [])))}
+        self._dup_depth = 0
 
     # -- dominance -----------------------------------------------------------
     def _dominates(self, a, b):
@@ -236,10 +243,13 @@ class Structurer:
             follow = None
             latch = latches[0] if len(latches) == 1 else None
             lterm = _terminator(self.blocks[latch])[1] if latch is not None else None
-            if len(self.succ[h]) == 2 and any(s not in body for s in self.succ[h]):
-                # pre-tested loop: the header itself is the conditional that exits
+            hbody, hterm = _terminator(self.blocks[h])
+            if len(self.succ[h]) == 2 and any(s not in body for s in self.succ[h]) and not hbody \
+                    and isinstance(hterm, Branch):
+                # pre-tested loop: the header is nothing but the test that exits
+                # (statements before the test would run once more than `while (c) {...}` says)
                 kind, follow = "while", next(s for s in self.succ[h] if s not in body)
-            elif latch is not None and latch != h and isinstance(lterm, Branch) and \
+            elif latch is not None and isinstance(lterm, Branch) and \
                     any(s not in body for s in self.succ[latch]):
                 # post-tested loop: the single latch tests and either repeats or leaves
                 kind, follow = "dowhile", next(s for s in self.succ[latch] if s not in body)
@@ -281,7 +291,74 @@ class Structurer:
                     return Seq([Block(n, body, copy=True), edge])
                 if _small_return(self.blocks[nxt]):
                     return Seq([Block(n, body, copy=True), Ret(self.blocks[nxt].stmts[0])])
+        region = self._dup_region(n, stops, ctx)
+        if region is not None:
+            return self._duplicate(n, region, stops, ctx)
         return Seq([self._goto(n)])
+
+    def _dup_region(self, n, stops, ctx):
+        """The blocks to copy so that reaching `n` again needs no goto, or None if too costly.
+
+        The region must be small (DUP_BLOCKS blocks, DUP_STMTS statements), acyclic,
+        free of loop headers and switches, and every way out of it must be one
+        this region handles anyway: the stop the current region ends at, a
+        break / continue of the enclosing construct, or a `return`.
+        """
+        if self._dup_depth >= 2:
+            return None
+        stop_set = stops if isinstance(stops, (set, frozenset)) else {stops}
+        region, order, work, total = set(), [], [n], 0
+        while work:
+            a = work.pop()
+            if a in region:
+                continue
+            blk = self.blocks.get(a)
+            if blk is None or a in self.loops or a == self.fn.addr:
+                return None
+            body, term = _terminator(blk)
+            if isinstance(term, IndirectJump):
+                return None
+            region.add(a)
+            total += len(body)
+            if len(region) > DUP_BLOCKS or total > DUP_STMTS:
+                return None
+            for s in self.succ.get(a, ()):
+                if s in stop_set or self._edge_kind(s, ctx) is not None:
+                    continue
+                if self._dominates(s, a):        # a back edge: a loop, not a tail
+                    return None
+                if _small_return(self.blocks[s]):
+                    continue
+                work.append(s)
+        return region
+
+    def _edge_kind(self, target, ctx):
+        """Like `_edge`, but without side effects (no goto bookkeeping)."""
+        if not ctx or target is None:
+            return None
+        top = ctx[-1]
+        if top.kind == "switch" and target == top.follow:
+            return "break"
+        loop = next((c for c in reversed(ctx) if c.kind == "loop"), None)
+        if loop is None:
+            return None
+        if target == loop.header and loop.latch_cond is None:
+            return "continue"
+        if target == loop.follow and top is loop:
+            return "break"
+        return None
+
+    def _duplicate(self, n, region, stops, ctx) -> Seq:
+        """Structure a copy of `region` (already emitted elsewhere) at this point."""
+        saved = set(self.emitted)
+        self.emitted -= region
+        self._dup_depth += 1
+        try:
+            seq = self._region(n, stops, ctx)
+        finally:
+            self._dup_depth -= 1
+            self.emitted = saved
+        return seq
 
     def _goto(self, n):
         self.gotos.add(n)
@@ -310,12 +387,15 @@ class Structurer:
             self.emitted.add(n)
             blk = self.blocks[n]
             body, term = _terminator(blk)
-            seq.items.append(Block(n, body))
+            seq.items.append(Block(n, body, copy=self._dup_depth > 0))
             inner = next((c for c in reversed(ctx) if c.kind == "loop"), None)
             if inner is not None and inner.latch_cond is not None and n == inner.latch:
                 break  # do-while latch: its test is the loop condition
             if isinstance(term, Return):
                 seq.items.append(Ret(term))
+                n = None
+            elif isinstance(term, IndirectJump) and not term.targets:
+                seq.items.append(Block(n, [term], copy=True))   # unresolved: `goto *expr`
                 n = None
             elif isinstance(term, IndirectJump):
                 node, n = self._switch(n, term, None, ctx, self._postdom(n))
@@ -367,15 +447,15 @@ class Structurer:
                 # inside the loop (rendered as a comment-free prefix of the body)
                 inner.items.append(Block(h, body_stmts))
             inner.items.append(self._region(stay, h, ctx + [c]))
-            return Loop("while", cond, inner), follow
+            return Loop("while", cond, inner, h), follow
         if info["kind"] == "dowhile":
             lterm = _terminator(self.blocks[c.latch])[1]
             cond = lterm.cond if lterm.true == h else _negate(lterm.cond)
             c.latch_cond = cond
             body = self._region(h, follow, ctx + [c])
-            return Loop("dowhile", cond, body), follow
+            return Loop("dowhile", cond, body, h), follow
         # endless: structure the whole body starting at the header
-        return Loop("inf", None, self._region(h, follow, ctx + [c])), follow
+        return Loop("inf", None, self._region(h, follow, ctx + [c]), h), follow
 
     def _if(self, n, term: Branch, stops, ctx):
         follow = self._postdom(n)
@@ -386,6 +466,8 @@ class Structurer:
         if sw is not None and follow is not None and follow == sw.follow:
             follow = None
         cond, t, f = term.cond, term.true, term.false
+        if follow is None:
+            follow = self._join(n, t, f, loop, sw, stops)
 
         # bounds check guarding a jump table -> switch with a default
         for tgt, other, c in ((f, t, cond), (t, f, _negate(cond))):
@@ -413,6 +495,42 @@ class Structurer:
         if then is None and els is not None:      # keep the taken side non-empty
             cond, then, els = _negate(cond), els, None
         return If(n, cond, then, els), follow
+
+    def _join(self, n, t, f, loop, sw, stops):
+        """Where the two sides of the branch at `n` meet when there is no post-dominator.
+
+        With a `return` (or a loop exit) on one side, no block post-dominates the
+        branch, but the sides may still meet: the first block (in reverse
+        post-order) that `n` dominates and both sides reach, without leaving the
+        enclosing loop, is the join. Sides that never get there end in their
+        own return / break / goto.
+        """
+        stop_set = stops if isinstance(stops, (set, frozenset)) else {stops}
+        limit = loop.body if loop is not None else None
+
+        def reach(start):
+            seen = {start}
+            work = [start]
+            while work:
+                a = work.pop()
+                for s in self.succ.get(a, ()):
+                    if s in seen or s == n or (limit is not None and s not in limit) or s in stop_set:
+                        continue
+                    if self._dominates(s, a):        # back edge: not part of this acyclic region
+                        continue
+                    if loop is not None and s == loop.header:
+                        continue
+                    if sw is not None and s == sw.follow:
+                        continue
+                    seen.add(s)
+                    work.append(s)
+            return seen
+
+        both = reach(t) & reach(f)
+        cands = [m for m in both if m not in self.emitted and self._dominates(n, m) and m in self.rpo_index]
+        if not cands:
+            return None
+        return min(cands, key=self.rpo_index.__getitem__)
 
     def _switch(self, n, term: IndirectJump, default, ctx, follow):
         """Switch on `term`'s jump table; `follow` is where every case ends up (or None)."""

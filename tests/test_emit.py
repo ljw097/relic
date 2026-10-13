@@ -48,7 +48,9 @@ def test_canary_is_reported_not_checked(ans):
 def test_checksum(ans, variant):
     code = _c(ans[variant], "checksum")
     assert code.startswith("int checksum(char *a1)")
-    assert "while (" in code and "> 100000" in code and "0x1337" in code
+    assert ("while (" in code or "for (" in code) and "> 100000" in code and "0x1337" in code
+    if variant == "vuln64":                        # -O0 keeps the source's counted loop
+        assert "for (var_10 = 0; var_20[var_10] != 0; var_10++) {" in code
     assert "goto" not in code
 
 
@@ -96,8 +98,18 @@ def test_every_function_decompiles(ans, variant):
         if not f.name.startswith("_"):                   # _start really does use the stack pointer
             assert "rsp" not in text, f.name
         assert text.count("{") == text.count("}"), f.name
+        _assert_labels(text, f.name)
         lo, hi = min(f.blocks), max(b.end for b in f.blocks.values())
         assert all(ln.addr is None or lo <= ln.addr < hi for ln in d.lines), f.name
+
+
+def _assert_labels(text, name):
+    """Every goto has its label, and every label is defined once."""
+    import re
+    labels = re.findall(r"^\s*(loc_[0-9a-f]+):", text, re.M)
+    assert len(labels) == len(set(labels)), f"{name}: duplicate label"
+    for target in re.findall(r"goto (loc_[0-9a-f]+);", text):
+        assert target in labels, f"{name}: goto {target} has no label\n{text}"
 
 
 def test_stripped_binary(vuln64_stripped):
@@ -171,3 +183,24 @@ def test_recompiled_pseudocode_matches_source(ans, variant, tmp_path):
     assert r.returncode == 0, f"pseudocode does not compile:\n{r.stderr}\n{code}"
     r = subprocess.run([str(exe)], capture_output=True, text=True)
     assert r.stdout.strip() == "ok", f"{r.stdout}\n{code}"
+
+
+def test_for_loop_not_formed_when_body_continues():
+    """`while` + continue skips the step; a `for` would run it -- so no `for` then."""
+    from relic.decompiler.emit import _for_parts
+    from relic.decompiler.ir import Assign, BinOp, Const, Var
+    from relic.decompiler.structure import Block, If, Jump1, Loop, Seq
+    i = Var("v1", 0, 32)
+    init = Assign(0x10, i, Const(0, 32))
+    step = Assign(0x30, i, BinOp("+", i, Const(1, 32), 32))
+    cond = BinOp("<s", i, Const(10, 32), 1)
+    body = Seq([Block(0x20, []), Block(0x30, [step])])
+    loop = Loop("while", cond, body, 0x18)
+    assert _for_parts(Block(0x10, [init]), loop, set()) is not None
+    skip = If(0x20, BinOp("==", i, Const(3, 32), 1), Seq([Jump1("continue")]))
+    loop = Loop("while", cond, Seq([skip, Block(0x30, [step])]), 0x18)
+    assert _for_parts(Block(0x10, [init]), loop, set()) is None
+    # a continue of a nested loop is fine
+    inner = Loop("inf", None, Seq([Jump1("continue")]), 0x40)
+    loop = Loop("while", cond, Seq([inner, Block(0x30, [step])]), 0x18)
+    assert _for_parts(Block(0x10, [init]), loop, set()) is not None
