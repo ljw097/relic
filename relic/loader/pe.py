@@ -64,6 +64,7 @@ def load_pe(path: str, data: bytes) -> Binary:
             b.add_symbol(s)
 
     _coff_symbols(pe, data, b)
+    _function_starts(pe, b)
 
     oh = pe.OPTIONAL_HEADER
     b.info["subsystem"] = pefile.SUBSYSTEM_TYPE.get(oh.Subsystem, str(oh.Subsystem))
@@ -114,3 +115,33 @@ def _coff_symbols(pe, data: bytes, b: Binary):
         if b.arch == "x86" and name.startswith("_"):
             name = name[1:].split("@", 1)[0]
         b.add_symbol(Symbol(name, addr, 0, "func" if is_func and is_code else "object", "symtab"))
+
+
+def _function_starts(pe, b: Binary):
+    """Function entries the PE declares itself: x64 exception data and TLS callbacks.
+
+    `.pdata` holds a RUNTIME_FUNCTION per non-leaf function (chained entries,
+    which describe a fragment of another function, are skipped). TLS callbacks
+    run before the entry point -- a favourite hiding place for anti-debugging
+    -- and are named `tls_callback_N`.
+    """
+    starts: list[int] = []
+    for rf in getattr(pe, "DIRECTORY_ENTRY_EXCEPTION", []) or []:
+        st = getattr(rf, "struct", None)
+        if st is None:
+            continue
+        unwind = getattr(rf, "unwindinfo", None)
+        if unwind is not None and getattr(unwind, "Flags", 0) & 0x4:      # UNW_FLAG_CHAININFO
+            continue
+        starts.append(b.base + st.BeginAddress)
+    b.function_starts = sorted(set(starts))
+    tls = getattr(pe, "DIRECTORY_ENTRY_TLS", None)
+    if tls is not None:
+        ptr = tls.struct.AddressOfCallBacks
+        for k in range(64):
+            if not ptr:
+                break
+            cb = b.read_ptr(ptr + k * (b.bits // 8))
+            if not cb:
+                break
+            b.add_symbol(Symbol(f"tls_callback_{k}", cb, 0, "func", "synthetic"))

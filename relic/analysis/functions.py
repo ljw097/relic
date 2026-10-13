@@ -83,6 +83,7 @@ class FunctionAnalyzer:
         seeds = [b.entry] if b.entry and b.is_exec(b.entry) else []
         seeds += sorted(a for a, s in b.symbols.items() if s.kind == "func" and b.is_exec(a))
         seeds += self._elf_ctor_seeds()
+        seeds += [a for a in getattr(b, "function_starts", []) if b.is_exec(a)]   # PE .pdata
         self._queue.extend(seeds)
         self._drain()
         main = self._find_main()

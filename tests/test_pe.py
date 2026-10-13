@@ -53,3 +53,23 @@ def test_decompile(pe):
     code = decompile(an, an.function_by_name("checksum")).text
     assert code.startswith("int checksum(char *a1)")
     assert "> 100000" in code and "0x1337" in code
+
+
+def test_stripped_pe_function_starts(vuln64_pe, tmp_path):
+    """Without symbols, .pdata still gives every non-leaf function's start; TLS callbacks are named."""
+    import shutil
+    import subprocess
+    strip = shutil.which("x86_64-w64-mingw32-strip")
+    if strip is None:
+        pytest.skip("x86_64-w64-mingw32-strip not available")
+    out = tmp_path / "s.exe"
+    subprocess.run([strip, "-o", str(out), vuln64_pe], check=True)
+    from relic.loader import load
+    full = load(vuln64_pe)
+    funcs = {a for a, s in full.symbols.items() if s.kind == "func"}
+    an = analyze(str(out))
+    starts = an.bin.function_starts
+    assert len(starts) > 50 and set(starts) <= funcs          # every .pdata entry is a real function
+    found = set(an.functions)
+    assert full.name_to_addr["vuln"] in found and full.name_to_addr["checksum"] in found
+    assert any(n.startswith("tls_callback_") for n in an.bin.name_to_addr)
