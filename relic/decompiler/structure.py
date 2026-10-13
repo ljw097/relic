@@ -19,6 +19,8 @@ from .ir import (BinOp, Branch, IndirectJump, IRFunction, Jump, Reg, Return, Stm
 
 EXIT = -1
 SMALL_TAIL = 3   # statements a block may have and still be duplicated instead of reached by goto
+DUP_BLOCKS = 6   # a tail region of at most this many blocks ...
+DUP_STMTS = 12   # ... and statements is copied rather than reached by goto
 
 
 # ------------------------------------------------------------------- AST nodes
@@ -191,6 +193,7 @@ class Structurer:
         self.emitted: set[int] = set()
         self.gotos: set[int] = set()
         self.rpo_index = {a: k for k, a in enumerate(_rpo(fn.addr, lambda a: self.succ.get(a, [])))}
+        self._dup_depth = 0
 
     # -- dominance -----------------------------------------------------------
     def _dominates(self, a, b):
@@ -288,7 +291,74 @@ class Structurer:
                     return Seq([Block(n, body, copy=True), edge])
                 if _small_return(self.blocks[nxt]):
                     return Seq([Block(n, body, copy=True), Ret(self.blocks[nxt].stmts[0])])
+        region = self._dup_region(n, stops, ctx)
+        if region is not None:
+            return self._duplicate(n, region, stops, ctx)
         return Seq([self._goto(n)])
+
+    def _dup_region(self, n, stops, ctx):
+        """The blocks to copy so that reaching `n` again needs no goto, or None if too costly.
+
+        The region must be small (DUP_BLOCKS blocks, DUP_STMTS statements), acyclic,
+        free of loop headers and switches, and every way out of it must be one
+        this region handles anyway: the stop the current region ends at, a
+        break / continue of the enclosing construct, or a `return`.
+        """
+        if self._dup_depth >= 2:
+            return None
+        stop_set = stops if isinstance(stops, (set, frozenset)) else {stops}
+        region, order, work, total = set(), [], [n], 0
+        while work:
+            a = work.pop()
+            if a in region:
+                continue
+            blk = self.blocks.get(a)
+            if blk is None or a in self.loops or a == self.fn.addr:
+                return None
+            body, term = _terminator(blk)
+            if isinstance(term, IndirectJump):
+                return None
+            region.add(a)
+            total += len(body)
+            if len(region) > DUP_BLOCKS or total > DUP_STMTS:
+                return None
+            for s in self.succ.get(a, ()):
+                if s in stop_set or self._edge_kind(s, ctx) is not None:
+                    continue
+                if self._dominates(s, a):        # a back edge: a loop, not a tail
+                    return None
+                if _small_return(self.blocks[s]):
+                    continue
+                work.append(s)
+        return region
+
+    def _edge_kind(self, target, ctx):
+        """Like `_edge`, but without side effects (no goto bookkeeping)."""
+        if not ctx or target is None:
+            return None
+        top = ctx[-1]
+        if top.kind == "switch" and target == top.follow:
+            return "break"
+        loop = next((c for c in reversed(ctx) if c.kind == "loop"), None)
+        if loop is None:
+            return None
+        if target == loop.header and loop.latch_cond is None:
+            return "continue"
+        if target == loop.follow and top is loop:
+            return "break"
+        return None
+
+    def _duplicate(self, n, region, stops, ctx) -> Seq:
+        """Structure a copy of `region` (already emitted elsewhere) at this point."""
+        saved = set(self.emitted)
+        self.emitted -= region
+        self._dup_depth += 1
+        try:
+            seq = self._region(n, stops, ctx)
+        finally:
+            self._dup_depth -= 1
+            self.emitted = saved
+        return seq
 
     def _goto(self, n):
         self.gotos.add(n)
@@ -317,7 +387,7 @@ class Structurer:
             self.emitted.add(n)
             blk = self.blocks[n]
             body, term = _terminator(blk)
-            seq.items.append(Block(n, body))
+            seq.items.append(Block(n, body, copy=self._dup_depth > 0))
             inner = next((c for c in reversed(ctx) if c.kind == "loop"), None)
             if inner is not None and inner.latch_cond is not None and n == inner.latch:
                 break  # do-while latch: its test is the loop condition
