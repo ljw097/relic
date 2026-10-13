@@ -1,3 +1,99 @@
 # Relic
 
-GUI decompiler & disassembler for reverse engineering and pwnable. (WIP)
+리버싱과 포너블을 위한 디스어셈블러 / 디컴파일러 (WIP).
+
+현재는 **분석 엔진과 CLI**가 동작하고, GUI와 디컴파일러는 개발 중입니다.
+진행 상황은 [TODO.md](TODO.md), 디컴파일러 설계는 [docs/decompiler-plan.md](docs/decompiler-plan.md)를 참고하세요.
+
+## 기능
+
+| 영역 | 상태 |
+|---|---|
+| 로더 | ELF / PE / RAW(셸코드·펌웨어 blob) |
+| 디스어셈블 | capstone 기반: x86, x64, ARM, AArch64, MIPS, RISC-V, PPC |
+| 함수 탐색 / CFG | 재귀 하강, noreturn 처리, tail call, x86-64 점프 테이블 복원 |
+| stripped 바이너리 | `__libc_start_main` 인자로 `main` 복구, 프롤로그 스캔, `.init_array` 시드 |
+| 참조 | 코드/데이터 xref, 문자열(ASCII, PE는 UTF-16LE) |
+| checksec | ELF: RELRO / Canary / NX / PIE / FORTIFY / RPATH, PE: ASLR / DEP / CFG / SEH / GS |
+| 포너블 휴리스틱 | `gets`·`strcpy` 등 위험 함수, 비상수 포맷 스트링, 폭 없는 `scanf("%s")`, ret2win 후보 |
+| 프로젝트 | 이름 변경·주석을 `<binary>.relic.json`에 저장 |
+| GUI | 뷰 위젯(디스어셈블리 / CFG 그래프 / 헥스)만 있음, 메인 윈도우 미구현 |
+| 디컴파일러 | 설계 단계 |
+
+> 인자 추적 기반 탐지(포맷 스트링, ret2win)와 점프 테이블 복원은 현재 **x86-64에서만** 동작합니다.
+
+## 설치
+
+```sh
+python3 -m venv .venv
+.venv/bin/pip install -e '.[dev]'
+```
+
+Python 3.10 이상, 의존성: capstone, pyelftools, pefile, PySide6.
+
+## 사용법
+
+```sh
+relic info      ./chall              # 헤더, 섹션, 라이브러리
+relic checksec  ./chall              # 보호 기법
+relic funcs     ./chall [-a]         # 함수 목록 (-a: import 스텁 포함)
+relic disasm    ./chall [main]       # 함수/주소 디스어셈블 (기본: main 또는 entry)
+relic disasm    ./chall 0x401000 -n 20   # 선형 스윕
+relic cfg       ./chall classify | dot -Tsvg > cfg.svg
+relic strings   ./chall
+relic imports   ./chall
+relic xrefs     ./chall menu
+relic vulns     ./chall              # 포너블 휴리스틱
+relic disasm    sc.bin --arch x64 --base 0x1000 -n 30   # RAW blob
+```
+
+주소 인자는 `0x401000`, `401000`, `main`, `main+0x10` 형식을 받습니다.
+
+예시 (`tests/src/vuln.c`, `-no-pie -fno-stack-protector`):
+
+```
+$ relic vulns vuln64.out
+[high  ] 0x4014d0 show_note            format-string   printf() called with a non-constant format string
+[high  ] 0x40162e vuln                 dangerous-call  gets() never checks bounds: stack/heap overflow
+[info  ] 0x401296 win                  win-function    win runs system("/bin/sh") - ret2win target?
+```
+
+## 라이브러리로 사용
+
+```python
+from relic.analysis import analyze
+
+an = analyze("./chall")
+main = an.function_by_name("main")
+for blk in main.blocks.values():
+    print(hex(blk.addr), [hex(s) for s in blk.succs])
+print(an.checksec())
+for v in an.vulns():
+    print(v.severity, hex(v.addr), v.message)
+```
+
+## 구조
+
+```
+relic/
+  loader/      ELF / PE / RAW → 공통 Binary 모델 (섹션, 세그먼트, 심볼, import, 재배치)
+  disasm.py    capstone 래퍼, 명령어 분류(call/jmp/cjmp/ret/halt), 분기 대상·데이터 참조 추출
+  analysis/    함수 탐색·CFG(functions), 문자열, checksec, 취약점 휴리스틱, xref, 프로젝트 저장
+  listing.py   심볼/문자열 주석이 붙은 디스어셈블리 리스팅 (CLI·GUI 공용)
+  gui/         PySide6 뷰 위젯
+  __main__.py  CLI
+tests/
+  src/vuln.c   테스트용 포너블 샘플 (테스트 실행 시 tests/bins/에 빌드)
+```
+
+## 테스트
+
+```sh
+.venv/bin/pytest -q
+```
+
+gcc가 있으면 `tests/src/vuln.c`를 여러 변형(no-PIE, PIE+보호기법, strip)으로 빌드해 검증합니다. 컴파일러가 없으면 해당 테스트는 skip됩니다.
+
+## 라이선스
+
+MIT
