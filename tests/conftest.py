@@ -45,7 +45,11 @@ def _build(name: str) -> str:
     src_path = SOURCES.get(name, SRC)
     if os.path.exists(out) and os.path.getmtime(out) >= os.path.getmtime(src_path) and not name.endswith("_stripped"):
         return out
-    cc = shutil.which(COMPILERS[name]) if name in COMPILERS else (shutil.which("gcc") or shutil.which("cc"))
+    if name in COMPILERS:   # cross compilers may only exist under a versioned name (`...-gcc-14`)
+        cc = shutil.which(COMPILERS[name]) or next(
+            (p for v in (14, 13, 12) if (p := shutil.which(f"{COMPILERS[name]}-{v}"))), None)
+    else:
+        cc = shutil.which("gcc") or shutil.which("cc")
     if cc is None:
         pytest.skip(f"no C compiler for {name}")
     os.makedirs(BINS, exist_ok=True)
