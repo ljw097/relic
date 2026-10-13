@@ -161,30 +161,44 @@ class CType:
         return self.base + (" " + "*" * self.ptr if self.ptr else "")
 
 
-def _addr_base(a: Expr):
-    """The variable a memory address is based on (`v`, `v + 8`, `v + i*4`)."""
+def _addr_base(a: Expr, is_addr=lambda v: False):
+    """The variable a memory address is based on (`v`, `v + 8`, `v + i*4`).
+
+    In `v + K` where K is itself an address (a global array), `v` is the
+    index, not the pointer.
+    """
     if isinstance(a, (Var, StackVar)):
         return a
+    if isinstance(a, BinOp) and a.op == "-" and isinstance(a.b, Const) and isinstance(a.a, (Var, StackVar)):
+        return a.a
     if isinstance(a, BinOp) and a.op == "+":
+        if any(isinstance(x, Const) and is_addr(x.value) for x in (a.a, a.b)):
+            return None
         for x in (a.a, a.b):
-            if isinstance(x, (Var, StackVar)) and x.bits == 64:
+            if isinstance(x, (Var, StackVar)):
                 return x
     return None
 
 
-def infer_types(fn: IRFunction, ptr_bits: int) -> dict[str, CType]:
-    """C type per variable name (registers' Vars and stack locals)."""
+def infer_types(fn: IRFunction, ptr_bits: int, is_addr=lambda v: False,
+                hints: dict[str, CType] | None = None) -> dict[str, CType]:
+    """C type per variable name (registers' Vars and stack locals).
+
+    `is_addr(value)` says whether a constant is a data address; `hints` are
+    known types (e.g. from library signatures) that win over inference.
+    """
     widths: dict[str, int] = {}
     pointee: dict[str, int] = {}
     unsigned: set[str] = set()
     signed: set[str] = set()
+    copies: list[tuple[str, str]] = []
 
     def note(e: Expr):
         for x in walk(e):
             if isinstance(x, (Var, StackVar)):
                 widths.setdefault(x.name, x.bits)
             if isinstance(x, Load):
-                b = _addr_base(x.addr)
+                b = _addr_base(x.addr, is_addr)
                 if b is not None and b.bits == ptr_bits:
                     pointee.setdefault(b.name, x.bits)
             if isinstance(x, BinOp) and x.op in ("<u", "<=u", "<s", "<=s", "/u", "/s", ">>u", ">>s", "%u", "%s"):
@@ -196,16 +210,31 @@ def infer_types(fn: IRFunction, ptr_bits: int) -> dict[str, CType]:
         for top in stmt_exprs(s):
             note(top)
         if isinstance(s, Store):
-            b = _addr_base(s.dst)
+            b = _addr_base(s.dst, is_addr)
             if b is not None and b.bits == ptr_bits:
                 pointee.setdefault(b.name, s.src.bits)
+        if isinstance(s, Assign) and isinstance(s.dst, (Var, StackVar)) and isinstance(s.src, (Var, StackVar)) \
+                and s.dst.bits == s.src.bits:
+            copies.append((s.dst.name, s.src.name))
         for d in _defs(s):
             if isinstance(d, (Var, StackVar)):
                 widths.setdefault(d.name, d.bits)
 
+    # a copy carries the pointer type both ways (`var_20 = a1` makes a1 a char * too)
+    changed = True
+    while changed:
+        changed = False
+        for x, y in copies:
+            for p, q in ((x, y), (y, x)):
+                if p in pointee and q not in pointee:
+                    pointee[q] = pointee[p]
+                    changed = True
+
     out: dict[str, CType] = {}
     for name, bits in widths.items():
-        if name in pointee and bits == ptr_bits:
+        if hints and name in hints:
+            out[name] = hints[name]
+        elif name in pointee and bits == ptr_bits:
             out[name] = CType(int_type(pointee[name]), 1)
         else:
             out[name] = CType(int_type(bits, name in unsigned and name not in signed))

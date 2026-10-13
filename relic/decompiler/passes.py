@@ -182,36 +182,34 @@ def _propagate(fn: IRFunction) -> bool:
 def _forward_loads(fn: IRFunction) -> bool:
     from .ir import map_stmt
     changed = False
-    while True:
-        uses = _count_uses(fn)
-        progressed = False
-        for b in fn.blocks.values():
-            for di, ds in enumerate(b.stmts):
-                if not (isinstance(ds, Assign) and isinstance(ds.dst, Var)):
-                    continue
-                src = ds.src
-                if isinstance(src, Phi) or not _has(src, Load) or _has(src, Call):
-                    continue
-                if uses.get(ds.dst, 0) != 1:
-                    continue
-                use_idx = None
-                for j in range(di + 1, len(b.stmts)):
-                    st = b.stmts[j]
-                    if _uses_var(st, ds.dst):
-                        use_idx = j
-                        break
-                    if isinstance(st, BARRIERS):
-                        break  # a memory write sits between the load and its use
-                if use_idx is None:
-                    continue
-                map_stmt(b.stmts[use_idx], lambda e: _subst(e, {ds.dst: src}))
-                del b.stmts[di]
-                progressed = changed = True
-                break
-            if progressed:
-                break
-        if not progressed:
-            return changed
+    # forwarding moves an expression from one statement into another: every other
+    # variable keeps its use count, so one count serves the whole pass
+    uses = _count_uses(fn)
+    for b in fn.blocks.values():
+        di = 0
+        while di < len(b.stmts):
+            ds = b.stmts[di]
+            src = ds.src if isinstance(ds, Assign) else None
+            if not (isinstance(ds, Assign) and isinstance(ds.dst, Var)) or isinstance(src, Phi) \
+                    or not _has(src, Load) or _has(src, Call) or uses.get(ds.dst, 0) != 1:
+                di += 1
+                continue
+            use_idx = None
+            for j in range(di + 1, len(b.stmts)):
+                st = b.stmts[j]
+                if _uses_var(st, ds.dst):
+                    use_idx = j
+                    break
+                if isinstance(st, BARRIERS):
+                    break  # a memory write sits between the load and its use
+            if use_idx is None:
+                di += 1
+                continue
+            map_stmt(b.stmts[use_idx], lambda e, v=ds.dst, src=src: _subst(e, {v: src}))
+            del b.stmts[di]
+            uses.pop(ds.dst, None)
+            changed = True
+    return changed
 
 
 # ------------------------------------------------------------- condition recovery

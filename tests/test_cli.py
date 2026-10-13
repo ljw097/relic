@@ -52,9 +52,17 @@ def test_opt_frame(capsys, vuln64):
 
 def test_decompile(capsys, vuln64):
     out = run(capsys, "decompile", vuln64, "main")
-    assert out.startswith("main()")
+    assert out.startswith("int main(int a1, ")
     assert "while (1) {" in out                         # structured menu loop
-    assert "if (" in out and "; menu" in out
+    assert "if (" in out and "menu()" in out
+
+
+def test_decompile_addrs_and_all(capsys, vuln64):
+    out = run(capsys, "decompile", vuln64, "vuln", "--addrs")
+    line = next(ln for ln in out.splitlines() if "gets(" in ln)
+    assert int(line.split()[0], 16)                    # address column
+    out = run(capsys, "decompile", vuln64, "-a")
+    assert "void vuln(void)" in out and "int checksum(" in out
 
 
 def test_strings_grep(capsys, vuln64):

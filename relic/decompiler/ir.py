@@ -20,6 +20,13 @@ class Expr:
     def __str__(self) -> str:
         return fmt(self)
 
+    # expressions are immutable: copying an IR function can share them
+    def __copy__(self):
+        return self
+
+    def __deepcopy__(self, memo):
+        return self
+
 
 @dataclass(frozen=True, slots=True)
 class Const(Expr):

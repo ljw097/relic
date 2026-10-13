@@ -18,6 +18,7 @@ from dataclasses import dataclass, field
 from .ir import (BinOp, Branch, IndirectJump, IRFunction, Jump, Reg, Return, Stmt, UnOp, fmt, fmt_stmt, walk)
 
 EXIT = -1
+SMALL_TAIL = 3   # statements a block may have and still be duplicated instead of reached by goto
 
 
 # ------------------------------------------------------------------- AST nodes
@@ -30,6 +31,7 @@ class Seq:
 class Block:
     addr: int
     stmts: list[Stmt]
+    copy: bool = False   # a duplicated small block (printed without its label)
 
 
 @dataclass
@@ -259,6 +261,28 @@ class Structurer:
                 tree.items.append(self._region(a, None, []))
         return tree
 
+    def _revisit(self, n, stops, ctx) -> Seq:
+        """Flow reaches `n`, which was already emitted elsewhere: duplicate it when it is a
+        small tail (a return, or a few statements leading straight to where this region goes
+        anyway), otherwise jump to it with a `goto`."""
+        blk = self.blocks[n]
+        if _small_return(blk):
+            return Seq([Ret(blk.stmts[0])])
+        body, term = _terminator(blk)
+        if len(body) <= SMALL_TAIL and not isinstance(term, (Branch, IndirectJump)):
+            if isinstance(term, Return):
+                return Seq([Block(n, body, copy=True), Ret(term)])
+            nxt = self.succ[n][0] if len(self.succ[n]) == 1 else None
+            if nxt is not None:
+                edge = self._edge(nxt, ctx)
+                if nxt in (stops if isinstance(stops, (set, frozenset)) else {stops}):
+                    return Seq([Block(n, body, copy=True)])
+                if edge is not None:
+                    return Seq([Block(n, body, copy=True), edge])
+                if _small_return(self.blocks[nxt]):
+                    return Seq([Block(n, body, copy=True), Ret(self.blocks[nxt].stmts[0])])
+        return Seq([self._goto(n)])
+
     def _goto(self, n):
         self.gotos.add(n)
         return Jump1("goto", n)
@@ -267,14 +291,15 @@ class Structurer:
         seq = Seq()
         stops = stop if isinstance(stop, (set, frozenset)) else {stop}
         while n is not None and n not in stops and n != EXIT:
+            if n not in self.blocks:            # outside the function: nothing to structure
+                seq.items.append(Jump1("goto", n))
+                break
             if n in self.emitted:
                 edge = self._edge(n, ctx)
                 if edge is not None:
                     seq.items.append(edge)
-                elif _small_return(self.blocks[n]):
-                    seq.items.append(Ret(self.blocks[n].stmts[0]))   # duplicate, no goto
                 else:
-                    seq.items.append(self._goto(n))
+                    seq.items.extend(self._revisit(n, stops, ctx).items)
                 break
             # a loop header we are not already inside -> emit the whole loop
             if n in self.loops and not any(c.kind == "loop" and c.header == n for c in ctx):
@@ -378,11 +403,10 @@ class Structurer:
                 return edge
             if target in stops:
                 return None
+            inner_stops = {follow} if follow is not None else stops
             if target in self.emitted:
-                if _small_return(self.blocks[target]):
-                    return Seq([Ret(self.blocks[target].stmts[0])])
-                return self._goto(target)
-            return self._region(target, follow if follow is not None else stops, ctx)
+                return self._revisit(target, inner_stops, ctx)
+            return self._region(target, inner_stops, ctx)
 
         then = branch(t)
         els = branch(f)
@@ -401,7 +425,7 @@ class Structurer:
         values: dict[int, list[int]] = {}
         for k, t in enumerate(term.table or term.targets):
             values.setdefault(t, []).append(k + bias)
-        targets = list(dict.fromkeys(term.targets))
+        targets = [t for t in dict.fromkeys(term.targets) if t in self.blocks]
         if default is not None and default not in targets:
             targets.append(default)
         # case order: by smallest label, default last -- unless a case falls through into

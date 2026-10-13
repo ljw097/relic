@@ -39,6 +39,15 @@ def _read_format(an: "Analysis", value) -> str | None:
 
 def _livein_arg_regs(an: "Analysis", arch: ArchInfo, target: int) -> list[str]:
     """Argument registers an internal callee reads on entry (its parameters, heuristically)."""
+    cache = getattr(an, "_livein_cache", None)
+    if cache is None:
+        cache = an._livein_cache = {}
+    if target not in cache:
+        cache[target] = _compute_livein(an, arch, target)
+    return cache[target]
+
+
+def _compute_livein(an: "Analysis", arch: ArchInfo, target: int) -> list[str]:
     f = an.functions.get(target)
     if f is None or f.is_import:
         return []
@@ -84,26 +93,55 @@ def _livein_arg_regs(an: "Analysis", arch: ArchInfo, target: int) -> list[str]:
     return params
 
 
+def _set_before_call(fn: IRFunction, argregs, uses: dict, params=()) -> list[str]:
+    """Argument registers the caller evidently loaded for this call (callee unknown).
+
+    A register counts when its value at the call was computed in this function:
+    not the untouched entry value (unless it is one of the caller's own parameters,
+    passed straight on), and not a leftover result of an earlier call.
+    The contiguous prefix of such registers is taken as the argument list.
+    """
+    from .ir import Assign
+    defined = {s.dst for s in fn.stmts() if isinstance(s, Assign) and isinstance(s.dst, Var)
+               and not isinstance(s.src, Phi)}
+    out: list[str] = []
+    for r in argregs:
+        v = uses.get(r)
+        if not (isinstance(v, Const) or (isinstance(v, Var) and (v in defined or
+                                                                  (v.version == 0 and v.name in params)))):
+            break
+        out.append(r)
+    return out
+
+
 def recover_calls(fn: IRFunction, an: "Analysis", arch: ArchInfo) -> IRFunction:
-    """Fill in `Call.args` for every resolved call (mutates and returns `fn`)."""
+    """Fill in `Call.args` for every call (mutates and returns `fn`).
+
+    Library calls use their signature, internal calls the callee's live-in
+    argument registers, and calls with neither (unknown imports, function
+    pointers) the registers the caller visibly set up for them.
+    """
     argregs = int_arg_regs(arch)
-    cache: dict[int, list[str]] = {}
+    own: list[str] | None = None
     for b in fn.blocks.values():
         for s in b.stmts:
-            if not isinstance(s, CallStmt) or not isinstance(s.call.target, Const):
+            if not isinstance(s, CallStmt) or s.call.args:
                 continue
             uses = dict(s.uses)
-            name = s.name or an.name(s.call.target.value)
+            tgt = s.call.target.value if isinstance(s.call.target, Const) else None
+            name = s.name or (an.name(tgt) if tgt is not None else None)
             sig = lookup(name)
+            f = an.functions.get(tgt) if tgt is not None else None
             if sig is not None:
                 fmt = _read_format(an, uses.get(argregs[sig.fmt])) if sig.fmt is not None and \
                     sig.fmt < len(argregs) else None
                 selected = list(argregs[:arg_count(sig, fmt)])
+            elif f is not None and not f.is_import:
+                selected = _livein_arg_regs(an, arch, tgt)
             else:
-                tgt = s.call.target.value
-                if tgt not in cache:
-                    cache[tgt] = _livein_arg_regs(an, arch, tgt)
-                selected = cache[tgt]
+                if own is None:
+                    own = _livein_arg_regs(an, arch, fn.addr)
+                selected = _set_before_call(fn, argregs, uses, own)
             args = [uses[r] for r in selected if r in uses]
             s.call = Call(s.call.target, tuple(args), s.call.bits)
             s.uses = [(r, uses[r]) for r in selected if r in uses]

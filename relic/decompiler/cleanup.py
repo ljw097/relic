@@ -114,44 +114,99 @@ def cached_ir(an: "Analysis", func: "Function") -> IRFunction:
     return c[func.addr]
 
 
-def returns_value(an: "Analysis", func: "Function", fn: IRFunction, ret_reg: str) -> bool:
-    """Whether `func` returns a value: its callers read the return register after the call.
+def _lifted(an: "Analysis", func: "Function") -> IRFunction:
+    from .lift import lift_function
+    c = _cache(an).setdefault("lift", {})
+    if func.addr not in c:
+        c[func.addr] = lift_function(an, func)
+    return c[func.addr]
 
-    Without callers we fall back to the function itself: it returns something
-    unless every `return` hands back an untouched entry register.
+
+def _read_form(e: Expr, reg: str):
+    """How expression `e` reads register `reg`: a low-bits width, "whole", or None (not at all)."""
+    from .ir import Cast, Extract, Reg, children
+    if isinstance(e, Cast) and e.kind == "low" and isinstance(e.a, Reg) and e.a.name == reg:
+        return e.bits
+    if isinstance(e, Extract) and isinstance(e.a, Reg) and e.a.name == reg:
+        return "whole"
+    if isinstance(e, Reg) and e.name == reg:
+        return "whole"
+    forms = [f for f in (_read_form(k, reg) for k in children(e)) if f is not None]
+    if not forms:
+        return None
+    return forms[0] if all(f == forms[0] for f in forms) else "whole"
+
+
+def result_reads(an: "Analysis", func: "Function", reg: str) -> list:
+    """For every call to `func`, how the caller first reads the result register.
+
+    Scans the caller's lifted (pre-SSA) IR forward from the call through the
+    block and its successors until the register is read or overwritten.
+    Entries are a width (`low32(rax)`), "whole", or "none" (overwritten or never
+    read); falling into a `return` hands the value on, which says nothing.
     """
-    c = _cache(an)["ret"]
-    if func.addr in c:
-        return c[func.addr]
-    name = an.name(func.addr) or ""
-    result = None
-    if name == "main":
-        result = True
-    else:
-        callers = [f for f in an.functions.values()
-                   if not f.is_import and f.addr != func.addr and (func.addr in f.calls or func.addr in f.tail_calls)]
-        if any(func.addr in f.tail_calls for f in callers):
-            result = True     # the caller hands our result on as its own
-        elif callers:
-            result = False
-            for f in callers:
-                try:
-                    ir = cached_ir(an, f)
-                except Exception:
-                    result = True
-                    break
-                for s in ir.stmts():
-                    if isinstance(s, CallStmt) and isinstance(s.call.target, Const) and \
-                            s.call.target.value == func.addr and any(r == ret_reg for r, _ in s.defs):
-                        result = True
-                        break
-                if result:
-                    break
-    if result is None:
-        rets = [s.value for s in fn.stmts() if isinstance(s, Return)]
-        result = any(v is not None and not (isinstance(v, Var) and v.version == 0) for v in rets)
-    c[func.addr] = result
-    return result
+    from .ir import Reg, stmt_defs
+    c = _cache(an).setdefault("reads", {})
+    key = (func.addr, reg)
+    if key in c:
+        return c[key]
+    out: list = []
+    for f in an.functions.values():
+        if f.is_import or func.addr not in f.calls:
+            continue
+        try:
+            fn = _lifted(an, f)
+        except Exception:
+            out.append("whole")
+            continue
+
+        def scan(stmts, blk, depth) -> str | int | None:
+            for t in stmts:
+                if isinstance(t, Return):
+                    return None
+                if isinstance(t, CallStmt):
+                    reads = [_read_form(a, reg) for a in [t.call.target, *t.call.args]]
+                    reads = [r for r in reads if r is not None]
+                    return reads[0] if reads else "none"   # a call clobbers the result register
+                forms = [r for r in (_read_form(x, reg) for x in stmt_exprs(t)) if r is not None]
+                if forms:
+                    return forms[0] if all(f == forms[0] for f in forms) else "whole"
+                if any(isinstance(d, Reg) and d.name == reg for d in stmt_defs(t)):
+                    return "none"
+            if depth >= 3:
+                return None
+            results = [scan(fn.blocks[sb].stmts, fn.blocks[sb], depth + 1) for sb in blk.succs if sb in fn.blocks]
+            results = [r for r in results if r is not None]
+            if not results:
+                return None
+            reads = [r for r in results if r != "none"]
+            return reads[0] if reads else "none"
+
+        for b in fn.blocks.values():
+            for k, s in enumerate(b.stmts):
+                if isinstance(s, CallStmt) and isinstance(s.call.target, Const) and s.call.target.value == func.addr:
+                    r = scan(b.stmts[k + 1:], b, 0)
+                    if r is not None:
+                        out.append(r)
+    c[key] = out
+    return out
+
+
+def returns_value(an: "Analysis", func: "Function", fn: IRFunction, ret_reg: str) -> bool:
+    """Whether `func` returns a value: some caller reads the return register after the call.
+
+    Without informative callers we fall back to the function itself: it returns
+    something unless every `return` hands back an untouched entry register.
+    """
+    if (an.name(func.addr) or "") == "main":
+        return True
+    if any(func.addr in f.tail_calls for f in an.functions.values() if not f.is_import):
+        return True     # a caller hands our result on as its own
+    reads = result_reads(an, func, ret_reg)
+    if reads:
+        return any(r != "none" for r in reads)
+    rets = [s.value for s in fn.stmts() if isinstance(s, Return)]
+    return any(v is not None and not (isinstance(v, Var) and v.version == 0) for v in rets)
 
 
 def drop_return_values(fn: IRFunction):
@@ -284,3 +339,196 @@ def _targets(s) -> list[int]:
 
 __all__ = ["hide_canary", "returns_value", "drop_return_values", "rewrite_locals", "forward_empty_blocks",
            "cached_ir"]
+
+
+# --------------------------------------------------------------- result widths
+_INT_RETS = {"int": (32, "sext"), "unsigned": (32, "zext"), "void": (0, "")}
+
+
+def return_width(an: "Analysis", func: "Function", ret_reg: str) -> int | None:
+    """Width of the result: what the callers read (`low32(rax)` everywhere -> 32), else what
+    the function itself returns."""
+    if (an.name(func.addr) or "") == "main":
+        return 32
+    reads = [r for r in result_reads(an, func, ret_reg) if r != "none"]
+    if reads and all(isinstance(r, int) for r in reads) and len(set(reads)) == 1:
+        return reads[0]
+    return self_width(an, func, ret_reg)
+
+
+def narrow_returns(fn: IRFunction, width: int):
+    """`return x` of a function whose result is `width` bits: return `low_width(x)`."""
+    from .ir import Cast
+    from .vartypes import simplify_low
+    for s in fn.stmts():
+        if isinstance(s, Return) and s.value is not None and s.value.bits > width:
+            s.value = simplify_low(Cast("low", s.value, width))
+
+
+def narrow_library_results(fn: IRFunction):
+    """Results of library calls returning `int` are 32-bit: read them as `sext64(low32(v))`."""
+    from .ir import Cast, transform
+    from .sigs import lookup
+    defs: dict[Var, int] = {}
+    for s in fn.stmts():
+        for d in _all_defs(s):
+            if isinstance(d, Var):
+                defs[d] = defs.get(d, 0) + 1
+    for s in list(fn.stmts()):
+        if not isinstance(s, CallStmt) or not s.defs:
+            continue
+        sig = lookup(s.name)
+        if sig is None or sig.ret not in ("int", "unsigned"):
+            continue
+        bits, ext = _INT_RETS[sig.ret]
+        for _, v in s.defs:
+            if isinstance(v, Var) and v.bits > bits and defs.get(v) == 1:
+                wrapped = Cast(ext, Cast("low", v, bits), v.bits)
+                for b in fn.blocks.values():
+                    for t in b.stmts:
+                        map_stmt(t, lambda e, v=v, w=wrapped: transform(e, lambda x: w if x == v else x))
+
+
+def _all_defs(s):
+    from .ir import stmt_defs
+    return stmt_defs(s)
+
+
+# ------------------------------------------------------------ expression inlining
+def _reads(e: Expr) -> tuple[set, bool]:
+    """(variables/locals read, whether memory is read)."""
+    names, mem = set(), False
+    for x in walk(e):
+        if isinstance(x, (Var, StackVar)):
+            names.add(x.name)
+        elif isinstance(x, Load):
+            mem = True
+    return names, mem
+
+
+def inline_single_use(fn: IRFunction) -> bool:
+    """Fold a temporary defined once and used once later in the same block into its use.
+
+    `v1 = notes[i]; free(v1)` -> `free(notes[i])`. Calls are only folded into
+    the very next statement, and nothing that could change what the
+    expression reads (a store, a call, a write to one of its variables) may
+    sit between the definition and the use.
+    """
+    from .ir import Call, CallStmt as _CS, Effect, Unknown, children, stmt_defs, transform
+    changed_any = False
+    while True:
+        uses: dict[str, int] = {}
+        defs: dict[str, int] = {}
+        for s in fn.stmts():
+            # a call's recovered `uses` mirror its arguments: count the arguments once
+            for top in ([s.call] if isinstance(s, _CS) else stmt_exprs(s)):
+                for x in walk(top):
+                    if isinstance(x, Var):
+                        uses[x.name] = uses.get(x.name, 0) + 1
+            for d in stmt_defs(s):
+                if isinstance(d, Var):
+                    defs[d.name] = defs.get(d.name, 0) + 1
+        changed = False
+        for b in fn.blocks.values():
+            k = 0
+            while k < len(b.stmts):
+                s = b.stmts[k]
+                cand = None
+                if isinstance(s, Assign) and isinstance(s.dst, Var) and not isinstance(s.src, Phi):
+                    cand = (s.dst, s.src)
+                elif isinstance(s, _CS) and not s.tail and len(s.defs) == 1 and isinstance(s.defs[0][1], Var):
+                    cand = (s.defs[0][1], s.call)
+                if cand is None:
+                    k += 1
+                    continue
+                v, src = cand
+                if uses.get(v.name) != 1 or defs.get(v.name) != 1 or v.version != 0 or not v.name.startswith("v"):
+                    k += 1
+                    continue
+                names, mem = _reads(src)
+                has_call = any(isinstance(x, Call) for x in walk(src))
+                target = None
+                # the statements after the definition: rest of this block, then on through
+                # straight-line successors (one successor, which has only this predecessor)
+                chain = [(b, j) for j in range(k + 1, len(b.stmts))]
+                cur = b
+                while len(cur.succs) == 1 and cur.succs[0] in fn.blocks and cur.succs[0] != b.addr:
+                    nxt = fn.blocks[cur.succs[0]]
+                    if len(nxt.preds) != 1 or nxt.addr == fn.addr:
+                        break
+                    chain += [(nxt, j) for j in range(len(nxt.stmts))]
+                    cur = nxt
+                for tb, j in chain:
+                    t = tb.stmts[j]
+                    if any(x == v for top in ([t.call] if isinstance(t, _CS) else stmt_exprs(t)) for x in walk(top)):
+                        target = (tb, j)
+                        break
+                    if has_call:
+                        break
+                    if isinstance(t, (_CS, Effect, Unknown)) or (isinstance(t, Store) and (mem or names)):
+                        break
+                    if any(getattr(d, "name", None) in names for d in stmt_defs(t)):
+                        break
+                if target is None:
+                    k += 1
+                    continue
+                t = target[0].stmts[target[1]]
+                if has_call and isinstance(t, _CS) and any(x == v for x in walk(t.call.target)):
+                    k += 1
+                    continue
+                map_stmt(t, lambda e, v=v, src=src: transform(e, lambda x: src if x == v else x))
+                del b.stmts[k]
+                changed = changed_any = True
+        if not changed:
+            return changed_any
+
+
+def _clean(e: Expr, bits: int, defs: dict, an: "Analysis", ret_reg: str, seen: set) -> bool:
+    """Is `e` a `bits`-wide value merely held in a wider register?"""
+    from .ir import Cast
+    from .sigs import lookup
+    if isinstance(e, Const):
+        return e.value < (1 << bits)
+    if isinstance(e, Cast) and e.kind in ("zext", "sext"):
+        return e.a.bits <= bits
+    if isinstance(e, Var):
+        if e in seen:
+            return True
+        seen.add(e)
+        d = defs.get(e)
+        if d is None:
+            return False
+        if isinstance(d, CallStmt):
+            sig = lookup(d.name)
+            if sig is not None:
+                return sig.ret in _INT_RETS and _INT_RETS[sig.ret][0] == bits
+            f = an.functions.get(d.call.target.value) if isinstance(d.call.target, Const) else None
+            return f is not None and not f.is_import and self_width(an, f, ret_reg) == bits
+        if isinstance(d, Phi):
+            return all(_clean(v, bits, defs, an, ret_reg, seen) for _, v in d.sources)
+        return _clean(d, bits, defs, an, ret_reg, seen)
+    return False
+
+
+def self_width(an: "Analysis", func: "Function", ret_reg: str, bits: int = 32) -> int | None:
+    """`bits` if every value `func` returns is a `bits`-wide integer (its own view of the result)."""
+    c = _cache(an).setdefault("self", {})
+    if func.addr in c:
+        return c[func.addr]
+    c[func.addr] = None          # recursion guard
+    try:
+        fn = cached_ir(an, func)
+    except Exception:
+        return None
+    defs: dict = {}
+    for s in fn.stmts():
+        if isinstance(s, Assign) and isinstance(s.dst, Var):
+            defs[s.dst] = s.src
+        elif isinstance(s, CallStmt):
+            for r, v in s.defs:
+                if isinstance(v, Var):
+                    defs[v] = s
+    vals = [s.value for s in fn.stmts() if isinstance(s, Return) and s.value is not None]
+    ok = bool(vals) and all(_clean(v, bits, defs, an, ret_reg, set()) for v in vals)
+    c[func.addr] = bits if ok else None
+    return c[func.addr]
