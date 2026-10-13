@@ -19,7 +19,8 @@ from relic.analysis import analyze
 from relic.decompiler.emit import decompile
 
 HERE = os.path.dirname(__file__)
-FUNCS = ["sc_or", "sc_and3", "find", "collatz", "nested", "sw_fall", "dowhile", "clamp", "gcd", "classify2", "scan"]
+FUNCS = ["sc_or", "sc_and3", "find", "collatz", "nested", "sw_fall", "dowhile", "clamp", "gcd", "classify2", "scan",
+         "div3", "udiv10", "mod10", "ldiv1000", "div_neg7", "is_mult6", "digsum"]
 
 _HARNESS = r"""
 #include <stdint.h>
@@ -40,21 +41,25 @@ static const char *TEXTS[] = {"", " ", "a", "two words", "  lead  and trail ", "
 
 int main(void) {
     int bad = 0;
-    int vals[] = {-200, -101, -9, -3, -1, 0, 1, 2, 3, 4, 5, 6, 7, 8, 13, 27, 100, 101, 150, 1000};
+    int vals[] = {-2147483647 - 1, -200, -101, -9, -3, -1, 0, 1, 2, 3, 4, 5, 6, 7, 8, 13, 27, 100, 101, 150, 1000,
+                  2147483647};
     int nv = sizeof vals / sizeof *vals;
     for (int i = 0; i < nv; i++) {
         int a = vals[i];
 #define CHK1(f, x) if (f(x) != ref_##f(x)) { printf(#f "(%%d) = %%d, want %%d\n", x, (int)f(x), ref_##f(x)); bad++; }
         CHK1(collatz, a < 0 ? -a : a)
         CHK1(sw_fall, a)
-        CHK1(dowhile, a)
+        if (a > -100000 && a < 100000) { CHK1(dowhile, a) }   /* n/3 iterations */
+        CHK1(div3, a) CHK1(mod10, a) CHK1(div_neg7, a)
+        CHK1(udiv10, (unsigned)a) CHK1(is_mult6, (unsigned)a) CHK1(digsum, (unsigned)a)
+        if (ldiv1000((long)a * 1000003) != ref_ldiv1000((long)a * 1000003)) { printf("ldiv1000 %%d\n", a); bad++; }
         for (int j = 0; j < nv; j++) {
             int b = vals[j];
 #define CHK2(f, x, y) if (f(x, y) != ref_##f(x, y)) { printf(#f "(%%d,%%d) = %%d, want %%d\n", x, y, (int)f(x, y), ref_##f(x, y)); bad++; }
             CHK2(sc_or, a, b)
             CHK2(classify2, a, b)
             if (a > 0 && b > 0 && a < 60 && b < 60) { CHK2(nested, a, b) }
-            if (b != 0 && a != -2147483647 - 1) { CHK2(gcd, a, b) }
+            if (b != 0 && a != -2147483647 - 1 && b != -2147483647 - 1) { CHK2(gcd, a, b) }
             for (int k = 0; k < nv; k += 3) {
                 int c = vals[k];
                 if (sc_and3(a, b, c) != ref_sc_and3(a, b, c)) { printf("sc_and3 %%d %%d %%d\n", a, b, c); bad++; }
@@ -102,3 +107,14 @@ def test_flow_recompiles_and_matches_source(flow, tmp_path):
     assert r.returncode == 0, f"{name}: pseudocode does not compile:\n{r.stderr[:3000]}\n{code}"
     r = subprocess.run([str(exe)], capture_output=True, text=True, timeout=60)
     assert r.stdout.strip().endswith("ok"), f"{name}: mismatches:\n{r.stdout[:3000]}\n{code}"
+
+
+@pytest.mark.parametrize("fn,shape", [("div3", "/ 3"), ("udiv10", "/ 10"), ("mod10", "% 10"),
+                                      ("ldiv1000", "/ 1000"), ("is_mult6", "% 6 == 0"), ("digsum", "% 10"),
+                                      ("div_neg7", "/ -7")])
+def test_division_by_constant_recovered(flow, fn, shape):
+    name, an = flow
+    text = decompile(an, an.function_by_name(fn)).text
+    assert shape in text, f"{name}/{fn}:\n{text}"
+    body = "\n".join(ln.split("//")[0] for ln in text.split("{", 1)[1].splitlines())
+    assert "0x" not in body, f"{name}/{fn}: magic constant left\n{text}"

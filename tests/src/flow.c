@@ -111,4 +111,20 @@ F int scan(const char *s) {
     return words;
 }
 
+F int div3(int x) { return x / 3; }
+F unsigned udiv10(unsigned x) { return x / 10; }
+F int mod10(int x) { return x % 10; }
+F long ldiv1000(long x) { return x / 1000; }
+F int div_neg7(int x) { return x / -7; }
+F int is_mult6(unsigned x) { return x % 6 == 0; }
+
+F int digsum(unsigned x) {
+    int s = 0;
+    while (x) {
+        s += x % 10;
+        x /= 10;
+    }
+    return s;
+}
+
 int main(void) { return 0; }
