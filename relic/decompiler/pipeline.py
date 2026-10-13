@@ -45,7 +45,8 @@ def prepare(an: "Analysis", func: "Function") -> Prepared:
     from .calls import _livein_arg_regs
     arch = arch_for(an.bin)
     fn = copy.deepcopy(cached_ir(an, func))
-    frame = analyze_frame(fn, arch)
+    from .cleanup import stack_guards
+    frame = analyze_frame(fn, arch, stack_guards(an))
     hide_canary(fn, frame)
     rets = returns_value(an, func, fn, arch.ret)
     if not rets:

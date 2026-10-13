@@ -23,6 +23,7 @@ _INT_ARGS = {
     "x64-sysv": ("rdi", "rsi", "rdx", "rcx", "r8", "r9"),
     "x64-win": ("rcx", "rdx", "r8", "r9"),
     "x86-cdecl": (),  # arguments are passed on the stack (recovered with the frame, stage 3b)
+    "arm64-aapcs": tuple(f"x{k}" for k in range(8)),
 }
 
 

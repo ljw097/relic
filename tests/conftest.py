@@ -26,12 +26,18 @@ VARIANTS = {
     # Windows PE with MinGW (skipped where the cross compilers are missing)
     "vuln64_pe": ["-O0"],
     "vuln32_pe": ["-O0"],
+    # AArch64 (cross compiler; skipped without it)
+    "vuln_a64": ["-O0"],
+    "vuln_a64_pie": ["-O1", "-fstack-protector-strong", "-pie", "-fPIE"],
+    "flow_a64_O0": ["-O0"],
+    "flow_a64_O2": ["-O2", "-fno-tree-vectorize"],
     # C++ (demangling)
     "shapes": ["-O0", "-no-pie", "-fno-inline"],
 }
-COMPILERS = {"vuln64_pe": "x86_64-w64-mingw32-gcc", "vuln32_pe": "i686-w64-mingw32-gcc", "shapes": "g++"}
+COMPILERS = {"vuln64_pe": "x86_64-w64-mingw32-gcc", "vuln32_pe": "i686-w64-mingw32-gcc", "shapes": "g++",
+             **{n: "aarch64-linux-gnu-gcc" for n in ("vuln_a64", "vuln_a64_pie", "flow_a64_O0", "flow_a64_O2")}}
 SOURCES = {"flow_O0": FLOW_SRC, "flow_O2": FLOW_SRC, "flow32_O0": FLOW_SRC, "flow32_O2": FLOW_SRC,
-           "shapes": os.path.join(HERE, "src", "shapes.cpp")}
+           "shapes": os.path.join(HERE, "src", "shapes.cpp"), "flow_a64_O0": FLOW_SRC, "flow_a64_O2": FLOW_SRC}
 
 
 def _build(name: str) -> str:
@@ -96,3 +102,7 @@ flow32_O2 = _fixture("flow32_O2")
 vuln64_pe = _fixture("vuln64_pe")
 vuln32_pe = _fixture("vuln32_pe")
 shapes = _fixture("shapes")
+vuln_a64 = _fixture("vuln_a64")
+vuln_a64_pie = _fixture("vuln_a64_pie")
+flow_a64_O0 = _fixture("flow_a64_O0")
+flow_a64_O2 = _fixture("flow_a64_O2")

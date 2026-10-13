@@ -100,7 +100,7 @@ def _ir_args(an: "Analysis", f, cache: dict) -> dict[int, tuple] | None:
     if f.addr in cache:
         return cache[f.addr]
     res = None
-    if an.bin.arch in ("x64", "x86"):
+    if an.bin.arch in ("x64", "x86", "arm64"):
         try:
             from ..decompiler.cleanup import cached_ir
             from ..decompiler.ir import CallStmt
@@ -140,7 +140,7 @@ def find_vulns(an: "Analysis") -> list[Finding]:
                 if base in DANGEROUS:
                     sev, msg = DANGEROUS[base]
                     out.append(Finding(i.addr, f.name, sev, "dangerous-call", msg))
-                if b.arch not in ("x64", "x86"):
+                if b.arch not in ("x64", "x86", "arm64"):
                     continue
 
                 def arg(k, reg, f=f, i=i, insns=insns, idx=idx):

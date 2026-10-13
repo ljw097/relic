@@ -44,9 +44,24 @@ X86_CDECL = ArchInfo(
 )
 
 
+_A64_ARGS = tuple(f"x{k}" for k in range(8))
+ARM64 = ArchInfo(
+    "arm64-aapcs", 64, "sp", "x0",
+    call_reads=(*_A64_ARGS, "sp", *(f"v{k}" for k in range(8))),
+    # x0-x18 are caller-saved (x16/x17 are the linker's veneer scratch, x18 the platform
+    # register); a call also overwrites the link register
+    call_clobbers=(*(f"x{k}" for k in range(19)), "x30", *FLAGS, *(f"v{k}" for k in range(8)),
+                   *(f"v{k}" for k in range(16, 32))),
+    syscall_reads=("x8", "x0", "x1", "x2", "x3", "x4", "x5"),
+    syscall_clobbers=("x0",),
+)
+
+
 def arch_for(binary) -> ArchInfo:
     if binary.arch == "x64":
         return X64_WIN if binary.format == "PE" else X64_SYSV
     if binary.arch == "x86":
         return X86_CDECL
+    if binary.arch == "arm64":
+        return ARM64
     raise NotImplementedError(f"no calling convention for {binary.arch} yet")

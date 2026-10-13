@@ -48,15 +48,31 @@ def _defs(fn: IRFunction) -> dict[Var, Expr]:
     return {s.dst: s.src for s in fn.stmts() if isinstance(s, Assign) and isinstance(s.dst, Var)}
 
 
-def _reaches_tls(e: Expr, defs: dict[Var, Expr], depth: int = 4) -> bool:
-    """Does `e` (through up to `depth` SSA definitions) read the thread pointer?"""
+def _reaches_tls(e: Expr, defs: dict[Var, Expr], depth: int = 4, guards=frozenset()) -> bool:
+    """Does `e` (through up to `depth` SSA definitions) read the stack-protector value -- the
+    thread pointer on x86, `__stack_chk_guard` (an address in `guards`) elsewhere?"""
     for x in walk(e):
+        if isinstance(x, Const) and x.value in guards:
+            return True
         if isinstance(x, Var):
             if x.name in ("fs_base", "gs_base"):
                 return True
-            if depth and x in defs and _reaches_tls(defs[x], defs, depth - 1):
+            if depth and x in defs and _reaches_tls(defs[x], defs, depth - 1, guards):
                 return True
     return False
+
+
+def stack_guards(an: "Analysis") -> frozenset:
+    """Addresses `__stack_chk_guard` is read through: its symbol and its GOT slots."""
+    b = an.bin
+    out = set()
+    a = b.name_to_addr.get("__stack_chk_guard")
+    if a:
+        out.add(a)
+    for imp in b.imports:
+        if imp.name.split("@")[0] == "__stack_chk_guard":
+            out |= {x for x in (imp.got, imp.addr) if x}
+    return frozenset(out)
 
 
 def _is_fail_block(blk) -> bool:
@@ -74,7 +90,7 @@ def hide_canary(fn: IRFunction, frame: Frame) -> bool:
         if not b.stmts:
             continue
         last = b.stmts[-1]
-        if isinstance(last, Branch) and _reaches_tls(last.cond, defs):
+        if isinstance(last, Branch) and _reaches_tls(last.cond, defs, guards=frame.guards):
             for fail, ok in ((last.true, last.false), (last.false, last.true)):
                 fb = fn.blocks.get(fail)
                 if fb is not None and _is_fail_block(fb):
@@ -88,7 +104,7 @@ def hide_canary(fn: IRFunction, frame: Frame) -> bool:
             if isinstance(s, Store) and frame.offset_of(s.dst) == frame.canary:
                 changed = True
                 continue
-            if isinstance(s, Return) and s.value is not None and _reaches_tls(s.value, defs):
+            if isinstance(s, Return) and s.value is not None and _reaches_tls(s.value, defs, guards=frame.guards):
                 s.value = None   # `return canary - fs:[0x28]` is the check's leftover, not a result
             kept.append(s)
         b.stmts = kept

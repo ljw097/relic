@@ -22,6 +22,8 @@ _CANARY_OFF = 0x28  # glibc thread-pointer offset of the stack guard
 
 
 def _callee_saved(arch: ArchInfo) -> set[str]:
+    if arch.name.startswith("arm64"):
+        return {f"x{k}" for k in range(19, 31)}      # x19-x28, frame pointer x29, link register x30
     if arch.bits == 64:
         return {"rbp", "rbx", "r12", "r13", "r14", "r15"}
     return {"ebp", "ebx", "esi", "edi"}
@@ -58,6 +60,7 @@ class Frame:
     slots: dict[int, Slot] = field(default_factory=dict)
     canary: int | None = None
     realigned: bool = False   # `and esp, -16` seen: offsets below it are approximate
+    guards: frozenset = frozenset()   # addresses that hold the stack-protector value
 
     def offset_of(self, e: Expr) -> int | None:
         """Signed frame offset if `e` is a stack address, else None."""
@@ -94,9 +97,12 @@ class Frame:
         return [s for s in self.locals() if s.kind == "buffer"]
 
 
-def _is_canary(e: Expr) -> bool:
-    # fs_base/gs_base starts as a Reg and becomes a Var once the IR is in SSA form
-    return any(isinstance(n, (Reg, Var)) and n.name in ("fs_base", "gs_base") for n in walk(e))
+def _is_canary(e: Expr, guards=frozenset()) -> bool:
+    """The stack-protector value: x86 reads it at fs/gs:[0x28 / 0x14] (fs_base starts as a Reg
+    and becomes a Var in SSA), other targets from the global `__stack_chk_guard` (`guards` are
+    its address and GOT slots)."""
+    return any((isinstance(n, (Reg, Var)) and n.name in ("fs_base", "gs_base")) or
+               (isinstance(n, Const) and n.value in guards) for n in walk(e))
 
 
 def _build_spoff(fn: IRFunction, arch: ArchInfo) -> dict[Var, int]:
@@ -139,8 +145,9 @@ def _frame_bookkeeping(frame: Frame, value: Expr) -> bool:
     return off is not None and off > 0
 
 
-def analyze_frame(fn: IRFunction, arch: ArchInfo) -> Frame:
+def analyze_frame(fn: IRFunction, arch: ArchInfo, guards=frozenset()) -> Frame:
     frame = build_frame(fn, arch)
+    frame.guards = frozenset(guards)
     realign_entry = frame.realigned
     saved = _callee_saved(arch)
 
@@ -162,7 +169,7 @@ def analyze_frame(fn: IRFunction, arch: ArchInfo) -> Frame:
             if off is not None:
                 sl = slot(off)
                 sl.width = max(sl.width, s.bits // 8)
-                if _is_canary(s.src):
+                if _is_canary(s.src, frame.guards):
                     sl.kind, frame.canary = "canary", off
                 elif isinstance(s.src, Var) and s.src.version == 0 and s.src.name in saved and sl.kind == "local":
                     sl.kind, sl.saved_reg = "saved", s.src.name

@@ -71,6 +71,8 @@ def _bare(e: Expr) -> Expr:
     return e
 
 
+_NUMERIC_OPS = {"*", "/u", "/s", "%u", "%s", "<<", ">>u", ">>s", "&", "|", "^"}
+
 # C precedence, larger binds tighter
 PREC_TERNARY, PREC_UNARY, PREC_POSTFIX = 3, 14, 15
 BIN = {"||": ("||", 4), "&&": ("&&", 5), "|": ("|", 6), "^": ("^", 7), "&": ("&", 8),
@@ -141,16 +143,24 @@ class CWriter:
         s = self.an.string_at(v)
         if s is not None:
             return f'"{escape(s.value)}"'
+        # other literals (short ones the string scan skips: "> ", "%d") must start a string:
+        # a NUL before them -- not the middle of one, which a small integer in a PIE often hits
+        prev = self.an.bin.read(v - 1, 1)
+        if prev != b"\0":
+            return None
         if _kind(self.an, v) == "string":
             return f'"{escape(self.an.bin.read_cstring(v, 256))}"'
-        # short literals the string scan skips ("> ", "%d"): NUL-preceded text in read-only data
         sec = self.an.bin.section_at(v)
         if sec is not None and sec.loaded and not sec.x and not getattr(sec, "w", False):
             text = self.an.bin.read_cstring(v, 256)
-            prev = self.an.bin.read(v - 1, 1)
-            if text and text.isprintable() and prev == b"\0":
+            if text and text.isprintable():
                 return f'"{escape(text)}"'
         return None
+
+    def _num(self, c: Const) -> str:
+        if c.bits >= 8 and c.value >> (c.bits - 1) and c.signed > -0x10000:
+            return "-" + number(-c.signed)
+        return number(c.value)
 
     def is_addr(self, v: int) -> bool:
         return bool(v) and self.an.bin.is_mapped(v) and v >= 0x100
@@ -243,6 +253,9 @@ class CWriter:
         if isinstance(e, Extract):
             inner = self.expr(e.a, 11)
             return f"({int_type(e.bits, True)})({inner} >> {e.lo})", PREC_UNARY
+        if isinstance(e, Ite) and e.bits == 1 and (isinstance(e.a, Const) or isinstance(e.b, Const)):
+            from .passes import bool_ite
+            return self._expr(bool_ite(e))            # `c ? x : 0` reads `c && x`
         if isinstance(e, Ite):
             return (f"{self.expr(e.cond, PREC_TERNARY + 1)} ? {self.expr(e.a, PREC_TERNARY + 1)} : "
                     f"{self.expr(e.b, PREC_TERNARY)}"), PREC_TERNARY
@@ -255,6 +268,15 @@ class CWriter:
     def _binop(self, e: BinOp) -> tuple[str, int]:
         if e.op not in BIN:                       # carry / sborrow ... : flag helpers
             return f"__{e.op}({self.expr(e.a)}, {self.expr(e.b)})", PREC_POSTFIX
+        if e.op in _NUMERIC_OPS:
+            # operands of *, /, %, shifts and bit operations are numbers, never addresses
+            a = Const(e.a.value, e.a.bits) if isinstance(e.a, Const) else e.a
+            b = e.b
+            if isinstance(a, Const) or isinstance(b, Const):
+                op, p = BIN[e.op]
+                ta = self._num(a) if isinstance(a, Const) else self.expr(a, p)
+                tb = self._num(b) if isinstance(b, Const) else self.expr(b, p + 1)
+                return f"{ta} {op} {tb}", p
         op, p = BIN[e.op]
         a, b = e.a, e.b
         if p == 10:
@@ -478,6 +500,12 @@ class CWriter:
             return str(self.types[v.name])
         return int_type(v.bits) if v.bits != 1 else "bool"
 
+    @property
+    def _base(self) -> str:
+        """What stack offsets are relative to: the return address on x86 (it is on the stack
+        at entry), the entry stack pointer elsewhere (the return address is in a register)."""
+        return "ret" if self.p.arch.name.startswith(("x64", "x86")) else "sp0"
+
     def declarations(self, depth: int):
         frame = self.p.frame
         used = {x.name for s in self.p.fn.stmts() for top in ir.stmt_exprs(s) for x in ir.walk(top)
@@ -489,13 +517,13 @@ class CWriter:
             if slot.name() in self.p.params:
                 continue                       # a stack parameter: declared in the signature
             if slot.kind == "canary":
-                self.emit(f"// stack canary at ret-{-slot.offset:#x} (check hidden)", None, depth)
+                self.emit(f"// stack canary at {self._base}-{-slot.offset:#x} (check hidden)", None, depth)
                 continue
             gen = slot.name()
             if gen not in used:
                 continue
             name = self.vname(gen)
-            where = f"// ret-{-slot.offset:#x}" if slot.offset < 0 else f"// ret+{slot.offset:#x}"
+            where = f"// {self._base}-{-slot.offset:#x}" if slot.offset < 0 else f"// {self._base}+{slot.offset:#x}"
             if slot.kind == "buffer":
                 self.emit(f"char {name}[{number(slot.size)}];  {where}", None, depth)
             else:

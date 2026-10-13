@@ -261,6 +261,14 @@ def _and_gt(a: Expr, b: Expr):
     return None
 
 
+def _le_and_ne(a: Expr, b: Expr):
+    """`(x <= y) & (x != y)` -> `x < y` (ARM's `hi` / `gt`: carry or N==V together with !Z)."""
+    if isinstance(a, BinOp) and a.op in ("<=u", "<=s") and isinstance(b, BinOp) and b.op == "!=" \
+            and {b.a, b.b} == {a.a, a.b}:
+        return BinOp("<u" if a.op == "<=u" else "<s", a.a, a.b, 1)
+    return None
+
+
 def _combine_node(e: Expr) -> Expr:
     if not isinstance(e, BinOp):
         return e
@@ -281,7 +289,7 @@ def _combine_node(e: Expr) -> Expr:
     elif op == "|":
         return _or_le(a, b) or _or_le(b, a) or e
     elif op == "&":
-        return _and_gt(a, b) or _and_gt(b, a) or e
+        return _and_gt(a, b) or _and_gt(b, a) or _le_and_ne(a, b) or _le_and_ne(b, a) or e
     return e
 
 
@@ -303,8 +311,48 @@ def _tidy_node(e: Expr) -> Expr:
     return e
 
 
+def _hoist_ite(e: Expr) -> Expr:
+    """`op(c ? x1 : y1, c ? x2 : y2)` -> `c ? op(x1, x2) : op(y1, y2)` for boolean results.
+
+    AArch64 `ccmp` leaves every flag as `c ? <compare> : <constant>`; with the
+    selects hoisted out of a condition, each side is a plain flag pattern the
+    other rules recover (`a2 > 1`) or a constant that folds away.
+    """
+    if e.bits != 1 or not isinstance(e, (BinOp, UnOp)):
+        return e
+    kids = (e.a, e.b) if isinstance(e, BinOp) else (e.a,)
+    ites = [k for k in kids if isinstance(k, Ite)]
+    if not ites or any(k.cond != ites[0].cond for k in ites):
+        return e
+    c = ites[0].cond
+    if any(not isinstance(k, Ite) and not _droppable(k) for k in kids):
+        return e
+
+    def side(pick):
+        ks = tuple(pick(k) if isinstance(k, Ite) else k for k in kids)
+        return BinOp(e.op, ks[0], ks[1], 1) if isinstance(e, BinOp) else UnOp(e.op, ks[0], 1)
+    return Ite(c, side(lambda k: k.a), side(lambda k: k.b), 1)
+
+
+def bool_ite(e: Expr) -> Expr:
+    """A boolean select with a constant side is a short-circuit condition (used for display:
+    the IR keeps the select so `_hoist_ite` can still see it)."""
+    if not (isinstance(e, Ite) and e.bits == 1):
+        return e
+    c, a, b = e.cond, e.a, e.b
+    if isinstance(b, Const):
+        return BinOp("&&", c, a, 1) if b.value == 0 else BinOp("||", UnOp("!", c, 1), a, 1)
+    if isinstance(a, Const):
+        return BinOp("||", c, b, 1) if a.value else BinOp("&&", UnOp("!", c, 1), b, 1)
+    return e
+
+
 def _conditions(fn: IRFunction) -> bool:
-    return _rewrite(fn, lambda e: transform(transform(e, _combine_node), _tidy_node))
+    def one(e):
+        e = transform(e, _hoist_ite)
+        e = transform(e, lambda x: _simp_node(_fold_node(x)))
+        return transform(transform(e, _combine_node), _tidy_node)
+    return _rewrite(fn, one)
 
 
 # -------------------------------------------------------------- dead-code elimination

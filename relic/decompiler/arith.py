@@ -228,7 +228,7 @@ def recover_division(fn: IRFunction) -> int:
 
                 def node(n: Expr) -> Expr:
                     nonlocal count
-                    if not isinstance(n, (BinOp, Cast)) or not children(n):
+                    if not isinstance(n, (BinOp, Cast, Ite, UnOp)) or not children(n):
                         return n
                     found = None
                     for x in candidates(n):
