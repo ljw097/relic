@@ -8,8 +8,8 @@ from __future__ import annotations
 
 from typing import Callable
 
-from .ir import (Assign, BinOp, Branch, Call, CallStmt, Cast, Const, Effect, Expr, Extract, IndirectJump,
-                 Intrinsic, IRFunction, Ite, Jump, Load, Reg, Return, Store, UnOp, Unknown, Var, mask)
+from .ir import (Assign, BinOp, Branch, CallStmt, Cast, Const, Effect, Expr, Extract, IndirectJump,
+                 Intrinsic, IRFunction, Ite, Jump, Load, Phi, Reg, Return, Store, UnOp, Unknown, Var, mask)
 
 
 class InterpError(Exception):
@@ -19,6 +19,89 @@ class InterpError(Exception):
 def _s(v: int, bits: int) -> int:
     v &= mask(bits)
     return v - (1 << bits) if bits and v >> (bits - 1) else v
+
+
+def apply_binop(op: str, a: int, b: int, aw: int, bw: int) -> int:
+    """Concrete semantics of a binary operator on raw integers (unmasked result).
+
+    `aw`/`bw` are the operand widths; signed operators interpret `a` in `aw` bits.
+    Shared by the interpreter and the constant-folding pass so both agree exactly.
+    """
+    w = aw
+    if op == "+":
+        return a + b
+    if op == "-":
+        return a - b
+    if op == "*":
+        return a * b
+    if op in ("/u", "%u", "/s", "%s"):
+        if b == 0:
+            raise InterpError("division by zero")
+        if op[1] == "u":
+            return a // b if op[0] == "/" else a % b
+        sa, sb = _s(a, w), _s(b, bw)
+        q = abs(sa) // abs(sb) * (1 if (sa < 0) == (sb < 0) else -1)
+        return q if op[0] == "/" else sa - q * sb
+    if op == "&":
+        return a & b
+    if op == "|":
+        return a | b
+    if op == "^":
+        return a ^ b
+    if op == "<<":
+        return a << b
+    if op == ">>u":
+        return a >> b
+    if op == ">>s":
+        return _s(a, w) >> b
+    if op in ("rol", "ror"):
+        b %= w
+        if op == "ror":
+            b = (w - b) % w
+        return (a << b | a >> (w - b)) & mask(w)
+    if op == "==":
+        return int(a == b)
+    if op == "!=":
+        return int(a != b)
+    if op == "<u":
+        return int(a < b)
+    if op == "<=u":
+        return int(a <= b)
+    if op == "<s":
+        return int(_s(a, w) < _s(b, w))
+    if op == "<=s":
+        return int(_s(a, w) <= _s(b, w))
+    if op == "carry":
+        return int(a + b > mask(w))
+    if op == "scarry":
+        r = _s(a, w) + _s(b, w)
+        return int(r != _s(r, w))
+    if op == "borrow":
+        return int(a < b)
+    if op == "sborrow":
+        r = _s(a, w) - _s(b, w)
+        return int(r != _s(r, w))
+    if op == "&&":
+        return int(bool(a) and bool(b))
+    if op == "||":
+        return int(bool(a) or bool(b))
+    raise InterpError(f"operator {op}")
+
+
+def apply_unop(op: str, a: int, bits: int) -> int:
+    if op == "-":
+        return -a & mask(bits)
+    if op == "~":
+        return ~a & mask(bits)
+    if op == "!":
+        return int(a == 0)
+    raise InterpError(f"unary operator {op}")
+
+
+def apply_cast(kind: str, a: int, src_bits: int, bits: int) -> int:
+    if kind == "sext":
+        return _s(a, src_bits) & mask(bits)
+    return a & mask(bits)
 
 
 class Machine:
@@ -67,28 +150,26 @@ class Interpreter:
         m = self.m
         if isinstance(e, Const):
             return e.value
-        if isinstance(e, (Reg, Var)):
-            key = e.name if isinstance(e, Reg) else f"{e.name}_{e.version}"
+        if isinstance(e, Reg):
+            if e.name not in m.regs:
+                raise InterpError(f"read of undefined {e.name}")
+            return m.regs[e.name] & mask(e.bits)
+        if isinstance(e, Var):
+            key = f"{e.name}_{e.version}"
+            # version 0 is the register's value on entry to the function
+            if key not in m.regs and e.version == 0:
+                key = e.name
             if key not in m.regs:
                 raise InterpError(f"read of undefined {key}")
             return m.regs[key] & mask(e.bits)
         if isinstance(e, Load):
             return m.read(self.eval(e.addr), e.bits // 8)
         if isinstance(e, BinOp):
-            return self._binop(e) & mask(e.bits)
+            return apply_binop(e.op, self.eval(e.a), self.eval(e.b), e.a.bits, e.b.bits) & mask(e.bits)
         if isinstance(e, UnOp):
-            a = self.eval(e.a)
-            if e.op == "-":
-                return -a & mask(e.bits)
-            if e.op == "~":
-                return ~a & mask(e.bits)
-            if e.op == "!":
-                return int(a == 0)
+            return apply_unop(e.op, self.eval(e.a), e.bits)
         if isinstance(e, Cast):
-            a = self.eval(e.a)
-            if e.kind == "sext":
-                return _s(a, e.a.bits) & mask(e.bits)
-            return a & mask(e.bits)
+            return apply_cast(e.kind, self.eval(e.a), e.a.bits, e.bits)
         if isinstance(e, Extract):
             return (self.eval(e.a) >> e.lo) & mask(e.bits)
         if isinstance(e, Ite):
@@ -96,69 +177,6 @@ class Interpreter:
         if isinstance(e, Intrinsic):
             return self._intrinsic(e)
         raise InterpError(f"cannot evaluate {e}")
-
-    def _binop(self, e: BinOp) -> int:
-        a, b = self.eval(e.a), self.eval(e.b)
-        w = e.a.bits
-        op = e.op
-        if op == "+":
-            return a + b
-        if op == "-":
-            return a - b
-        if op == "*":
-            return a * b
-        if op in ("/u", "%u", "/s", "%s"):
-            if b == 0:
-                raise InterpError("division by zero")
-            if op[1] == "u":
-                return a // b if op[0] == "/" else a % b
-            sa, sb = _s(a, w), _s(b, e.b.bits)
-            q = abs(sa) // abs(sb) * (1 if (sa < 0) == (sb < 0) else -1)
-            return q if op[0] == "/" else sa - q * sb
-        if op == "&":
-            return a & b
-        if op == "|":
-            return a | b
-        if op == "^":
-            return a ^ b
-        if op == "<<":
-            return a << b
-        if op == ">>u":
-            return a >> b
-        if op == ">>s":
-            return _s(a, w) >> b
-        if op in ("rol", "ror"):
-            b %= w
-            if op == "ror":
-                b = (w - b) % w
-            return (a << b | a >> (w - b)) & mask(w)
-        if op == "==":
-            return int(a == b)
-        if op == "!=":
-            return int(a != b)
-        if op == "<u":
-            return int(a < b)
-        if op == "<=u":
-            return int(a <= b)
-        if op == "<s":
-            return int(_s(a, w) < _s(b, w))
-        if op == "<=s":
-            return int(_s(a, w) <= _s(b, w))
-        if op == "carry":
-            return int(a + b > mask(w))
-        if op == "scarry":
-            r = _s(a, w) + _s(b, w)
-            return int(r != _s(r, w))
-        if op == "borrow":
-            return int(a < b)
-        if op == "sborrow":
-            r = _s(a, w) - _s(b, w)
-            return int(r != _s(r, w))
-        if op == "&&":
-            return int(bool(a) and bool(b))
-        if op == "||":
-            return int(bool(a) or bool(b))
-        raise InterpError(f"operator {op}")
 
     def _intrinsic(self, e: Intrinsic) -> int:
         args = [self.eval(a) for a in e.args]
@@ -191,19 +209,32 @@ class Interpreter:
         raise InterpError(f"intrinsic {e.name}")
 
     # ------------------------------------------------------- statements
+    def _store_key(self, dst) -> str:
+        return dst.name if isinstance(dst, Reg) else f"{dst.name}_{dst.version}"
+
     def run(self) -> int | None:
-        """Run from the entry block; returns the address of the Return reached."""
+        """Run from the entry block (SSA or non-SSA); returns the Return's address.
+
+        The returned value, if any, is left in ``self.result``. SSA phi nodes are
+        resolved on block entry using the predecessor we arrived from, so running
+        a function before and after the optimisation passes is a direct check that
+        the passes preserved its meaning.
+        """
+        self.result: int | None = None
         blk = self.fn.blocks[self.fn.addr]
+        prev: int | None = None
         steps = 0
         while True:
+            self._phis(blk, prev)
             nxt = None
             for s in blk.stmts:
                 steps += 1
                 if steps > self.max_steps:
                     raise InterpError("step limit")
                 if isinstance(s, Assign):
-                    key = s.dst.name if isinstance(s.dst, Reg) else f"{s.dst.name}_{s.dst.version}"
-                    self.m.regs[key] = self.eval(s.src)
+                    if isinstance(s.src, Phi):
+                        continue  # handled on block entry
+                    self.m.regs[self._store_key(s.dst)] = self.eval(s.src)
                 elif isinstance(s, Store):
                     self.m.write(self.eval(s.dst), self.eval(s.src), s.bits // 8)
                 elif isinstance(s, Branch):
@@ -218,9 +249,11 @@ class Interpreter:
                         raise InterpError(f"indirect jump to {nxt:#x} outside its table")
                     break
                 elif isinstance(s, Return):
+                    if s.value is not None:
+                        self.result = self.eval(s.value)
                     return s.addr
                 elif isinstance(s, CallStmt):
-                    self._call(s.call)
+                    self._call(s)
                     if s.tail:
                         continue
                 elif isinstance(s, Effect):
@@ -231,10 +264,32 @@ class Interpreter:
                 raise InterpError(f"fell off block {blk.addr:#x}")
             if nxt not in self.fn.blocks:
                 raise InterpError(f"jump outside function to {nxt:#x}")
-            blk = self.fn.blocks[nxt]
+            prev, blk = blk.addr, self.fn.blocks[nxt]
 
-    def _call(self, c: Call):
+    def _phis(self, blk, prev: int | None):
+        """Evaluate all phi nodes at the top of `blk` simultaneously."""
+        pending = []
+        for s in blk.stmts:
+            if isinstance(s, Assign) and isinstance(s.src, Phi):
+                srcs = dict(s.src.sources)
+                if prev not in srcs:
+                    raise InterpError(f"phi at {blk.addr:#x} has no source for predecessor {prev}")
+                pending.append((self._store_key(s.dst), self.eval(srcs[prev])))
+            else:
+                break  # phis are always first in the block
+        for key, val in pending:
+            self.m.regs[key] = val
+
+    def _call(self, s: CallStmt):
+        c = s.call
+        # bind argument registers the SSA form threads into the call
+        for r, v in s.uses:
+            self.m.regs[r] = self.eval(v)
         target = self.eval(c.target)
         if self.call_hook is None:
             raise InterpError(f"call to {target:#x} without a hook")
         self.call_hook(self.m, target)
+        # publish the call's result registers to their fresh SSA versions
+        for r, d in s.defs:
+            if isinstance(d, Var):
+                self.m.regs[self._store_key(d)] = self.m.regs.get(r, 0) & mask(d.bits)

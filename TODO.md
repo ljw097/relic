@@ -45,9 +45,11 @@
 설계: [docs/decompiler-plan.md](docs/decompiler-plan.md)
 
 - [x] **P1** 단계 1 — IR 정의와 x86-64 리프팅 (`relic ir`, IR 인터프리터로 의미 검증)
-- [ ] **P1** 단계 2 — SSA, 상수/복사 전파, 죽은 코드 제거 (패스 전후 결과를 `interp`로 비교)
+- [x] **P1** 단계 2 — SSA, 상수/복사 전파, 죽은 코드 제거 (패스 전후 결과를 `interp`로 비교)
   - [x] 호출 규약 표(`arch.py`), SSA 구성(`ssa.py`: 지배자, phi, 이름 부여)
-  - [ ] 최적화 패스(`passes.py`), 인터프리터의 SSA 실행 지원
+  - [x] 최적화 패스(`passes.py`): 상수 폴딩·대수 단순화, 상수/복사 전파, 단일 사용 load 전달, 플래그→비교식 복원, DCE
+  - [x] 인터프리터의 SSA 실행 지원(phi, 호출 use/def, version-0 → 진입 레지스터)
+  - [x] 최적화 IR의 문자열/교차참조(`refs.py`: `ir_xrefs`, `format_ir`), `relic opt` 커맨드
 - [ ] **P1** 단계 3 — 호출 인자/반환값 복원, 스택 변수
 - [ ] **P1** 단계 4 — 제어 흐름 구조화(if/while/switch)
 - [ ] **P2** 단계 5 — 타입 추론, C 출력 정리

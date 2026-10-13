@@ -33,3 +33,17 @@ def test_cfg_dot(capsys, vuln64):
 def test_ir(capsys, vuln64):
     out = run(capsys, "ir", vuln64, "classify")
     assert out.startswith("function classify @") and "goto *rax" in out and "__asm" not in out
+
+
+def test_opt(capsys, vuln64):
+    out = run(capsys, "opt", vuln64, "menu", "--xrefs")
+    assert out.startswith("function menu @")
+    assert "zf_" not in out and "pf_" not in out      # flags cleaned up
+    assert '"1. add"' in out                           # strings resolved inline
+    assert "call   -> puts" in out                     # xref listing
+
+
+def test_strings_grep(capsys, vuln64):
+    out = run(capsys, "strings", vuln64, "-g", "bin/sh")
+    assert '"/bin/sh"' in out
+    assert "hello" not in out
