@@ -6,6 +6,7 @@ import io
 import capstone as cs
 from elftools.elf.dynamic import DynamicSection
 from elftools.elf.elffile import ELFFile
+from elftools.elf.descriptions import describe_reloc_type
 from elftools.elf.relocation import RelocationSection
 from elftools.elf.sections import SymbolTableSection
 
@@ -116,7 +117,7 @@ def load_elf(path: str, data: bytes) -> Binary:
                 except Exception:
                     name = ""
             off = rel["r_offset"]
-            b.relocs.append(Relocation(off, name, str(rel["r_info_type"])))
+            b.relocs.append(Relocation(off, name, describe_reloc_type(rel["r_info_type"], elf)))
             if name:
                 got_names[off] = name
     b.got_names = got_names
