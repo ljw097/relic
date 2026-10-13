@@ -91,10 +91,12 @@ def test_pseudocode_tab_follows_navigation(win):
     win.goto(vuln)
     win.toggle_decompile()
     assert win.tabs.currentIndex() == win.TAB_DECOMP
+    assert win.decomp.wait_idle()
     text = win.decomp.toPlainText()
     assert text.startswith("void vuln(void)") and "gets(buf_48);" in text
     # navigating while the tab is shown re-decompiles the new function
     win.goto_text("checksum")
+    assert win.decomp.wait_idle()
     assert win.decomp.toPlainText().startswith("int checksum(char *a1)")
     win.toggle_decompile()
     assert win.tabs.currentIndex() == win.TAB_DISASM
@@ -104,6 +106,7 @@ def test_pseudocode_cursor_syncs_with_listing(win):
     vuln = win.an.function_by_name("vuln")
     win.goto(vuln.addr)
     win.tabs.setCurrentIndex(win.TAB_DECOMP)
+    assert win.decomp.wait_idle()
     # put the pseudocode cursor on the gets() line: the window's current address follows
     row = next(k for k, ln in enumerate(win.decomp.result.lines) if "gets(" in ln.text)
     from PySide6.QtGui import QTextCursor
@@ -114,19 +117,23 @@ def test_pseudocode_cursor_syncs_with_listing(win):
     assert win.disasm.current_line().mnemonic == "call" and win.disasm.current_addr() == gets_addr
     # and back: a listing address maps to the pseudocode line it produced
     win.tabs.setCurrentIndex(win.TAB_DECOMP)
+    assert win.decomp.wait_idle()
     assert win.decomp.textCursor().blockNumber() == row
 
 
 def test_pseudocode_shows_renames(win):
     win.goto_text("vuln")
     win.tabs.setCurrentIndex(win.TAB_DECOMP)
+    assert win.decomp.wait_idle()
     win.rename(win.an.function_by_name("checksum").addr, "hash_name")
+    assert win.decomp.wait_idle()
     assert "hash_name(buf_48)" in win.decomp.toPlainText()
 
 
 def test_pseudocode_rename_subject_is_word_under_cursor(win):
     win.goto_text("vuln")
     win.tabs.setCurrentIndex(win.TAB_DECOMP)
+    assert win.decomp.wait_idle()
     doc = win.decomp.document()
     row = next(k for k, ln in enumerate(win.decomp.result.lines) if "checksum(" in ln.text)
     col = doc.findBlockByNumber(row).text().index("checksum") + 2
@@ -141,3 +148,23 @@ def test_pseudocode_rename_subject_is_word_under_cursor(win):
     cur.movePosition(QTextCursor.MoveOperation.Right, n=10)
     win.decomp.setTextCursor(cur)
     assert win._rename_subject() == win.an.function_by_name("vuln").addr
+
+
+def test_pseudocode_decompiles_in_background(win):
+    """The GUI thread only shows a placeholder; the result replaces it when the job is done."""
+    win.goto_text("main")
+    win.tabs.setCurrentIndex(win.TAB_DECOMP)
+    assert win.decomp.busy() or win.decomp.toPlainText().startswith("int main(")
+    first = win.decomp.toPlainText()
+    assert first.startswith("// decompiling main") or first.startswith("int main(")
+    assert win.decomp.wait_idle()
+    assert win.decomp.toPlainText().startswith("int main(")
+
+
+def test_pseudocode_stale_result_is_not_shown(win):
+    """Switching function while a job runs shows the newer function, not the old result."""
+    win.tabs.setCurrentIndex(win.TAB_DECOMP)
+    win.goto_text("add_note")
+    win.goto_text("classify")          # requested while add_note may still be decompiling
+    assert win.decomp.wait_idle()
+    assert win.decomp.toPlainText().startswith("int classify(")

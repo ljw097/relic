@@ -544,6 +544,7 @@ class MainWindow(QMainWindow):
             return
         if self.thread is not None:
             self.thread.wait()
+        self.decomp.shutdown()
         super().closeEvent(e)
 
     # ---------------------------------------------------------------- xrefs

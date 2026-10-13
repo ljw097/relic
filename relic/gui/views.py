@@ -1,7 +1,7 @@
 """Central views: linear disassembly, control-flow graph and hex dump."""
 from __future__ import annotations
 
-from PySide6.QtCore import QPointF, QRectF, Qt, Signal
+from PySide6.QtCore import QCoreApplication, QPointF, QRectF, Qt, QThread, Signal
 from PySide6.QtGui import (QBrush, QColor, QFont, QFontDatabase, QPainter, QPainterPath, QPen,
                            QSyntaxHighlighter, QTextCharFormat, QTextCursor)
 from PySide6.QtWidgets import (QGraphicsItem, QGraphicsPathItem, QGraphicsScene, QGraphicsSimpleTextItem,
@@ -422,11 +422,38 @@ class PseudocodeHighlighter(QSyntaxHighlighter):
                 self.setFormat(m.start(), m.end() - m.start(), f)
 
 
+def _decompile_text(an: Analysis, f: Function):
+    """Decompiled result for `f`, or an explanatory comment string on failure."""
+    try:
+        from ..decompiler.emit import decompile
+        return decompile(an, f)
+    except NotImplementedError as e:
+        return f"// {e}"
+    except Exception as e:  # noqa: BLE001 - never take the GUI down with a decompiler bug
+        return f"// decompilation failed: {type(e).__name__}: {e}"
+
+
+class DecompileJob(QThread):
+    """Decompiles one function off the GUI thread."""
+
+    finished_result = Signal(int, int, object)   # generation, function address, Decompiled | str
+
+    def __init__(self, gen: int, an: Analysis, f: Function, parent=None):
+        super().__init__(parent)
+        self.gen, self.an, self.f = gen, an, f
+
+    def run(self):
+        self.finished_result.emit(self.gen, self.f.addr, _decompile_text(self.an, self.f))
+
+
 class PseudocodeView(QPlainTextEdit):
     """Decompiled C of one function, synchronised with the listing by instruction address.
 
-    Decompilation runs on demand (when the view is shown) and is cached per
-    function until `invalidate` is called (after a rename, say).
+    Decompilation runs on demand (when the view is shown) in a background
+    thread, one function at a time, and is cached per function until
+    `invalidate` is called (after a rename, say). While it runs the view shows
+    a placeholder; a result that arrives for a function no longer shown, or
+    from before an invalidation, is not displayed.
     """
 
     navigate = Signal(int)
@@ -444,6 +471,9 @@ class PseudocodeView(QPlainTextEdit):
         self.result = None                      # emit.Decompiled of the shown function
         self.cache: dict[int, object] = {}
         self.pending: int | None = None         # address to show once decompiled
+        self.gen = 0                            # bumped by invalidate(): older results are stale
+        self.job: DecompileJob | None = None
+        self.queued: Function | None = None     # requested while a job was running
         self._syncing = False
         self.cursorPositionChanged.connect(self._moved)
 
@@ -451,16 +481,24 @@ class PseudocodeView(QPlainTextEdit):
         if an is not self.an:
             self.cache.clear()
         self.an = an
+        target = addr if addr is not None else f.addr
         if f is not self.func or f.addr not in self.cache:
             self.func = f
+            self.pending = target
             self.reload()
-        self.goto(addr if addr is not None else f.addr)
+        if self.result is not None and self.result.addr == f.addr:
+            self.goto(target)
+        else:
+            self.pending = target
 
     def invalidate(self, reload: bool = True):
         """Forget cached output (names changed); re-render now if `reload`, else when next shown."""
+        keep = self.current_addr_or_func()
         self.cache.clear()
         self.result = None
+        self.gen += 1
         if reload and self.func is not None and self.an is not None:
+            self.pending = keep
             self.reload()
 
     def symbol_under_cursor(self) -> int | None:
@@ -475,24 +513,78 @@ class PseudocodeView(QPlainTextEdit):
         a = self.an.resolve(word)
         return a if a is not None and self.an.name(a) else None
 
+    def current_addr_or_func(self) -> int | None:
+        a = self.current_addr()
+        return a if a is not None else (self.func.addr if self.func is not None else None)
+
     def reload(self):
         if self.an is None or self.func is None:
             return
         f = self.func
         res = self.cache.get(f.addr)
         if res is None:
-            try:
-                from ..decompiler.emit import decompile
-                res = decompile(self.an, f)
-            except NotImplementedError as e:
-                res = str(e)
-            except Exception as e:  # never take the GUI down with a decompiler bug
-                res = f"// decompilation failed: {type(e).__name__}: {e}"
-            self.cache[f.addr] = res
-        self.result = res if not isinstance(res, str) else None
+            self.result = None
+            self._set_text(f"// decompiling {self.an.name(f.addr) or f.name} ...")
+            self._request(f)
+            return
+        self._display(res)
+
+    def _set_text(self, text: str):
         self._syncing = True
-        self.setPlainText(res if isinstance(res, str) else res.text)
+        self.setPlainText(text)
         self._syncing = False
+
+    def _display(self, res):
+        self.result = res if not isinstance(res, str) else None
+        self._set_text(res if isinstance(res, str) else res.text)
+        if self.result is not None and self.pending is not None:
+            self.goto(self.pending)
+
+    def _request(self, f: Function):
+        if self.job is not None and self.job.isRunning():
+            self.queued = f        # only the latest request matters
+            return
+        self.job = DecompileJob(self.gen, self.an, f, self)
+        self.job.finished_result.connect(self._finished)
+        self.job.start()
+
+    def _finished(self, gen: int, addr: int, res):
+        job, self.job = self.job, None
+        if job is not None:
+            job.wait()
+            job.deleteLater()
+        if gen == self.gen:
+            self.cache[addr] = res
+        if self.func is not None and self.func.addr == addr and gen == self.gen:
+            self._display(res)
+        nxt, self.queued = self.queued, None
+        if self.func is not None and self.func.addr not in self.cache:
+            nxt = self.func        # still waiting for the shown function (e.g. renamed meanwhile)
+        if nxt is not None and nxt.addr not in self.cache:
+            self._request(nxt)
+
+    def shutdown(self):
+        """Wait for a running job before the view goes away (a QThread must not outlive it)."""
+        self.queued = None
+        if self.job is not None:
+            self.job.wait()
+            self.job = None
+
+    def busy(self) -> bool:
+        return self.job is not None or self.queued is not None
+
+    def wait_idle(self, ms: int = 60000) -> bool:
+        """Block until pending decompilation finished and is shown (for scripts and tests)."""
+        import time
+        end = time.monotonic() + ms / 1000
+        while self.busy():
+            if self.job is not None:
+                self.job.wait(50)
+            QCoreApplication.processEvents()
+            if time.monotonic() > end:
+                return False
+        QCoreApplication.processEvents()
+        return True
 
     def line_for(self, addr: int) -> int | None:
         """The line for `addr`: exact, else the closest line from an earlier instruction."""
