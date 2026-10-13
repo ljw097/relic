@@ -1,6 +1,6 @@
 # 디컴파일러 계획
 
-상태: 단계 4 완료 (SSA·최적화·인터프리터, 호출/스택 복원, 제어 흐름 구조화; `relic decompile`). 단계 5(타입·출력 정리)가 다음. 이 문서는 구현 순서와 모듈 경계를 정한다.
+상태: 단계 5 완료 — x86-64에서 `relic decompile`이 C 유사 코드를 출력한다(out-of-SSA, 타입, 출력 정리). 단계 6(GUI 디컴파일 뷰, x86-32)이 다음. 이 문서는 구현 순서와 모듈 경계를 정한다.
 
 ## 목표
 
@@ -37,25 +37,29 @@ AST
 의사 코드
 ```
 
-## 모듈 구성 (예정)
+## 모듈 구성
 
 ```
 relic/decompiler/
-  __init__.py     decompile(analysis, func) -> Decompiled (text + addr↔line 매핑)
-  ir.py           IR 정의
+  __init__.py     decompile_ir(analysis, func) -> 최적화된 SSA IR (호출 인자 복원까지)
+  ir.py           IR 정의 (StackVar/StackAddr: 출력용 지역 변수)
   lift/
-    __init__.py   리프터 선택
+    __init__.py   리프터 선택, 다른 함수로 가는 조건 분기 → 꼬리 호출 블록
     x86.py        x86 / x64
+  arch.py         호출 규약 표
   ssa.py          지배자, phi 삽입, 이름 부여
-  passes.py       상수/복사 전파, load 전달, 조건식 복원, DCE (구현됨)
-  refs.py         IR 문자열/교차참조 추출, 주석 포함 출력 (구현됨)
-  calls.py        호출 규약, 인자/반환값 (구현됨)
-  sigs.py         libc 시그니처 표, 포맷 문자열 인자 수 (구현됨)
-  stack.py        스택 프레임 분석: 오프셋 정규화, 슬롯 분류, 버퍼 크기, 카나리 (구현됨)
-  structure.py    제어 흐름 구조화: if/while/switch, break/continue, goto 폴백 (구현됨)
-  types.py        타입 추론
-  emit.py         C 출력
-  interp.py       IR 인터프리터 (리프팅·최적화 패스의 의미 보존 테스트용)
+  passes.py       상수/복사 전파, load 전달, 조건식 복원, DCE
+  interp.py       IR 인터프리터 (각 변환의 의미 보존 테스트용)
+  refs.py         IR 문자열/교차참조 추출, 주석 포함 출력
+  calls.py        호출 인자 복원 (시그니처 / 피호출자 live-in / 호출 직전 설정 레지스터)
+  sigs.py         libc 시그니처 표, 포맷 문자열 인자 수
+  stack.py        스택 프레임 분석: 오프셋 정규화, 슬롯 분류, 버퍼 크기, 카나리
+  cleanup.py      출력용 정리: 카나리 숨김, void/반환 폭, 스택 지역 변수, 빈 블록 우회, 임시 변수 인라인
+  outssa.py       phi → 복사, 간섭 그래프 기반 변수 병합
+  vartypes.py     폭 축소, C 타입 추론
+  structure.py    제어 흐름 구조화: if/while/do-while/switch, break/continue, goto 폴백
+  pipeline.py     위 단계를 순서대로 실행 (prepare)
+  emit.py         C 출력, 줄 ↔ 주소 매핑 (decompile)
 ```
 
 `relic.analysis`는 디컴파일러를 몰라도 동작해야 한다. 의존 방향은 `decompiler → analysis → disasm → loader`.
@@ -117,6 +121,14 @@ relic/decompiler/
 - 출력: 변수 이름 규칙(`arg1`, `var_50`, `buf_50`, 반환값 `result`), 문자열·심볼 인라인, 사용자 이름 변경(`Analysis.renames`) 반영.
 - 출력 객체는 줄 ↔ 주소 매핑을 갖고 있어서 GUI·CLI에서 서로 이동할 수 있게 한다.
 
+## 구현 메모 (단계 5)
+
+- **out-of-SSA**: phi마다 새 임시 변수를 만들어 각 선행 블록 끝에서 복사하고 phi 자리에서 읽는다. 임시 변수가 phi 블록 입구에서만 읽히므로 critical edge 분할이나 swap 문제 처리 없이 정확하다. 그 뒤 간섭 그래프(Chaitin식, 복사 예외)로 복사 관계 변수를 병합해 복사를 없앤다. 서로만 참조하는 phi 묶음(루프 안 호출이 덮어쓰는 레지스터)은 먼저 지운다.
+- **반환값**: 호출자의 리프팅 IR에서 호출 직후 반환 레지스터를 처음 읽는 형태를 본다. 아무도 읽지 않으면 void, 모두 `low32(rax)`로 읽으면 `int`. 호출자가 없으면 함수 자신의 반환식으로 판단한다(상수·32비트 확장·int 반환 libc 호출).
+- **폭 축소**: 모든 사용이 `low_n(v)`이거나 그대로 넘겨지는(인자·반환) 변수는 n비트 변수로 바꾸고, 정의는 `low_n(...)`을 산술 안으로 밀어 넣어 단순화한다.
+- **임시 변수 인라인**: 한 번 정의·한 번 사용, 같은 블록(또는 단일 선행/후속 블록 사슬) 안, 사이에 메모리 쓰기·호출·관련 변수 쓰기가 없을 때만. 호출 결과는 바로 다음 문장에만 넣는다.
+- **검증**: out-of-SSA는 인터프리터로, 최종 C는 다시 컴파일해서 원본 소스와 결과를 비교한다(`tests/test_emit.py`). 실제 바이너리(`/usr/bin/{true,cat,ls,gzip,sed,grep}`) 전체 함수에서 예외 없이 동작하는지 확인했다.
+
 ## 단계별 일정
 
 | 단계 | 내용 | 완료 조건 |
@@ -125,8 +137,8 @@ relic/decompiler/
 | 2 | SSA + 최적화 패스 | `checksum` 루프의 계산식이 `h = h * 31 + s[i]`((h<<5)-h + sext(s[i])) 형태로 접힘 ✅ |
 | 3 | 호출·스택 | `vuln`에서 `gets(buf)`와 `char buf[0x40]`(PIE 0x48) 크기, 카나리 식별, `printf("hello %s (%d)\n", buf, checksum(buf))` 복원 ✅ |
 | 4 | 구조화 | `main`의 `while(1)` 메뉴 루프, `classify`의 `switch`가 goto 없이 출력 ✅ |
-| 5 | 타입·출력 정리 | `-O0`/`-O1`/PIE 변형 모두에서 위 결과 유지 |
-| 6 | CLI(`relic decompile`) / GUI 탭, x86-32 리프터 | CLI 테스트와 GUI 스모크 테스트 통과 |
+| 5 | 타입·출력 정리 | `-O0`/`-O1`/PIE 변형 모두에서 위 결과 유지, 재컴파일 결과가 원본과 일치 ✅ |
+| 6 | GUI 디컴파일 탭, x86-32 리프터 (CLI `relic decompile`은 단계 5에서 완료) | GUI 스모크 테스트 통과 |
 
 각 단계는 `tests/src/vuln.c` 기반의 골든 테스트를 추가한다. 출력 문자열 전체 비교 대신 핵심 구문(호출, 조건, 루프 형태)의 포함 여부로 검증해 출력 형식 변경에 덜 민감하게 한다.
 
