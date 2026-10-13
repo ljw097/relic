@@ -96,8 +96,18 @@ def test_every_function_decompiles(ans, variant):
         if not f.name.startswith("_"):                   # _start really does use the stack pointer
             assert "rsp" not in text, f.name
         assert text.count("{") == text.count("}"), f.name
+        _assert_labels(text, f.name)
         lo, hi = min(f.blocks), max(b.end for b in f.blocks.values())
         assert all(ln.addr is None or lo <= ln.addr < hi for ln in d.lines), f.name
+
+
+def _assert_labels(text, name):
+    """Every goto has its label, and every label is defined once."""
+    import re
+    labels = re.findall(r"^\s*(loc_[0-9a-f]+):", text, re.M)
+    assert len(labels) == len(set(labels)), f"{name}: duplicate label"
+    for target in re.findall(r"goto (loc_[0-9a-f]+);", text):
+        assert target in labels, f"{name}: goto {target} has no label\n{text}"
 
 
 def test_stripped_binary(vuln64_stripped):

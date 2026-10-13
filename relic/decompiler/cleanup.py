@@ -530,5 +530,90 @@ def self_width(an: "Analysis", func: "Function", ret_reg: str, bits: int = 32) -
                     defs[v] = s
     vals = [s.value for s in fn.stmts() if isinstance(s, Return) and s.value is not None]
     ok = bool(vals) and all(_clean(v, bits, defs, an, ret_reg, set()) for v in vals)
+    if not ok and bits == 32:
+        # `mov eax, -1` leaves 0x00000000ffffffff in rax: a constant with bit 31 set and nothing
+        # above bit 31 only makes sense as a negative 32-bit int
+        consts = [_resolve_const(v, defs) for v in vals]
+        ok = any(c is not None and c >> 31 == 1 for c in consts)
     c[func.addr] = bits if ok else None
     return c[func.addr]
+
+
+# ----------------------------------------------------------- short-circuit conditions
+def fold_short_circuits(fn: IRFunction) -> int:
+    """Merge chained conditional branches into `&&` / `||` conditions (non-SSA input).
+
+    When block `n` ends in `if (c1)` and one of its successors `m` holds nothing
+    but `if (c2)`, has `n` as its only predecessor, and shares a target with
+    `n`, the two tests are one short-circuit condition:
+
+        n: if (c1) T else m;  m: if (c2) T else F   ->  n: if (c1 || c2) T else F
+        n: if (c1) m else F;  m: if (c2) T else F   ->  n: if (c1 && c2) T else F
+
+    (with `!c2` when `m` reaches the shared target on its false side). The
+    evaluation order and laziness are exactly those of the original branches.
+    Returns the number of merges.
+    """
+    from .ir import UnOp
+    merged = 0
+    changed = True
+    while changed:
+        changed = False
+        for n in list(fn.blocks.values()):
+            if n.addr not in fn.blocks or not n.stmts or not isinstance(n.stmts[-1], Branch):
+                continue
+            b1 = n.stmts[-1]
+            for m_addr in (b1.true, b1.false):
+                m = fn.blocks.get(m_addr)
+                if m is None or m.addr == n.addr or m.addr == fn.addr or m.preds != [n.addr] or \
+                        len(m.stmts) != 1 or not isinstance(m.stmts[0], Branch):
+                    continue
+                b2 = m.stmts[0]
+                if m.addr in (b2.true, b2.false):
+                    continue
+                other = b1.false if m_addr == b1.true else b1.true     # n's target besides m
+                if other not in (b2.true, b2.false):
+                    continue
+                c2 = b2.cond if b2.true == other else UnOp("!", b2.cond, 1)   # c2' true -> other
+                rest = b2.false if b2.true == other else b2.true
+                if m_addr == b1.false:      # n: if (c1) other else m  -> c1 || c2' -> other
+                    cond, t, f = BinOp("||", b1.cond, c2, 1), other, rest
+                else:                       # n: if (c1) m else other  -> c1 && !c2' -> rest
+                    cond, t, f = BinOp("&&", b1.cond, UnOp("!", c2, 1), 1), rest, other
+                n.stmts[-1] = Branch(b1.addr, _simplify_not(cond), t, f)
+                n.succs = [t, f]
+                del fn.blocks[m.addr]
+                _relink(fn)
+                merged += 1
+                changed = True
+                break
+    return merged
+
+
+def _simplify_not(e: Expr) -> Expr:
+    """Push `!` into comparisons (`!(a < b)` -> `b <= a`) so conditions read naturally."""
+    from .ir import UnOp, transform
+    from .structure import _negate
+
+    def node(x):
+        if isinstance(x, UnOp) and x.op == "!":
+            neg = _negate(x.a)
+            if not (isinstance(neg, UnOp) and neg.op == "!" and neg.a == x.a):
+                return neg
+        return x
+    return transform(e, node)
+
+
+def _resolve_const(e: Expr, defs: dict, depth: int = 4):
+    """The constant `e` evaluates to, following SSA copies / phis of a single constant."""
+    if isinstance(e, Const):
+        return e.value
+    if isinstance(e, Var) and depth and e in defs:
+        d = defs[e]
+        if isinstance(d, Phi):
+            vals = {_resolve_const(v, defs, depth - 1) for _, v in d.sources}
+            vals.discard(None)
+            return vals.pop() if len(vals) == 1 else None
+        if isinstance(d, Expr):
+            return _resolve_const(d, defs, depth - 1)
+    return None

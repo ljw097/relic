@@ -223,6 +223,9 @@ def _match_signed(p: Expr, q: Expr):
         s = _sub_ops(p.a)
         if s and isinstance(q, BinOp) and q.op == "sborrow" and q.a == s[0] and q.b == s[1]:
             return s
+        # `cmp x, 0`: folding has already turned `x - 0` into `x`
+        if isinstance(q, BinOp) and q.op == "sborrow" and q.a == p.a and isinstance(q.b, Const) and q.b.value == 0:
+            return p.a, q.b
     return None
 
 
@@ -251,6 +254,9 @@ def _combine_node(e: Expr) -> Expr:
     if not isinstance(e, BinOp):
         return e
     op, a, b = e.op, e.a, e.b
+    if op in ("==", "!=") and isinstance(b, Const) and b.value == 0 and a.bits == 1:
+        # a flag compared with 0 (`SF != OF` once `test` made OF zero): the flag itself, or its negation
+        return a if op == "!=" else UnOp("!", a, 1)
     if op in ("==", "!="):
         for x, y in ((a, b), (b, a)):
             if isinstance(y, Const) and y.value == 0:

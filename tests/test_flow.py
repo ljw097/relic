@@ -1,0 +1,104 @@
+"""Control-flow structuring checked by recompilation.
+
+tests/src/flow.c holds pure functions with short-circuit conditions,
+multi-exit loops, nested break/continue/goto, switch fall-through,
+do-while and ternaries. Each variant (-O0, -O2) is decompiled, the
+pseudocode compiled again, and every function must agree with the
+original source on a grid of inputs. This is what keeps goto reduction
+and other structuring changes honest.
+"""
+import itertools
+import os
+import re
+import shutil
+import subprocess
+
+import pytest
+
+from relic.analysis import analyze
+from relic.decompiler.emit import decompile
+
+HERE = os.path.dirname(__file__)
+FUNCS = ["sc_or", "sc_and3", "find", "collatz", "nested", "sw_fall", "dowhile", "clamp", "gcd", "classify2", "scan"]
+
+_HARNESS = r"""
+#include <stdint.h>
+#include <stdio.h>
+#include <stdbool.h>
+
+/* decompiled */
+%(code)s
+
+/* reference: the original source with every function renamed ref_* */
+%(defines)s
+#define main ref_main
+#include "%(src)s"
+#undef main
+
+static const int ARR[] = {5, -2, 9, 9, 0, 13, -7, 4};
+static const char *TEXTS[] = {"", " ", "a", "two words", "  lead  and trail ", "\ttab\tsep x", "x y z w v"};
+
+int main(void) {
+    int bad = 0;
+    int vals[] = {-200, -101, -9, -3, -1, 0, 1, 2, 3, 4, 5, 6, 7, 8, 13, 27, 100, 101, 150, 1000};
+    int nv = sizeof vals / sizeof *vals;
+    for (int i = 0; i < nv; i++) {
+        int a = vals[i];
+#define CHK1(f, x) if (f(x) != ref_##f(x)) { printf(#f "(%%d) = %%d, want %%d\n", x, (int)f(x), ref_##f(x)); bad++; }
+        CHK1(collatz, a < 0 ? -a : a)
+        CHK1(sw_fall, a)
+        CHK1(dowhile, a)
+        for (int j = 0; j < nv; j++) {
+            int b = vals[j];
+#define CHK2(f, x, y) if (f(x, y) != ref_##f(x, y)) { printf(#f "(%%d,%%d) = %%d, want %%d\n", x, y, (int)f(x, y), ref_##f(x, y)); bad++; }
+            CHK2(sc_or, a, b)
+            CHK2(classify2, a, b)
+            if (a > 0 && b > 0 && a < 60 && b < 60) { CHK2(nested, a, b) }
+            if (b != 0 && a != -2147483647 - 1) { CHK2(gcd, a, b) }
+            for (int k = 0; k < nv; k += 3) {
+                int c = vals[k];
+                if (sc_and3(a, b, c) != ref_sc_and3(a, b, c)) { printf("sc_and3 %%d %%d %%d\n", a, b, c); bad++; }
+                if (clamp(a, b, c) != ref_clamp(a, b, c)) { printf("clamp %%d %%d %%d\n", a, b, c); bad++; }
+            }
+        }
+        for (int n = 0; n <= 8; n++)
+            if (find((int *)ARR, n, a) != ref_find(ARR, n, a)) { printf("find n=%%d key=%%d\n", n, a); bad++; }
+    }
+    for (unsigned t = 0; t < sizeof TEXTS / sizeof *TEXTS; t++)
+        if (scan((char *)TEXTS[t]) != ref_scan(TEXTS[t])) { printf("scan '%%s'\n", TEXTS[t]); bad++; }
+    if (!bad)
+        puts("ok");
+    return bad != 0;
+}
+"""
+
+
+@pytest.fixture(scope="module", params=["flow_O0", "flow_O2"])
+def flow(request):
+    path = request.getfixturevalue(request.param)
+    return request.param, analyze(path)
+
+
+def test_flow_functions_decompile_without_goto_soup(flow):
+    name, an = flow
+    for fn in FUNCS:
+        text = decompile(an, an.function_by_name(fn)).text
+        labels = re.findall(r"^\s*(loc_[0-9a-f]+):", text, re.M)
+        for target in re.findall(r"goto (loc_[0-9a-f]+);", text):
+            assert target in labels, f"{name}/{fn}: goto {target} without label\n{text}"
+
+
+def test_flow_recompiles_and_matches_source(flow, tmp_path):
+    cc = shutil.which("gcc") or shutil.which("cc")
+    if cc is None:
+        pytest.skip("no C compiler")
+    name, an = flow
+    code = "\n\n".join(decompile(an, an.function_by_name(fn)).text for fn in FUNCS)
+    defines = "\n".join(f"#define {fn} ref_{fn}" for fn in FUNCS)
+    src = tmp_path / "re.c"
+    src.write_text(_HARNESS % {"code": code, "defines": defines, "src": os.path.join(HERE, "src", "flow.c")})
+    exe = tmp_path / "re"
+    r = subprocess.run([cc, "-w", "-fwrapv", "-o", str(exe), str(src)], capture_output=True, text=True)
+    assert r.returncode == 0, f"{name}: pseudocode does not compile:\n{r.stderr[:3000]}\n{code}"
+    r = subprocess.run([str(exe)], capture_output=True, text=True, timeout=60)
+    assert r.stdout.strip().endswith("ok"), f"{name}: mismatches:\n{r.stdout[:3000]}\n{code}"

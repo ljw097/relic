@@ -374,10 +374,10 @@ class CWriter:
             addr = self._term_addr(n.addr)
             cond, then, els = n.cond, n.then, n.els
             # if (a) { if (b) { X } }  ->  if (a && b) { X }
-            inner = _only_if(then) if els is None else None
+            inner = _only_if(then, self.p.gotos) if els is None else None
             while inner is not None and inner.els is None:
                 cond, then = BinOp("&&", cond, inner.cond, 1), inner.then
-                inner = _only_if(then)
+                inner = _only_if(then, self.p.gotos)
             # if (c) { ...; return; } else { Y }  ->  if (c) { ...; return; } Y
             if els is not None and _exits(then):
                 self.node(If(n.addr, cond, then), depth)
@@ -390,7 +390,7 @@ class CWriter:
             self.emit(f"if ({self.expr(cond)}) {{", addr, depth)
             self.node(then or Seq(), depth + 1)
             while els is not None:
-                inner = _only_if(els)
+                inner = _only_if(els, self.p.gotos)
                 if inner is None:
                     self.emit("} else {", None, depth)
                     self.node(els, depth + 1)
@@ -401,6 +401,9 @@ class CWriter:
             self.emit("}", None, depth)
         elif isinstance(n, Loop):
             body = n.body
+            if n.kind == "while" and n.header in self.p.gotos:
+                # the header is only the test: a jump to it re-enters the loop before the test
+                self.emit(f"loc_{n.header:x}:", n.header, max(depth - 1, 0))
             if n.kind == "while":
                 self.emit(f"while ({self.expr(n.cond)}) {{", None, depth)
             elif n.kind == "dowhile":
@@ -487,9 +490,15 @@ class CWriter:
 
 
 # ------------------------------------------------------------- tree tidying
-def _only_if(n):
-    """`n` if it is (a Seq of) exactly one If node -- an `else if` / `&&` candidate."""
-    items = [x for x in _flatten(n) if not (isinstance(x, Block) and not x.stmts)] if n is not None else []
+def _only_if(n, gotos=()):
+    """`n` if it is (a Seq of) exactly one If node -- an `else if` / `&&` candidate.
+
+    Empty blocks are ignored unless they carry a label some `goto` jumps to:
+    folding the If into `else if` / `&&` would lose that label.
+    """
+    items = [x for x in _flatten(n)
+             if not (isinstance(x, Block) and not x.stmts and (x.copy or x.addr not in gotos))] \
+        if n is not None else []
     return items[0] if len(items) == 1 and isinstance(items[0], If) else None
 
 
