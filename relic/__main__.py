@@ -23,7 +23,7 @@ import sys
 from . import __version__
 
 COMMANDS = ("info", "checksec", "funcs", "disasm", "cfg", "strings", "imports", "xrefs", "vulns", "ir", "opt",
-            "decompile", "search", "gui")
+            "decompile", "search", "patch", "gui")
 
 
 def _parser() -> argparse.ArgumentParser:
@@ -69,6 +69,16 @@ def _parser() -> argparse.ArgumentParser:
                      help="instructions using this immediate or displacement")
     how.add_argument("--insn", metavar="REGEX", help="instructions whose text matches: 'call.*system'")
     s.add_argument("--case", action="store_true", help="case-sensitive --text")
+    s = add("patch", "patch bytes / NOP / invert a branch / assemble, write a patched copy", where=True)
+    how = s.add_mutually_exclusive_group()
+    how.add_argument("--bytes", metavar="HEX", help="bytes to write: '90 90'")
+    how.add_argument("--nop", action="store_true", help="replace the instruction with NOPs")
+    how.add_argument("--invert", action="store_true", help="negate the conditional branch")
+    how.add_argument("--asm", metavar="TEXT", help="assemble (keystone): 'xor eax, eax; ret'")
+    how.add_argument("--revert", action="store_true", help="drop the project's patch at this address")
+    how.add_argument("--list", action="store_true", help="list the project's patches")
+    s.add_argument("-o", "--output", help="patched file to write (default: FILE.patched)")
+    s.add_argument("--no-save", action="store_true", help="do not record the patch in the project file")
     g = sub.add_parser("gui", help="open the GUI")
     g.add_argument("file", nargs="?")
     g.add_argument("--arch", help="architecture for raw blobs (x86, x64, arm, arm64, mips, ...)")
@@ -304,6 +314,56 @@ def cmd_search(args):
         print("not found")
     for h in hits:
         print(f"{h.addr:#x}  {an.location(h.addr):28} {h.text}")
+
+
+def cmd_patch(args):
+    from . import patch as P
+    an = _analyze(args)
+    if args.list:
+        for a, (old, new) in sorted(an.patches.items()):
+            print(f"{a:#x}  {an.location(a):28} {old.hex(' ')} -> {new.hex(' ')}")
+        if not an.patches:
+            print("no patches")
+        return
+    if args.where is None:
+        sys.exit("relic: patch needs an address")
+    addr = _where(an, args.where)
+    try:
+        if args.revert:
+            if not an.revert(addr):
+                sys.exit(f"relic: no patch at {addr:#x}")
+        else:
+            if args.nop:
+                data = P.nop_bytes(an, addr)
+            elif args.invert:
+                data = P.invert_bytes(an, addr)
+            elif args.asm is not None:
+                data = P.fit(an, addr, P.assemble(an, addr, args.asm))
+            elif args.bytes is not None:
+                data = P.parse_hex(args.bytes)
+            else:
+                sys.exit("relic: one of --bytes / --nop / --invert / --asm / --revert / --list")
+            old = an.patch(addr, data)
+            print(f"{addr:#x}  {old.hex(' ')} -> {data.hex(' ')}")
+            for ln in _disasm_lines(an, addr, len(data)):
+                print("   ", ln)
+    except P.PatchError as e:
+        sys.exit(f"relic: {e}")
+    if not args.no_save:
+        an.save_project()
+    out = P.export(an.bin, args.output or args.file + ".patched")
+    print(f"wrote {out} ({len(an.patches)} patch{'es' if len(an.patches) != 1 else ''})")
+
+
+def _disasm_lines(an, addr: int, size: int) -> list[str]:
+    out, a = [], addr
+    while a < addr + size:
+        i = an.dis.decode(a)
+        if i is None:
+            break
+        out.append(f"{i.addr:#x}  {i.mnemonic} {i.op_str}".rstrip())
+        a = i.end
+    return out
 
 
 def cmd_gui(args):

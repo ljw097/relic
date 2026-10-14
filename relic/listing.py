@@ -34,6 +34,10 @@ def operands(an: Analysis, i: Insn) -> str:
 
 def comment(an: Analysis, i: Insn) -> str:
     parts = []
+    for a, (old, new) in getattr(an, "patches", {}).items():
+        if a <= i.addr < a + len(new):
+            parts.append(f"patched (was {old.hex(' ')})" if a == i.addr else "patched")
+            break
     user = an.comments.get(i.addr)
     if user:
         parts.append(user)

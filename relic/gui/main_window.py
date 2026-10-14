@@ -394,6 +394,13 @@ class MainWindow(QMainWindow):
         act(m, "&Rename...", "N", self.rename_dialog)
         act(m, "&Comment...", ";", self.comment_dialog)
         act(m, "&Xrefs to...", "X", self.show_xrefs_here)
+        m.addSeparator()
+        act(m, "&Patch bytes...", "Ctrl+Alt+P", self.patch_bytes_dialog)
+        act(m, "&Assemble...", "Ctrl+Alt+A", self.assemble_dialog)
+        act(m, "&NOP instruction", "Ctrl+Alt+N", lambda: self.patch_with("nop"))
+        act(m, "In&vert branch", "Ctrl+Alt+J", lambda: self.patch_with("invert"))
+        act(m, "Re&vert patch", None, self.revert_patch_here)
+        act(m, "&Export patched file...", None, self.export_patched_dialog)
         m = mb.addMenu("&Search")
         act(m, "Sequence of &bytes...", "Alt+B", lambda: self.search_dialog("bytes"))
         act(m, "&Text...", "Alt+T", lambda: self.search_dialog("text"))
@@ -1166,6 +1173,105 @@ class MainWindow(QMainWindow):
             self.disasm.goto(keep)
             self.graph.goto(keep)
 
+    # ------------------------------------------------------------------ patching
+    def _patch_target(self) -> int | None:
+        """The instruction under the cursor (listing / graph), or the cursor address."""
+        return self.cur if self.an is not None else None
+
+    def patch(self, addr: int, data: bytes) -> bool:
+        """Write bytes at `addr`, re-analyse, refresh the views (the cursor stays)."""
+        from ..patch import PatchError
+        QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
+        try:
+            old = self.an.patch(addr, data)
+        except PatchError as e:
+            QApplication.restoreOverrideCursor()
+            self.statusBar().showMessage(f"patch: {e}", 6000)
+            return False
+        QApplication.restoreOverrideCursor()
+        self._after_patch(addr)
+        self.statusBar().showMessage(f"patched {addr:#x}: {old.hex(' ')} -> {data.hex(' ')}", 6000)
+        return True
+
+    def patch_with(self, how: str) -> bool:
+        """NOP the instruction at the cursor, or invert its conditional branch."""
+        from ..patch import PatchError, invert_bytes, nop_bytes
+        a = self._patch_target()
+        if a is None:
+            return False
+        try:
+            data = nop_bytes(self.an, a) if how == "nop" else invert_bytes(self.an, a)
+        except PatchError as e:
+            self.statusBar().showMessage(f"patch: {e}", 6000)
+            return False
+        return self.patch(a, data)
+
+    def patch_bytes_dialog(self):
+        from ..patch import PatchError, parse_hex
+        a = self._patch_target()
+        if a is None:
+            return
+        i = self.an.dis.decode(a)
+        text, ok = QInputDialog.getText(self, "Patch bytes", f"Bytes at {a:#x} (hex):",
+                                        text=i.raw.hex(" ") if i is not None else "")
+        if ok and text.strip():
+            try:
+                self.patch(a, parse_hex(text))
+            except PatchError as e:
+                self.statusBar().showMessage(f"patch: {e}", 6000)
+
+    def assemble_dialog(self):
+        from ..patch import PatchError, assemble, fit
+        a = self._patch_target()
+        if a is None:
+            return
+        i = self.an.dis.decode(a)
+        text, ok = QInputDialog.getText(self, "Assemble", f"Instructions at {a:#x} (`;` between them):",
+                                        text=f"{i.mnemonic} {i.op_str}".strip() if i is not None else "")
+        if ok and text.strip():
+            try:
+                self.patch(a, fit(self.an, a, assemble(self.an, a, text)))
+            except PatchError as e:
+                self.statusBar().showMessage(f"assemble: {e}", 6000)
+
+    def revert_patch_here(self) -> bool:
+        a = self._patch_target()
+        if a is None:
+            return False
+        start = next((p for p, (_, new) in self.an.patches.items() if p <= a < p + len(new)), None)
+        if start is None:
+            self.statusBar().showMessage("no patch here", 3000)
+            return False
+        self.an.revert(start)
+        self._after_patch(a)
+        self.statusBar().showMessage(f"reverted the patch at {start:#x}", 4000)
+        return True
+
+    def export_patched_dialog(self):
+        from ..patch import export
+        if self.an is None:
+            return
+        path, _ = QFileDialog.getSaveFileName(self, "Export patched file", self.an.bin.path + ".patched")
+        if path:
+            try:
+                export(self.an.bin, path)
+            except OSError as e:
+                QMessageBox.warning(self, "Relic", f"cannot write {path}: {e}")
+                return
+            self.statusBar().showMessage(f"wrote {path} ({len(self.an.patches)} patches)", 5000)
+
+    def _after_patch(self, keep: int | None):
+        """The analysis was redone in place: functions, blocks and xrefs are new objects."""
+        self.disasm.func = self.graph.func = None
+        self.decomp.func = None
+        self.decomp.invalidate(reload=False)
+        self._fill_functions()
+        self._fill_tables(self._last_checksec)
+        self.dirty = True
+        self.setWindowTitle(self.windowTitle().rstrip(" *") + " *")
+        if keep is not None:
+            self.goto(keep, record=False)
+
     def save_project(self) -> bool:
         if self.an is None:
             return False
@@ -1182,7 +1288,7 @@ class MainWindow(QMainWindow):
     def _confirm_discard(self) -> bool:
         if not self.dirty or self.an is None:
             return True
-        r = QMessageBox.question(self, "Relic", "Save renames and comments to the project file?",
+        r = QMessageBox.question(self, "Relic", "Save renames, comments and patches to the project file?",
                                  QMessageBox.StandardButton.Save | QMessageBox.StandardButton.Discard
                                  | QMessageBox.StandardButton.Cancel)
         if r == QMessageBox.StandardButton.Save:

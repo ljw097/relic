@@ -567,3 +567,35 @@ def test_debugger_pseudocode_marks_and_editing(app, win):
     assert _debug_wait(app, win, lambda: "exited with code 10" in win.dbg_console.out.toPlainText())
     win.dbg.stop()
     assert _debug_wait(app, win, lambda: win.dbg.session is None)
+
+
+def test_patching_inverts_nops_reverts_and_exports(app, win, tmp_path):
+    an = win.an
+    main = an.function_by_name("main")
+    cj = next(i for b in sorted(main.blocks.values(), key=lambda b: b.addr) for i in b.insns if i.kind == "cjmp")
+    before = cj.mnemonic
+    win.goto(cj.addr)
+    assert win.patch_with("invert")
+    assert win.an is an and an.dis.decode(cj.addr).mnemonic != before and cj.addr in an.patches
+    assert win.cur == cj.addr and "*" in win.windowTitle()
+    assert "patched (was " in win.disasm.toPlainText()
+    assert not win.patch_with("invert") or an.dis.decode(cj.addr).mnemonic == before   # twice: back
+    win.goto(an.function_by_name("vuln").addr)
+    gets_call = next(i for b in an.function_at(win.cur).blocks.values() for i in b.insns
+                     if i.kind == "call" and an.call_name(i) == "gets")
+    win.goto(gets_call.addr)
+    assert win.patch_with("nop")
+    assert all(an.dis.decode(a).mnemonic == "nop" for a in range(gets_call.addr, gets_call.end))
+    win.toggle_decompile()
+    assert win.decomp.wait_idle() and "gets(" not in win.decomp.toPlainText()
+    win.toggle_decompile()
+    out = tmp_path / "patched"
+    from relic.patch import export
+    export(an.bin, str(out))
+    assert out.read_bytes() != open(an.bin.path, "rb").read() and os.access(out, os.X_OK)
+    assert win.revert_patch_here() and gets_call.addr not in an.patches
+    assert an.dis.decode(gets_call.addr).kind == "call"
+    win.save_project()
+    import json
+    saved = json.load(open(an.project_path))["patches"]
+    assert list(saved) == list({f"{a:#x}" for a in an.patches})

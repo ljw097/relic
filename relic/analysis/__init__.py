@@ -33,11 +33,15 @@ class Analysis:
         self.renames: dict[int, str] = {}
         # decompiler variable names: function address -> {generated name: user name}
         self.var_names: dict[int, dict[str, str]] = {}
+        # byte patches: address -> (original bytes, new bytes), applied to `bin.data`
+        self.patches: dict[int, tuple[bytes, bytes]] = {}
         self._fstarts: list[int] = []
         self._strings_by_addr: dict[int, String] = {}
 
     # ------------------------------------------------------------------ run
-    def run(self) -> "Analysis":
+    def run(self, load_project: bool = True) -> "Analysis":
+        if load_project:
+            self._apply_saved_patches()
         report("functions", 0, force=True)
         finder = FunctionAnalyzer(self.bin, self.dis)
         self.functions = finder.run()
@@ -53,8 +57,71 @@ class Analysis:
         self.strings = find_strings(self.bin)
         self._strings_by_addr = {s.addr: s for s in self.strings}
         self._build_xrefs()
-        self.load_project()
+        if load_project:
+            self.load_project()
         return self
+
+    def reanalyze(self) -> "Analysis":
+        """Analyse again (after a patch), keeping names, comments, variable names and patches."""
+        keep = (self.renames, self.comments, self.var_names, self.patches)
+        b = self.bin
+        self.__dict__.clear()                    # decompiler caches live on the instance too
+        self.__init__(b)
+        self.renames, self.comments, self.var_names, self.patches = keep
+        return self.run(load_project=False)
+
+    # ------------------------------------------------------------- patches
+    def patch(self, addr: int, data: bytes, reanalyze: bool = True) -> bytes:
+        """Write `data` at `addr` (see `relic.patch`); returns the bytes it replaced. Patching
+        the same address again replaces the earlier patch; overlapping another one is refused."""
+        from ..patch import PatchError, write
+        end = addr + len(data)
+        for a, (_old, new) in self.patches.items():
+            if a != addr and a < end and addr < a + len(new):
+                raise PatchError(f"overlaps the patch at {a:#x} (revert it first)")
+        if addr in self.patches:
+            self.revert(addr, reanalyze=False)
+        old = write(self.bin, addr, data)
+        self.patches[addr] = (old, bytes(data))
+        if reanalyze:
+            self.reanalyze()
+        return old
+
+    def revert(self, addr: int, reanalyze: bool = True) -> bool:
+        """Put back the original bytes of the patch at `addr`."""
+        from ..patch import write
+        p = self.patches.pop(addr, None)
+        if p is None:
+            return False
+        write(self.bin, addr, p[0])
+        if reanalyze:
+            self.reanalyze()
+        return True
+
+    def patched_at(self, addr: int) -> bool:
+        return any(a <= addr < a + len(new) for a, (_, new) in self.patches.items())
+
+    def _apply_saved_patches(self):
+        """Patches kept in the project file, applied before the analysis sees the code. One whose
+        original bytes no longer match (the binary changed) is skipped."""
+        path = self.project_path
+        if not os.path.exists(path):
+            return
+        try:
+            with open(path) as fp:
+                saved = json.load(fp).get("patches", {})
+        except (OSError, ValueError):
+            return
+        from ..patch import PatchError, write
+        for a, p in saved.items():
+            addr, old, new = int(a, 16), bytes.fromhex(p["old"]), bytes.fromhex(p["new"])
+            if self.bin.read(addr, len(old)) != old or addr in self.patches:
+                continue
+            try:
+                write(self.bin, addr, new)
+            except PatchError:
+                continue
+            self.patches[addr] = (old, new)
 
     def _main_from_start(self) -> int | None:
         """`main` of a stripped binary: the first argument `_start` passes to __libc_start_main,
@@ -257,6 +324,7 @@ class Analysis:
             "renames": {f"{a:#x}": n for a, n in sorted(self.renames.items())},
             "comments": {f"{a:#x}": c for a, c in sorted(self.comments.items())},
             "variables": {f"{a:#x}": dict(sorted(v.items())) for a, v in sorted(self.var_names.items())},
+            "patches": {f"{a:#x}": {"old": o.hex(), "new": n.hex()} for a, (o, n) in sorted(self.patches.items())},
         }
         with open(path or self.project_path, "w") as fp:
             json.dump(data, fp, indent=2)

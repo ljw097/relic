@@ -21,6 +21,7 @@ dependencies = [
 
 [project.optional-dependencies]
 dev = ["pytest", "ruff"]
+asm = ["keystone-engine"]      # Edit > Assemble, `relic patch --asm`
 
 [project.scripts]
 relic = "relic.__main__:main"
