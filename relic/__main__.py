@@ -23,7 +23,7 @@ import sys
 from . import __version__
 
 COMMANDS = ("info", "checksec", "funcs", "disasm", "cfg", "strings", "imports", "xrefs", "vulns", "ir", "opt",
-            "decompile", "search", "patch", "gui")
+            "decompile", "search", "patch", "script", "gui")
 
 
 def _parser() -> argparse.ArgumentParser:
@@ -79,6 +79,11 @@ def _parser() -> argparse.ArgumentParser:
     how.add_argument("--list", action="store_true", help="list the project's patches")
     s.add_argument("-o", "--output", help="patched file to write (default: FILE.patched)")
     s.add_argument("--no-save", action="store_true", help="do not record the patch in the project file")
+    s = add("script", "run a Python script against the analysis (an, decompile(), rename(), ...)")
+    s.add_argument("script", help="Python file; the scripting API is in its globals (see relic.scripting)")
+    s.add_argument("args", nargs=argparse.REMAINDER, help="arguments for the script (sys.argv[1:]); "
+                   "relic's own options go before the script")
+    s.add_argument("--save", action="store_true", help="save the project file afterwards")
     g = sub.add_parser("gui", help="open the GUI")
     g.add_argument("file", nargs="?")
     g.add_argument("--arch", help="architecture for raw blobs (x86, x64, arm, arm64, mips, ...)")
@@ -364,6 +369,14 @@ def _disasm_lines(an, addr: int, size: int) -> list[str]:
         out.append(f"{i.addr:#x}  {i.mnemonic} {i.op_str}".rstrip())
         a = i.end
     return out
+
+
+def cmd_script(args):
+    from .scripting import namespace, run_script
+    an = _analyze(args)
+    run_script(args.script, namespace(an), args.args)
+    if args.save:
+        an.save_project()
 
 
 def cmd_gui(args):

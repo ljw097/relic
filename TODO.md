@@ -13,6 +13,16 @@
 - [ ] **P2** CFG: 간선 묶음(bundling), 블록 접기
 - [x] 테마 전환(라이트/다크, `Ctrl+Shift+L`)과 코드 글꼴 크기(`Ctrl+=`/`Ctrl+-`/`Ctrl+0`): 모든 뷰·표·앱 팔레트에 즉시 반영, `QSettings`에 저장
 
+## 스크립팅
+
+- [x] 스크립팅 API(`relic/scripting.py`), GUI Python 콘솔(`Ctrl+Shift+P`, 기록, 여러 줄 문장), 플러그인(`RELIC_PLUGINS` / `~/.relic/plugins`의 `register(api)` → Plugins 메뉴, 오류는 콘솔에), `relic script`
+- [ ] **P2** 플러그인이 뷰에 주석·색을 다는 훅(리스팅 줄 꾸미기), 분석 완료 이벤트
+
+## 패치
+
+- [x] 바이트·NOP·조건 분기 반전(x86, ARM/Thumb, AArch64, MIPS)·어셈블(keystone), 재분석, 프로젝트에 저장·다시 적용, 패치된 파일 내보내기(`relic patch`, Edit 메뉴)
+- [ ] **P2** 디버거가 패치된 이미지를 실행(지금은 디스크의 원본), 패치 undo 기록
+
 ## 디버거 (로컬, GDB/MI, pwndbg식 GUI)
 
 - [x] GDB/MI 레코드 파서·프로세스 래퍼(`relic/debugger/mi.py`), 세션(`session.py`): pty 입출력, 시작(entry/main)·계속·단계 실행·커서까지·중단·종료, 중단점, PIE 슬라이드(`to_live`/`to_static`), 레지스터 변경 추적, `telescope`, 백트레이스

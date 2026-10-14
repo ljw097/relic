@@ -10,7 +10,7 @@
 진행률은 "IDA Pro가 그 영역에서 하는 일 중 Relic이 같은 수준으로 하는 비율"을 어림한 값입니다.
 전체 값은 영역 가중 평균(가중치는 리버싱 실무에서의 비중)입니다.
 
-**전체: 약 36%** — 분석·디컴파일 핵심 경로는 x86/ARM 계열에서 실사용 가능, 타입 시스템·라이브러리 식별·스크립팅 콘솔이 큰 격차.
+**전체: 약 38%** — 분석·디컴파일 핵심 경로는 x86/ARM 계열에서 실사용 가능, 타입 시스템·라이브러리 식별·스크립팅 콘솔이 큰 격차.
 
 | 영역 (가중치) | IDA Pro 기준 | Relic 현재 | 진행률 |
 |---|---|---|---|
@@ -21,7 +21,7 @@
 | 타입 시스템 (10) | 구조체·열거형·로컬 타입, 타입 라이브러리, 타입 전파 | int/포인터/unsigned 추론, libc 시그니처 일부 | 10% |
 | 디컴파일러 (20) | Hex-Rays: 다수 아키텍처, 타입·구조체 대화형 수정, 부동소수점 | x86-64/x86-32/AArch64/ARM32/MIPS32, 재컴파일 검증, 구조화(switch·for·&&), 상수 나눗셈, -fipa-ra 레지스터 보존; 구조체·부동소수점·대화형 재타입 없음 | 40% |
 | 대화형 UI (12) | 리스팅·그래프·xref·이름/주석·검색·패치·undo·북마크·구조체 창 | 리스팅·그래프(층별 레이아웃)·의사 코드·헥스, 이름/주석/변수 이름, xref, 이동 기록, 테마·확대, 검색(바이트·텍스트·즉치값·명령어), 바이트 패치(NOP·분기 반전·어셈블, 되돌리기, 프로젝트에 저장, 패치된 파일 내보내기); undo·북마크 없음 | 52% |
-| 스크립팅·확장 (8) | IDAPython, IDC, SDK, 플러그인 | Python 라이브러리 API (`relic.analysis`, `relic.decompiler`), CLI | 20% |
+| 스크립팅·확장 (8) | IDAPython, IDC, SDK, 플러그인 | Python 라이브러리 API, 스크립팅 API(`here()`·`rename()`·`decompile()`·`patch()` …), GUI Python 콘솔, 플러그인(`register(api)` → Plugins 메뉴), `relic script` 배치 실행, CLI | 40% |
 | 디버거 (7) | 로컬·원격(gdbserver 등) 디버깅 | 로컬 GUI 디버거(GDB/MI): 실행·단계 실행·중단점(조건·활성화·적중 횟수, 라이브러리 함수 이름)·하드웨어 watchpoint·리스팅/의사 코드 동기화, pwndbg식 레지스터·스택 telescope·vmmap·메모리 hexdump·백트레이스·콘솔, 레지스터·메모리 편집, PIE 슬라이드 보정; 원격·힙 뷰 없음 | 40% |
 | 프로젝트·협업 (5) | IDB, 스냅숏, Teams, Lumina | `<binary>.relic.json`(이름·주석·변수 이름·패치) | 18% |
 
@@ -30,7 +30,7 @@ IDA Pro에 없는 Relic 쪽 기능: checksec(ELF/PE 보호 기법), 포너블 �
 ### 다음 단계 (격차가 큰 순)
 
 1. ~~검색(텍스트·바이트 패턴·즉치값·명령어)~~, ~~바이트 패치·패치된 바이너리 저장~~ (완료)
-2. GUI 안의 Python 콘솔과 플러그인 진입점 (IDAPython 대응)
+2. ~~GUI 안의 Python 콘솔과 플러그인 진입점 (IDAPython 대응)~~ (완료: `relic.scripting`)
 3. 정적 링크 라이브러리 함수 식별 (FLIRT 대응 시그니처)
 4. 구조체·타입 시스템과 디컴파일러 연동 (필드 접근 `p->size`)
 5. Mach-O 로더, RISC-V / PPC 리프터 (MIPS32는 완료)
@@ -82,6 +82,7 @@ relic ir        ./chall vuln         # 디컴파일러 IR (리프팅 직후, 디
 relic opt       ./chall checksum --xrefs  # SSA + 최적화 IR, 문자열·교차참조, 스택 프레임
 relic decompile ./chall main         # C 유사 의사 코드 (--addrs: 줄마다 명령어 주소, -a: 모든 함수)
 relic search    ./chall --bytes '48 8b ?? 05'   # 바이트 패턴 (--text, --imm 0x186a0, --insn 'call.*system')
+relic script    ./chall rename_all.py arg1      # 스크립팅 API로 Python 실행 (--save: 프로젝트 저장, 옵션은 스크립트 앞에)
 relic patch     ./chall main+0x2f --invert      # 조건 분기 반전 → ./chall.patched (--nop, --bytes '90 90',
                                                 #   --asm 'xor eax, eax; ret', --revert, --list, -o 출력 파일)
 relic disasm    sc.bin --arch x64 --base 0x1000 -n 30   # RAW blob
@@ -142,6 +143,7 @@ relic sc.bin --arch x64 --base 0x1000
 | `Ctrl+Alt+Pause` / `Ctrl+F2` | 일시 정지 / 종료 |
 | `Ctrl+Alt+P` / `Ctrl+Alt+A` | 바이트 패치 / 어셈블해서 패치 (`pip install .[asm]`: keystone) |
 | `Ctrl+Alt+N` / `Ctrl+Alt+J` | 명령어를 NOP으로 / 조건 분기 반전 (Edit ▸ Revert patch, Export patched file) |
+| `Ctrl+Shift+P` | Python 콘솔 (`an`, `here()`, `goto()`, `rename()`, `decompile()`, `patch()` …, ↑/↓ 기록) |
 | `Ctrl+.` | 실행 중인 분석 / 취약점 스캔 / 검색 취소 |
 | `Ctrl+Shift+L` | 라이트 / 다크 테마 전환 |
 | `Ctrl+=` / `Ctrl+-` / `Ctrl+0` | 코드 글꼴 크게 / 작게 / 기본 (테마·크기는 저장됨) |
@@ -164,6 +166,25 @@ Debug 메뉴(`F9`)가 열린 바이너리를 로컬 `gdb`(GDB/MI)로 실행합�
 - 리스팅과 의사 코드에서 현재 pc 줄(의사 코드는 그 명령이 속한 문장)은 초록, 중단점은 빨강으로 표시하며 멈출 때마다 정적 주소로 따라갑니다(PIE 슬라이드는 자동 보정)
 - 값 바꾸기: Registers 패널에서 `E`(또는 우클릭 ▸ Set)로 레지스터를 숫자나 gdb 식(`$rsp+8`)으로, Debug ▸ Write memory로 메모리에 hex 바이트(`41 42 ff`)·문자열(`"AAAA\n"`)·워드(`0x401136`)를 씁니다
 
+
+## 스크립팅과 플러그인
+
+GUI의 Python 콘솔(`Ctrl+Shift+P`), 플러그인, `relic script`는 같은 이름들을 씁니다(`relic/scripting.py`):
+`an`, `bin`, `here()`, `goto(x)`, `addr(x)`, `name(a)`, `rename(a, n)`, `comment(a, t)`, `func(x)`, `functions()`,
+`xrefs_to(a)`, `xrefs_from(a)`, `disasm(x, n)`, `decompile(x)`, `strings()`, `search('48 8b ?? 05')`,
+`patch(a, b'..')`, `nop(a)`, `invert(a)`, `assemble(a, 'ret')`, `revert(a)`, `save()`.
+
+```python
+# ~/.relic/plugins/mark_gets.py  (또는 RELIC_PLUGINS 환경 변수의 디렉터리)
+def register(api):
+    def run(ns):
+        for f in ns["functions"]():
+            if "gets(" in ns["decompile"](f):
+                ns["comment"](f.addr, "calls gets")
+    api.add_action("Mark gets() callers", run, "Ctrl+Alt+G")     # Plugins 메뉴에 추가
+```
+
+플러그인을 불러오다 난 오류는 GUI를 막지 않고 Python 콘솔에 표시됩니다.
 
 ## 라이브러리로 사용
 

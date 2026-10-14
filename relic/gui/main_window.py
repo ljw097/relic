@@ -282,9 +282,11 @@ class MainWindow(QMainWindow):
         self.vulns.activated_addr.connect(self.goto)
         self.info.table.activated_addr.connect(self.goto)
         bottom = Qt.DockWidgetArea.BottomDockWidgetArea
+        from .pyconsole import PythonConsole
+        self.pyconsole = PythonConsole()
         docks = [self._dock(t, w, bottom) for t, w in (("Strings", self.strings), ("Imports", self.imports),
                                                        ("Vulns", self.vulns), ("Checksec", self.checksec),
-                                                       ("Sections", self.info))]
+                                                       ("Sections", self.info), ("Python", self.pyconsole))]
         for d in docks[1:]:
             self.tabifyDockWidget(docks[0], d)
         docks[0].raise_()
@@ -349,6 +351,7 @@ class MainWindow(QMainWindow):
         self._closing = False
         self._actions()
         self._update_actions()
+        self._load_plugins()
         self._restore_layout()
 
     # ---------------------------------------------------------------- setup
@@ -422,7 +425,9 @@ class MainWindow(QMainWindow):
         act(m, "S&top", "Ctrl+F2", self.dbg.stop, False)
         m.addSeparator()
         act(m, "Program &arguments...", None, self.debug_arguments_dialog)
+        self.plugins_menu = mb.addMenu("&Plugins")
         m = mb.addMenu("&View")
+        act(m, "&Python console", "Ctrl+Shift+P", self.show_python_console, False)
         self.light_act = act(m, "&Light theme", "Ctrl+Shift+L",
                              lambda on: self.set_appearance(theme="light" if on else "dark"), False)
         self.light_act.setCheckable(True)
@@ -462,7 +467,7 @@ class MainWindow(QMainWindow):
         if size is not None:
             st.setValue("font_size", set_font_size(size))
         st.sync()
-        for v in (self.disasm, self.graph, self.decomp, self.hex):
+        for v in (self.disasm, self.graph, self.decomp, self.hex, self.pyconsole):
             v.restyle()
         if theme is not None and self.an is not None:
             # table rows carry theme colours (imports, noreturn functions, severities)
@@ -629,6 +634,8 @@ class MainWindow(QMainWindow):
     def set_analysis(self, an: Analysis, extra: dict | None = None):
         extra = extra or {}
         self.an = an
+        from ..scripting import namespace
+        self.pyconsole.set_namespace(namespace(an, self))
         self.back.clear()
         self.fwd.clear()
         self.cur = None
@@ -1172,6 +1179,34 @@ class MainWindow(QMainWindow):
         if keep is not None:
             self.disasm.goto(keep)
             self.graph.goto(keep)
+
+    # ------------------------------------------------------------- scripting
+    def show_python_console(self):
+        d = self.findChild(QDockWidget, "Python")
+        d.show()
+        d.raise_()
+        self.pyconsole.line.setFocus()
+
+    def _load_plugins(self):
+        from ..scripting import load_plugins
+        self.plugin_names, failed = load_plugins(self)
+        if not self.plugin_names and not failed:
+            self.plugins_menu.addAction("(no plugins: RELIC_PLUGINS or ~/.relic/plugins)").setEnabled(False)
+        for name, err in failed:
+            self.report_plugin_error(name, err)
+
+    def add_plugin_action(self, text: str, slot, shortcut: str | None = None) -> QAction:
+        a = QAction(text, self)
+        if shortcut:
+            a.setShortcut(QKeySequence(shortcut))
+            a.setShortcutContext(Qt.ShortcutContext.WindowShortcut)
+        a.triggered.connect(slot)
+        self.plugins_menu.addAction(a)
+        return a
+
+    def report_plugin_error(self, plugin: str, error: str):
+        self.pyconsole.append(f"[plugin {plugin}] {error}\n")
+        self.statusBar().showMessage(f"plugin {plugin} failed (see the Python console)", 6000)
 
     # ------------------------------------------------------------------ patching
     def _patch_target(self) -> int | None:

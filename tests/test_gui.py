@@ -599,3 +599,37 @@ def test_patching_inverts_nops_reverts_and_exports(app, win, tmp_path):
     import json
     saved = json.load(open(an.project_path))["patches"]
     assert list(saved) == list({f"{a:#x}" for a in an.patches})
+
+
+def test_python_console_and_plugins(app, vuln64, tmp_path, monkeypatch):
+    plugins = tmp_path / "plugins"
+    plugins.mkdir()
+    (plugins / "mark.py").write_text(
+        "def register(api):\n"
+        "    def run(ns):\n"
+        "        ns['comment'](ns['here'](), 'seen by a plugin')\n"
+        "    api.add_action('Mark here', run, 'Ctrl+Alt+M')\n")
+    (plugins / "broken.py").write_text("raise RuntimeError('boom')\n")
+    monkeypatch.setenv("RELIC_PLUGINS", str(plugins))
+    path = tmp_path / "vuln64"
+    shutil.copy(vuln64, path)
+    w = MainWindow()
+    try:
+        w.open_file(str(path))
+        assert w.wait()
+        assert w.plugin_names == ["mark"]
+        assert "[plugin broken]" in w.pyconsole.out.toPlainText() and "boom" in w.pyconsole.out.toPlainText()
+        act = next(a for a in w.plugins_menu.actions() if a.text() == "Mark here")
+        act.trigger()
+        assert w.an.comments.get(w.cur) == "seen by a plugin" and "seen by a plugin" in w.disasm.toPlainText()
+        w.show_python_console()
+        out = w.pyconsole.run("hex(here()) == hex(an.function_by_name('main').addr)")
+        assert out.strip() == "True"
+        w.pyconsole.run("goto('vuln')")
+        assert w.cur == w.an.function_by_name("vuln").addr
+        w.pyconsole.line.setText("rename(here(), 'pwnme')")
+        w.pyconsole._enter()
+        assert w.an.name(w.cur) == "pwnme" and w.pyconsole.line.history == ["rename(here(), 'pwnme')"]
+    finally:
+        w.dirty = False
+        w.close()
