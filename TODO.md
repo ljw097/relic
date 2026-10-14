@@ -20,7 +20,7 @@
 - [ ] goto 줄이기 — 기준선(bench): true 153, cat 375, gzip 911, grep 1861. 구조화·출력 정확성은 무작위 CFG 실행 비교 테스트(`test_random_cfgs_run_like_the_cfg`: 구조화 트리, `test_emitted_c_runs_like_the_cfg`: 출력한 C를 gcc로 컴파일해 실행)로 지킴: 줄이는 변경도 이 테스트를 통과해야 함
   - [ ] -O0 비교 트리(범위 검사 분기마다 꼬리 블록이 복제된 형태)를 switch로
   - [ ] 큰 상태 기계 함수의 goto(gnulib `quotearg`, gzip deflate/inflate) — 조건 기반 구조화 검토
-- [ ] 함수 내부 데이터(점프 테이블, 리터럴 풀)를 리스팅에서 데이터로 표시
+- [x] 함수 내부 데이터를 리스팅에 데이터로 표시: ARM 리터럴 풀(`ldr r0, [pc, #n]`, AArch64 `ldr x0, #addr`)은 `.word` + 값·참조, Thumb `tbb`/`tbh`·ARM `ldr pc` 점프 테이블은 항목마다 대상 레이블
 
 ## P1 — 분석
 
