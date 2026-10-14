@@ -30,7 +30,8 @@
   - 상대 테이블은 후보 기준 주소들을 검증해서 선택
 - [ ] **P1** MIPS: `.MIPS.stubs` / GOT(`DT_MIPS_GOTSYM`, `DT_MIPS_LOCAL_GOTNO`) 기반 import 이름 해석, 지연 슬롯을 블록에 포함
 - [x] **P1** ARM Thumb 모드: 주소별 명령어 집합(`$a`/`$t` 매핑 심볼, 심볼·엔트리 LSB, `bl`은 유지·`blx label`은 전환), IT 블록(조건을 한 번에 디코딩), Thumb PLT 진입점(`bx pc`)
-  - [ ] **P2** 매핑 심볼 없는 stripped 바이너리: 리터럴 풀 함수 포인터(`func | 1`)로 시드, 데이터 영역 오디코딩(ldc/stc) 감지
+  - [x] 심볼 없는(stripped) ARM / Thumb / AArch64: `_start`의 리프트된 IR에서 `__libc_start_main` 첫 인자(GOT·리터럴 풀 슬롯)를 읽어 `main` 복원, 함수 사이 빈 구간의 프롤로그 스캔(A32/Thumb `push {…, lr}`, AArch64 `stp x29, x30`·`paciasp`·`bti c`)으로 포인터로만 쓰이는 함수(`win`) 발견
+  - [ ] **P2** 데이터 영역 오디코딩(ldc/stc 같은 coprocessor 명령) 감지
 - [ ] **P2** PPC64 ELFv1 함수 디스크립터, RISC-V `auipc` 쌍
 
 ## 테스트 / 인프라

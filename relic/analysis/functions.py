@@ -578,6 +578,18 @@ class FunctionAnalyzer:
                     return self._name_main(pushes[-1].refs[0])
         return None
 
+    def add_function(self, addr: int, name: str | None = None) -> int:
+        """Analyse one more function (and what it reaches) after `run`; returns its address."""
+        if self.dis.md_thumb is not None and addr & 1:
+            self.dis.hint(addr, True)
+            addr &= ~1
+        self._queue.append(addr)
+        self._drain()
+        if name == "main":
+            self._name_main(addr)
+        self._link()
+        return addr
+
     def _name_main(self, cand: int) -> int:
         self.bin.add_symbol(Symbol("main", cand, 0, "func", "synthetic"), override=True)
         self.bin.name_to_addr["main"] = cand
@@ -586,10 +598,11 @@ class FunctionAnalyzer:
         return cand
 
     def _scan_gaps(self):
-        """Pick up functions only reachable indirectly (prologue scan, x86)."""
-        if self.dis.arch not in ("x86", "x64"):
+        """Pick up functions only reachable indirectly (prologue scan: x86, ARM, AArch64)."""
+        if self.dis.arch not in ("x86", "x64", "arm", "arm64"):
             return
         prologues = (b"\xf3\x0f\x1e\xfa", b"\xf3\x0f\x1e\xfb", b"\x55\x48\x89\xe5", b"\x55\x89\xe5")
+        tried: set[int] = set()
         for sec in self.bin.exec_sections:
             if sec.name in (".plt", ".plt.sec", ".plt.got", ".init", ".fini"):
                 continue
@@ -606,12 +619,46 @@ class FunctionAnalyzer:
                 if cur < sec.end:
                     gaps.append((cur, sec.end))
                 for s, e in gaps:
-                    start = self._gap_function(s, e, prologues)
-                    if start is not None:
+                    if self.dis.arch in ("arm", "arm64"):
+                        start = self._arm_gap_function(s, e)
+                    else:
+                        start = self._gap_function(s, e, prologues)
+                    if start is not None and start not in tried:
+                        tried.add(start)
                         self._queue.append(start)
                         self._drain()
                         changed = True
                         break
+
+    def _arm_gap_function(self, s: int, e: int) -> int | None:
+        """First prologue in [s, e) after padding (an odd result is a Thumb start).
+
+        AArch64: `stp x29, x30, [sp, #-n]!`, `paciasp`, `bti c`. ARM: A32 `push {..., lr}`
+        (`stmdb sp!` / `str lr, [sp, #-4]!`), Thumb `push {..., lr}` and Thumb-2 `push.w`.
+        Gaps also hold literal pools and tables, so only a real prologue counts here.
+        """
+        a = (s + 3) & ~3 if self.dis.arch == "arm64" else (s + 1) & ~1
+        while a + 4 <= e:
+            w = self.bin.read_int(a, 4)
+            if w is None:
+                return None
+            if self.dis.arch == "arm64":
+                if w == 0 or w == 0xD503201F:                       # padding, nop
+                    a += 4
+                    continue
+                if (w & 0xFFC07FFF) == 0xA9807BFD or w in (0xD503233F, 0xD503245F, 0xD503249F):
+                    return a
+                return None
+            h = w & 0xFFFF
+            if w == 0 or h == 0xBF00 or w == 0xE1A00000 or w == 0xE320F000:   # padding, nops
+                a += 2 if h in (0, 0xBF00) and w != 0 else 4
+                continue
+            if a % 4 == 0 and ((w & 0xFFFF4000) == 0xE92D4000 or w == 0xE52DE004):
+                return a                                            # A32 push {..., lr}
+            if (h & 0xFF00) == 0xB500 or (h == 0xE92D and (w >> 16) & 0x4000):
+                return a | 1                                        # Thumb push {..., lr}
+            return None
+        return None
 
     def _gap_function(self, s: int, e: int, prologues: tuple[bytes, ...]) -> int | None:
         """First plausible function start in [s, e) after alignment padding."""
