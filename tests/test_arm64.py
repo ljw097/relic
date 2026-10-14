@@ -59,3 +59,13 @@ def test_every_function_decompiles(an):
         if not f.is_import:
             text = decompile(a, f).text
             assert text.count("{") == text.count("}"), f.name
+
+
+def test_callee_clobber_summary(flow_a64_O2):
+    from relic.decompiler.clobbers import callee_clobbers
+    a = analyze(flow_a64_O2)
+    clob = callee_clobbers(a, a.function_by_name("gcd").addr)
+    assert clob is not None and {"x0", "x1", "x2", "x3"} <= clob    # sdiv w3 / msub w1 / mov w2
+    assert "x4" not in clob and "x19" not in clob                   # registers gcd never writes
+    puts = next(f.addr for f in a.functions.values() if f.is_import)
+    assert callee_clobbers(a, puts) is None             # imports: the whole ABI set

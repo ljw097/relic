@@ -60,6 +60,13 @@ def lift_function(an: Analysis, f: Function) -> IRFunction:
             for s in ib.succs:
                 if s in out.blocks and ib.addr not in out.blocks[s].preds:
                     out.blocks[s].preds.append(ib.addr)
+    # calls to functions of this binary change only the registers the callee writes (gcc keeps
+    # values in caller-saved registers across such calls at -O2: -fipa-ra)
+    from ..clobbers import callee_clobbers
+    for ib in out.blocks.values():
+        for s in ib.stmts:
+            if isinstance(s, CallStmt) and not s.tail and isinstance(s.call.target, Const):
+                s.clobbers = callee_clobbers(an, s.call.target.value)
     # a conditional jump into another function is a conditional tail call: give it a
     # block of its own (call + return) so every branch target is a block of this function
     bits = an.bin.bits

@@ -207,11 +207,16 @@ class FunctionAnalyzer:
                         leaders.add(t)
                         work.append(t)
                     self.prev[nxt] = a
+                    if i.target is not None:
+                        # a branch target's first predecessor: lets jump-table matching look past
+                        # `b.ls table_block` back to the bounds check (`cmp w0, #11`)
+                        self.prev.setdefault(i.target, a)
                     a = nxt
                     continue
-                # function pointers taken by address (not on ARM: its immediates are offsets and
-                # masks, addresses come from literal pools)
-                for r in (i.refs if self.dis.md_thumb is None else ()):
+                # function pointers taken by address -- not on ARM (its immediates are offsets and
+                # masks, addresses come from literal pools) nor from AArch64 `adr` (local labels
+                # such as a jump table's base; function pointers come from `adrp` + `add`)
+                for r in (i.refs if self.dis.md_thumb is None and i.mnemonic != "adr" else ()):
                     if r not in self.funcs and self.bin.is_exec(r) and r != start and self._looks_like_code(r):
                         self._queue.append(r)
                 self.prev[nxt] = a
@@ -280,6 +285,97 @@ class FunctionAnalyzer:
                 break
             out.append(i)
             a = self.prev.get(a)
+        return out
+
+    def _arm64_jump_table(self, jmp: Insn) -> list[int]:
+        """gcc's AArch64 switch dispatch, bounded by a `cmp wI, #n` before it:
+
+            adrp xT, table ; add xT, xT, :lo12:table
+            ldrb wE, [xT, wI, uxtw]          (ldrh ... lsl #1 / ldr ... lsl #2: wider entries)
+            adr  xB, base
+            add  xD, xB, wE, sxtb #2         (entries are signed offsets from `base`, in words)
+            br   xD
+        """
+        import capstone.arm64 as A64
+        c = jmp.cs
+        if jmp.mnemonic != "br" or not c.operands or c.operands[0].type != 1:
+            return []
+
+        def reg(name: str) -> str:              # w5 and x5 are the same register
+            return name[1:] if name[:1] in ("w", "x") and name[1:].isdigit() else name
+
+        def ops(i):
+            return i.cs.operands
+
+        hist = self._back(jmp.addr, 16)
+        want = reg(c.reg_name(c.operands[0].reg))
+        k = 0
+
+        def find(pred):
+            nonlocal k
+            while k < len(hist):
+                i = hist[k]
+                k += 1
+                if pred(i):
+                    return i
+            return None
+
+        add = find(lambda i: i.mnemonic == "add" and len(ops(i)) == 3 and ops(i)[2].type == 1
+                   and reg(i.cs.reg_name(ops(i)[0].reg)) == want)
+        if add is None:
+            return []
+        o = ops(add)
+        base_reg, off_reg = reg(add.cs.reg_name(o[1].reg)), reg(add.cs.reg_name(o[2].reg))
+        ext, shift = o[2].ext, o[2].shift.value
+        signed = ext in (A64.ARM64_EXT_SXTB, A64.ARM64_EXT_SXTH, A64.ARM64_EXT_SXTW)
+        save = k
+        adr = find(lambda i: i.mnemonic == "adr" and reg(i.cs.reg_name(ops(i)[0].reg)) == base_reg)
+        if adr is None:
+            return []
+        base = ops(adr)[1].imm
+        k = save
+        load = find(lambda i: i.mnemonic in ("ldrb", "ldrh", "ldr", "ldrsb", "ldrsh", "ldrsw")
+                    and reg(i.cs.reg_name(ops(i)[0].reg)) == off_reg and len(ops(i)) == 2
+                    and ops(i)[1].type == 3 and ops(i)[1].mem.index)
+        if load is None:
+            return []
+        m = ops(load)[1].mem
+        tab_reg, idx = reg(load.cs.reg_name(m.base)), reg(load.cs.reg_name(m.index))
+        size = {"ldrb": 1, "ldrsb": 1, "ldrh": 2, "ldrsh": 2, "ldrsw": 4}.get(
+            load.mnemonic, 4 if load.cs.reg_name(ops(load)[0].reg).startswith("w") else 8)
+        lo = find(lambda i: i.mnemonic == "add" and len(ops(i)) == 3 and ops(i)[2].type == 2
+                  and reg(i.cs.reg_name(ops(i)[0].reg)) == tab_reg)
+        page = find(lambda i: i.mnemonic == "adrp" and reg(i.cs.reg_name(ops(i)[0].reg)) == tab_reg)
+        if lo is None or page is None:
+            return []
+        table = ops(page)[1].imm + ops(lo)[2].imm
+        # the bound: `cmp` on the index or on the register it was copied from (`mov w5, w0`)
+        aliases = {idx}
+        for _ in range(3):
+            for i in hist:
+                o = ops(i)
+                if i.mnemonic == "mov" and len(o) == 2 and o[1].type == 1:
+                    a, b = reg(i.cs.reg_name(o[0].reg)), reg(i.cs.reg_name(o[1].reg))
+                    if a in aliases or b in aliases:
+                        aliases |= {a, b}
+        n = None
+        for i in hist:
+            o = ops(i)
+            if i.mnemonic == "cmp" and len(o) == 2 and o[0].type == 1 and o[1].type == 2 and \
+                    reg(i.cs.reg_name(o[0].reg)) in aliases:
+                n = o[1].imm
+                break
+        if n is None or not 0 <= n < 4096:
+            return []
+        out = []
+        for e in range(n + 1):
+            v = self.bin.read_int(table + size * e, size, signed=signed)
+            if v is None:
+                return []
+            t = base + (v << shift)
+            if not self.bin.is_exec(t):
+                return []
+            out.append(t)
         return out
 
     def _arm_jump_table(self, jmp: Insn) -> list[int]:
@@ -376,6 +472,8 @@ class FunctionAnalyzer:
         """Resolve `jmp reg` / `jmp [table+reg*N]` switch dispatch on x86."""
         if self.dis.arch == "arm":
             return self._arm_jump_table(jmp)
+        if self.dis.arch == "arm64":
+            return self._arm64_jump_table(jmp)
         if self.dis.arch not in ("x86", "x64"):
             return []
         ptr = self.bin.bits // 8
@@ -480,6 +578,18 @@ class FunctionAnalyzer:
                     return self._name_main(pushes[-1].refs[0])
         return None
 
+    def add_function(self, addr: int, name: str | None = None) -> int:
+        """Analyse one more function (and what it reaches) after `run`; returns its address."""
+        if self.dis.md_thumb is not None and addr & 1:
+            self.dis.hint(addr, True)
+            addr &= ~1
+        self._queue.append(addr)
+        self._drain()
+        if name == "main":
+            self._name_main(addr)
+        self._link()
+        return addr
+
     def _name_main(self, cand: int) -> int:
         self.bin.add_symbol(Symbol("main", cand, 0, "func", "synthetic"), override=True)
         self.bin.name_to_addr["main"] = cand
@@ -488,10 +598,11 @@ class FunctionAnalyzer:
         return cand
 
     def _scan_gaps(self):
-        """Pick up functions only reachable indirectly (prologue scan, x86)."""
-        if self.dis.arch not in ("x86", "x64"):
+        """Pick up functions only reachable indirectly (prologue scan: x86, ARM, AArch64)."""
+        if self.dis.arch not in ("x86", "x64", "arm", "arm64"):
             return
         prologues = (b"\xf3\x0f\x1e\xfa", b"\xf3\x0f\x1e\xfb", b"\x55\x48\x89\xe5", b"\x55\x89\xe5")
+        tried: set[int] = set()
         for sec in self.bin.exec_sections:
             if sec.name in (".plt", ".plt.sec", ".plt.got", ".init", ".fini"):
                 continue
@@ -508,12 +619,46 @@ class FunctionAnalyzer:
                 if cur < sec.end:
                     gaps.append((cur, sec.end))
                 for s, e in gaps:
-                    start = self._gap_function(s, e, prologues)
-                    if start is not None:
+                    if self.dis.arch in ("arm", "arm64"):
+                        start = self._arm_gap_function(s, e)
+                    else:
+                        start = self._gap_function(s, e, prologues)
+                    if start is not None and start not in tried:
+                        tried.add(start)
                         self._queue.append(start)
                         self._drain()
                         changed = True
                         break
+
+    def _arm_gap_function(self, s: int, e: int) -> int | None:
+        """First prologue in [s, e) after padding (an odd result is a Thumb start).
+
+        AArch64: `stp x29, x30, [sp, #-n]!`, `paciasp`, `bti c`. ARM: A32 `push {..., lr}`
+        (`stmdb sp!` / `str lr, [sp, #-4]!`), Thumb `push {..., lr}` and Thumb-2 `push.w`.
+        Gaps also hold literal pools and tables, so only a real prologue counts here.
+        """
+        a = (s + 3) & ~3 if self.dis.arch == "arm64" else (s + 1) & ~1
+        while a + 4 <= e:
+            w = self.bin.read_int(a, 4)
+            if w is None:
+                return None
+            if self.dis.arch == "arm64":
+                if w == 0 or w == 0xD503201F:                       # padding, nop
+                    a += 4
+                    continue
+                if (w & 0xFFC07FFF) == 0xA9807BFD or w in (0xD503233F, 0xD503245F, 0xD503249F):
+                    return a
+                return None
+            h = w & 0xFFFF
+            if w == 0 or h == 0xBF00 or w == 0xE1A00000 or w == 0xE320F000:   # padding, nops
+                a += 2 if h in (0, 0xBF00) and w != 0 else 4
+                continue
+            if a % 4 == 0 and ((w & 0xFFFF4000) == 0xE92D4000 or w == 0xE52DE004):
+                return a                                            # A32 push {..., lr}
+            if (h & 0xFF00) == 0xB500 or (h == 0xE92D and (w >> 16) & 0x4000):
+                return a | 1                                        # Thumb push {..., lr}
+            return None
+        return None
 
     def _gap_function(self, s: int, e: int, prologues: tuple[bytes, ...]) -> int | None:
         """First plausible function start in [s, e) after alignment padding."""

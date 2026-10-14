@@ -39,7 +39,12 @@ class Analysis:
     # ------------------------------------------------------------------ run
     def run(self) -> "Analysis":
         report("functions", 0, force=True)
-        self.functions = FunctionAnalyzer(self.bin, self.dis).run()
+        finder = FunctionAnalyzer(self.bin, self.dis)
+        self.functions = finder.run()
+        if "main" not in self.bin.name_to_addr:
+            main = self._main_from_start()
+            if main is not None:
+                finder.add_function(main, "main")
         self._fstarts = sorted(self.functions)
         report("strings", 0, force=True)
         self.strings = find_strings(self.bin)
@@ -47,6 +52,38 @@ class Analysis:
         self._build_xrefs()
         self.load_project()
         return self
+
+    def _main_from_start(self) -> int | None:
+        """`main` of a stripped binary: the first argument `_start` passes to __libc_start_main,
+        read from the lifted entry code (a constant, or a GOT / literal-pool slot holding it).
+        The x86 finder recognises its own `_start` already; this covers the other lifters."""
+        if self.bin.format != "ELF" or self.bin.arch in ("x86", "x64"):
+            return None
+        start = self.functions.get(self.bin.entry)
+        if start is None:
+            return None
+        try:
+            from ..decompiler.arch import arch_for
+            from ..decompiler.calls import int_arg_regs
+            from ..decompiler.ir import CallStmt, Const, Load
+            from ..decompiler.lift import lift_function
+            from ..decompiler.passes import optimize
+            from ..decompiler.ssa import to_ssa
+            arch = arch_for(self.bin)
+            regs = int_arg_regs(arch)
+            ir = optimize(to_ssa(lift_function(self, start), arch), arch)
+        except Exception:  # noqa: BLE001 - no lifter for this target, or it failed: no main
+            return None
+        for s in ir.stmts():
+            if not (isinstance(s, CallStmt) and (s.name or "").split("@")[0] == "__libc_start_main"):
+                continue
+            v = dict(s.uses).get(regs[0]) if regs else None
+            if isinstance(v, Load) and isinstance(v.addr, Const):
+                v = self.bin.read_int(v.addr.value, v.bits // 8)
+                v = Const(v, arch.bits) if v is not None else None
+            if isinstance(v, Const) and v.value and self.bin.is_exec(v.value & ~1):
+                return v.value
+        return None
 
     def _build_xrefs(self):
         total = len(self.functions)

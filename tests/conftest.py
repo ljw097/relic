@@ -52,8 +52,20 @@ SOURCES = {"flow_O0": FLOW_SRC, "flow_O2": FLOW_SRC, "flow32_O0": FLOW_SRC, "flo
 
 def _build(name: str) -> str:
     out = os.path.join(BINS, f"{name}.out")
-    src_path = SOURCES.get(name, SRC)
-    if os.path.exists(out) and os.path.getmtime(out) >= os.path.getmtime(src_path) and not name.endswith("_stripped"):
+    base = name[: -len("_stripped")] if name.endswith("_stripped") else name
+    src_path = SOURCES.get(base, SRC)
+    if os.path.exists(out) and os.path.getmtime(out) >= os.path.getmtime(src_path):
+        return out
+    if name != base:
+        src = _build(base)
+        # the binutils of the target (`arm-linux-gnueabihf-strip`); the host's for native ones
+        prefix = COMPILERS.get(base, "")[: -len("gcc")] if COMPILERS.get(base, "").endswith("gcc") else ""
+        strip = shutil.which(f"{prefix}strip") or next(
+            (p for v in (14, 13, 12) if (p := shutil.which(f"{prefix}strip-{v}"))), None) \
+            if prefix else shutil.which("strip")
+        if strip is None:
+            pytest.skip(f"no strip for {base}")
+        subprocess.run([strip, "-o", out, src], check=True)
         return out
     if name in COMPILERS:   # cross compilers may only exist under a versioned name (`...-gcc-14`)
         cc = shutil.which(COMPILERS[name]) or next(
@@ -63,13 +75,6 @@ def _build(name: str) -> str:
     if cc is None:
         pytest.skip(f"no C compiler for {name}")
     os.makedirs(BINS, exist_ok=True)
-    if name.endswith("_stripped"):
-        src = _build(name[: -len("_stripped")])
-        strip = shutil.which("strip")
-        if strip is None:
-            pytest.skip("strip not available")
-        subprocess.run([strip, "-o", out, src], check=True)
-        return out
     try:
         subprocess.run([cc, *VARIANTS[name], "-w", "-o", out, src_path], check=True, capture_output=True)
     except subprocess.CalledProcessError as e:
@@ -122,6 +127,10 @@ flow_a64_O0 = _fixture("flow_a64_O0")
 flow_a64_O2 = _fixture("flow_a64_O2")
 vuln_arm = _fixture("vuln_arm")
 vuln_thumb = _fixture("vuln_thumb")
+vuln_arm_stripped = _fixture("vuln_arm_stripped")
+vuln_thumb_stripped = _fixture("vuln_thumb_stripped")
+vuln_a64_stripped = _fixture("vuln_a64_stripped")
+vuln_a64_pie_stripped = _fixture("vuln_a64_pie_stripped")
 flow_arm_O0 = _fixture("flow_arm_O0")
 flow_arm_O2 = _fixture("flow_arm_O2")
 flow_thumb_O0 = _fixture("flow_thumb_O0")

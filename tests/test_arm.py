@@ -73,3 +73,18 @@ def test_every_function_decompiles(an):
         if not f.is_import:
             text = decompile(a, f).text
             assert text.count("{") == text.count("}"), f.name
+
+
+@pytest.mark.parametrize("name", ["vuln_arm_stripped", "vuln_thumb_stripped", "vuln_a64_stripped",
+                                  "vuln_a64_pie_stripped"])
+def test_stripped_binary_finds_main_and_win(request, name):
+    """No symbols at all: `main` from __libc_start_main's argument in `_start` (a GOT slot here),
+    functions only reached through pointers (`win`) from a prologue scan of the gaps."""
+    a = analyze(request.getfixturevalue(name))
+    main = a.function_by_name("main")
+    assert main is not None
+    code = decompile(a, main).text
+    assert code.startswith("int main(int a1, ") and "setvbuf(" in code and "while (1) {" in code
+    kinds = {f.kind for f in a.vulns()}
+    assert "win-function" in kinds and "dangerous-call" in kinds
+    assert len([f for f in a.functions.values() if not f.is_import]) >= 14

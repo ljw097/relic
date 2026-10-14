@@ -146,4 +146,24 @@ F int sw_calls(int x, int y) {
     return r + x;
 }
 
+// a bigger switch: AArch64 gcc emits a table of byte / word offsets from an `adr` base
+F int sw_big(int x, int y) {
+    int r;
+    switch (x) {
+    case 0: r = gcd(y, 18); break;
+    case 1: r = sc_or(y, 7) + 3; break;
+    case 2: r = clamp(y, -5, 50) * 2; break;
+    case 3: r = y - 7; break;
+    case 4: r = gcd(y + 1, 30); break;
+    case 5: r = sc_or(y ^ 5, 1); break;
+    case 6: return mod10(y);
+    case 7: r = y * y; break;
+    case 9: r = gcd(y, 4) - sc_or(y, 9); break;
+    case 10: r = y << 3; break;
+    case 11: r = clamp(-y, 0, 99); break;
+    default: r = -y;
+    }
+    return r + x;
+}
+
 int main(void) { return 0; }
