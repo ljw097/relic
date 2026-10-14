@@ -138,9 +138,12 @@ def test_jump_table_switch(flow):
     """sw_calls is a dense switch: a jump table at every optimisation level."""
     name, an = flow
     text = decompile(an, an.function_by_name("sw_calls")).text
+    if name != "flow_a64_O0":     # (an unoptimised compare tree with tail-duplicated joins)
+        assert "switch (" in text, f"{name}:\n{text}"
     if not name.startswith("flow_a64"):
-        assert "switch (" in text and "default:" in text, f"{name}:\n{text}"
-    # (AArch64 gcc compiles this switch to a compare tree, not a table: an if-chain is right)
+        assert "default:" in text, f"{name}:\n{text}"
+    # (AArch64 gcc compiles this switch to a compare tree: chains.py turns it back into a switch,
+    # with the no-match code after it instead of a `default`)
     for callee in ("sc_or(", "gcd(", "clamp(", "collatz(", "mod10("):
         assert callee in text, f"{name}: {callee}\n{text}"
     assert "goto" not in text, f"{name}:\n{text}"

@@ -81,6 +81,8 @@ def prepare(an: "Analysis", func: "Function") -> Prepared:
     fold_short_circuits(fn)
     st = Structurer(fn)
     tree = st.run()
+    from .chains import switchify
+    tree = switchify(tree, frozenset(st.gotos))     # compare chains on one value -> switch
     return Prepared(fn, arch, frame, params, rets, tree, st.gotos, w)
 
 
