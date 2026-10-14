@@ -39,10 +39,12 @@ class Field:
     ctype: str = ""
     name: str = ""
     child: "Struct | None" = None            # the struct a pointer field points to
+    array: bool = False                      # an array of `bits`-wide elements
+    count: int | None = None                 # its length (None: a flexible member, last)
 
     @property
     def end(self) -> int:
-        return self.offset + self.bits // 8
+        return self.offset + self.bits // 8 * ((self.count or 1) if self.array else 1)
 
 
 @dataclass
@@ -57,7 +59,15 @@ class Struct:
 
     def field_at(self, offset: int, bits: int) -> Field | None:
         f = self.fields.get(offset)
-        return f if f is not None and f.bits == bits else None
+        return f if f is not None and f.bits == bits and not f.array else None
+
+    def array_at(self, offset: int, bits: int) -> tuple[Field, int] | None:
+        """(array field, element index) for an element-wide access at `offset` inside an array."""
+        for f in self.fields.values():
+            if f.array and f.bits == bits and offset >= f.offset and (offset - f.offset) % (bits // 8) == 0 \
+                    and (f.count is None or offset < f.end):
+                return f, (offset - f.offset) // (bits // 8)
+        return None
 
     def declaration(self, sname=None, fname=None, ftype=None) -> list[str]:
         """C lines; `sname(struct)` / `fname(field)` give the names to show (user renames),
@@ -75,7 +85,8 @@ class Struct:
                 continue                     # overlaps the previous field: shown through casts
             t = ftype(f) or (f"struct {sname(f.child)} *" if f.child is not None else (f.ctype or int_type(f.bits)))
             sep = "" if t.endswith("*") else " "
-            out.append(f"    {t}{sep}{fname(f)};")
+            dims = f"[{f.count if f.count is not None else ''}]" if f.array else ""
+            out.append(f"    {t}{sep}{fname(f)}{dims};")
             pos = f.end
         out.append("};")
         return out
@@ -96,6 +107,37 @@ def split_addr(addr: Expr) -> tuple[Expr, int] | None:
         return None
     if isinstance(addr, (Var, StackVar, Load)):
         return addr, 0
+    return None
+
+
+def split_indexed(addr: Expr) -> tuple[Expr, int, Expr, int] | None:
+    """(base, constant offset, index, element size) for `base + k + i*s` in any order of the
+    additions (`l->vals[i]`); None when the address has no single index term."""
+    terms: list[Expr] = []
+
+    def flat(e: Expr):
+        if isinstance(e, BinOp) and e.op == "+":
+            flat(e.a)
+            flat(e.b)
+        else:
+            terms.append(e)
+    flat(addr)
+    k = sum(t.signed for t in terms if isinstance(t, Const))
+    rest = [t for t in terms if not isinstance(t, Const)]
+    if len(rest) != 2 or not 0 <= k < 0x10000:
+        return None
+    for base, idx in ((rest[0], rest[1]), (rest[1], rest[0])):
+        if not isinstance(base, (Var, StackVar, Load)):
+            continue
+        if isinstance(idx, BinOp) and idx.op == "*" and isinstance(idx.b, Const):
+            return base, k, idx.a, idx.b.value
+        if isinstance(idx, BinOp) and idx.op == "<<" and isinstance(idx.b, Const) and idx.b.value < 8:
+            return base, k, idx.a, 1 << idx.b.value
+    # a byte array: the index is not scaled (`l->name[k]`); the base is the pointer-wide term
+    ptrs = [t for t in rest if isinstance(t, (Var, StackVar, Load))]
+    if len(ptrs) == 1:
+        other = rest[1] if rest[0] is ptrs[0] else rest[0]
+        return ptrs[0], k, other, 1
     return None
 
 
@@ -201,6 +243,15 @@ def store_aliases(fn: IRFunction, defs: dict[str, Expr], ptr_bits: int) -> dict[
 class _Use:
     sizes: dict[int, set] = field(default_factory=dict)      # offset -> widths
     hints: dict[int, str] = field(default_factory=dict)      # offset -> C type
+    arrays: dict[int, int] = field(default_factory=dict)     # offset -> element width (indexed accesses)
+
+    def merge(self, u: "_Use"):
+        for off, bs in u.sizes.items():
+            self.sizes.setdefault(off, set()).update(bs)
+        for off, t in u.hints.items():
+            self.hint(off, t)
+        for off, b in u.arrays.items():
+            self.arrays.setdefault(off, b)
 
     def add(self, off: int, bits: int):
         self.sizes.setdefault(off, set()).add(bits)
@@ -222,6 +273,11 @@ def scan(fn: IRFunction, fn_addr: int, ptr_bits: int, name_of=None) -> dict[tupl
     def access(addr: Expr, bits: int) -> tuple | None:
         sp = split_addr(addr)
         if sp is None:
+            ix = split_indexed(addr)
+            if ix is not None and ix[3] == bits // 8 and ix[0].bits == ptr_bits:
+                key = base_key(ix[0], fn_addr, defs, ptr_bits, aliases)
+                if key is not None:
+                    uses.setdefault(key, _Use()).arrays.setdefault(ix[1], bits)
             return None
         key = base_key(sp[0], fn_addr, defs, ptr_bits, aliases)
         if key is None:
@@ -306,6 +362,8 @@ def _is_struct(use: _Use, global_elem: bool = False, field: bool = False, ptr_bi
     read out of a struct field is one already at a single access past its start."""
     if field and use.sizes and max(use.sizes) > 0:
         return True
+    if use.arrays and (use.sizes or max(use.arrays) > 0):
+        return True                           # an array inside something: `l->vals[i]` beside `l->n`
     if len(use.sizes) < 2:
         return False
     widths = {b for bs in use.sizes.values() for b in bs}
@@ -324,7 +382,26 @@ def _build(name: str, key: tuple, use: _Use, ptr_bits: int) -> Struct:
         if bits != ptr_bits and t.endswith("*"):
             t = ""
         st.fields[off] = Field(off, bits, t, f"f_{off:x}")
+    _add_arrays(st, use.arrays)
     return st
+
+
+def _add_arrays(st: Struct, arrays: dict[int, int]):
+    """Array fields: each runs to the next field after it (a flexible member when none follows);
+    fixed accesses inside it are its elements."""
+    for off in sorted(arrays):
+        bits = arrays[off]
+        if any(f.array and f.offset <= off < f.end for f in st.fields.values() if f.count is not None):
+            continue
+        later = [o for o, f in st.fields.items() if o > off and not (f.bits == bits and (o - off) % (bits // 8) == 0
+                                                                     and o not in arrays)]
+        later += [o for o in arrays if o > off]
+        nxt = min(later, default=None)
+        count = (nxt - off) // (bits // 8) if nxt is not None else None
+        end = nxt if nxt is not None else 1 << 30
+        for o in [o for o in st.fields if off <= o < end]:
+            del st.fields[o]                  # `l->vals[0]` read on its own is element 0
+        st.fields[off] = Field(off, bits, "", f"f_{off:x}", array=True, count=count)
 
 
 # ---------------------------------------------------------------- per analysis
@@ -405,11 +482,7 @@ def global_struct(an: "Analysis", key: tuple, ptr_bits: int) -> Struct | None:
     use = _Use()
     links: dict[tuple, tuple] = {}
 
-    def merge(u):
-        for off, bs in u.sizes.items():
-            use.sizes.setdefault(off, set()).update(bs)
-        for off, t in u.hints.items():
-            use.hint(off, t)
+    merge = use.merge
 
     regs = _param_regs(an)
     for f in funcs[:MAX_SCAN]:
@@ -453,21 +526,14 @@ def function_structs(an: "Analysis", faddr: int, res: dict, ptr_bits: int) -> di
         for ckey, cu in _scan_function(an, cf).items():
             if isinstance(cu, _Use) and root(ckey) == croot:
                 tgt = reroot(ckey, passed) if ckey != croot else passed
-                m = merged.setdefault(tgt, _Use())
-                for off, bs in cu.sizes.items():
-                    m.sizes.setdefault(off, set()).update(bs)
-                for off, t in cu.hints.items():
-                    m.hint(off, t)
+                merged.setdefault(tgt, _Use()).merge(cu)
     for tgt, m in merged.items():
         u = uses.get(tgt)
         if u is None:
             uses[tgt] = m
             continue
-        u2 = _Use({o: set(b) for o, b in u.sizes.items()}, dict(u.hints))
-        for off, bs in m.sizes.items():
-            u2.sizes.setdefault(off, set()).update(bs)
-        for off, t in m.hints.items():
-            u2.hint(off, t)
+        u2 = _Use({o: set(b) for o, b in u.sizes.items()}, dict(u.hints), dict(u.arrays))
+        u2.merge(m)
         uses[tgt] = u2
     f = an.functions.get(faddr)
     fname = "".join(c if c.isalnum() else "_" for c in (an.name(faddr) or (f.name if f else f"{faddr:x}")))
@@ -555,8 +621,11 @@ class StructView:
         if not layout:
             return None
         st = Struct(gen, ("saved", gen))
-        for off, (bits, ctype) in layout.items():
-            st.fields[int(off, 16)] = Field(int(off, 16), bits, ctype, f"f_{int(off, 16):x}")
+        for off, entry in layout.items():
+            o = int(off, 16)
+            st.fields[o] = Field(o, entry[0], entry[1], f"f_{o:x}")
+            if len(entry) > 2:                         # an array: its length (-1: flexible)
+                st.fields[o].array, st.fields[o].count = True, (entry[2] if entry[2] >= 0 else None)
         self.an.__dict__.setdefault("_local_structs", {})[gen] = st
         return st
 
@@ -614,7 +683,8 @@ class StructView:
             return
         d = self.an.struct_names.get(st.name)
         if d is not None:
-            d["layout"] = {f"{o:#x}": [f.bits, f.ctype] for o, f in sorted(st.fields.items())}
+            d["layout"] = {f"{o:#x}": [f.bits, f.ctype] + ([f.count if f.count is not None else -1] if f.array else [])
+                           for o, f in sorted(st.fields.items())}
         for f in st.fields.values():
             c = self.child(st, f)
             if c is not None and c is not st and c not in self.used and \
@@ -674,6 +744,25 @@ class StructView:
             return None
         f = st.field_at(sp[1], bits)
         return (sp[0], st, f) if f is not None else None
+
+    def array_ref(self, addr: Expr, bits: int) -> tuple[Expr, Struct, Field, Expr] | None:
+        """(base, struct, array field, index) for an element of an array field: `l->vals[i]`
+        (`base + k + i*s`) or `l->vals[2]` (a fixed offset inside the array)."""
+        sp = split_addr(addr)
+        if sp is not None:
+            st = self.struct_of(sp[0])
+            hit = st.array_at(sp[1], bits) if st is not None else None
+            return (sp[0], st, hit[0], Const(hit[1], 32)) if hit is not None else None
+        ix = split_indexed(addr)
+        if ix is None or ix[3] != bits // 8:
+            return None
+        st = self.struct_of(ix[0])
+        hit = st.array_at(ix[1], bits) if st is not None else None
+        if hit is None:
+            return None
+        f, j = hit
+        idx = ix[2] if not j else BinOp("+", ix[2], Const(j, ix[2].bits), ix[2].bits)
+        return ix[0], st, f, idx
 
     def part_of_field(self, addr: Expr, bits: int) -> tuple[Expr, Struct, Field] | None:
         """(base, struct, field) when `bits` at `addr` are the low part of a wider field (a 16-bit

@@ -270,6 +270,10 @@ class CWriter:
         fa = self.structs.field(addr, bits)
         if fa is not None:
             return f"{self.expr(fa[0], PREC_POSTFIX)}->{self.fname(*fa[1:])}"
+        ar = self.structs.array_ref(addr, bits)
+        if ar is not None:
+            base, st, f, idx = ar
+            return f"{self.expr(base, PREC_POSTFIX)}->{self.fname(st, f)}[{self.expr(_bare(idx))}]"
         if self.an.bin.endian == "little":
             pa = self.structs.part_of_field(addr, bits)
             if pa is not None:                    # the low bytes of a wider field
@@ -392,6 +396,11 @@ class CWriter:
                 left = f"(unsigned {int_type(a.bits)}){self.expr(a, PREC_UNARY)}" if a.bits in (8, 16, 32) \
                     else f"({int_type(a.bits, True)}){self.expr(a, PREC_UNARY)}"
                 return f"{left} {op} {self.expr(b, p + 1)}", p
+        if e.op in ("+", "-") and (self._struct_ptr(a) or e.op == "+" and self._struct_ptr(b)):
+            # a byte offset from a struct pointer (not a field: a loop's end pointer, say)
+            if self._struct_ptr(b) and not self._struct_ptr(a):
+                a, b = b, a
+            return f"(char *){self.expr(a, PREC_UNARY)} {op} {self.expr(b, p + 1)}", p
         if e.op in ("+", "-"):
             ptr = self._scaled(a, b)
             if ptr is not None:
@@ -410,6 +419,12 @@ class CWriter:
 
     _SIZES = {"char": 1, "unsigned char": 1, "short": 2, "unsigned short": 2, "int": 4, "unsigned int": 4,
               "int64_t": 8, "uint64_t": 8}
+
+    def _struct_ptr(self, e: Expr) -> bool:
+        if isinstance(e, (Var, StackVar)):
+            t = self.types.get(e.name)
+            return t is not None and t.ptr >= 1 and t.base.startswith("struct ")
+        return False
 
     def _ptr_size(self, e: Expr) -> int:
         """Element size if `e` is a typed pointer variable (C scales arithmetic on it), else 0."""

@@ -11,7 +11,7 @@ from relic.decompiler.emit import decompile
 
 HERE = os.path.dirname(__file__)
 FUNCS = ["item_score", "item_add", "name_len", "pool_total", "pool_first", "item_weight", "make_item",
-         "chain_sum"]      # callees first
+         "list_sum", "list_put", "list_initial", "chain_sum"]      # callees first
 
 
 def _c(an, name):
@@ -103,6 +103,14 @@ int main(void) {
         if (item_weight((void *)&it[k]) != ref_item_weight(&it[k])) { printf("item_weight %%d\n", k); bad++; }
     }
     if (chain_sum((void *)&n1) != ref_chain_sum(&n1)) { printf("chain_sum\n"); bad++; }
+    struct list la = {3, -2, {4, -9, 100, 7, 7, 7, 7, 7}, "hello, struct"}, lb = la;
+    for (int i = -1; i < 9; i++) {
+        list_put((void *)&la, i, i * 11 - 3); ref_list_put(&lb, i, i * 11 - 3);
+        if (memcmp(&la, &lb, sizeof la)) { printf("list_put %%d\n", i); bad++; }
+        if (list_sum((void *)&la) != ref_list_sum(&la)) { printf("list_sum %%d\n", i); bad++; }
+        for (int k = 0; k < 20; k += 3)
+            if (list_initial((void *)&la, k) != ref_list_initial(&la, k)) { printf("list_initial %%d\n", k); bad++; }
+    }
     int ns[] = {-5, 0, 3, 7, 1234, 70000};
     for (int k = 0; k < 6; k++)
         if (make_item(ns[k]) != ref_make_item(ns[k])) { printf("make_item %%d\n", ns[k]); bad++; }
@@ -228,3 +236,15 @@ def test_local_struct_passed_to_a_callee(request, variant):
     assert f"int item_weight(struct {name} *a1)" in callee, callee
     decl = re.search(r"^struct %s \{.*?^\};" % name, caller, re.M | re.S).group(0)
     assert "short f_c;" in decl and "int64_t f_10;" in decl and decl in callee
+
+
+@pytest.mark.parametrize("variant", ["structs_O0", "structs_O2"])
+def test_array_fields(request, variant):
+    an = analyze(request.getfixturevalue(variant))
+    text = _c(an, "list_put")
+    assert re.search(r"void list_put\(struct s_list_put_\d+ \*a1, int a2, int a3\)", text), text
+    assert "    int f_8[];" in text and re.search(r"->f_8\[\w+\] = ", text) and "->f_0 = " in text, text
+    text = _c(an, "list_initial")
+    assert "    char f_28[];" in text and re.search(r"->f_28\[\w+ & 15\]", text), text
+    if variant.endswith("O0"):                  # (-O2 walks a pointer through vals instead)
+        assert re.search(r"->f_8\[var_\w+\]", _c(an, "list_sum"))

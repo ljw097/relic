@@ -16,6 +16,13 @@ struct node {
     struct node *next;
 };
 
+struct list {
+    int n;
+    short tag;
+    int vals[8];
+    char name[16];
+};
+
 struct item *pool[4];
 
 int item_score(struct item *it) {
@@ -56,6 +63,25 @@ int make_item(int n) {
     int w = item_weight(it);
     free(it);
     return w + n;
+}
+
+int list_sum(struct list *l) {
+    int s = 0;
+    for (int i = 0; i < l->n; i++)
+        s += l->vals[i] * l->tag;
+    return s;
+}
+
+void list_put(struct list *l, int i, int v) {
+    if (i >= 0 && i < 8) {
+        l->vals[i] = v;
+        if (i >= l->n)
+            l->n = i + 1;
+    }
+}
+
+int list_initial(struct list *l, int k) {
+    return l->name[k & 15] ? l->name[k & 15] + l->n : -1;
 }
 
 int chain_sum(struct node *n) {

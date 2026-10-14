@@ -222,7 +222,18 @@ def returns_value(an: "Analysis", func: "Function", fn: IRFunction, ret_reg: str
     if reads:
         return any(r != "none" for r in reads)
     rets = [s.value for s in fn.stmts() if isinstance(s, Return)]
-    return any(v is not None and not (isinstance(v, Var) and v.version == 0) for v in rets)
+    # a function that returns something sets the register on every path: one where the entry
+    # value can still come back (through phis) only used it as scratch (-O0 x86 `rax`)
+    phis = {s.dst: s.src for s in fn.stmts() if isinstance(s, Assign) and isinstance(s.dst, Var)
+            and isinstance(s.src, Phi)}
+
+    def entry(v, depth=8) -> bool:
+        if isinstance(v, Var) and v.version == 0:
+            return True
+        if depth and v in phis:
+            return any(entry(x, depth - 1) for _, x in phis[v].sources)
+        return False
+    return any(v is not None for v in rets) and not any(v is not None and entry(v) for v in rets)
 
 
 def drop_return_values(fn: IRFunction):
