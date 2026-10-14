@@ -30,7 +30,7 @@
   - [x] x86-32 PIC: `__x86.get_pc_thunk.*` + `add` 로 만든 GOT 기준 레지스터
   - [x] AArch64: `adrp` + `add` / `ldr`
   - [x] ARM / Thumb: 리터럴 풀 `ldr rN, [pc, #off]`, `add rN, pc`, `adr`, `movw`/`movt`
-  - [ ] MIPS: `lui` + `addiu`, `$gp` 기준 접근 (MIPS 지원과 함께)
+  - [x] MIPS: `$gp` 고정(`_gp` = GOT + 0x7ff0), `lui` + `addiu`, GOT 슬롯 로드(PIE의 로컬 GOT 페이지 + `addiu`), 슬롯에서 읽은 `$t9`로 호출 이름
   - 문자열 xref 비율: armhf `ld.so` 1 → 513/842, aarch64 `ld.so` 0 → 409/836, `vuln32_pie` 0 → 10/10
   - [x] ARM/AArch64 즉치값은 주소로 보지 않음(`mov w0, #0xffff`가 PIE에서 함수 시작으로 잡히던 문제), 빈 구간 계산은 함수 범위가 아니라 블록 구간으로(멀리 떨어진 cold 블록이 사이 함수들을 가리던 문제), 구간 중간의 프롤로그도 종결 명령 뒤라면 인정
 - [ ] **P0** 호출 규약별 인자 추출을 `vulns`에서 공통 사용
@@ -40,7 +40,7 @@
   - [ ] MIPS a0–a3, RISC-V a0–a7, PPC r3–r10 (해당 리프터가 생기면 같은 경로로)
 - [x] **P1** 점프 테이블: ~~x86-32 PIC(GOT 기준 오프셋)~~ (완료), ~~AArch64(`adrp`+`add` 테이블, `ldrb/ldrh/ldr` 항목, `adr` 기준, `add ..., sxtb #2`, 다른 블록의 `cmp`와 `mov` 별칭으로 범위)~~ (완료), ~~ARM(`addls pc, pc, rN, lsl #2`, `ldr pc, [pc, rN, lsl #2]`, Thumb `tbb`/`tbh`, `adr`+`ldr`+`add`+`bx` 오프셋 테이블)~~ (완료)
   - 상대 테이블은 후보 기준 주소들을 검증해서 선택
-- [ ] **P1** MIPS: `.MIPS.stubs` / GOT(`DT_MIPS_GOTSYM`, `DT_MIPS_LOCAL_GOTNO`) 기반 import 이름 해석, 지연 슬롯을 블록에 포함
+- [x] **P1** MIPS: GOT(`DT_PLTGOT`, `DT_MIPS_LOCAL_GOTNO`, `DT_MIPS_GOTSYM`, `DT_MIPS_SYMTABNO`) 기반 import(슬롯·`.MIPS.stubs` 스텁), 지연 슬롯을 분기 블록에 포함(`Insn.delay`, `Block.last`는 분기), `bal`은 호출(`bal .+8`은 pc 읽기), `jalr $t9`는 `lw $t9, off($gp)` 슬롯으로 이름·noreturn 판정
 - [x] **P1** ARM Thumb 모드: 주소별 명령어 집합(`$a`/`$t` 매핑 심볼, 심볼·엔트리 LSB, `bl`은 유지·`blx label`은 전환), IT 블록(조건을 한 번에 디코딩), Thumb PLT 진입점(`bx pc`)
   - [x] 심볼 없는(stripped) ARM / Thumb / AArch64: `_start`의 리프트된 IR에서 `__libc_start_main` 첫 인자(GOT·리터럴 풀 슬롯)를 읽어 `main` 복원, 함수 사이 빈 구간의 프롤로그 스캔(A32/Thumb `push {…, lr}`, AArch64 `stp x29, x30`·`paciasp`·`bti c`)으로 포인터로만 쓰이는 함수(`win`) 발견
   - [ ] **P2** 데이터 영역 오디코딩(ldc/stc 같은 coprocessor 명령) 감지
@@ -49,7 +49,7 @@
 ## 테스트 / 인프라
 
 - [x] **P0** GitHub Actions CI (pytest, gcc 설치, Python 3.10 / 3.12 / 3.13)
-- [ ] **P1** 멀티 아키텍처 샘플: `-m32`(완료: vuln32·flow32, CI에 gcc-multilib), `aarch64-linux-gnu-gcc`(완료: vuln_a64·flow_a64), `arm-linux-gnueabihf-gcc`(완료: vuln_arm·vuln_thumb·flow_arm·flow_thumb; CI는 교차 컴파일 job이 샘플을 만들고 본 job이 `-m32`로 재컴파일 검증), `mipsel-linux-gnu-gcc` (툴체인 없으면 skip)
+- [ ] **P1** 멀티 아키텍처 샘플: `-m32`(완료: vuln32·flow32, CI에 gcc-multilib), `aarch64-linux-gnu-gcc`(완료: vuln_a64·flow_a64), `arm-linux-gnueabihf-gcc`(완료: vuln_arm·vuln_thumb·flow_arm·flow_thumb; CI는 교차 컴파일 job이 샘플을 만들고 본 job이 `-m32`로 재컴파일 검증), `mipsel-linux-gnu-gcc`(완료: vuln_mips·vuln_mips_pie, CI 교차 job; MIPS 리프터는 아직 없음)
 - [x] case마다 함수를 호출하는 `switch` 샘플(`flow.c`의 `sw_calls`): x86-64/x86-32 × -O0/-O2 모두 점프 테이블 → `switch`, 재컴파일 검증
 - [x] PE 테스트: MinGW x64/x86 샘플로 로더·COFF 심볼·IAT 호출 이름·checksec·vulns·디컴파일 (CI에 mingw 설치, 없으면 skip)
 - [x] ruff 린트(`pyproject.toml`, E/F/W/B, CI `lint` job). 포맷터·import 정렬은 기존 줄바꿈 스타일과 맞지 않아 적용하지 않음

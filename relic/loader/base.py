@@ -90,6 +90,7 @@ class Binary:
         # mapping symbols (address -> "a" | "t" | "d")
         self.thumb_code: set[int] = set()
         self.arm_mapping: dict[int, str] = {}
+        self.mips_gp: int | None = None     # MIPS: value of $gp (GOT + 0x7ff0)
 
     # ------------------------------------------------------------------ memory
     def _finalize(self):

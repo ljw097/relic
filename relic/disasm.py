@@ -34,6 +34,7 @@ class Insn:
     cs: object = field(default=None, repr=False, compare=False)  # underlying capstone insn (detail available)
     cond: bool = False  # ARM: executes only when its condition holds
     thumb: bool = False  # ARM: decoded as Thumb
+    delay: bool = False  # MIPS: in the delay slot of the branch before it (runs before the branch takes effect)
 
     @property
     def end(self) -> int:
@@ -256,7 +257,8 @@ class Disassembler:
                 (arch.startswith("mips") and m == "jr" and c.op_str.strip() == "$ra") or \
                 (arch == "arm" and (m == "bx" and c.op_str == "lr" or (m.startswith("pop") and "pc" in c.op_str))):
             i.kind = RET
-        elif cs.CS_GRP_CALL in groups or m in ("bl", "blx", "blr", "jal", "jalr", "bctrl"):
+        elif cs.CS_GRP_CALL in groups or m in ("bl", "blx", "blr", "jal", "jalr", "bctrl") or \
+                (arch.startswith("mips") and m in ("bal", "bgezal", "bltzal", "jalx", "jalr.hb")):
             i.kind = CALL
         elif cs.CS_GRP_JUMP in groups or cs.CS_GRP_BRANCH_RELATIVE in groups:
             cond = False
@@ -274,6 +276,9 @@ class Disassembler:
         elif m in _HALT:
             i.kind = HALT
         imms = [op.imm for op in c.operands if op.type == OP_IMM]
+        if arch.startswith("mips") and m == "bal" and imms and imms[-1] & self._mask == i.addr + 8:
+            i.kind = NORMAL                       # `bal .+8`: reads pc into $ra (PIC startup), not a call
+            return
         if i.kind in (CALL, JMP, CJMP) and imms:
             i.target = imms[-1] & self._mask
         elif m == "adrp" or (arch in ("arm", "thumb", "arm64") and m != "adr"):

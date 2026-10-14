@@ -28,6 +28,9 @@ class Block:
 
     @property
     def last(self) -> Insn:
+        """The block's terminator: on MIPS the branch, not the delay-slot instruction after it."""
+        if len(self.insns) > 1 and self.insns[-1].delay:
+            return self.insns[-2]
         return self.insns[-1]
 
 
@@ -155,6 +158,14 @@ class FunctionAnalyzer:
                 nxt = i.end
                 if self.dis.md_thumb is not None:
                     self._hint_modes(i)
+                # MIPS: the instruction after a branch, call or return runs before control moves;
+                # it belongs to the branch's block, which then ends after it (edges are keyed by it)
+                if self.dis.delay_slots and i.kind in (CALL, RET, JMP, CJMP):
+                    d = self.dis.decode(nxt)
+                    if d is not None and nxt not in insns:
+                        d.delay = True
+                        insns[nxt] = d
+                        a, nxt = nxt, d.end
                 if i.kind == CALL:
                     tgt = i.target
                     if tgt is not None and self.bin.is_exec(tgt):
@@ -228,7 +239,7 @@ class FunctionAnalyzer:
         for a in sorted(insns):
             i = insns[a]
             if cur is None or a in leaders or cur.end != a:
-                if cur is not None and cur.last.addr not in edges and cur.end == a:
+                if cur is not None and cur.insns[-1].addr not in edges and cur.end == a:
                     cur.succs.append(a)  # fallthrough into a leader
                 cur = Block(a)
                 f.blocks[a] = cur
@@ -236,7 +247,7 @@ class FunctionAnalyzer:
             if a in edges:
                 cur.succs.extend(edges[a])
                 cur = None
-        if cur is not None and cur.last.addr not in edges and cur.end in insns:
+        if cur is not None and cur.insns[-1].addr not in edges and cur.end in insns:
             cur.succs.append(cur.end)
         for b in f.blocks.values():
             b.succs = [s for s in dict.fromkeys(b.succs) if s in f.blocks]
@@ -251,7 +262,31 @@ class FunctionAnalyzer:
             flip = i.kind == CALL and i.mnemonic.startswith("blx") and not i.op_str.startswith(("r", "l", "s", "i"))
             self.dis.hint(i.target, i.thumb != flip)
 
+    def _mips_call_slot(self, i: Insn) -> int | None:
+        """The GOT slot a MIPS `jalr $t9` calls through: `lw $t9, off($gp)` shortly before it,
+        directly or by way of a `move $t9, $v0`."""
+        gp = self.bin.mips_gp
+        if gp is None or not i.op_str.endswith("$t9"):
+            return None
+        want = "$t9"
+        for p in self._back(i.addr, 8):
+            ops = [o.strip() for o in p.op_str.split(",")]
+            if not ops or ops[0] != want:
+                continue
+            if p.mnemonic == "move" and len(ops) == 2:
+                want = ops[1]
+                continue
+            if p.mnemonic == "lw" and len(ops) == 2 and ops[1].endswith("($gp)"):
+                try:
+                    return (gp + int(ops[1][:-5] or "0", 0)) & ((1 << self.bin.bits) - 1)
+                except ValueError:
+                    return None
+            return None
+        return None
+
     def _is_noreturn_call(self, i: Insn) -> bool:
+        if i.target is None and i.mem_target is None and i.mnemonic == "jalr" and self.dis.delay_slots:
+            i.mem_target = self._mips_call_slot(i)
         tgt = i.target
         name = None
         if tgt is not None:

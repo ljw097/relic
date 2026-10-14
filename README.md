@@ -10,19 +10,19 @@
 진행률은 "IDA Pro가 그 영역에서 하는 일 중 Relic이 같은 수준으로 하는 비율"을 어림한 값입니다.
 전체 값은 영역 가중 평균(가중치는 리버싱 실무에서의 비중)입니다.
 
-**전체: 약 33%** — 분석·디컴파일 핵심 경로는 x86/ARM 계열에서 실사용 가능, 타입 시스템·라이브러리 식별·스크립팅 콘솔이 큰 격차.
+**전체: 약 34%** — 분석·디컴파일 핵심 경로는 x86/ARM 계열에서 실사용 가능, 타입 시스템·라이브러리 식별·스크립팅 콘솔이 큰 격차.
 
 | 영역 (가중치) | IDA Pro 기준 | Relic 현재 | 진행률 |
 |---|---|---|---|
 | 파일 포맷 (8) | ELF, PE, Mach-O, COFF/OMF, 펌웨어·raw 등 수십 종 | ELF, PE(import/export/COFF 심볼/.pdata), RAW | 35% |
-| 프로세서 (8) | 60여 개 CPU 계열 | 디스어셈블 7종(x86, x64, ARM/Thumb, AArch64, MIPS, RISC-V, PPC), 분석·리프팅은 x86/x64/ARM/AArch64 | 35% |
+| 프로세서 (8) | 60여 개 CPU 계열 | 디스어셈블 7종(x86, x64, ARM/Thumb, AArch64, MIPS, RISC-V, PPC), 분석은 x86/x64/ARM/AArch64/MIPS32(GOT import·지연 슬롯·`$gp`), 리프팅은 x86/x64/ARM/AArch64 | 38% |
 | 자동 분석 (14) | 함수·CFG·xref·점프 테이블·noreturn·문자열·stripped 복구 | 재귀 하강 + 프롤로그 스캔, 점프 테이블(x86/ARM/AArch64), 레지스터 상수 전파로 데이터 xref, stripped `main` 복구, ARM/Thumb 상호 운용 | 55% |
 | 라이브러리 식별 (8) | FLIRT 시그니처, Lumina | 없음 (심볼·import·PLT 이름만) | 0% |
 | 타입 시스템 (10) | 구조체·열거형·로컬 타입, 타입 라이브러리, 타입 전파 | int/포인터/unsigned 추론, libc 시그니처 일부 | 10% |
 | 디컴파일러 (20) | Hex-Rays: 다수 아키텍처, 타입·구조체 대화형 수정, 부동소수점 | x86-64/x86-32/AArch64/ARM32, 재컴파일 검증, 구조화(switch·for·&&), 상수 나눗셈, -fipa-ra 레지스터 보존; 구조체·부동소수점·대화형 재타입 없음 | 40% |
 | 대화형 UI (12) | 리스팅·그래프·xref·이름/주석·검색·패치·undo·북마크·구조체 창 | 리스팅·그래프(층별 레이아웃)·의사 코드·헥스, 이름/주석/변수 이름, xref, 이동 기록, 테마·확대, 검색(바이트·텍스트·즉치값·명령어); 패치·undo·북마크 없음 | 47% |
 | 스크립팅·확장 (8) | IDAPython, IDC, SDK, 플러그인 | Python 라이브러리 API (`relic.analysis`, `relic.decompiler`), CLI | 20% |
-| 디버거 (7) | 로컬·원격(gdbserver 등) 디버깅 | 로컬 GUI 디버거(GDB/MI): 실행·단계 실행·중단점(조건·활성화·적중 횟수)·리스팅 동기화, pwndbg식 레지스터·스택 telescope·vmmap·메모리 hexdump·백트레이스·콘솔, PIE 슬라이드 보정; 원격·메모리 편집·힙 뷰 없음 | 30% |
+| 디버거 (7) | 로컬·원격(gdbserver 등) 디버깅 | 로컬 GUI 디버거(GDB/MI): 실행·단계 실행·중단점(조건·활성화·적중 횟수, 라이브러리 함수 이름)·하드웨어 watchpoint·리스팅/의사 코드 동기화, pwndbg식 레지스터·스택 telescope·vmmap·메모리 hexdump·백트레이스·콘솔, 레지스터·메모리 편집, PIE 슬라이드 보정; 원격·힙 뷰 없음 | 40% |
 | 프로젝트·협업 (5) | IDB, 스냅숏, Teams, Lumina | `<binary>.relic.json`(이름·주석·변수 이름) | 15% |
 
 IDA Pro에 없는 Relic 쪽 기능: checksec(ELF/PE 보호 기법), 포너블 휴리스틱(위험 함수, 비상수 포맷 스트링, 폭 없는 `scanf("%s")`, ret2win 후보), 디컴파일 결과의 재컴파일 검증 하네스.
@@ -33,8 +33,8 @@ IDA Pro에 없는 Relic 쪽 기능: checksec(ELF/PE 보호 기법), 포너블 �
 2. GUI 안의 Python 콘솔과 플러그인 진입점 (IDAPython 대응)
 3. 정적 링크 라이브러리 함수 식별 (FLIRT 대응 시그니처)
 4. 구조체·타입 시스템과 디컴파일러 연동 (필드 접근 `p->size`)
-5. Mach-O 로더, MIPS / RISC-V 리프터
-6. 디버거 보강: watchpoint·힙 정보 패널, 레지스터·메모리 값 편집
+5. Mach-O 로더, MIPS / RISC-V 리프터 (MIPS32 분석은 완료)
+6. ~~디버거 보강: watchpoint, 레지스터·메모리 값 편집~~ (완료)
 
 ## 기능
 
@@ -42,7 +42,7 @@ IDA Pro에 없는 Relic 쪽 기능: checksec(ELF/PE 보호 기법), 포너블 �
 |---|---|
 | 로더 | ELF / PE(import, export, COFF 심볼) / RAW(셸코드·펌웨어 blob) |
 | 디스어셈블 | capstone 기반: x86, x64, ARM, AArch64, MIPS, RISC-V, PPC |
-| 함수 탐색 / CFG | 재귀 하강, noreturn 처리, tail call, x86-64 점프 테이블 복원 |
+| 함수 탐색 / CFG | 재귀 하강, noreturn 처리, tail call, 점프 테이블 복원, MIPS 지연 슬롯 |
 | stripped 바이너리 | `__libc_start_main` 인자로 `main` 복구, 프롤로그 스캔, `.init_array` 시드 |
 | 참조 | 코드/데이터 xref, 문자열(ASCII, PE는 UTF-16LE) |
 | C++ | Itanium 심볼 디맹글링 (`geo::Rect::area() const`), 짧은 이름으로 이동·디컴파일 (`relic decompile ./a.out geo::total`) |
