@@ -750,8 +750,9 @@ def _loop_body(body):
     if items and isinstance(items[-1], If):
         last = items[-1]
         for keep, leave, cond in ((last.then, last.els, _negate(last.cond)), (last.els, last.then, last.cond)):
+            # (only when `leave` does leave: falling out of it must not run X)
             if keep is not None and leave is not None and _ends_with(keep, "continue") and \
-                    not _ends_with(leave, "continue"):
+                    not _ends_with(leave, "continue") and _exits(leave):
                 items[-1] = If(last.addr, cond, leave)
                 items.append(_drop_last(keep))
                 break
