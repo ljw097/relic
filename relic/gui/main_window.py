@@ -47,7 +47,11 @@ class WorkThread(QThread):
 
     def __init__(self, parent=None):
         super().__init__(parent)
-        self.token = Progress(lambda stage, done, total: self.progress.emit(stage, done, total))
+        self.what = ""
+        self.token = Progress(self._report)
+
+    def _report(self, stage: str, done: int, total: int):
+        self.progress.emit(stage, done, total)
 
     def cancel(self):
         self.token.cancel()
@@ -62,6 +66,7 @@ class WorkThread(QThread):
             self.failed.emit(f"{type(e).__name__}: {e}\n\n{traceback.format_exc()}")
         finally:
             Progress.deactivate(handle)
+            self.token.callback = None      # refers back to this thread: no cycle once done
 
     def work(self):
         raise NotImplementedError
@@ -366,23 +371,35 @@ class MainWindow(QMainWindow):
         self.statusBar().showMessage(f"analysing {path} ...")
         self.setWindowTitle(f"Relic - {os.path.basename(path)} (analysing)")
         self.thread = AnalysisThread(path, arch, base, self)
-        self.thread.done.connect(lambda an, extra, p=path, a=arch, b=base: (self._remember(p, a, b),
-                                                                             self.set_analysis(an, extra)))
+        self.thread.done.connect(self._analysis_done)
         self.thread.failed.connect(self._failed)
         self.thread.cancelled.connect(self._analysis_cancelled)
         self._track(self.thread, "analysing")
         self.thread.start()
 
     # ------------------------------------------------------- background work
+    # thread signals go to bound methods (per-thread data lives on the thread, found through
+    # `sender()`), not to lambdas capturing the window: no window <-> thread reference cycles
+    def _analysis_done(self, an: Analysis, extra: dict):
+        t = self.sender()
+        if isinstance(t, AnalysisThread):
+            self._remember(t.path, t.arch, t.base)
+        self.set_analysis(an, extra)
+
     def _track(self, thread: WorkThread, what: str):
         """Show `thread`'s progress in the status bar until it ends."""
-        thread.progress.connect(lambda stage, done, total, w=what: self._on_progress(w, stage, done, total))
+        thread.what = what
+        thread.progress.connect(self._thread_progress)
         thread.finished.connect(self._work_finished)
         self.progress.setRange(0, 0)
         self.progress.setFormat(what)
         self.progress.show()
         self.cancel_button.setEnabled(True)
         self.cancel_button.show()
+
+    def _thread_progress(self, stage: str, done: int, total: int):
+        t = self.sender()
+        self._on_progress(getattr(t, "what", "working"), stage, done, total)
 
     def _on_progress(self, what: str, stage: str, done: int, total: int):
         if total:
@@ -452,7 +469,7 @@ class MainWindow(QMainWindow):
             self.vulns_thread = VulnsThread(an, self)
             self.vulns_thread.done.connect(self._fill_vulns)
             self.vulns_thread.failed.connect(self._vulns_failed)
-            self.vulns_thread.cancelled.connect(lambda: self._vulns_stopped("scan cancelled"))
+            self.vulns_thread.cancelled.connect(self._vulns_cancelled)
             self._track(self.vulns_thread, "vulns scan")
             self.vulns_thread.start()
         self.statusBar().showMessage(f"{len(an.functions)} functions, {len(an.strings)} strings", 5000)
@@ -491,6 +508,9 @@ class MainWindow(QMainWindow):
         self.vulns.clear_rows()
         self.vulns.add_row(["error" if color else "-", "", "", "", message], None, color)
         self.vulns.fit()
+
+    def _vulns_cancelled(self):
+        self._vulns_stopped("scan cancelled")
 
     def _vulns_failed(self, msg: str):
         head = msg.split("\n\n", 1)[0]
