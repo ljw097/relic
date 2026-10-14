@@ -191,6 +191,9 @@ class DisasmView(QPlainTextEdit):
         self.debug_pc: int | None = None          # while debugging: the stopped-at instruction
         self.debug_bps: set[int] = set()
         self.show_bytes = True
+        # plugins' (name, callback(an, addr) -> str | None): text added to instruction comments
+        self.decorators: list = []
+        self.on_decorator_error = None             # (plugin, traceback text) -> None
         self.highlighter = ListingHighlighter(self.document(), self)
         self.cursorPositionChanged.connect(self._moved)
 
@@ -215,6 +218,7 @@ class DisasmView(QPlainTextEdit):
         if self.an is None or self.func is None:
             return
         lines = function_lines(self.an, self.func)
+        self._decorate(lines)
         text = render(lines, self.show_bytes)
         if text.startswith("\n"):  # render() puts a blank line before the function header
             text = text[1:]
@@ -228,6 +232,25 @@ class DisasmView(QPlainTextEdit):
         sb = self.verticalScrollBar().value()
         self.setPlainText(text)
         self.verticalScrollBar().setValue(sb)
+
+    def _decorate(self, lines):
+        failed = set()
+        for ln in lines:
+            if ln.kind != "insn":
+                continue
+            for plugin, cb in self.decorators:
+                if plugin in failed:
+                    continue
+                try:
+                    note = cb(self.an, ln.addr)
+                except Exception:  # noqa: BLE001 - one broken plugin must not break the listing
+                    failed.add(plugin)
+                    if self.on_decorator_error is not None:
+                        import traceback
+                        self.on_decorator_error(plugin, traceback.format_exc())
+                    continue
+                if note:
+                    ln.comment = f"{ln.comment}; {note}" if ln.comment else str(note)
 
     def goto(self, addr: int) -> bool:
         row = self.row_of.get(addr)
@@ -258,20 +281,10 @@ class DisasmView(QPlainTextEdit):
         self._highlight_row(self.textCursor().blockNumber())
 
     def _debug_selections(self) -> list:
-        out = []
-        marks = [(a, "bp_line") for a in getattr(self, "debug_bps", ())]
+        marks = [(self.row_of.get(a), "bp_line") for a in getattr(self, "debug_bps", ())]
         if getattr(self, "debug_pc", None) is not None:
-            marks.append((self.debug_pc, "pc_line"))
-        for addr, key in marks:
-            row = self.row_of.get(addr)
-            if row is None:
-                continue
-            sel = QTextEdit.ExtraSelection()
-            sel.format.setBackground(QColor(THEME[key]))
-            sel.format.setProperty(QTextCharFormat.Property.FullWidthSelection, True)
-            sel.cursor = QTextCursor(self.document().findBlockByNumber(row))
-            out.append(sel)
-        return out
+            marks.append((self.row_of.get(self.debug_pc), "pc_line"))
+        return _line_marks(self, marks)
 
     def _moved(self):
         row = self.textCursor().blockNumber()
@@ -343,6 +356,90 @@ class GraphView(QGraphicsView):
         self.an: Analysis | None = None
         self.func: Function | None = None
         self.graph_layout = None
+        # collapsed groups per function: head block -> the blocks folded into it
+        self.collapsed: dict[int, dict[int, frozenset]] = {}
+        self.rep: dict[int, int] = {}          # block -> the node showing it
+
+    # ------------------------------------------------------------- collapsing
+    def groups(self) -> dict[int, frozenset]:
+        return self.collapsed.setdefault(self.func.addr, {}) if self.func is not None else {}
+
+    def selected_block(self) -> int | None:
+        return next((a for a, n in self.nodes.items() if n.selected), None)
+
+    def loop_of(self, addr: int) -> frozenset | None:
+        """The innermost natural loop containing block `addr` (header first in iteration: the set's
+        header is the one block every other reaches the latch through), or None."""
+        f = self.func
+        if f is None:
+            return None
+        from .layout import _back_edges
+        succs = {a: list(b.succs) for a, b in f.blocks.items()}
+        back = _back_edges(set(f.blocks), succs, f.addr)
+        best = None
+        for latch, head in back:
+            body, work = {head}, [latch]
+            while work:
+                b = work.pop()
+                if b in body:
+                    continue
+                body.add(b)
+                work += [p for p in f.blocks[b].preds if p in f.blocks]
+            if addr in body and (best is None or len(body) < len(best[1])):
+                best = (head, body)
+        return frozenset(best[1]) if best else None
+
+    def collapse(self, addr: int | None = None, loop: bool = False) -> bool:
+        """Fold the selected block (or the innermost loop around it) into one node."""
+        if self.func is None:
+            return False
+        a = addr if addr is not None else self.selected_block()
+        if a is None:
+            return False
+        a = self.rep.get(a, a)
+        members = self.loop_of(a) if loop else frozenset({a})
+        if not members:
+            return False
+        head = self._loop_head(members) if loop else a
+        g = self.groups()
+        for h in [h for h, ms in g.items() if ms & members]:
+            members |= g.pop(h)                  # a loop around collapsed blocks swallows them
+        g[head] = frozenset(members)
+        self.reload()
+        self.goto(head)
+        return True
+
+    def _loop_head(self, members: frozenset) -> int:
+        """The block of a loop entered from outside it (its header)."""
+        f = self.func
+        entries = [m for m in members if m == f.addr or any(p not in members for p in f.blocks[m].preds)]
+        return min(entries) if entries else min(members)
+
+    def expand(self, addr: int | None = None) -> bool:
+        a = addr if addr is not None else self.selected_block()
+        if a is None:
+            return False
+        head = self.rep.get(a, a)
+        if self.groups().pop(head, None) is None:
+            return False
+        self.reload()
+        self.goto(head)
+        return True
+
+    def expand_all(self):
+        self.groups().clear()
+        self.reload()
+
+    def keyPressEvent(self, e):
+        k = e.key()
+        if k == Qt.Key.Key_Minus and not e.modifiers() & Qt.KeyboardModifier.ControlModifier:
+            self.collapse()
+        elif k == Qt.Key.Key_L:
+            self.collapse(loop=True)
+        elif k in (Qt.Key.Key_Plus, Qt.Key.Key_Equal) and not e.modifiers() & Qt.KeyboardModifier.ControlModifier:
+            self.expand()
+        else:
+            super().keyPressEvent(e)
 
     def restyle(self):
         """Apply the current theme and font size (the graph is drawn again)."""
@@ -372,9 +469,27 @@ class GraphView(QGraphicsView):
         sc.clear()
         self.nodes = {}
         an, f = self.an, self.func
+        self.rep = {}
         if an is None or f is None or not f.blocks:
             return
+        groups = {h: ms for h, ms in self.groups().items() if h in f.blocks}
+        for h, ms in groups.items():
+            for m in ms:
+                self.rep[m] = h
         for a, blk in f.blocks.items():
+            if a in self.rep and self.rep[a] != a:
+                continue                          # shown by its group's node
+            if a in groups:
+                ms = groups[a]
+                n_ins = sum(len(f.blocks[m].insns) for m in ms if m in f.blocks)
+                what = f"{len(ms)} blocks (loop)" if len(ms) > 1 else "block"
+                rows = [f"{an.label(a)}:" if a != f.addr else f"{an.name(a)}:",
+                        f"  [+] {what}, {n_ins} instructions collapsed"]
+                node = _Node(self, a, rows, self.font)
+                node.collapsed = True
+                sc.addItem(node)
+                self.nodes[a] = node
+                continue
             rows = [f"{an.label(a)}:"] if a != f.addr else [f"{an.name(a)}:"]
             for i in blk.insns:
                 ln = insn_line(an, i)
@@ -390,14 +505,34 @@ class GraphView(QGraphicsView):
         routed between the blocks they pass, crossings are reduced."""
         from .layout import layered_layout
         sizes = {a: (n.w, n.h) for a, n in self.nodes.items()}
-        edges = [(a, s) for a, blk in f.blocks.items() for s in blk.succs if s in self.nodes]
-        lay = layered_layout(sizes, edges, f.addr)
+        rep = lambda b: self.rep.get(b, b)         # noqa: E731 - a block's node
+        out: dict[int, list[int]] = {}
+        for a, blk in f.blocks.items():
+            for s in blk.succs:
+                ra, rs = rep(a), rep(s)
+                if s in f.blocks and rs in self.nodes and ra != rs and rs not in out.setdefault(ra, []):
+                    out[ra].append(rs)
+        edges = [(a, s) for a, ss in out.items() for s in ss]
+        lay = layered_layout(sizes, edges, rep(f.addr))
         self.graph_layout = lay
         for a, (x, y) in lay.pos.items():
             self.nodes[a].setPos(x, y)
-        for a, blk in f.blocks.items():
+        # edge bundling: three or more forward edges into one block meet at a junction above it,
+        # three or more out of one block (a switch) leave it through a shared trunk
+        fan_in: dict[int, int] = {}
+        for a2, s2 in edges:
+            if (a2, s2) not in lay.back:
+                fan_in[s2] = fan_in.get(s2, 0) + 1
+        self.bundled_in = {s for s, n in fan_in.items() if n >= self.BUNDLE}
+        self.bundled_out = set()
+        for a in self.nodes:
+            blk = f.blocks[a]
             src = self.nodes[a]
-            succs = [s for s in dict.fromkeys(blk.succs) if s in self.nodes]
+            succs = out.get(a, [])
+            fwd = [s for s in succs if (a, s) not in lay.back]
+            trunk = len(fwd) >= self.BUNDLE
+            if trunk:
+                self.bundled_out.add(a)
             # out-ports spread along the block's bottom, in the order of where the edges go
             def heads(s, a=a):
                 r = lay.routes.get((a, s))
@@ -405,9 +540,11 @@ class GraphView(QGraphicsView):
             ports = sorted(succs, key=heads)
             for k, s in enumerate(ports):
                 color = THEME["edge"]
-                if blk.last.kind == "cjmp":
+                if blk.last.kind == "cjmp" and not getattr(src, "collapsed", False):
                     color = THEME["edge_true"] if s == blk.last.target else THEME["edge_false"]
                 frac = (k + 1) / (len(ports) + 1)
+                if trunk and (a, s) not in lay.back:
+                    frac = 0.5                         # the shared trunk leaves from the middle
                 route = lay.routes.get((a, s), [])
                 if (a, s) not in lay.back:
                     # drop straight to the bottom of the layer before bending, so the edge never
@@ -415,14 +552,24 @@ class GraphView(QGraphicsView):
                     bottom = lay.row_bottom.get(lay.layer[a])
                     if bottom is not None and bottom > src.pos().y() + src.h + 1:
                         route = [(src.pos().x() + src.w * frac, bottom), *route]
-                self._edge(src, self.nodes[s], color, (a, s) in lay.back, route, frac)
+                self._edge(src, self.nodes[s], color, (a, s) in lay.back, route, frac,
+                           trunk=trunk and (a, s) not in lay.back,
+                           junction=s in self.bundled_in and (a, s) not in lay.back)
         self.setSceneRect(self.scene().itemsBoundingRect().adjusted(-60, -60, 60, 60))
 
-    def _edge(self, a: _Node, b: _Node, color: str, back: bool, route=(), frac: float = 0.5):
+    BUNDLE = 3            # edges sharing an end, from which on they are bundled
+    JUNCTION = 16         # how far from the block the bundle splits / merges
+
+    def _edge(self, a: _Node, b: _Node, color: str, back: bool, route=(), frac: float = 0.5,
+              trunk: bool = False, junction: bool = False):
         p1 = a.pos() + QPointF(a.w * frac, a.h)
         p2 = b.pos() + QPointF(b.w / 2, 0)
         path = QPainterPath(p1)
         pts = [QPointF(x, y) for x, y in route]
+        if trunk:                                  # down the shared trunk, then apart
+            pts.insert(0, QPointF(p1.x(), p1.y() + self.JUNCTION))
+        if junction:                               # together into the shared end above the block
+            pts.append(QPointF(p2.x(), p2.y() - self.JUNCTION))
         if back:
             # leave below the block, climb along the route (or beside both blocks), enter from above
             side = pts[0].x() if pts else max(a.pos().x() + a.w, b.pos().x() + b.w) + 25
@@ -459,8 +606,12 @@ class GraphView(QGraphicsView):
         if self.func is None:
             return False
         blk = self.func.block_at(addr) if addr not in self.nodes else self.func.blocks[addr]
-        if blk is None or blk.addr not in self.nodes:
+        if blk is None:
             return False
+        a = self.rep.get(blk.addr, blk.addr)
+        if a not in self.nodes:
+            return False
+        blk = self.func.blocks[a]
         for n in self.nodes.values():
             if n.selected:
                 n.selected = False
@@ -472,6 +623,9 @@ class GraphView(QGraphicsView):
         return True
 
     def node_activated(self, node: _Node, row: int):
+        if getattr(node, "collapsed", False):
+            self.expand(node.addr)                    # double-click opens a collapsed node
+            return
         blk = self.func.blocks[node.addr]
         k = row - 1
         if 0 <= k < len(blk.insns):
@@ -556,13 +710,16 @@ class PseudocodeHighlighter(QSyntaxHighlighter):
                 self.setFormat(m.start(), m.end() - m.start(), f)
 
 
+CANCELLED_TEXT = "// decompilation cancelled"
+
+
 def _decompile_text(an: Analysis, f: Function):
     """Decompiled result for `f`, or an explanatory comment string on failure."""
     try:
         from ..decompiler.emit import decompile
         return decompile(an, f)
     except Cancelled:
-        return "// decompilation cancelled"
+        return CANCELLED_TEXT
     except NotImplementedError as e:
         return f"// {e}"
     except Exception as e:  # noqa: BLE001 - never take the GUI down with a decompiler bug
@@ -588,6 +745,20 @@ class DecompileJob(QThread):
             self.finished_result.emit(self.gen, self.f.addr, _decompile_text(self.an, self.f))
         finally:
             Progress.deactivate(handle)
+
+
+def _line_marks(view: QPlainTextEdit, marks) -> list:
+    """Full-width background bands for (row, THEME key) pairs; rows that are None are skipped."""
+    out = []
+    for row, key in marks:
+        if row is None:
+            continue
+        sel = QTextEdit.ExtraSelection()
+        sel.format.setBackground(QColor(THEME[key]))
+        sel.format.setProperty(QTextCharFormat.Property.FullWidthSelection, True)
+        sel.cursor = QTextCursor(view.document().findBlockByNumber(row))
+        out.append(sel)
+    return out
 
 
 class PseudocodeView(QPlainTextEdit):
@@ -618,6 +789,8 @@ class PseudocodeView(QPlainTextEdit):
         self.gen = 0                            # bumped by invalidate(): older results are stale
         self.job: DecompileJob | None = None
         self.queued: Function | None = None     # requested while a job was running
+        self.debug_pc: int | None = None        # while debugging: the stopped-at instruction (static)
+        self.debug_bps: set[int] = set()
         self._syncing = False
         self.cursorPositionChanged.connect(self._moved)
 
@@ -656,6 +829,19 @@ class PseudocodeView(QPlainTextEdit):
         cur = self.textCursor()
         cur.select(QTextCursor.SelectionType.WordUnderCursor)
         return cur.selectedText()
+
+    def struct_under_cursor(self) -> tuple[str, str, str | None] | None:
+        """(shown name, generated struct, generated field or None) for a struct or field name
+        under the cursor; a field shared by several structs resolves to the first shown."""
+        word = self.word_under_cursor()
+        if self.result is None or not word:
+            return None
+        if word in self.result.structs:
+            return word, self.result.structs[word], None
+        pairs = self.result.fields.get(word)
+        if pairs:
+            return word, pairs[0][0], pairs[0][1]
+        return None
 
     def variable_under_cursor(self) -> tuple[str, str] | None:
         """(shown name, generated name) of the local / parameter under the cursor."""
@@ -706,6 +892,10 @@ class PseudocodeView(QPlainTextEdit):
     def _request(self, f: Function):
         if self.job is not None and self.job.isRunning():
             self.queued = f        # only the latest request matters
+            if self.job.f is not f:
+                # the user moved on: stop the old one at its next checkpoint instead of making
+                # the new function wait for it (work it finished stays cached in the analysis)
+                self.job.cancel()
             return
         self.job = DecompileJob(self.gen, self.an, f, self)
         self.job.finished_result.connect(self._finished)
@@ -716,9 +906,10 @@ class PseudocodeView(QPlainTextEdit):
         if job is not None:
             job.wait()
             job.deleteLater()
-        if gen == self.gen:
+        cancelled = isinstance(res, str) and res == CANCELLED_TEXT
+        if gen == self.gen and not cancelled:
             self.cache[addr] = res
-        if self.func is not None and self.func.addr == addr and gen == self.gen:
+        if self.func is not None and self.func.addr == addr and gen == self.gen and not cancelled:
             self._display(res)
         nxt, self.queued = self.queued, None
         if self.func is not None and self.func.addr not in self.cache:
@@ -784,7 +975,34 @@ class PseudocodeView(QPlainTextEdit):
         return lines[row].addr if 0 <= row < len(lines) else None
 
     def _highlight_row(self, row: int):
-        self.setExtraSelections(_row_and_word_selections(self, row))
+        sel = _row_and_word_selections(self, row)
+        self.setExtraSelections(sel[:1] + self._debug_selections() + sel[1:])
+
+    def set_debug_marks(self, pc: int | None, breakpoints=()):
+        """Mark the statement being executed and the lines with breakpoints (static addresses)."""
+        self.debug_pc = pc
+        self.debug_bps = set(breakpoints)
+        self._highlight_row(self.textCursor().blockNumber())
+
+    def debug_rows(self) -> tuple[int | None, list[int]]:
+        """(row of the statement at pc, rows of breakpoints) in the shown function. pc maps to the
+        statement whose first instruction is the closest at or before it; a breakpoint needs
+        a statement starting at its address, or the function's entry."""
+        if self.result is None or self.an is None or self.func is None:
+            return None, []
+        pc_row = None
+        if self.debug_pc is not None and self.an.function_at(self.debug_pc) is self.func:
+            pc_row = self.line_for(self.debug_pc)
+        exact = {}
+        for k, ln in enumerate(self.result.lines):
+            if ln.addr is not None:
+                exact.setdefault(ln.addr, k)
+        bp_rows = sorted({exact.get(a, 0 if a == self.func.addr else None) for a in self.debug_bps} - {None})
+        return pc_row, bp_rows
+
+    def _debug_selections(self) -> list:
+        pc_row, bp_rows = self.debug_rows()
+        return _line_marks(self, [(r, "bp_line") for r in bp_rows] + [(pc_row, "pc_line")])
 
     def _moved(self):
         self._highlight_row(self.textCursor().blockNumber())

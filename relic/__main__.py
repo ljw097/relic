@@ -14,16 +14,23 @@
     relic opt FILE [WHERE]        optimised SSA IR, with strings/xrefs resolved
     relic decompile FILE [WHERE]  structured C-like pseudocode of a function
     relic search FILE --bytes P   byte pattern (`48 8b ?? 05`), --text, --imm or --insn REGEX
+    relic sigs build LIB.a... -o OUT.sig   library signatures (name functions of static binaries)
+    relic sigs list               the signature files analyses use
+
+Commands that analyse a FILE take `--sigs OUT.sig` (repeatable) to name library functions
+with those signature files instead of the ones in ~/.relic/sigs / $RELIC_SIGS, `--no-sigs`
+to use none.
 """
 from __future__ import annotations
 
 import argparse
+import os
 import sys
 
 from . import __version__
 
 COMMANDS = ("info", "checksec", "funcs", "disasm", "cfg", "strings", "imports", "xrefs", "vulns", "ir", "opt",
-            "decompile", "search", "gui")
+            "decompile", "search", "patch", "script", "sigs", "gui")
 
 
 def _parser() -> argparse.ArgumentParser:
@@ -38,6 +45,9 @@ def _parser() -> argparse.ArgumentParser:
             s.add_argument("where", nargs=None if where_required else "?", help="address, symbol or symbol+off")
         s.add_argument("--arch", help="architecture for raw blobs (x86, x64, arm, arm64, mips, ...)")
         s.add_argument("--base", type=lambda v: int(v, 0), default=0, help="load address for raw blobs")
+        s.add_argument("--sigs", action="append", metavar="FILE.sig",
+                       help="library signature file to name functions with (repeatable)")
+        s.add_argument("--no-sigs", action="store_true", help="name no functions by library signatures")
         return s
 
     add("info", "file headers, sections and libraries")
@@ -69,6 +79,25 @@ def _parser() -> argparse.ArgumentParser:
                      help="instructions using this immediate or displacement")
     how.add_argument("--insn", metavar="REGEX", help="instructions whose text matches: 'call.*system'")
     s.add_argument("--case", action="store_true", help="case-sensitive --text")
+    s = add("patch", "patch bytes / NOP / invert a branch / assemble, write a patched copy", where=True)
+    how = s.add_mutually_exclusive_group()
+    how.add_argument("--bytes", metavar="HEX", help="bytes to write: '90 90'")
+    how.add_argument("--nop", action="store_true", help="replace the instruction with NOPs")
+    how.add_argument("--invert", action="store_true", help="negate the conditional branch")
+    how.add_argument("--asm", metavar="TEXT", help="assemble (keystone): 'xor eax, eax; ret'")
+    how.add_argument("--revert", action="store_true", help="drop the project's patch at this address")
+    how.add_argument("--list", action="store_true", help="list the project's patches")
+    s.add_argument("-o", "--output", help="patched file to write (default: FILE.patched)")
+    s.add_argument("--no-save", action="store_true", help="do not record the patch in the project file")
+    s = add("script", "run a Python script against the analysis (an, decompile(), rename(), ...)")
+    s.add_argument("script", help="Python file; the scripting API is in its globals (see relic.scripting)")
+    s.add_argument("args", nargs=argparse.REMAINDER, help="arguments for the script (sys.argv[1:]); "
+                   "relic's own options go before the script")
+    s.add_argument("--save", action="store_true", help="save the project file afterwards")
+    s = sub.add_parser("sigs", help="library signatures: build from static libraries, list")
+    s.add_argument("action", choices=("build", "list"))
+    s.add_argument("libs", nargs="*", help="static libraries (.a) / object files to build from")
+    s.add_argument("-o", "--output", help="signature file to write (build)")
     g = sub.add_parser("gui", help="open the GUI")
     g.add_argument("file", nargs="?")
     g.add_argument("--arch", help="architecture for raw blobs (x86, x64, arm, arm64, mips, ...)")
@@ -79,7 +108,9 @@ def _parser() -> argparse.ArgumentParser:
 def _analyze(args):
     from .analysis import Analysis
     from .loader import load
-    return Analysis(load(args.file, args.arch, args.base)).run()
+    an = Analysis(load(args.file, args.arch, args.base))
+    an.sig_paths = [] if getattr(args, "no_sigs", False) else getattr(args, "sigs", None)
+    return an.run()
 
 
 def _where(an, text, default=None) -> int:
@@ -123,7 +154,29 @@ def cmd_funcs(args):
         if f.is_import and not args.all:
             continue
         flags = " [import]" if f.is_import else (" [noreturn]" if f.noreturn else "")
+        if f.library:
+            flags += " [lib]"
         print(f"{f.addr:#18x}  {f.size:6} {len(f.blocks):6} {len(f.calls):5}  {an.name(f.addr)}{flags}")
+
+
+def cmd_sigs(args):
+    from .analysis import libsigs
+    if args.action == "build":
+        if not args.libs or not args.output:
+            sys.exit("relic: sigs build LIB.a... -o OUT.sig")
+        db = libsigs.build(args.libs)
+        db.save(args.output)
+        print(f"{args.output}: {len(db.sigs)} signatures ({db.arch}) from {db.source}")
+        return 0
+    dirs = libsigs.sig_dirs()
+    if not dirs:
+        print("no signature directories (~/.relic/sigs, $RELIC_SIGS)")
+    for d in dirs:
+        for f in sorted(os.listdir(d)):
+            if f.endswith(".sig"):
+                db = libsigs.SigDB.load(os.path.join(d, f))
+                print(f"{os.path.join(d, f)}: {db.arch}, {len(db.sigs)} signatures from {db.source}")
+    return 0
 
 
 def cmd_disasm(args):
@@ -304,6 +357,64 @@ def cmd_search(args):
         print("not found")
     for h in hits:
         print(f"{h.addr:#x}  {an.location(h.addr):28} {h.text}")
+
+
+def cmd_patch(args):
+    from . import patch as P
+    an = _analyze(args)
+    if args.list:
+        for a, (old, new) in sorted(an.patches.items()):
+            print(f"{a:#x}  {an.location(a):28} {old.hex(' ')} -> {new.hex(' ')}")
+        if not an.patches:
+            print("no patches")
+        return
+    if args.where is None:
+        sys.exit("relic: patch needs an address")
+    addr = _where(an, args.where)
+    try:
+        if args.revert:
+            if not an.revert(addr):
+                sys.exit(f"relic: no patch at {addr:#x}")
+        else:
+            if args.nop:
+                data = P.nop_bytes(an, addr)
+            elif args.invert:
+                data = P.invert_bytes(an, addr)
+            elif args.asm is not None:
+                data = P.fit(an, addr, P.assemble(an, addr, args.asm))
+            elif args.bytes is not None:
+                data = P.parse_hex(args.bytes)
+            else:
+                sys.exit("relic: one of --bytes / --nop / --invert / --asm / --revert / --list")
+            old = an.patch(addr, data)
+            print(f"{addr:#x}  {old.hex(' ')} -> {data.hex(' ')}")
+            for ln in _disasm_lines(an, addr, len(data)):
+                print("   ", ln)
+    except P.PatchError as e:
+        sys.exit(f"relic: {e}")
+    if not args.no_save:
+        an.save_project()
+    out = P.export(an.bin, args.output or args.file + ".patched")
+    print(f"wrote {out} ({len(an.patches)} patch{'es' if len(an.patches) != 1 else ''})")
+
+
+def _disasm_lines(an, addr: int, size: int) -> list[str]:
+    out, a = [], addr
+    while a < addr + size:
+        i = an.dis.decode(a)
+        if i is None:
+            break
+        out.append(f"{i.addr:#x}  {i.mnemonic} {i.op_str}".rstrip())
+        a = i.end
+    return out
+
+
+def cmd_script(args):
+    from .scripting import namespace, run_script
+    an = _analyze(args)
+    run_script(args.script, namespace(an), args.args)
+    if args.save:
+        an.save_project()
 
 
 def cmd_gui(args):

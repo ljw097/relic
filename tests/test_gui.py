@@ -9,7 +9,8 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 os.environ["RELIC_SETTINGS"] = os.path.join(__import__("tempfile").mkdtemp(), "relic-test.ini")
 pytest.importorskip("PySide6.QtWidgets", exc_type=ImportError)  # also missing libEGL etc.
 
-from PySide6.QtCore import Qt  # noqa: E402
+from PySide6.QtCore import QEvent, Qt  # noqa: E402
+from PySide6.QtGui import QKeyEvent  # noqa: E402
 from PySide6.QtWidgets import QApplication  # noqa: E402
 
 from relic.gui.main_window import MainWindow  # noqa: E402
@@ -18,6 +19,16 @@ from relic.gui.main_window import MainWindow  # noqa: E402
 @pytest.fixture(scope="module")
 def app():
     return QApplication.instance() or QApplication([])
+
+
+@pytest.fixture(autouse=True)
+def _collect_windows():
+    """Collect windows of finished tests here, on the GUI thread between tests: left to the
+    cyclic GC, one is freed wherever it runs next -- a worker thread of a later test -- and
+    destroying Qt objects there crashes."""
+    yield
+    import gc
+    gc.collect()
 
 
 @pytest.fixture
@@ -171,6 +182,41 @@ def test_pseudocode_stale_result_is_not_shown(win):
     win.goto_text("classify")          # requested while add_note may still be decompiling
     assert win.decomp.wait_idle()
     assert win.decomp.toPlainText().startswith("int classify(")
+
+
+def test_pseudocode_switch_cancels_slow_job(win, monkeypatch):
+    """Moving to another function stops a long decompilation instead of waiting for it, and the
+    cancelled one is not cached: shown again, it is decompiled again."""
+    import time
+
+    from relic.decompiler import emit
+    from relic.progress import checkpoint
+    real = emit.decompile
+    slow = win.an.function_by_name("add_note").addr
+
+    def decompile(an, f):
+        if f.addr == slow:
+            end = time.monotonic() + 30
+            while time.monotonic() < end:          # a long job that reaches checkpoints
+                checkpoint()
+                time.sleep(0.01)
+        return real(an, f)
+    monkeypatch.setattr(emit, "decompile", decompile)
+    win.tabs.setCurrentIndex(win.TAB_DECOMP)
+    win.decomp.wait_idle()
+    win.decomp.invalidate(reload=False)
+    win.goto_text("add_note")
+    assert win.decomp.busy()
+    t = time.monotonic()
+    win.goto_text("classify")
+    assert win.decomp.wait_idle(20000)
+    assert time.monotonic() - t < 10
+    assert win.decomp.toPlainText().startswith("int classify(")
+    assert slow not in win.decomp.cache
+    monkeypatch.setattr(emit, "decompile", real)
+    win.goto_text("add_note")
+    assert win.decomp.wait_idle()
+    assert "add_note(" in win.decomp.toPlainText()
 
 
 def _cursor_on(view, needle, offset=1):
@@ -439,8 +485,8 @@ def test_debugger_panels_breakpoints_and_console(app, win):
     win.debug_start_or_continue()                       # F9: continue to the breakpoint
     assert _debug_wait(app, win, lambda: win.disasm.debug_pc == vuln)
     assert win.cur == vuln
-    assert win.dbg_bps.rowCount() == 1 and win.dbg_bps.item(0, 2).text() == "vuln"
-    assert win.dbg_bps.item(0, 4).text() == "1"
+    assert win.dbg_bps.rowCount() == 1 and win.dbg_bps.item(0, 3).text() == "vuln"
+    assert win.dbg_bps.item(0, 5).text() == "1"
     assert win.dbg_regs.rowCount() >= 16 and win.dbg_regs.item(0, 0).text() == "rax"
     assert win.dbg_stack.rowCount() == 16 and "main+" in win.dbg_stack.item(0, 2).text()
     assert win.dbg_bt.item(0, 2).text() == "vuln"
@@ -475,7 +521,369 @@ def test_debugger_panels_breakpoints_and_console(app, win):
     assert _debug_wait(app, win, lambda: win.dbg.session is None)
     # breakpoints panel: disable and add a condition (kept for the next run)
     win.dbg_bps.item(0, 0).setCheckState(Qt.CheckState.Unchecked)
-    win.dbg_bps.item(0, 3).setText("$rdi == 1")
+    win.dbg_bps.item(0, 4).setText("$rdi == 1")
     bp = win.dbg.static_bps[vuln]
     assert not bp.enabled and bp.condition == "$rdi == 1"
     assert vuln not in win.disasm.debug_bps
+
+
+def test_debugger_watchpoints_and_library_breakpoints(app, win):
+    from test_debugger import _can_debug
+    if not _can_debug():
+        pytest.skip("gdb with ptrace permission is needed")
+    from relic.gui.main_window import WatchDialog
+    an = win.an
+    notes = an.resolve("notes")
+    # the watch dialog offers the global the cursor's instruction refers to
+    add_note = an.function_by_name("add_note")
+    win.goto(next(x.frm for x in an.xrefs_to[notes] if an.function_at(x.frm) is add_note))
+    assert win._debug_watch_default() == "notes"
+    dlg = WatchDialog(win, "notes")
+    dlg.access.setCurrentText("read")
+    dlg.size.setCurrentIndex(3)
+    assert dlg.values() == ("notes", "read", 4)
+    # set before the program runs: applied at start, a library function stops inside libc
+    win.debug_break_at("puts")
+    win.debug_break_at("add_note")
+    win.debug_watch("notes", "write")
+    assert [win.dbg_bps.item(k, 1).text() for k in range(3)] == ["break", "break", "write watch"]
+    assert win.dbg_bps.item(0, 3).text() == "add_note" and win.dbg_bps.item(1, 3).text() == "puts"
+    assert add_note.addr in win.dbg.static_bps
+    win.debug_start()
+    assert _debug_wait(app, win, lambda: win.dbg_regs.rowCount() > 0)
+    win.debug_start_or_continue()
+    assert _debug_wait(app, win, lambda: "puts" in win.dbg_bt.item(0, 2).text())
+    assert win.dbg.last.pc_static is None                   # in libc, not at the PLT stub
+    win.dbg_bps.selectRow(1)                       # Delete on the puts row
+    win.dbg_bps.keyPressEvent(QKeyEvent(QEvent.Type.KeyPress, Qt.Key.Key_Delete, Qt.KeyboardModifier.NoModifier))
+    assert win.dbg_bps.rowCount() == 2 and "puts" not in win.dbg.other_bps
+    win.dbg.send_input("1\n8\nAAAA\n4\n")
+    win.debug_start_or_continue()
+    assert _debug_wait(app, win, lambda: win.disasm.debug_pc == add_note.addr)
+    win.debug_start_or_continue()
+    assert _debug_wait(app, win, lambda: "[ watchpoint " in win.dbg_console.out.toPlainText())
+    assert an.function_at(win.cur) is add_note
+    assert win.dbg.last.stop.startswith("watchpoint ") and ": 0 -> " in win.dbg.last.stop
+    assert win.dbg.last.reason == "watchpoint-trigger"
+    assert win.dbg_bps.item(1, 5).text() == "1"
+    win.dbg_bps.item(1, 0).setCheckState(Qt.CheckState.Unchecked)
+    assert not win.dbg.other_bps["write:notes"].enabled
+    win.debug_start_or_continue()
+    assert _debug_wait(app, win, lambda: "exited" in win.dbg_console.out.toPlainText())
+    win.dbg.stop()
+    assert _debug_wait(app, win, lambda: win.dbg.session is None)
+
+
+def test_debugger_pseudocode_marks_and_editing(app, win):
+    from test_debugger import _can_debug
+    if not _can_debug():
+        pytest.skip("gdb with ptrace permission is needed")
+    an = win.an
+    win.dbg_args = ["5"]
+    classify = an.function_by_name("classify").addr
+    win.goto(classify)
+    win.debug_toggle_breakpoint()
+    win.toggle_decompile()
+    assert win.decomp.wait_idle()
+    pc_row, bp_rows = win.decomp.debug_rows()
+    assert pc_row is None and bp_rows == [0]                 # the signature line stands for the entry
+    win.debug_start()
+    assert _debug_wait(app, win, lambda: win.dbg_regs.rowCount() > 0)
+    win.dbg.send_input("x\n")
+    win.debug_start_or_continue()
+    assert _debug_wait(app, win, lambda: win.decomp.debug_pc == classify)
+    assert win.decomp.wait_idle() and win.decomp.func.addr == classify
+    assert win.decomp.debug_rows() == (0, [0])
+    from PySide6.QtGui import QColor
+    from relic.gui.views import THEME
+    marks = [s.cursor.blockNumber() for s in win.decomp.extraSelections()
+             if s.format.background().color() == QColor(THEME["pc_line"])]
+    assert marks == [0]
+
+    def reg(name):
+        return next(int(win.dbg_regs.item(k, 1).text(), 16) for k in range(win.dbg_regs.rowCount())
+                    if win.dbg_regs.item(k, 0).text() == name)
+    assert reg("rdi") == 5
+    win.dbg.set_register("rdi", "0")                          # classify(0) returns 10
+    assert _debug_wait(app, win, lambda: reg("rdi") == 0)
+    win.dbg.write_memory("$rsp-0x40", '"relic"')
+    assert _debug_wait(app, win, lambda: "|relic" in win.dbg_mem.text.toPlainText())
+    assert "wrote 5 bytes" in win.dbg_console.out.toPlainText()
+    win.debug_start_or_continue()
+    assert _debug_wait(app, win, lambda: "exited with code 10" in win.dbg_console.out.toPlainText())
+    win.dbg.stop()
+    assert _debug_wait(app, win, lambda: win.dbg.session is None)
+
+
+def test_patching_inverts_nops_reverts_and_exports(app, win, tmp_path):
+    an = win.an
+    main = an.function_by_name("main")
+    cj = next(i for b in sorted(main.blocks.values(), key=lambda b: b.addr) for i in b.insns if i.kind == "cjmp")
+    before = cj.mnemonic
+    win.goto(cj.addr)
+    assert win.patch_with("invert")
+    assert win.an is an and an.dis.decode(cj.addr).mnemonic != before and cj.addr in an.patches
+    assert win.cur == cj.addr and "*" in win.windowTitle()
+    assert "patched (was " in win.disasm.toPlainText()
+    assert not win.patch_with("invert") or an.dis.decode(cj.addr).mnemonic == before   # twice: back
+    win.goto(an.function_by_name("vuln").addr)
+    gets_call = next(i for b in an.function_at(win.cur).blocks.values() for i in b.insns
+                     if i.kind == "call" and an.call_name(i) == "gets")
+    win.goto(gets_call.addr)
+    assert win.patch_with("nop")
+    assert all(an.dis.decode(a).mnemonic == "nop" for a in range(gets_call.addr, gets_call.end))
+    win.toggle_decompile()
+    assert win.decomp.wait_idle() and "gets(" not in win.decomp.toPlainText()
+    win.toggle_decompile()
+    out = tmp_path / "patched"
+    from relic.patch import export
+    export(an.bin, str(out))
+    assert out.read_bytes() != open(an.bin.path, "rb").read() and os.access(out, os.X_OK)
+    assert win.revert_patch_here() and gets_call.addr not in an.patches
+    assert an.dis.decode(gets_call.addr).kind == "call"
+    win.save_project()
+    import json
+    saved = json.load(open(an.project_path))["patches"]
+    assert list(saved) == list({f"{a:#x}" for a in an.patches})
+
+
+def test_python_console_and_plugins(app, vuln64, tmp_path, monkeypatch):
+    plugins = tmp_path / "plugins"
+    plugins.mkdir()
+    (plugins / "mark.py").write_text(
+        "def register(api):\n"
+        "    def run(ns):\n"
+        "        ns['comment'](ns['here'](), 'seen by a plugin')\n"
+        "    api.add_action('Mark here', run, 'Ctrl+Alt+M')\n")
+    (plugins / "broken.py").write_text("raise RuntimeError('boom')\n")
+    monkeypatch.setenv("RELIC_PLUGINS", str(plugins))
+    path = tmp_path / "vuln64"
+    shutil.copy(vuln64, path)
+    w = MainWindow()
+    try:
+        w.open_file(str(path))
+        assert w.wait()
+        assert w.plugin_names == ["mark"]
+        assert "[plugin broken]" in w.pyconsole.out.toPlainText() and "boom" in w.pyconsole.out.toPlainText()
+        act = next(a for a in w.plugins_menu.actions() if a.text() == "Mark here")
+        act.trigger()
+        assert w.an.comments.get(w.cur) == "seen by a plugin" and "seen by a plugin" in w.disasm.toPlainText()
+        w.show_python_console()
+        out = w.pyconsole.run("hex(here()) == hex(an.function_by_name('main').addr)")
+        assert out.strip() == "True"
+        w.pyconsole.run("goto('vuln')")
+        assert w.cur == w.an.function_by_name("vuln").addr
+        w.pyconsole.line.setText("rename(here(), 'pwnme')")
+        w.pyconsole._enter()
+        assert w.an.name(w.cur) == "pwnme" and w.pyconsole.line.history == ["rename(here(), 'pwnme')"]
+    finally:
+        w.dirty = False
+        w.close()
+
+
+def test_pseudocode_struct_field_rename(app, win):
+    win.goto(win.an.function_by_name("add_note").addr)
+    win.toggle_decompile()
+    assert win.decomp.wait_idle()
+    text = win.decomp.toPlainText()
+    assert "struct s_notes {" in text and "->f_8 = " in text
+    pos = text.index("->f_8") + 3
+    cur = win.decomp.textCursor()
+    cur.setPosition(pos)
+    win.decomp.setTextCursor(cur)
+    assert win.decomp.struct_under_cursor() == ("f_8", "s_notes", "f_8")
+    assert win.rename_struct("s_notes", "f_8", "size")
+    assert win.rename_struct("s_notes", None, "note")
+    assert not win.rename_struct("s_notes", None, "not valid")
+    assert win.decomp.wait_idle()
+    text = win.decomp.toPlainText()
+    assert "struct note {" in text and "->size = " in text and "*" in win.windowTitle()
+    cur = win.decomp.textCursor()
+    cur.setPosition(text.index("struct note") + 8)
+    win.decomp.setTextCursor(cur)
+    assert win.decomp.struct_under_cursor() == ("note", "s_notes", None)
+    win.save_project()
+    import json
+    saved = json.load(open(win.an.project_path))["structs"]["s_notes"]
+    assert saved["name"] == "note" and saved["fields"] == {"f_8": "size"}
+    assert saved["layout"] == {"0x0": [64, "char *"], "0x8": [32, ""]}       # for types that name it
+
+
+def test_pseudocode_set_type(app, win, monkeypatch):
+    from PySide6.QtWidgets import QInputDialog
+    win.goto(win.an.function_by_name("show_note").addr)
+    win.toggle_decompile()
+    assert win.decomp.wait_idle()
+    text = win.decomp.toPlainText()
+    cur = win.decomp.textCursor()
+    cur.setPosition(text.index("int a1") + 4)
+    win.decomp.setTextCursor(cur)
+    seen = {}
+
+    def answer(parent, title, label, text=""):
+        seen["prefill"] = text
+        return "unsigned int", True
+    monkeypatch.setattr(QInputDialog, "getText", answer)
+    win.set_type_dialog()
+    assert seen["prefill"] == "int"
+    assert win.decomp.wait_idle() and "show_note(unsigned int a1)" in win.decomp.toPlainText()
+    text = win.decomp.toPlainText()
+    cur.setPosition(text.index("->f_0") + 3)
+    win.decomp.setTextCursor(cur)
+    monkeypatch.setattr(QInputDialog, "getText", lambda *a, **k: ("void *", True))
+    win.set_type_dialog()
+    assert win.decomp.wait_idle() and "    void *f_0;" in win.decomp.toPlainText()
+    assert not win.set_var_type("a1", "not a type!")
+
+
+def test_structures_window(app, win, monkeypatch):
+    from PySide6.QtWidgets import QInputDialog
+    win.goto(win.an.function_by_name("add_note").addr)
+    win.toggle_decompile()
+    assert win.decomp.wait_idle()
+    dlg = win.show_structs()
+    assert [dlg.list.item(k).text() for k in range(dlg.list.count())] == ["s_notes  (12 bytes)"]
+    assert [dlg.table.item(r, 0).text() for r in range(dlg.table.rowCount())] == ["0x0", "0x8"]
+    assert dlg.table.item(0, 2).text() == "char *" and "struct s_notes {" in dlg.decl.text()
+    dlg.table.item(1, 1).setText("size")                      # rename a field in place
+    assert win.decomp.wait_idle() and "->size = " in win.decomp.toPlainText()
+    dlg.table.item(1, 2).setText("unsigned int")              # retype it
+    assert win.decomp.wait_idle() and "    unsigned int size;" in win.decomp.toPlainText()
+    monkeypatch.setattr(QInputDialog, "getText", lambda *a, **k: ("0x10 char[8] tag", True))
+    dlg.add_field()
+    assert dlg.table.rowCount() == 3 and dlg.table.item(2, 1).text() == "tag"
+    assert dlg.table.item(2, 2).text() == "char[8]"
+    assert win.decomp.wait_idle() and "    char tag[8];" in win.decomp.toPlainText()
+    dlg.table.selectRow(0)
+    dlg.remove_field()
+    assert win.decomp.wait_idle() and "*(int64_t *)notes[" in win.decomp.toPlainText()
+    monkeypatch.setattr(QInputDialog, "getText", lambda *a, **k: ("note", True))
+    dlg.rename_struct()
+    assert dlg.list.item(0).text().startswith("note ") and win.decomp.wait_idle()
+    assert "struct note {" in win.decomp.toPlainText()
+    win.save_project()
+    import json
+    saved = json.load(open(win.an.project_path))["structs"]["s_notes"]
+    assert saved["removed"] == ["0x0"] and saved["added"] == {"0x10": ["char[8]", "tag"]}
+    dlg.close()
+
+
+def test_debugger_runs_the_patched_image_and_undo(app, win):
+    from test_debugger import _can_debug
+    if not _can_debug():
+        pytest.skip("gdb with ptrace permission is needed")
+    an = win.an
+    main = an.function_by_name("main")
+    cj = next(i for b in sorted(main.blocks.values(), key=lambda b: b.addr) for i in b.insns if i.kind == "cjmp")
+    win.goto(cj.addr)
+    assert win.patch_with("invert")                  # `argc > 1` turned around: no argument runs vuln()
+    win.dbg_args = []
+    win.debug_start()
+    assert _debug_wait(app, win, lambda: win.dbg_regs.rowCount() > 0)
+    assert "debugging the patched image (1 patch)" in win.dbg_console.out.toPlainText()
+    win.dbg.send_input("relic\n")
+    win.debug_start_or_continue()
+    # vuln() ran; main then hands argv[1] (NULL: no argument) to atoi and stops on a signal
+    assert _debug_wait(app, win, lambda: "hello relic" in win.dbg_console.out.toPlainText())
+    assert "name?" in win.dbg_console.out.toPlainText()
+    tmp = win.dbg._tmpdir
+    win.dbg.stop()
+    assert _debug_wait(app, win, lambda: win.dbg.session is None)
+    assert tmp and not os.path.exists(tmp)                      # the patched copy is gone
+    assert win.undo_patch() and not an.patches and an.dis.decode(cj.addr).mnemonic == cj.mnemonic
+    assert win.redo_patch() and cj.addr in an.patches
+    assert win.undo_patch() and not win.undo_patch()
+
+
+def test_graph_collapse_block_and_loop(app, win):
+    from PySide6.QtCore import QEvent
+    from PySide6.QtGui import QKeyEvent
+    an = win.an
+    f = an.function_by_name("checksum")                    # a loop with an if inside
+    win.goto(f.addr)
+    g = win.graph
+    g.show_function(an, f, f.addr)
+    full = len(g.nodes)
+    body = g.loop_of(next(a for a, b in f.blocks.items() if b.last.kind == "cjmp" and a != f.addr))
+    assert body and len(body) >= 2 and full == len(f.blocks)
+    # one block
+    g.goto(f.addr)
+    assert g.collapse()
+    assert len(g.nodes) == full and "collapsed" in "".join(g.nodes[f.addr].lines)
+    assert g.expand(f.addr) and "collapsed" not in "".join(g.nodes[f.addr].lines)
+    # the loop around a block, with a key
+    inner = next(iter(body - {g._loop_head(body)}))
+    g.goto(inner)
+    g.keyPressEvent(QKeyEvent(QEvent.Type.KeyPress, Qt.Key.Key_L, Qt.KeyboardModifier.NoModifier))
+    head = g._loop_head(body)
+    assert len(g.nodes) == full - len(body) + 1 and g.selected_block() == head
+    assert f"{len(body)} blocks (loop)" in "".join(g.nodes[head].lines)
+    assert not (set(g.graph_layout.pos) & (body - {head}))     # folded blocks have no node of their own
+    assert g.goto(inner) and g.selected_block() == head      # a folded block's address finds its group
+    g.node_activated(g.nodes[head], 0)                          # double-click opens it again
+    assert len(g.nodes) == full
+    g.collapse(inner, loop=True)
+    g.expand_all()
+    assert len(g.nodes) == full
+
+
+def test_graph_bundles_fan_out_and_fan_in(app, flow_O2):
+    from relic.analysis import analyze
+    from relic.gui.views import GraphView
+    an = analyze(flow_O2)
+    g = GraphView()
+    f = an.function_by_name("sw_big")
+    g.show_function(an, f, f.addr)
+    switch = next(a for a, b in f.blocks.items() if len(b.succs) >= 10)
+    join = max(f.blocks, key=lambda a: len(f.blocks[a].preds))
+    assert switch in g.bundled_out and join in g.bundled_in
+    small = an.function_by_name("gcd")
+    g.show_function(an, small, small.addr)
+    assert not g.bundled_out                                # two-way branches are not bundled
+
+
+def test_apply_library_signatures(app, vuln64_stripped, tmp_path):
+    """File > Apply library signatures names a stripped binary's functions in place."""
+    import subprocess
+    from relic.analysis import libsigs
+    obj = str(tmp_path / "vuln.o")
+    subprocess.run(["gcc", "-O0", "-fno-stack-protector", "-w", "-c", "-o", obj,
+                    os.path.join(os.path.dirname(__file__), "src", "vuln.c")], check=True)
+    sig = str(tmp_path / "vuln.sig")
+    libsigs.build([obj]).save(sig)
+    path = tmp_path / "stripped"
+    shutil.copy(vuln64_stripped, path)
+    w = MainWindow()
+    w.open_file(str(path))
+    assert w.wait()
+    assert w.an.function_by_name("checksum") is None
+    assert w.apply_signatures([sig]) >= 8
+    f = w.an.function_by_name("checksum")
+    assert f is not None and f.library
+    assert "checksum" in [r[0] for r in _rows(w.funcs.table)]
+    w.dirty = False
+    w.close()
+
+
+def test_plugin_hooks_analysis_and_listing(app, vuln64, tmp_path, monkeypatch):
+    plugins = tmp_path / "plugins"
+    plugins.mkdir()
+    log = tmp_path / "seen.txt"
+    (plugins / "hooks.py").write_text(
+        "def register(api):\n"
+        f"    api.on_analysis(lambda ns: open({str(log)!r}, 'a').write(ns['an'].bin.path + '\\n'))\n"
+        "    api.add_listing_comment(lambda an, a: 'entry!' if a == an.function_by_name('main').addr else None)\n"
+        "    api.add_listing_comment(lambda an, a: 1 / 0)\n")
+    monkeypatch.setenv("RELIC_PLUGINS", str(plugins))
+    path = tmp_path / "vuln64"
+    shutil.copy(vuln64, path)
+    w = MainWindow()
+    try:
+        w.open_file(str(path))
+        assert w.wait()
+        assert log.read_text().split() == [str(path)]
+        assert "entry!" in w.disasm.toPlainText()          # a failing hook does not stop the others
+        assert "ZeroDivisionError" in w.pyconsole.out.toPlainText()
+    finally:
+        w.dirty = False
+        w.close()

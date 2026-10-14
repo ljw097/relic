@@ -17,44 +17,62 @@ class Sig:
     fmt: int | None = None   # index of the printf/scanf-style format argument
     ret: str = "int"
     noreturn: bool = False
+    args: str = ""       # C types of the fixed arguments, one code each (see ARG_TYPES)
+
+
+# argument type codes: `s` string, `p` memory, `n` size, `F` stream, `i` int; `.` anything else
+ARG_TYPES = {"s": "char *", "p": "void *", "n": "size_t", "F": "FILE *", "i": "int"}
+
+
+def arg_type(sig: Sig, k: int) -> str | None:
+    """The C type of fixed argument `k`, when the table knows it."""
+    return ARG_TYPES.get(sig.args[k]) if k < len(sig.args) else None
 
 
 SIGS: dict[str, Sig] = {
     # output
-    "puts": Sig(1), "putchar": Sig(1), "perror": Sig(1), "fputs": Sig(2), "putc": Sig(2),
-    "printf": Sig(1, fmt=0), "fprintf": Sig(2, fmt=1), "dprintf": Sig(2, fmt=1),
-    "sprintf": Sig(2, fmt=1, ret="int"), "snprintf": Sig(3, fmt=2),
-    "vprintf": Sig(2, fmt=0), "vfprintf": Sig(3, fmt=1), "vsprintf": Sig(3, fmt=1),
+    "puts": Sig(1, args="s"), "putchar": Sig(1, args="i"), "perror": Sig(1, ret="void", args="s"),
+    "fputs": Sig(2, args="sF"), "putc": Sig(2, args="iF"),
+    "printf": Sig(1, fmt=0, args="s"), "fprintf": Sig(2, fmt=1, args="Fs"), "dprintf": Sig(2, fmt=1, args="is"),
+    "sprintf": Sig(2, fmt=1, ret="int", args="ss"), "snprintf": Sig(3, fmt=2, args="sns"),
+    "vprintf": Sig(2, fmt=0, args="s"), "vfprintf": Sig(3, fmt=1, args="Fs"), "vsprintf": Sig(3, fmt=1, args="ss"),
     # input
-    "gets": Sig(1, ret="char *"), "fgets": Sig(3, ret="char *"), "getchar": Sig(0),
-    "scanf": Sig(1, fmt=0), "fscanf": Sig(2, fmt=1), "sscanf": Sig(2, fmt=1),
-    "__isoc99_scanf": Sig(1, fmt=0), "__isoc99_fscanf": Sig(2, fmt=1), "__isoc99_sscanf": Sig(2, fmt=1),
-    "read": Sig(3, ret="ssize_t"), "write": Sig(3, ret="ssize_t"),
-    "fread": Sig(4, ret="size_t"), "fwrite": Sig(4, ret="size_t"),
+    "gets": Sig(1, ret="char *", args="s"), "fgets": Sig(3, ret="char *", args="siF"), "getchar": Sig(0),
+    "scanf": Sig(1, fmt=0, args="s"), "fscanf": Sig(2, fmt=1, args="Fs"), "sscanf": Sig(2, fmt=1, args="ss"),
+    "__isoc99_scanf": Sig(1, fmt=0, args="s"), "__isoc99_fscanf": Sig(2, fmt=1, args="Fs"),
+    "__isoc99_sscanf": Sig(2, fmt=1, args="ss"),
+    "read": Sig(3, ret="ssize_t", args="ipn"), "write": Sig(3, ret="ssize_t", args="ipn"),
+    "fread": Sig(4, ret="size_t", args="pnnF"), "fwrite": Sig(4, ret="size_t", args="pnnF"),
     # strings / memory
-    "strlen": Sig(1, ret="size_t"), "strcpy": Sig(2, ret="char *"), "strncpy": Sig(3, ret="char *"),
-    "strcat": Sig(2, ret="char *"), "strncat": Sig(3, ret="char *"),
-    "strcmp": Sig(2), "strncmp": Sig(3), "strchr": Sig(2, ret="char *"), "strstr": Sig(2, ret="char *"),
-    "strdup": Sig(1, ret="char *"), "strtol": Sig(3, ret="long"), "atoi": Sig(1), "atol": Sig(1, ret="long"),
-    "memcpy": Sig(3, ret="void *"), "memmove": Sig(3, ret="void *"), "memset": Sig(3, ret="void *"),
-    "memcmp": Sig(3), "bzero": Sig(2, ret="void"),
+    "strlen": Sig(1, ret="size_t", args="s"), "strcpy": Sig(2, ret="char *", args="ss"),
+    "strncpy": Sig(3, ret="char *", args="ssn"),
+    "strcat": Sig(2, ret="char *", args="ss"), "strncat": Sig(3, ret="char *", args="ssn"),
+    "strcmp": Sig(2, args="ss"), "strncmp": Sig(3, args="ssn"), "strchr": Sig(2, ret="char *", args="si"),
+    "strrchr": Sig(2, ret="char *", args="si"), "strstr": Sig(2, ret="char *", args="ss"),
+    "strdup": Sig(1, ret="char *", args="s"), "strtol": Sig(3, ret="long", args="s.i"),
+    "atoi": Sig(1, args="s"), "atol": Sig(1, ret="long", args="s"),
+    "memcpy": Sig(3, ret="void *", args="ppn"), "memmove": Sig(3, ret="void *", args="ppn"),
+    "memset": Sig(3, ret="void *", args="pin"), "memcmp": Sig(3, args="ppn"), "bzero": Sig(2, ret="void", args="pn"),
     # heap / process
-    "malloc": Sig(1, ret="void *"), "calloc": Sig(2, ret="void *"), "realloc": Sig(2, ret="void *"),
-    "free": Sig(1, ret="void"), "exit": Sig(1, ret="void", noreturn=True),
-    "_exit": Sig(1, ret="void", noreturn=True), "abort": Sig(0, ret="void", noreturn=True),
-    "system": Sig(1), "setvbuf": Sig(4), "setbuf": Sig(2, ret="void"),
-    "fopen": Sig(2, ret="FILE *"), "fclose": Sig(1), "open": Sig(2), "close": Sig(1),
+    "malloc": Sig(1, ret="void *", args="n"), "calloc": Sig(2, ret="void *", args="nn"),
+    "realloc": Sig(2, ret="void *", args="pn"), "free": Sig(1, ret="void", args="p"),
+    "exit": Sig(1, ret="void", noreturn=True, args="i"),
+    "_exit": Sig(1, ret="void", noreturn=True, args="i"), "abort": Sig(0, ret="void", noreturn=True),
+    "system": Sig(1, args="s"), "setvbuf": Sig(4, args="Fsin"), "setbuf": Sig(2, ret="void", args="Fs"),
+    "fopen": Sig(2, ret="FILE *", args="ss"), "fclose": Sig(1, args="F"), "fflush": Sig(1, args="F"),
+    "fgetc": Sig(1, args="F"), "getc": Sig(1, args="F"), "fputc": Sig(2, args="iF"),
+    "open": Sig(2, args="si"), "close": Sig(1, args="i"),
     "sleep": Sig(1, ret="unsigned"), "srand": Sig(1, ret="void"), "rand": Sig(0), "time": Sig(1, ret="time_t"),
     # _FORTIFY_SOURCE variants carry an extra leading flag / trailing object-size argument,
     # so the format index and arg count differ from the plain function
-    "__printf_chk": Sig(2, fmt=1), "__fprintf_chk": Sig(3, fmt=2),
-    "__sprintf_chk": Sig(4, fmt=3), "__snprintf_chk": Sig(5, fmt=4),
-    "__vprintf_chk": Sig(3, fmt=1), "__vfprintf_chk": Sig(4, fmt=2),
-    "__memcpy_chk": Sig(4, ret="void *"), "__memmove_chk": Sig(4, ret="void *"),
-    "__memset_chk": Sig(4, ret="void *"),
-    "__strcpy_chk": Sig(3, ret="char *"), "__strncpy_chk": Sig(4, ret="char *"),
-    "__strcat_chk": Sig(3, ret="char *"), "__strncat_chk": Sig(4, ret="char *"),
-    "__gets_chk": Sig(2, ret="char *"), "__read_chk": Sig(4, ret="ssize_t"),
+    "__printf_chk": Sig(2, fmt=1, args="is"), "__fprintf_chk": Sig(3, fmt=2, args="Fis"),
+    "__sprintf_chk": Sig(4, fmt=3, args="sins"), "__snprintf_chk": Sig(5, fmt=4, args="snins"),
+    "__vprintf_chk": Sig(3, fmt=1, args="is"), "__vfprintf_chk": Sig(4, fmt=2, args="Fis"),
+    "__memcpy_chk": Sig(4, ret="void *", args="ppnn"), "__memmove_chk": Sig(4, ret="void *", args="ppnn"),
+    "__memset_chk": Sig(4, ret="void *", args="pinn"),
+    "__strcpy_chk": Sig(3, ret="char *", args="ssn"), "__strncpy_chk": Sig(4, ret="char *", args="ssnn"),
+    "__strcat_chk": Sig(3, ret="char *", args="ssn"), "__strncat_chk": Sig(4, ret="char *", args="ssnn"),
+    "__gets_chk": Sig(2, ret="char *", args="sn"), "__read_chk": Sig(4, ret="ssize_t", args="ipnn"),
 }
 
 # %[flags][width][.precision][length]conversion   (width/precision may be `*` = an extra arg)
@@ -97,4 +115,25 @@ def arg_count(sig: Sig, fmt: str | None) -> int:
     return sig.fmt + 1 + count_conversions(fmt)
 
 
-__all__ = ["Sig", "SIGS", "base_name", "lookup", "count_conversions", "arg_count"]
+def format_types(fmt: str, scan: bool = False) -> list[str | None]:
+    """C types of the arguments a format string consumes, in order (None: not worth saying):
+    `%s` a `char *`; for printf, `%p` a `void *` and `%zu` a `size_t` (scanf's take pointers)."""
+    out: list[str | None] = []
+    for m in _CONV.finditer(fmt):
+        conv = m.group(6)
+        if conv == "%":
+            continue
+        out += [None] * ((m.group(2) == "*") + (m.group(4) == "*"))
+        if conv == "s":
+            out.append("char *")
+        elif conv == "p" and not scan:
+            out.append("void *")
+        elif m.group(5) == "z" and conv in "diouxX" and not scan:
+            out.append("size_t")
+        else:
+            out.append(None)
+    return out
+
+
+__all__ = ["ARG_TYPES", "Sig", "SIGS", "arg_count", "arg_type", "base_name", "count_conversions", "format_types",
+           "lookup"]

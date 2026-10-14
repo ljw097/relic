@@ -7,7 +7,7 @@ from relic.analysis import analyze
 from relic.decompiler.arch import arch_for
 from relic.decompiler.interp import Interpreter, Machine
 from relic.decompiler.ir import (Assign, BinOp, Branch, Const, IRBlock, IRFunction, Jump, Phi, Return, Var,
-                                 stmt_defs, stmt_exprs, walk)
+                                 stmt_exprs, walk)
 from relic.decompiler.lift import lift_function
 from relic.decompiler.outssa import out_of_ssa
 from relic.decompiler.passes import optimize

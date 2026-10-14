@@ -6,15 +6,15 @@ import traceback
 
 from PySide6.QtCore import QSettings, QSortFilterProxyModel, Qt, QThread, Signal
 from PySide6.QtGui import QAction, QColor, QKeySequence, QPalette, QStandardItem, QStandardItemModel
-from PySide6.QtWidgets import (QAbstractItemView, QApplication, QDockWidget, QFileDialog,
-                               QInputDialog, QLabel, QLineEdit, QMainWindow, QMessageBox, QProgressBar,
-                               QTableView, QTabWidget, QToolButton, QVBoxLayout, QWidget)
+from PySide6.QtWidgets import (QAbstractItemView, QApplication, QComboBox, QDialog, QDialogButtonBox, QDockWidget,
+                               QFileDialog, QFormLayout, QInputDialog, QLabel, QLineEdit, QMainWindow, QMessageBox,
+                               QProgressBar, QTableView, QTabWidget, QToolButton, QVBoxLayout, QWidget)
 
 from ..analysis import Analysis
 from ..analysis.strings import escape
 from ..progress import Cancelled, Progress
-from .debugger import (BacktracePanel, BreakpointsPanel, CodePanel, ConsolePanel, DebugController, MemoryPanel, RegistersPanel,
-                       StackPanel, VmmapPanel, item_value)
+from .debugger import (BacktracePanel, BreakpointsPanel, CodePanel, ConsolePanel, DebugController, MemoryPanel,
+                       RegistersPanel, StackPanel, VmmapPanel, item_value)
 from .views import (DEFAULT_FONT_SIZE, THEME, DisasmView, GraphView, HexView, PseudocodeView, current_theme,
                     font_size, mono_font, set_font_size, set_theme)
 
@@ -198,6 +198,33 @@ _C_RESERVED = {"if", "else", "while", "do", "for", "switch", "case", "default", 
                "enum", "typedef", "const", "static", "extern", "volatile", "float", "double"}
 
 
+class WatchDialog(QDialog):
+    """Expression to watch, write / read / access, and how many bytes."""
+
+    SIZES = [("word", None), ("1 byte", 1), ("2 bytes", 2), ("4 bytes", 4), ("8 bytes", 8)]
+
+    def __init__(self, parent=None, expr: str = ""):
+        super().__init__(parent)
+        self.setWindowTitle("Add watchpoint")
+        self.expr = QLineEdit(expr)
+        self.expr.setPlaceholderText("notes, notes+8, 0x404040, *(int *)($rbp-4)")
+        self.access = QComboBox()
+        self.access.addItems(["write", "read", "access"])
+        self.size = QComboBox()
+        self.size.addItems([t for t, _ in self.SIZES])
+        form = QFormLayout(self)
+        form.addRow("Expression", self.expr)
+        form.addRow("Stop on", self.access)
+        form.addRow("Size", self.size)
+        buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        form.addRow(buttons)
+
+    def values(self) -> tuple[str, str, int | None]:
+        return self.expr.text().strip(), self.access.currentText(), self.SIZES[self.size.currentIndex()][1]
+
+
 class MainWindow(QMainWindow):
     TAB_DISASM, TAB_GRAPH, TAB_DECOMP, TAB_HEX = range(4)
 
@@ -216,6 +243,7 @@ class MainWindow(QMainWindow):
         self.setWindowTitle("Relic")
 
         self.disasm = DisasmView()
+        self.disasm.on_decorator_error = self.report_plugin_error
         self.graph = GraphView()
         self.decomp = PseudocodeView()
         self.hex = HexView()
@@ -255,9 +283,11 @@ class MainWindow(QMainWindow):
         self.vulns.activated_addr.connect(self.goto)
         self.info.table.activated_addr.connect(self.goto)
         bottom = Qt.DockWidgetArea.BottomDockWidgetArea
+        from .pyconsole import PythonConsole
+        self.pyconsole = PythonConsole()
         docks = [self._dock(t, w, bottom) for t, w in (("Strings", self.strings), ("Imports", self.imports),
                                                        ("Vulns", self.vulns), ("Checksec", self.checksec),
-                                                       ("Sections", self.info))]
+                                                       ("Sections", self.info), ("Python", self.pyconsole))]
         for d in docks[1:]:
             self.tabifyDockWidget(docks[0], d)
         docks[0].raise_()
@@ -298,6 +328,8 @@ class MainWindow(QMainWindow):
         self.dbg.memory.connect(self.dbg_mem.show_memory)
         self.dbg_mem.goto_expr.connect(self.dbg.view_memory)
         self.dbg_bps.changed.connect(self._debug_breakpoint_edited)
+        self.dbg_bps.removed.connect(self._debug_breakpoint_removed)
+        self.dbg_regs.edit_requested.connect(self.debug_set_register_dialog)
         self.dbg_bps.cellDoubleClicked.connect(self._debug_breakpoint_clicked)
         for t in (self.dbg_regs, self.dbg_stack, self.dbg_vmmap):
             t.cellDoubleClicked.connect(lambda r, c, t=t: self._debug_follow(t, r, c))
@@ -320,6 +352,7 @@ class MainWindow(QMainWindow):
         self._closing = False
         self._actions()
         self._update_actions()
+        self._load_plugins()
         self._restore_layout()
 
     # ---------------------------------------------------------------- setup
@@ -348,6 +381,7 @@ class MainWindow(QMainWindow):
         self.recent_menu = m.addMenu("Open &Recent")
         self._fill_recent_menu()
         act(m, "&Save project", QKeySequence.StandardKey.Save, self.save_project)
+        act(m, "Apply library &signatures...", None, self.signatures_dialog)
         m.addSeparator()
         act(m, "&Cancel background work", "Ctrl+.", self.cancel_work, False)
         m.addSeparator()
@@ -364,7 +398,17 @@ class MainWindow(QMainWindow):
         m = mb.addMenu("&Edit")
         act(m, "&Rename...", "N", self.rename_dialog)
         act(m, "&Comment...", ";", self.comment_dialog)
+        act(m, "Set t&ype...", "Y", self.set_type_dialog)
         act(m, "&Xrefs to...", "X", self.show_xrefs_here)
+        m.addSeparator()
+        act(m, "&Patch bytes...", "Ctrl+Alt+P", self.patch_bytes_dialog)
+        act(m, "&Assemble...", "Ctrl+Alt+A", self.assemble_dialog)
+        act(m, "&NOP instruction", "Ctrl+Alt+N", lambda: self.patch_with("nop"))
+        act(m, "In&vert branch", "Ctrl+Alt+J", lambda: self.patch_with("invert"))
+        act(m, "Re&vert patch", None, self.revert_patch_here)
+        act(m, "&Undo patch", "Ctrl+Z", self.undo_patch)
+        act(m, "Redo patc&h", ("Ctrl+Shift+Z", "Ctrl+Y"), self.redo_patch)
+        act(m, "&Export patched file...", None, self.export_patched_dialog)
         m = mb.addMenu("&Search")
         act(m, "Sequence of &bytes...", "Alt+B", lambda: self.search_dialog("bytes"))
         act(m, "&Text...", "Alt+T", lambda: self.search_dialog("text"))
@@ -378,11 +422,18 @@ class MainWindow(QMainWindow):
         act(m, "Step o&ut", "Ctrl+F7", self.dbg.step_out)
         act(m, "&Run to cursor", "F4", self.debug_run_to_cursor)
         act(m, "Toggle &breakpoint", "F2", self.debug_toggle_breakpoint)
+        act(m, "Breakpoint at &function...", "Ctrl+Alt+B", self.debug_breakpoint_dialog)
+        act(m, "Add &watchpoint...", "Ctrl+Alt+W", self.debug_watchpoint_dialog)
+        act(m, "Set re&gister...", None, lambda: self.debug_set_register_dialog())
+        act(m, "&Write memory...", None, self.debug_write_memory_dialog)
         act(m, "&Pause", "Ctrl+Alt+Pause", self.dbg.interrupt, False)
         act(m, "S&top", "Ctrl+F2", self.dbg.stop, False)
         m.addSeparator()
         act(m, "Program &arguments...", None, self.debug_arguments_dialog)
+        self.plugins_menu = mb.addMenu("&Plugins")
         m = mb.addMenu("&View")
+        act(m, "&Python console", "Ctrl+Shift+P", self.show_python_console, False)
+        act(m, "&Structures...", "Ctrl+Shift+S", self.show_structs)
         self.light_act = act(m, "&Light theme", "Ctrl+Shift+L",
                              lambda on: self.set_appearance(theme="light" if on else "dark"), False)
         self.light_act.setCheckable(True)
@@ -422,7 +473,7 @@ class MainWindow(QMainWindow):
         if size is not None:
             st.setValue("font_size", set_font_size(size))
         st.sync()
-        for v in (self.disasm, self.graph, self.decomp, self.hex):
+        for v in (self.disasm, self.graph, self.decomp, self.hex, self.pyconsole):
             v.restyle()
         if theme is not None and self.an is not None:
             # table rows carry theme colours (imports, noreturn functions, severities)
@@ -589,6 +640,8 @@ class MainWindow(QMainWindow):
     def set_analysis(self, an: Analysis, extra: dict | None = None):
         extra = extra or {}
         self.an = an
+        from ..scripting import namespace
+        self.pyconsole.set_namespace(namespace(an, self))
         self.back.clear()
         self.fwd.clear()
         self.cur = None
@@ -612,6 +665,7 @@ class MainWindow(QMainWindow):
         start = main.addr if main else an.bin.entry
         self._update_actions()
         self.goto(start, record=False)
+        self._run_analysis_hooks()
 
     def _fill_functions(self):
         t = self.funcs.table
@@ -619,7 +673,8 @@ class MainWindow(QMainWindow):
         t.clear_rows()
         an = self.an
         for f in sorted(an.functions.values(), key=lambda f: f.addr):
-            color = THEME["addr"] if f.is_import else (THEME["jump"] if f.noreturn else None)
+            color = THEME["addr"] if f.is_import else (THEME["jump"] if f.noreturn else
+                                                       THEME["comment"] if f.library else None)
             t.add_row([an.name(f.addr) or f.name, f.addr, f.size], f.addr, color)
         t.setSortingEnabled(True)
         t.fit()
@@ -833,20 +888,102 @@ class MainWindow(QMainWindow):
         self.statusBar().showMessage(f"breakpoint {'set' if on else 'cleared'} at {self.an.location(self.cur)}", 3000)
 
     def _debug_breakpoints_changed(self):
-        self.disasm.set_debug_marks(self.dbg.last.pc_static,
-                                    [a for a, b in self.dbg.static_bps.items() if b.enabled])
+        self._debug_marks(self.dbg.last.pc_static)
         self.dbg_bps.an = self.an
-        self.dbg_bps.show_breakpoints(sorted(self.dbg.static_bps.values(), key=lambda b: b.addr))
+        self.dbg_bps.show_breakpoints(self.dbg.breakpoint_list)
 
-    def _debug_breakpoint_edited(self, addr: int, enabled, condition):
-        self.dbg.set_breakpoint(addr, enabled, condition)
+    def _debug_marks(self, pc_static: int | None):
+        """pc and enabled breakpoints in the listing and the pseudocode."""
+        bps = [a for a, b in self.dbg.static_bps.items() if b.enabled]
+        self.disasm.set_debug_marks(pc_static, bps)
+        self.decomp.set_debug_marks(pc_static, bps)
+
+    def _debug_breakpoint_edited(self, key, enabled, condition):
+        self.dbg.set_breakpoint(key, enabled, condition)
+        self._debug_breakpoints_changed()
+
+    def _debug_breakpoint_removed(self, key):
+        self.dbg.remove_breakpoint(key)
         self._debug_breakpoints_changed()
 
     def _debug_breakpoint_clicked(self, row: int, col: int):
-        if col in (1, 2):
-            a = item_value(self.dbg_bps.item(row, 1))
+        if col in (2, 3):
+            a = item_value(self.dbg_bps.item(row, 2))
             if a is not None:
                 self.goto(a)
+
+    def debug_breakpoint_dialog(self):
+        """Break on a function by name: one of the binary (`vuln`), `puts@plt`, or a library
+        function (`puts` stops inside libc)."""
+        if self.an is None:
+            return
+        cur = self.an.name(self.cur) if self.cur is not None else ""
+        text, ok = QInputDialog.getText(self, "Breakpoint at function",
+                                        "Function (vuln, puts, puts@plt, libc.so.6:system, 0x401136):",
+                                        text=cur or "")
+        if ok and text.strip():
+            self.debug_break_at(text)
+
+    def debug_break_at(self, text: str):
+        bp = self.dbg.breakpoint_at(text, self.an)
+        self._debug_breakpoints_changed()
+        if bp is not None:
+            self.dbg_docks[7].show()
+            self.statusBar().showMessage(f"breakpoint on {bp.describe(self.an)}", 3000)
+
+    def debug_watchpoint_dialog(self):
+        """Watch memory: a global of the binary (`notes`), an address, or a gdb expression."""
+        if self.an is None:
+            return
+        dlg = WatchDialog(self, self._debug_watch_default())
+        if dlg.exec():
+            self.debug_watch(*dlg.values())
+
+    def _debug_watch_default(self) -> str:
+        """The data the cursor's instruction refers to, else the memory view's address."""
+        if self.cur is not None:
+            refs = [x.to for x in self.an.xrefs_from.get(self.cur, ()) if x.kind == "data"]
+            refs = [a for a in refs if self.an.string_at(a) is None] or refs
+            if refs:
+                return self.an.label(refs[0])
+        return f"{self.dbg_mem.addr:#x}" if self.dbg_mem.addr is not None else ""
+
+    def debug_set_register_dialog(self, name: str = "", value: int | None = None):
+        """Change a register: `rax = 0x41`, or `$rsp+8` (any gdb expression)."""
+        if not self.dbg.active:
+            return
+        if not name:
+            name, ok = QInputDialog.getItem(self, "Set register", "Register:",
+                                            [n for n, *_ in self.dbg.last.regs], 0, False)
+            if not ok:
+                return
+            value = next((v for n, v, *_ in self.dbg.last.regs if n == name), None)
+        text, ok = QInputDialog.getText(self, "Set register", f"New value of {name} (number or gdb expression):",
+                                        text=f"{value:#x}" if value is not None else "")
+        if ok and text.strip():
+            self.dbg.set_register(name, text)
+
+    def debug_write_memory_dialog(self):
+        """Write bytes at an address: hex (`41 42 ff`), a string (`"AAAA\\n"`) or a word (`0x401136`)."""
+        if not self.dbg.active:
+            return
+        where, ok = QInputDialog.getText(self, "Write memory", "Address or expression ($rsp+8, notes, 0x7ffd...):",
+                                         text=f"{self.dbg_mem.addr:#x}" if self.dbg_mem.addr is not None else "$rsp")
+        if not ok or not where.strip():
+            return
+        data, ok = QInputDialog.getText(self, "Write memory",
+                                        'Bytes: hex (41 42 ff), "string\\n", or a word (0x401136):')
+        if ok and data.strip():
+            self.dbg.write_memory(where, data)
+            self.dbg_docks[5].show()
+            self.dbg_docks[5].raise_()
+
+    def debug_watch(self, expr: str, access: str = "write", size: int | None = None):
+        bp = self.dbg.add_watchpoint(expr, access, size)
+        self._debug_breakpoints_changed()
+        if bp is not None:
+            self.dbg_docks[7].show()
+            self.statusBar().showMessage(f"watching {bp.describe()}", 3000)
 
     def debug_run_to_cursor(self):
         if self.cur is not None:
@@ -867,15 +1004,17 @@ class MainWindow(QMainWindow):
         for panel in (self.dbg_regs, self.dbg_stack, self.dbg_bt, self.dbg_code, self.dbg_vmmap, self.dbg_bps):
             panel.show_snapshot(snap)
         if snap.exited:
-            self.disasm.set_debug_marks(None, [a for a, b in self.dbg.static_bps.items() if b.enabled])
+            self._debug_marks(None)
             self.dbg_console.append(f"[ {snap.exited} ]\n")
             self.statusBar().showMessage(f"program {snap.exited}", 5000)
             return
         if snap.pc_static is not None:
             self.goto(snap.pc_static, record=False)
-        self.disasm.set_debug_marks(snap.pc_static, [a for a, b in self.dbg.static_bps.items() if b.enabled])
+        self._debug_marks(snap.pc_static)
         where = self.an.location(snap.pc_static) if snap.pc_static is not None else f"{snap.pc:#x}"
-        self.statusBar().showMessage(f"stopped at {where}" + (f" ({snap.reason})" if snap.reason else ""), 5000)
+        self.statusBar().showMessage(f"stopped at {where}" + (f" ({snap.stop})" if snap.stop else ""), 5000)
+        if snap.reason.endswith(("watchpoint-trigger", "watchpoint-scope")):
+            self.dbg_console.append(f"[ {snap.stop} at {where} ]\n")
 
     def _debug_output(self, data: bytes):
         self.dbg_console.append(data.decode("utf-8", "replace"))
@@ -1006,6 +1145,14 @@ class MainWindow(QMainWindow):
                 if ok:
                     self.rename_variable(gen, text.strip())
                 return
+            st = self.decomp.struct_under_cursor()
+            if st is not None:
+                shown, struct, fld = st
+                what = f"field {shown} of struct {struct}" if fld else f"struct {shown}"
+                text, ok = QInputDialog.getText(self, "Rename", f"Name for {what} (empty to reset):", text=shown)
+                if ok:
+                    self.rename_struct(struct, fld, text.strip())
+                return
         a = self._rename_subject()
         if a is None:
             return
@@ -1032,6 +1179,64 @@ class MainWindow(QMainWindow):
         self._after_edit()
         return True
 
+    def set_type_dialog(self):
+        """Pseudocode: a C type for the variable / parameter or struct field under the cursor
+        (`char *`, `unsigned int`, `struct note *`); empty resets to the recovered one."""
+        if self.tabs.currentIndex() != self.TAB_DECOMP or self.decomp.result is None:
+            self.statusBar().showMessage("set type: put the cursor on a variable or field in the pseudocode", 4000)
+            return
+        var = self.decomp.variable_under_cursor()
+        if var is not None:
+            shown, gen = var
+            cur = self.decomp.result.types.get(gen, "")
+            text, ok = QInputDialog.getText(self, "Set type", f"Type of {shown} (empty: as recovered):", text=cur)
+            if ok:
+                self.set_var_type(gen, text)
+            return
+        st = self.decomp.struct_under_cursor()
+        if st is not None and st[2] is not None:
+            shown, struct, fld = st
+            cur = self.an.struct_names.get(struct, {}).get("types", {}).get(fld, "")
+            text, ok = QInputDialog.getText(self, "Set type", f"Type of field {shown} (empty: as recovered):",
+                                            text=cur)
+            if ok:
+                self.set_field_type(struct, fld, text)
+
+    def set_var_type(self, generated: str, ctype: str) -> bool:
+        func = self.decomp.func
+        if func is None or self.an is None:
+            return False
+        try:
+            self.an.set_var_type(func.addr, generated, ctype)
+        except ValueError as e:
+            self.statusBar().showMessage(f"set type: {e}", 5000)
+            return False
+        self._after_edit()
+        return True
+
+    def set_field_type(self, struct: str, field: str, ctype: str) -> bool:
+        try:
+            self.an.set_field_type(struct, field, ctype)
+        except ValueError as e:
+            self.statusBar().showMessage(f"set type: {e}", 5000)
+            return False
+        self._after_edit()
+        return True
+
+    def rename_struct(self, struct: str, field: str | None, name: str) -> bool:
+        """Name a recovered struct (field None) or one of its fields, by generated names."""
+        import keyword
+        import re
+        if name and (not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", name) or keyword.iskeyword(name)):
+            self.statusBar().showMessage(f"'{name}' is not a C identifier", 3000)
+            return False
+        if field is None:
+            self.an.rename_struct(struct, name)
+        else:
+            self.an.rename_field(struct, field, name)
+        self._after_edit()
+        return True
+
     def rename(self, addr: int, name: str):
         if name and any(c.isspace() for c in name):
             self.statusBar().showMessage("names cannot contain spaces", 3000)
@@ -1053,6 +1258,49 @@ class MainWindow(QMainWindow):
         self.an.comment(addr, text)
         self._after_edit()
 
+    def signatures_dialog(self):
+        """Pick signature files (or static libraries, built into ~/.relic/sigs) and name the
+        functions without a symbol that match."""
+        from ..analysis import libsigs
+        start = (libsigs.sig_dirs() or [os.path.expanduser("~")])[0]
+        paths, _ = QFileDialog.getOpenFileNames(self, "Library signatures", start,
+                                                "Signatures or static libraries (*.sig *.a *.o);;All files (*)")
+        if paths:
+            self.apply_signatures(paths)
+
+    def apply_signatures(self, paths: list[str]) -> int:
+        """Name functions by these signature files / static libraries; how many were named."""
+        from ..analysis import libsigs
+        dbs = []
+        QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
+        try:
+            for p in paths:
+                try:
+                    if p.endswith(".sig"):
+                        db = libsigs.SigDB.load(p)
+                    else:                        # a library: build its signatures once, keep them
+                        db = libsigs.build([p])
+                        out = os.path.join(os.path.expanduser("~"), ".relic", "sigs",
+                                           f"{os.path.splitext(os.path.basename(p))[0]}-{db.arch}.sig")
+                        db.save(out)
+                except (OSError, ValueError) as e:
+                    QMessageBox.warning(self, "Library signatures", f"{p}: {e}")
+                    continue
+                if db.arch == self.an.bin.arch:
+                    dbs.append(db)
+            named = libsigs.apply(self.an, dbs)
+        finally:
+            QApplication.restoreOverrideCursor()
+        self.an.lib_names.update(named)
+        if not dbs:
+            self.statusBar().showMessage(f"no signatures for {self.an.bin.arch}", 5000)
+        else:
+            self.statusBar().showMessage(f"{len(named)} functions named by library signatures", 5000)
+        if named:
+            self._after_edit()
+            self._fill_functions()
+        return len(named)
+
     def _after_edit(self):
         self.dirty = True
         self.setWindowTitle(self.windowTitle().rstrip(" *") + " *")
@@ -1063,6 +1311,185 @@ class MainWindow(QMainWindow):
         if keep is not None:
             self.disasm.goto(keep)
             self.graph.goto(keep)
+
+    # ------------------------------------------------------------- scripting
+    def show_structs(self):
+        """The structures window (one per main window, refreshed when shown)."""
+        from .structs import StructsDialog
+        if getattr(self, "structs_dialog", None) is None:
+            self.structs_dialog = StructsDialog(self)
+        else:
+            self.structs_dialog.refresh()
+        self.structs_dialog.show()
+        self.structs_dialog.raise_()
+        return self.structs_dialog
+
+    def show_python_console(self):
+        d = self.findChild(QDockWidget, "Python")
+        d.show()
+        d.raise_()
+        self.pyconsole.line.setFocus()
+
+    def _load_plugins(self):
+        from ..scripting import load_plugins
+        self.plugin_names, failed = load_plugins(self)
+        if not self.plugin_names and not failed:
+            self.plugins_menu.addAction("(no plugins: RELIC_PLUGINS or ~/.relic/plugins)").setEnabled(False)
+        for name, err in failed:
+            self.report_plugin_error(name, err)
+
+    def add_plugin_action(self, text: str, slot, shortcut: str | None = None) -> QAction:
+        a = QAction(text, self)
+        if shortcut:
+            a.setShortcut(QKeySequence(shortcut))
+            a.setShortcutContext(Qt.ShortcutContext.WindowShortcut)
+        a.triggered.connect(slot)
+        self.plugins_menu.addAction(a)
+        return a
+
+    def add_analysis_hook(self, plugin: str, callback):
+        """`callback(ns)` after a binary's analysis is shown (see PluginAPI.on_analysis)."""
+        self.__dict__.setdefault("analysis_hooks", []).append((plugin, callback))
+
+    def add_listing_hook(self, plugin: str, callback):
+        """`callback(an, addr) -> str | None`: text added to listing comments."""
+        self.disasm.decorators.append((plugin, callback))
+        if self.an is not None:
+            self.disasm.reload()
+
+    def _run_analysis_hooks(self):
+        from ..scripting import namespace
+        for plugin, cb in getattr(self, "analysis_hooks", ()):
+            try:
+                cb(namespace(self.an, self))
+            except Exception:  # noqa: BLE001 - a plugin bug is reported, the GUI stays up
+                self.report_plugin_error(plugin, traceback.format_exc())
+
+    def report_plugin_error(self, plugin: str, error: str):
+        self.pyconsole.append(f"[plugin {plugin}] {error}\n")
+        self.statusBar().showMessage(f"plugin {plugin} failed (see the Python console)", 6000)
+
+    # ------------------------------------------------------------------ patching
+    def _patch_target(self) -> int | None:
+        """The instruction under the cursor (listing / graph), or the cursor address."""
+        return self.cur if self.an is not None else None
+
+    def patch(self, addr: int, data: bytes) -> bool:
+        """Write bytes at `addr`, re-analyse, refresh the views (the cursor stays)."""
+        from ..patch import PatchError
+        QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
+        try:
+            old = self.an.patch(addr, data)
+        except PatchError as e:
+            QApplication.restoreOverrideCursor()
+            self.statusBar().showMessage(f"patch: {e}", 6000)
+            return False
+        QApplication.restoreOverrideCursor()
+        self._after_patch(addr)
+        self.statusBar().showMessage(f"patched {addr:#x}: {old.hex(' ')} -> {data.hex(' ')}", 6000)
+        return True
+
+    def patch_with(self, how: str) -> bool:
+        """NOP the instruction at the cursor, or invert its conditional branch."""
+        from ..patch import PatchError, invert_bytes, nop_bytes
+        a = self._patch_target()
+        if a is None:
+            return False
+        try:
+            data = nop_bytes(self.an, a) if how == "nop" else invert_bytes(self.an, a)
+        except PatchError as e:
+            self.statusBar().showMessage(f"patch: {e}", 6000)
+            return False
+        return self.patch(a, data)
+
+    def patch_bytes_dialog(self):
+        from ..patch import PatchError, parse_hex
+        a = self._patch_target()
+        if a is None:
+            return
+        i = self.an.dis.decode(a)
+        text, ok = QInputDialog.getText(self, "Patch bytes", f"Bytes at {a:#x} (hex):",
+                                        text=i.raw.hex(" ") if i is not None else "")
+        if ok and text.strip():
+            try:
+                self.patch(a, parse_hex(text))
+            except PatchError as e:
+                self.statusBar().showMessage(f"patch: {e}", 6000)
+
+    def assemble_dialog(self):
+        from ..patch import PatchError, assemble, fit
+        a = self._patch_target()
+        if a is None:
+            return
+        i = self.an.dis.decode(a)
+        text, ok = QInputDialog.getText(self, "Assemble", f"Instructions at {a:#x} (`;` between them):",
+                                        text=f"{i.mnemonic} {i.op_str}".strip() if i is not None else "")
+        if ok and text.strip():
+            try:
+                self.patch(a, fit(self.an, a, assemble(self.an, a, text)))
+            except PatchError as e:
+                self.statusBar().showMessage(f"assemble: {e}", 6000)
+
+    def revert_patch_here(self) -> bool:
+        a = self._patch_target()
+        if a is None:
+            return False
+        start = next((p for p, (_, new) in self.an.patches.items() if p <= a < p + len(new)), None)
+        if start is None:
+            self.statusBar().showMessage("no patch here", 3000)
+            return False
+        self.an.revert(start)
+        self._after_patch(a)
+        self.statusBar().showMessage(f"reverted the patch at {start:#x}", 4000)
+        return True
+
+    def undo_patch(self) -> bool:
+        """Undo the last patch or revert (Ctrl+Z); the cursor goes to it."""
+        if self.an is None:
+            return False
+        addr = self.an.undo_patch()
+        if addr is None:
+            self.statusBar().showMessage("nothing to undo", 3000)
+            return False
+        self._after_patch(addr)
+        self.statusBar().showMessage(f"undid the patch edit at {addr:#x}", 4000)
+        return True
+
+    def redo_patch(self) -> bool:
+        if self.an is None:
+            return False
+        addr = self.an.redo_patch()
+        if addr is None:
+            self.statusBar().showMessage("nothing to redo", 3000)
+            return False
+        self._after_patch(addr)
+        self.statusBar().showMessage(f"redid the patch edit at {addr:#x}", 4000)
+        return True
+
+    def export_patched_dialog(self):
+        from ..patch import export
+        if self.an is None:
+            return
+        path, _ = QFileDialog.getSaveFileName(self, "Export patched file", self.an.bin.path + ".patched")
+        if path:
+            try:
+                export(self.an.bin, path)
+            except OSError as e:
+                QMessageBox.warning(self, "Relic", f"cannot write {path}: {e}")
+                return
+            self.statusBar().showMessage(f"wrote {path} ({len(self.an.patches)} patches)", 5000)
+
+    def _after_patch(self, keep: int | None):
+        """The analysis was redone in place: functions, blocks and xrefs are new objects."""
+        self.disasm.func = self.graph.func = None
+        self.decomp.func = None
+        self.decomp.invalidate(reload=False)
+        self._fill_functions()
+        self._fill_tables(self._last_checksec)
+        self.dirty = True
+        self.setWindowTitle(self.windowTitle().rstrip(" *") + " *")
+        if keep is not None:
+            self.goto(keep, record=False)
 
     def save_project(self) -> bool:
         if self.an is None:
@@ -1080,7 +1507,7 @@ class MainWindow(QMainWindow):
     def _confirm_discard(self) -> bool:
         if not self.dirty or self.an is None:
             return True
-        r = QMessageBox.question(self, "Relic", "Save renames and comments to the project file?",
+        r = QMessageBox.question(self, "Relic", "Save renames, comments and patches to the project file?",
                                  QMessageBox.StandardButton.Save | QMessageBox.StandardButton.Discard
                                  | QMessageBox.StandardButton.Cancel)
         if r == QMessageBox.StandardButton.Save:

@@ -22,8 +22,8 @@ from collections import Counter
 from ..progress import checkpoint
 from .arch import ArchInfo
 from .interp import InterpError, apply_binop, apply_cast, apply_unop
-from .ir import (BARRIERS, Assign, BinOp, Call, CallStmt, Cast, Const, Effect, Expr, Extract, IRFunction,
-                 Ite, Load, Phi, UnOp, Unknown, Var, mask, stmt_exprs, transform, walk)
+from .ir import (BARRIERS, Assign, BinOp, Branch, Call, CallStmt, Cast, Const, Effect, Expr, Extract, IRFunction,
+                 Ite, Jump, Load, Phi, Return, UnOp, Unknown, Var, children, mask, stmt_exprs, transform, walk)
 
 MAX_ITERS = 64
 
@@ -52,13 +52,23 @@ def _dead_removable(e: Expr) -> bool:
     return not _has(e, Call)
 
 
+def _add_uses(c: Counter, s, k: int = 1) -> None:
+    """Add `k` to the count of every variable statement `s` reads (an explicit stack: this
+    runs over every statement of every pass round, generator recursion costs too much)."""
+    stack = list(stmt_exprs(s))
+    pop, push = stack.pop, stack.extend
+    while stack:
+        x = pop()
+        if isinstance(x, Var):
+            c[x] += k
+        else:
+            push(children(x))
+
+
 def _count_uses(fn: IRFunction) -> Counter:
     c: Counter = Counter()
     for s in fn.stmts():
-        for top in stmt_exprs(s):
-            for x in walk(top):
-                if isinstance(x, Var):
-                    c[x] += 1
+        _add_uses(c, s)
     return c
 
 
@@ -78,6 +88,24 @@ def _rewrite(fn: IRFunction, f) -> bool:
             if stmt_exprs(s) != before:
                 changed = True
     return changed
+
+
+def _fixed(f, memo: dict | None):
+    """`f` (a pure rewrite of one expression) skipping expressions it already left unchanged:
+    `memo` maps id -> expression for those (the expression is kept alive, so its id is not
+    reused). An unchanged result returns the original object, so it stays known next round."""
+    if memo is None:
+        return f
+
+    def g(e: Expr) -> Expr:
+        if memo.get(id(e)) is e:
+            return e
+        r = f(e)
+        if r == e:
+            memo[id(e)] = e
+            return e
+        return r
+    return g
 
 
 def _subst(e: Expr, sub: dict[Var, Expr]) -> Expr:
@@ -173,6 +201,10 @@ def _simp_node(e: Expr) -> Expr:
             if ones(b): return a
             if ones(a): return b
             if a == b and _droppable(a): return a
+            if isinstance(a, Cast) and a.kind == "zext" and a.a.bits == 1 and isinstance(b, Const) and b.value & 1:
+                return a                                  # `(int)c & 0xff`: c is 0 or 1 already
+        elif op == "<u" and one(b):
+            return BinOp("==", a, Const(0, a.bits), 1)    # `x <u 1` (MIPS `sltiu x, 1`): x == 0
         elif op == "^":
             if z(b): return a
             if z(a): return b
@@ -223,8 +255,8 @@ def _simp_node(e: Expr) -> Expr:
     return e
 
 
-def _fold_pass(fn: IRFunction) -> bool:
-    return _rewrite(fn, lambda e: transform(e, lambda x: _simp_node(_fold_node(x))))
+def _fold_pass(fn: IRFunction, memo: dict | None = None) -> bool:
+    return _rewrite(fn, _fixed(lambda e: transform(e, lambda x: _simp_node(_fold_node(x))), memo))
 
 
 # ----------------------------------------------------- constant / copy propagation
@@ -412,25 +444,28 @@ def bool_ite(e: Expr) -> Expr:
     return e
 
 
-def _conditions(fn: IRFunction) -> bool:
+def _conditions(fn: IRFunction, memo: dict | None = None) -> bool:
     def one(e):
         e = transform(e, _hoist_ite)
         e = transform(e, lambda x: _simp_node(_fold_node(x)))
         return transform(transform(e, _combine_node), _tidy_node)
-    return _rewrite(fn, one)
+    return _rewrite(fn, _fixed(one, memo))
 
 
 # -------------------------------------------------------------- dead-code elimination
 def _dce(fn: IRFunction) -> bool:
     changed = False
+    # counted once: a removed statement takes its reads off the count, which can make the
+    # definitions it read dead in the next round
+    uses = _count_uses(fn)
     while True:
-        uses = _count_uses(fn)
         removed = False
         for b in fn.blocks.values():
             kept = []
             for s in b.stmts:
                 if isinstance(s, Assign) and isinstance(s.dst, Var) \
                         and uses.get(s.dst, 0) == 0 and _dead_removable(s.src):
+                    _add_uses(uses, s, -1)
                     removed = True
                     continue
                 if isinstance(s, (CallStmt, Effect, Unknown)):
@@ -445,16 +480,69 @@ def _dce(fn: IRFunction) -> bool:
             return changed
 
 
+def _sign_test(c: Expr) -> bool:
+    """`x < 0` / `0 <= x` style: the sign of one value."""
+    return isinstance(c, BinOp) and c.op in ("<s", "<=s") and any(isinstance(k, Const) and k.value == 0
+                                                                 for k in (c.a, c.b))
+
+
+def _sign_fixups(fn: IRFunction) -> bool:
+    """`if (x < 0) x += 15;` and `return x < 0 ? f(x) : x` written as branches (MIPS has no
+    select instruction): turn them into selects, so the division recovery sees gcc's
+    rounding of signed power-of-two quotients and remainders. Only sign tests of pure values,
+    with nothing else in the branch, are converted."""
+    from .cleanup import _relink
+    changed = False
+    for h in list(fn.blocks.values()):
+        last = h.stmts[-1] if h.stmts else None
+        if not isinstance(last, Branch) or not _sign_test(last.cond) or last.true == last.false:
+            continue
+        t, f = fn.blocks.get(last.true), fn.blocks.get(last.false)
+        if t is None or f is None:
+            continue
+        # two returns: `return c ? a : b`
+        rets = [b.stmts[0] if len(b.stmts) == 1 and isinstance(b.stmts[0], Return) else None for b in (t, f)]
+        if all(r is not None and r.value is not None and _droppable(r.value) for r in rets) and \
+                t.preds == [h.addr] and f.preds == [h.addr]:
+            r = rets[0]
+            h.stmts[-1] = Return(r.addr, Ite(last.cond, rets[0].value, rets[1].value, r.value.bits))
+            h.succs = []
+            changed = True
+            continue
+        # a triangle: an empty side block, the values chosen by a phi at the join
+        for side, join, c in ((t, f, last.cond), (f, t, _not(last.cond))):
+            if side.preds != [h.addr] or side.succs != [join.addr] or \
+                    any(not isinstance(s, Jump) for s in side.stmts) or \
+                    sorted(join.preds) != sorted([h.addr, side.addr]):
+                continue
+            phis = [s for s in join.stmts if isinstance(s, Assign) and isinstance(s.src, Phi)]
+            srcs = [dict(s.src.sources) for s in phis]
+            if not phis or not all(side.addr in d and h.addr in d and _droppable(d[side.addr]) for d in srcs):
+                continue
+            for s, d in zip(phis, srcs):
+                s.src = Ite(c, d[side.addr], d[h.addr], s.src.bits)
+            h.stmts[-1] = Jump(last.addr, join.addr)
+            h.succs = [join.addr]
+            changed = True
+            break
+    if changed:
+        _relink(fn)
+    return changed
+
+
 # ---------------------------------------------------------------------- driver
 def optimize(fn: IRFunction, arch: ArchInfo | None = None) -> IRFunction:
     """Run every pass to a fixpoint. Mutates and returns `fn` (expects SSA input)."""
+    folded: dict = {}
+    conds: dict = {}
     for _ in range(MAX_ITERS):
         checkpoint()                 # a cancelled decompilation stops between rounds
         changed = False
-        changed |= _fold_pass(fn)
+        changed |= _fold_pass(fn, folded)
         changed |= _propagate(fn)
         changed |= _forward_loads(fn)
-        changed |= _conditions(fn)
+        changed |= _conditions(fn, conds)
+        changed |= _sign_fixups(fn)
         changed |= _dce(fn)
         if not changed:
             break

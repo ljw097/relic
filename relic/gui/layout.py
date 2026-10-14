@@ -94,12 +94,22 @@ def _count(upper: list, lower: list, down: dict) -> int:
     """Crossings between two adjacent layers (`down`: node -> neighbours in the lower layer)."""
     idx = {n: k for k, n in enumerate(lower)}
     ends = [idx[m] for n in upper for m in sorted(down.get(n, ()), key=idx.__getitem__)]
-    # inversions of the lower endpoints, read in upper order
+    # inversions of the lower endpoints, read in upper order, counted with a Fenwick tree over
+    # the lower layer (Barth, Juenger, Mutzel): O(E log V) instead of comparing every pair
+    size = len(lower)
+    tree = [0] * (size + 1)
     c = 0
-    for i in range(len(ends)):
-        for j in range(i + 1, len(ends)):
-            if ends[i] > ends[j]:
-                c += 1
+    for seen, e in enumerate(ends):
+        k = e + 1                      # endpoints so far at or left of e ...
+        le = 0
+        while k:
+            le += tree[k]
+            k &= k - 1
+        c += seen - le                 # ... the rest are right of it: crossings
+        k = e + 1
+        while k <= size:
+            tree[k] += 1
+            k += k & -k
     return c
 
 

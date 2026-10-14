@@ -17,6 +17,7 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
+from ..progress import Cancelled
 from .ir import (Assign, BinOp, Branch, CallStmt, Const, Expr, IndirectJump, IRFunction, Jump, Load, Phi, Return,
                  StackAddr, StackVar, Store, Var, map_stmt, stmt_exprs, walk)
 from .stack import Frame, Slot
@@ -222,7 +223,18 @@ def returns_value(an: "Analysis", func: "Function", fn: IRFunction, ret_reg: str
     if reads:
         return any(r != "none" for r in reads)
     rets = [s.value for s in fn.stmts() if isinstance(s, Return)]
-    return any(v is not None and not (isinstance(v, Var) and v.version == 0) for v in rets)
+    # a function that returns something sets the register on every path: one where the entry
+    # value can still come back (through phis) only used it as scratch (-O0 x86 `rax`)
+    phis = {s.dst: s.src for s in fn.stmts() if isinstance(s, Assign) and isinstance(s.dst, Var)
+            and isinstance(s.src, Phi)}
+
+    def entry(v, depth=8) -> bool:
+        if isinstance(v, Var) and v.version == 0:
+            return True
+        if depth and v in phis:
+            return any(entry(x, depth - 1) for _, x in phis[v].sources)
+        return False
+    return any(v is not None for v in rets) and not any(v is not None and entry(v) for v in rets)
 
 
 def drop_return_values(fn: IRFunction):
@@ -430,7 +442,7 @@ def inline_single_use(fn: IRFunction) -> bool:
     expression reads (a store, a call, a write to one of its variables) may
     sit between the definition and the use.
     """
-    from .ir import Call, CallStmt as _CS, Effect, Unknown, children, stmt_defs, transform
+    from .ir import Call, CallStmt as _CS, Effect, Unknown, stmt_defs, transform
     changed_any = False
     while True:
         uses: dict[str, int] = {}
@@ -533,7 +545,17 @@ def self_width(an: "Analysis", func: "Function", ret_reg: str, bits: int = 32) -
         return c[func.addr]
     c[func.addr] = None          # recursion guard
     try:
+        return _self_width(an, func, ret_reg, bits, c)
+    except Cancelled:
+        del c[func.addr]         # the guard is not an answer
+        raise
+
+
+def _self_width(an: "Analysis", func: "Function", ret_reg: str, bits: int, c: dict) -> int | None:
+    try:
         fn = cached_ir(an, func)
+    except Cancelled:
+        raise
     except Exception:
         return None
     defs: dict = {}
@@ -541,7 +563,7 @@ def self_width(an: "Analysis", func: "Function", ret_reg: str, bits: int = 32) -
         if isinstance(s, Assign) and isinstance(s.dst, Var):
             defs[s.dst] = s.src
         elif isinstance(s, CallStmt):
-            for r, v in s.defs:
+            for _r, v in s.defs:
                 if isinstance(v, Var):
                     defs[v] = s
     vals = [s.value for s in fn.stmts() if isinstance(s, Return) and s.value is not None]

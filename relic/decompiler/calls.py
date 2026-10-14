@@ -25,6 +25,7 @@ _INT_ARGS = {
     "x86-cdecl": (),  # arguments are passed on the stack (recovered with the frame, stage 3b)
     "arm64-aapcs": tuple(f"x{k}" for k in range(8)),
     "arm-aapcs": ("r0", "r1", "r2", "r3"),
+    "mips-o32": ("a0", "a1", "a2", "a3"),
 }
 
 

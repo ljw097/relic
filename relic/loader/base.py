@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 import bisect
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 
 
 @dataclass
@@ -61,6 +61,7 @@ class Relocation:
     addr: int
     name: str
     kind: str = ""
+    addend: int = 0
 
 
 class Binary:
@@ -90,6 +91,8 @@ class Binary:
         # mapping symbols (address -> "a" | "t" | "d")
         self.thumb_code: set[int] = set()
         self.arm_mapping: dict[int, str] = {}
+        self.mips_gp: int | None = None     # MIPS: value of $gp (GOT + 0x7ff0)
+        self.mips_local_got = (0, 0)         # MIPS: [start, end) of the GOT's local entries
 
     # ------------------------------------------------------------------ memory
     def _finalize(self):

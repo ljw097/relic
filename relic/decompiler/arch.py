@@ -68,6 +68,17 @@ ARM = ArchInfo(
 )
 
 
+_MIPS_ARGS = ("a0", "a1", "a2", "a3")
+MIPS_O32 = ArchInfo(
+    "mips-o32", 32, "sp", "v0",
+    call_reads=(*_MIPS_ARGS, "sp"),
+    # at, v0-v1, a0-a3, t0-t9 and hi/lo are caller-saved; a call also overwrites ra
+    call_clobbers=("at", "v0", "v1", *_MIPS_ARGS, *(f"t{k}" for k in range(10)), "ra", "hi", "lo"),
+    syscall_reads=("v0", *_MIPS_ARGS),
+    syscall_clobbers=("v0", "a3"),
+)
+
+
 def arch_for(binary) -> ArchInfo:
     if binary.arch == "x64":
         return X64_WIN if binary.format == "PE" else X64_SYSV
@@ -77,4 +88,6 @@ def arch_for(binary) -> ArchInfo:
         return ARM64
     if binary.arch == "arm":
         return ARM
+    if binary.arch == "mips" and binary.bits == 32:
+        return MIPS_O32
     raise NotImplementedError(f"no calling convention for {binary.arch} yet")

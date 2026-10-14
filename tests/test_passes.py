@@ -12,7 +12,7 @@ from relic.analysis import Analysis, analyze
 from relic.decompiler import decompile_ir, lift
 from relic.decompiler.arch import arch_for
 from relic.decompiler.interp import Interpreter, Machine
-from relic.decompiler.ir import (Assign, BinOp, Cast, Const, Load, Store, Var, stmt_defs, stmt_exprs, walk)
+from relic.decompiler.ir import (BinOp, Cast, Load, Var, stmt_defs, stmt_exprs, walk)
 from relic.decompiler.passes import optimize
 from relic.decompiler.refs import format_ir, ir_xrefs
 from relic.decompiler.ssa import to_ssa

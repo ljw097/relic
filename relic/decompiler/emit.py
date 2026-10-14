@@ -19,9 +19,9 @@ from typing import TYPE_CHECKING
 from . import ir
 from .ir import (Assign, BinOp, CallStmt, Cast, Const, Effect, Expr, Extract, Intrinsic, Ite, Load, Reg, Return,
                  StackAddr, StackVar, Store, UnOp, Unknown, Var)
-from .sigs import base_name, lookup
+from .sigs import base_name
 from .structure import Block, If, Jump1, Loop, Ret, Seq, Switch, _negate, case_labels
-from .vartypes import CType, infer_types, int_type
+from .vartypes import CType, infer_types, int_type, library_types, parse_ctype
 
 if TYPE_CHECKING:
     from ..analysis import Analysis, Function
@@ -41,6 +41,9 @@ class Decompiled:
     addr: int
     lines: list[Line] = field(default_factory=list)
     variables: dict[str, str] = field(default_factory=dict)   # shown name -> generated name
+    structs: dict[str, str] = field(default_factory=dict)     # shown struct name -> generated name
+    fields: dict[str, list] = field(default_factory=dict)     # shown field -> [(struct, field), ...]
+    types: dict[str, str] = field(default_factory=dict)       # generated variable name -> C type shown
 
     @property
     def text(self) -> str:
@@ -88,6 +91,15 @@ class CWriter:
         self.p = prep
         self.ptr_bits = prep.arch.bits
         self.types: dict[str, CType] = infer_types(prep.fn, self.ptr_bits, self.is_addr)
+        # library calls name what plain integers really are (`strlen(a1)`: a1 is a `char *`); a
+        # pointer type recovered from how memory is accessed says more and is kept
+        for name, t in library_types(prep.fn, self.ptr_bits, prep.arch.ret, self._callee_name,
+                                     lambda a: an.bin.read_cstring(a, 512)).items():
+            cur = self.types.get(name)
+            if cur is not None and cur.ptr == 0:
+                self.types[name] = t
+        self.shown_structs: dict[str, str] = {}
+        self.shown_fields: dict[str, list] = {}
         self.names: dict[str, str] = {}
         # user names for variables (Analysis.var_names), keyed by the generated name
         self.user: dict[str, str] = dict(an.var_names.get(prep.fn.addr, {}))
@@ -95,6 +107,60 @@ class CWriter:
         self.commented: set[int] = set()
         self.out: list[Line] = []
         self._name_vars()
+        # user types (Analysis.var_types, keyed by generated name) -> by the IR's variable names
+        wanted = an.var_types.get(prep.fn.addr, {})
+        user_types: dict[str, str] = {}
+        for name in set(self.types) | set(self.p.params):
+            gen = self.names.get(name, name)
+            if gen in wanted:
+                user_types[name] = wanted[gen]
+        from .structs import StructView
+        self.structs = StructView(an, prep.fn, self.ptr_bits, user_types)
+        for name in list(self.types):
+            st = self.structs.var_struct(name)
+            if st is not None and self.types[name].ptr <= 1:
+                self.types[name] = CType(f"struct {self.sname(st)}", 1)
+            else:
+                ft = self.structs.var_field_type(name)
+                if ft is not None and self.types[name].ptr <= 1:
+                    self.types[name] = parse_ctype(ft)
+        self.notes: list[str] = []
+        for name, t in user_types.items():
+            try:
+                ct = parse_ctype(t)
+            except ValueError:
+                continue
+            st = self.structs.forced.get(name)
+            if st is not None:
+                self.types[name] = CType(f"struct {self.sname(st)}", 1)
+            elif ct.base.startswith("struct "):
+                # no struct by that name (yet): keep what was recovered rather than declare one
+                self.notes.append(f"// {self.names.get(name, name)}: no struct {ct.base[7:]} to apply "
+                                  "(rename a recovered struct to it first)")
+            else:
+                self.types[name] = ct
+
+    # ------------------------------------------------------------- structs
+    def sname(self, st) -> str:
+        shown = self.an.struct_names.get(st.name, {}).get("name") or st.name
+        self.shown_structs[shown] = st.name
+        return shown
+
+    def ftype(self, st, f) -> str | None:
+        """The user's type of a field; a struct it names is shown by its current name."""
+        t = self.structs.field_type(st, f)
+        if t and t.startswith("struct "):
+            target = self.structs.find(t[7:].rstrip(" *"))
+            if target is not None:
+                return f"struct {self.sname(target)} " + "*" * t.count("*")
+        return t
+
+    def fname(self, st, f) -> str:
+        shown = self.an.struct_names.get(st.name, {}).get("fields", {}).get(f.name) or f.name
+        pairs = self.shown_fields.setdefault(shown, [])
+        if (st.name, f.name) not in pairs:
+            pairs.append((st.name, f.name))
+        return shown
 
     # ------------------------------------------------------------- naming
     def _name_vars(self):
@@ -133,9 +199,32 @@ class CWriter:
             sym = self.symbol(v)
             if sym:
                 return sym if v in self.an.functions else f"&{sym}"
+        if c.bits == self.ptr_bits and v:
+            inside = self._inside_object(v)
+            if inside is not None:                # in or just past a data object (an end pointer)
+                return f"(char *)&{inside[0]} + {number(inside[1])}"
         if c.bits >= 8 and v >> (c.bits - 1) and c.signed > -0x10000:
             return "-" + number(-c.signed)
         return number(v)
+
+    def _inside_object(self, v: int) -> tuple[str, int] | None:
+        """(object symbol, offset) for an address inside a sized data object or one past its
+        end (`&pool[4]`, a loop's end pointer)."""
+        objs = self.__dict__.get("_objs")
+        if objs is None:
+            import bisect
+            objs = sorted((s.addr, s.size, s.name) for s in self.an.bin.symbols.values()
+                          if s.kind == "object" and s.size)
+            self._objs = objs
+            self._obj_starts = [o[0] for o in objs]
+            self._bisect = bisect
+        k = self._bisect.bisect_left(self._obj_starts, v) - 1
+        if k < 0:
+            return None
+        a, size, name = self._objs[k]
+        if a < v <= a + size:
+            return base_name(self.an.name(a) or name), v - a
+        return None
 
     def string(self, v: int) -> str | None:
         from ..analysis.strings import escape
@@ -171,16 +260,35 @@ class CWriter:
         if isinstance(addr, Const):
             sym = self.symbol(addr.value)
             if sym:
+                # the first element of an array object (`pool[0]`): the bare name is the array
+                s = self.an.bin.symbols.get(addr.value)
+                if s is not None and s.kind == "object" and s.size > size and s.size % size == 0:
+                    return f"{sym}[0]"
                 return sym
             # a GOT slot read on its own (kept in a register): the address of the import
             imp = self.an.bin.imports_by_got.get(addr.value)
             if imp is not None and imp.name and bits == self.an.bin.bits:
                 return f"&{base_name(imp.name)}"
+            if self.string(addr.value) is not None and not self.an.string_at(addr.value):
+                # data read whole that happens to look like text (a stripped `stdout`'s
+                # pointer bytes): an address, not a string literal
+                return f"*({int_type(bits)} *){number(addr.value)}"
         if isinstance(addr, Load) and isinstance(addr.addr, Const):
             # through a GOT slot: `*(*(stdout@got))` is the imported object itself
             imp = self.an.bin.imports_by_got.get(addr.addr.value)
             if imp is not None and imp.name:
                 return base_name(imp.name)
+        fa = self.structs.field(addr, bits)
+        if fa is not None:
+            return f"{self.expr(fa[0], PREC_POSTFIX)}->{self.fname(*fa[1:])}"
+        ar = self.structs.array_ref(addr, bits)
+        if ar is not None:
+            base, st, f, idx = ar
+            return f"{self.expr(base, PREC_POSTFIX)}->{self.fname(st, f)}[{self.expr(_bare(idx))}]"
+        if self.an.bin.endian == "little":
+            pa = self.structs.part_of_field(addr, bits)
+            if pa is not None:                    # the low bytes of a wider field
+                return f"*({int_type(bits)} *)&{self.expr(pa[0], PREC_POSTFIX)}->{self.fname(*pa[1:])}"
         idx = self._indexed(addr, size)
         if idx is not None:
             base, i = idx
@@ -253,6 +361,11 @@ class CWriter:
             if e.a.bits == 1:                     # bool widened to an int: C does this already
                 return self._expr(e.a)
             t = int_type(e.bits, e.kind == "zext")
+            if e.kind == "zext" and e.a.bits in (8, 16, 32) and e.a.bits < e.bits and not self._unsigned(e.a) \
+                    and not isinstance(e.a, Const):
+                # C widens a signed value with its sign: zero-extend through the unsigned type
+                inner = e.a.a if isinstance(e.a, Cast) and e.a.kind == "low" else e.a
+                return f"({t})({int_type(e.a.bits, True)}){self.expr(inner, PREC_UNARY)}", PREC_UNARY
             return f"({t}){self.expr(e.a, PREC_UNARY)}", PREC_UNARY
         if isinstance(e, Extract):
             inner = self.expr(e.a, 11)
@@ -270,6 +383,10 @@ class CWriter:
         return str(e), PREC_POSTFIX
 
     def _binop(self, e: BinOp) -> tuple[str, int]:
+        if e.op == "+" and e.bits == self.ptr_bits:
+            fa = self.structs.field_addr(e)
+            if fa is not None:                    # the address of a field: `&p->f_8`
+                return f"&{self.expr(fa[0], PREC_POSTFIX)}->{self.fname(*fa[1:])}", PREC_UNARY
         if e.op not in BIN:                       # carry / sborrow ... : flag helpers
             return f"__{e.op}({self.expr(e.a)}, {self.expr(e.b)})", PREC_POSTFIX
         if e.op in _NUMERIC_OPS:
@@ -290,6 +407,11 @@ class CWriter:
                 left = f"(unsigned {int_type(a.bits)}){self.expr(a, PREC_UNARY)}" if a.bits in (8, 16, 32) \
                     else f"({int_type(a.bits, True)}){self.expr(a, PREC_UNARY)}"
                 return f"{left} {op} {self.expr(b, p + 1)}", p
+        if e.op in ("+", "-") and (self._struct_ptr(a) or e.op == "+" and self._struct_ptr(b)):
+            # a byte offset from a struct pointer (not a field: a loop's end pointer, say)
+            if self._struct_ptr(b) and not self._struct_ptr(a):
+                a, b = b, a
+            return f"(char *){self.expr(a, PREC_UNARY)} {op} {self.expr(b, p + 1)}", p
         if e.op in ("+", "-"):
             ptr = self._scaled(a, b)
             if ptr is not None:
@@ -308,6 +430,13 @@ class CWriter:
 
     _SIZES = {"char": 1, "unsigned char": 1, "short": 2, "unsigned short": 2, "int": 4, "unsigned int": 4,
               "int64_t": 8, "uint64_t": 8}
+
+    def _struct_ptr(self, e: Expr) -> bool:
+        if isinstance(e, (Var, StackVar)):
+            t = self.types.get(e.name)
+            # (a `FILE *` too: C would scale arithmetic on it by an unknown size)
+            return t is not None and t.ptr >= 1 and (t.base.startswith("struct ") or t.base == "FILE")
+        return False
 
     def _ptr_size(self, e: Expr) -> int:
         """Element size if `e` is a typed pointer variable (C scales arithmetic on it), else 0."""
@@ -333,15 +462,21 @@ class CWriter:
     def _unsigned(self, e: Expr) -> bool:
         if isinstance(e, (Var, StackVar)):
             t = self.types.get(e.name)
-            return t is not None and t.base.startswith("unsigned") or (t is not None and t.base.startswith("uint"))
+            return t is not None and t.ptr == 0 and (t.base.startswith(("unsigned", "uint")) or t.base == "size_t")
         return isinstance(e, Cast) and e.kind == "zext"
 
-    def call(self, c: ir.Call) -> str:
+    def _callee_name(self, c: ir.Call) -> str | None:
         t = c.target
+        if isinstance(t, Load) and isinstance(t.addr, Const):
+            imp = self.an.bin.imports_by_got.get(t.addr.value)
+            if imp is not None:                 # through the import's GOT slot (MIPS `jalr $t9`)
+                return base_name(imp.name)
         if isinstance(t, Const):
-            name = self.symbol(t.value) or f"sub_{t.value:x}"
-        else:
-            name = f"(*{self.expr(t, PREC_UNARY)})"
+            return self.symbol(t.value) or f"sub_{t.value:x}"
+        return None
+
+    def call(self, c: ir.Call) -> str:
+        name = self._callee_name(c) or f"(*{self.expr(c.target, PREC_UNARY)})"
         return f"{name}({', '.join(self.expr(_bare(a)) for a in c.args)})"
 
     # --------------------------------------------------------- statements
@@ -496,12 +631,17 @@ class CWriter:
                 ret = int_type(self.p.ret_bits)
             else:
                 ret = self._ret_type(vals[0]) if vals else "int"
-        return f"{ret} {name}({', '.join(params) or 'void'})"
+        return f"{ret}{'' if ret.endswith('*') else ' '}{name}({', '.join(params) or 'void'})"
 
     def _ret_type(self, v: Expr) -> str:
         v = _bare(v)
         if isinstance(v, (Var, StackVar)) and v.name in self.types:
             return str(self.types[v.name])
+        if isinstance(v, ir.Call):               # `return strdup(s)`: the library's result type
+            from .sigs import lookup
+            sig = lookup(self._callee_name(v))
+            if sig is not None and sig.ret.endswith("*") and v.bits == self.ptr_bits:
+                return sig.ret
         return int_type(v.bits) if v.bits != 1 else "bool"
 
     @property
@@ -511,6 +651,8 @@ class CWriter:
         return "ret" if self.p.arch.name.startswith(("x64", "x86")) else "sp0"
 
     def declarations(self, depth: int):
+        for note in self.notes:
+            self.emit(note, None, depth)
         frame = self.p.frame
         used = {x.name for s in self.p.fn.stmts() for top in ir.stmt_exprs(s) for x in ir.walk(top)
                 if isinstance(x, (StackVar, StackAddr))}
@@ -554,6 +696,11 @@ class CWriter:
         if len(self.out) >= 2 and self.out[-1].text == "return;" and self.out[-1].depth == 1:
             self.out.pop()
         self.emit("}", None, 0)
+        if self.structs.used:                     # the structs the body refers to, above it
+            head = [Line(t, None, 0) for st in self.structs.used
+                    for t in st.declaration(self.sname, lambda f, st=st: self.fname(st, f),
+                                            lambda f, st=st: self.ftype(st, f)) + [""]]
+            self.out[:0] = head
         return self.out
 
 
@@ -607,8 +754,9 @@ def _loop_body(body):
     if items and isinstance(items[-1], If):
         last = items[-1]
         for keep, leave, cond in ((last.then, last.els, _negate(last.cond)), (last.els, last.then, last.cond)):
+            # (only when `leave` does leave: falling out of it must not run X)
             if keep is not None and leave is not None and _ends_with(keep, "continue") and \
-                    not _ends_with(leave, "continue"):
+                    not _ends_with(leave, "continue") and _exits(leave):
                 items[-1] = If(last.addr, cond, leave)
                 items.append(_drop_last(keep))
                 break
@@ -684,7 +832,9 @@ def decompile(an: "Analysis", func: "Function") -> Decompiled:
     prep = prepare(an, func)
     w = CWriter(an, prep)
     lines = w.render()
-    return Decompiled(an.name(func.addr) or func.name, func.addr, lines, dict(w.shown))
+    types = {w.names.get(n, n): str(t) for n, t in w.types.items()}
+    return Decompiled(an.name(func.addr) or func.name, func.addr, lines, dict(w.shown), dict(w.shown_structs),
+                      {k: list(v) for k, v in w.shown_fields.items()}, types)
 
 
 __all__ = ["Decompiled", "Line", "decompile", "number"]

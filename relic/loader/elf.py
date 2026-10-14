@@ -31,11 +31,11 @@ def load_elf(path: str, data: bytes) -> Binary:
     b = Binary(path, data)
     b.format = "ELF"
     elf = ELFFile(io.BytesIO(data))
-    arch, bits = MACHINES.get(elf["e_machine"], ("unknown", elf.elfclass))
+    arch = MACHINES.get(elf["e_machine"], ("unknown", elf.elfclass))[0]
     if arch == "mips" and elf.elfclass == 64:
         arch = "mips64"
     if arch == "riscv64" and elf.elfclass == 32:
-        arch, bits = "riscv32", 32
+        arch = "riscv32"
     b.arch, b.bits = arch, elf.elfclass
     b.endian = "little" if elf.little_endian else "big"
     b.entry = elf["e_entry"]
@@ -125,14 +125,49 @@ def load_elf(path: str, data: bytes) -> Binary:
                 except Exception:
                     name = ""
             off = rel["r_offset"]
-            b.relocs.append(Relocation(off, name, describe_reloc_type(rel["r_info_type"], elf)))
+            b.relocs.append(Relocation(off, name, describe_reloc_type(rel["r_info_type"], elf),
+                                       rel["r_addend"] if rel.is_RELA() else 0))
             if name:
                 got_names[off] = name
     b.got_names = got_names
 
+    if arch.startswith("mips"):
+        _resolve_mips_got(b, elf, got_names)
     _resolve_plt(b, got_names)
     b._finalize()
     return b
+
+
+def _resolve_mips_got(b: Binary, elf: ELFFile, got_names: dict[int, str]):
+    """MIPS has no JUMP_SLOT relocations: the dynamic linker fills the global part of the GOT
+    from the dynamic symbol table. GOT entry `local_gotno + (k - gotsym)` belongs to dynamic
+    symbol k; an imported function's symbol value is its lazy-binding stub in `.MIPS.stubs`
+    (0 when calls go straight through the GOT). Code reaches the GOT through `$gp`, which
+    points 0x7ff0 bytes past its start (`_gp`, the same for every function of a module)."""
+    d = b.dynamic
+    got, local, gotsym, symtabno = (d.get(k) for k in ("DT_PLTGOT", "DT_MIPS_LOCAL_GOTNO", "DT_MIPS_GOTSYM",
+                                                       "DT_MIPS_SYMTABNO"))
+    if got is None:
+        return
+    b.mips_gp = got + 0x7FF0
+    dynsym = elf.get_section_by_name(".dynsym")
+    if local is None or gotsym is None or not isinstance(dynsym, SymbolTableSection):
+        return
+    word = b.bits // 8
+    # the local part: page addresses and local symbols, only rebased by the dynamic linker
+    b.mips_local_got = (got, got + local * word)
+    count = symtabno if symtabno is not None else dynsym.num_symbols()
+    for k in range(gotsym, count):
+        sym = dynsym.get_symbol(k)
+        name = sym.name.split("@")[0]
+        if not name:
+            continue
+        slot = got + (local + k - gotsym) * word
+        got_names.setdefault(slot, name)
+        if sym["st_shndx"] != "SHN_UNDEF":
+            continue                    # defined here: reached through the GOT, but not an import
+        stub = sym["st_value"] if sym["st_info"]["type"] == "STT_FUNC" else 0
+        b.imports.append(Import(name, stub, slot))
 
 
 def _resolve_plt(b: Binary, got_names: dict[int, str]):
@@ -173,11 +208,11 @@ def _resolve_plt(b: Binary, got_names: dict[int, str]):
             code = b.data[sec.offset:sec.offset + sec.size]
             insns = list(md.disasm(code, sec.addr))
             for i in range(len(insns) - 1):
-                a, l = insns[i], insns[i + 1]
-                if a.mnemonic == "adrp" and l.mnemonic == "ldr":
+                a, ld = insns[i], insns[i + 1]
+                if a.mnemonic == "adrp" and ld.mnemonic == "ldr":
                     try:
                         page = int(a.op_str.split("#")[-1], 16)
-                        off = int(l.op_str.split("#")[-1].rstrip("]!"), 16) if "#" in l.op_str else 0
+                        off = int(ld.op_str.split("#")[-1].rstrip("]!"), 16) if "#" in ld.op_str else 0
                     except ValueError:
                         continue
                     slot = page + off

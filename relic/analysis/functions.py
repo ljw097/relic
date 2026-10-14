@@ -1,6 +1,7 @@
 """Function discovery and control-flow graphs (recursive descent)."""
 from __future__ import annotations
 
+import bisect
 from dataclasses import dataclass, field
 
 from ..disasm import CALL, CJMP, HALT, JMP, RET, Disassembler, Insn
@@ -28,7 +29,47 @@ class Block:
 
     @property
     def last(self) -> Insn:
+        """The block's terminator: on MIPS the branch, not the delay-slot instruction after it."""
+        if len(self.insns) > 1 and self.insns[-1].delay:
+            return self.insns[-2]
         return self.insns[-1]
+
+
+class _Cover:
+    """Sorted, disjoint [start, end) ranges of code already claimed by functions."""
+
+    def __init__(self):
+        self.starts: list[int] = []
+        self.ends: list[int] = []
+
+    def add(self, s: int, e: int):
+        if e <= s:
+            return
+        i = bisect.bisect_left(self.ends, s)          # first range that ends at or after s
+        j = bisect.bisect_right(self.starts, e)       # ranges starting after e stay
+        if i < j:
+            s = min(s, self.starts[i])
+            e = max(e, self.ends[j - 1])
+        self.starts[i:j] = [s]
+        self.ends[i:j] = [e]
+
+    def add_blocks(self, f: "Function", sec):
+        for b in f.blocks.values():
+            if sec.contains(b.addr):
+                self.add(b.addr, b.end)
+
+    def next_gap(self, pos: int, end: int) -> tuple[int, int] | None:
+        """The first uncovered range [s, e) at or after `pos`, before `end`."""
+        i = bisect.bisect_right(self.starts, pos) - 1
+        if i >= 0 and self.ends[i] > pos:
+            pos = self.ends[i]
+            i += 1
+        else:
+            i += 1
+        if pos >= end:
+            return None
+        e = self.starts[i] if i < len(self.starts) else end
+        return (pos, min(e, end)) if pos < min(e, end) else self.next_gap(min(e, end), end) if e < end else None
 
 
 @dataclass
@@ -42,6 +83,7 @@ class Function:
     jump_tables: dict[int, list[int]] = field(default_factory=dict)  # jmp addr -> targets
     is_import: bool = False
     noreturn: bool = False
+    library: bool = False   # named by a library signature (libsigs), not by a symbol
 
     @property
     def end(self) -> int:
@@ -67,9 +109,10 @@ class Function:
 class FunctionAnalyzer:
     MAX_INSNS = 200_000
 
-    def __init__(self, binary: Binary, dis: Disassembler):
+    def __init__(self, binary: Binary, dis: Disassembler, noreturn: set[int] = frozenset()):
         self.bin = binary
         self.dis = dis
+        self.noreturn = noreturn      # functions known not to return (named by library signatures)
         self.funcs: dict[int, Function] = {}
         self.prev: dict[int, int] = {}  # insn addr -> previous insn addr on fallthrough
         self._queue: list[int] = []
@@ -155,6 +198,15 @@ class FunctionAnalyzer:
                 nxt = i.end
                 if self.dis.md_thumb is not None:
                     self._hint_modes(i)
+                # MIPS: the instruction after a branch, call or return runs before control moves;
+                # it belongs to the branch's block, which then ends after it (edges are keyed by it)
+                if self.dis.delay_slots and i.kind in (CALL, RET, JMP, CJMP):
+                    d = self.dis.decode(nxt)
+                    if d is not None and nxt not in insns:
+                        d.delay = True
+                        insns[nxt] = d
+                        self.prev[nxt] = a
+                        a, nxt = nxt, d.end
                 if i.kind == CALL:
                     tgt = i.target
                     if tgt is not None and self.bin.is_exec(tgt):
@@ -186,7 +238,7 @@ class FunctionAnalyzer:
                     else:
                         table = self._jump_table(i)
                         if table:
-                            f.jump_tables[a] = table
+                            f.jump_tables[i.addr] = table
                             succ = list(dict.fromkeys(table))
                         if i.cond:                      # ARM `addls pc, pc, ...`: default falls through
                             succ.append(nxt)
@@ -228,7 +280,7 @@ class FunctionAnalyzer:
         for a in sorted(insns):
             i = insns[a]
             if cur is None or a in leaders or cur.end != a:
-                if cur is not None and cur.last.addr not in edges and cur.end == a:
+                if cur is not None and cur.insns[-1].addr not in edges and cur.end == a:
                     cur.succs.append(a)  # fallthrough into a leader
                 cur = Block(a)
                 f.blocks[a] = cur
@@ -236,7 +288,7 @@ class FunctionAnalyzer:
             if a in edges:
                 cur.succs.extend(edges[a])
                 cur = None
-        if cur is not None and cur.last.addr not in edges and cur.end in insns:
+        if cur is not None and cur.insns[-1].addr not in edges and cur.end in insns:
             cur.succs.append(cur.end)
         for b in f.blocks.values():
             b.succs = [s for s in dict.fromkeys(b.succs) if s in f.blocks]
@@ -251,10 +303,36 @@ class FunctionAnalyzer:
             flip = i.kind == CALL and i.mnemonic.startswith("blx") and not i.op_str.startswith(("r", "l", "s", "i"))
             self.dis.hint(i.target, i.thumb != flip)
 
+    def _mips_call_slot(self, i: Insn) -> int | None:
+        """The GOT slot a MIPS `jalr $t9` calls through: `lw $t9, off($gp)` shortly before it,
+        directly or by way of a `move $t9, $v0`."""
+        gp = self.bin.mips_gp
+        if gp is None or not i.op_str.endswith("$t9"):
+            return None
+        want = "$t9"
+        for p in self._back(i.addr, 8):
+            ops = [o.strip() for o in p.op_str.split(",")]
+            if not ops or ops[0] != want:
+                continue
+            if p.mnemonic == "move" and len(ops) == 2:
+                want = ops[1]
+                continue
+            if p.mnemonic == "lw" and len(ops) == 2 and ops[1].endswith("($gp)"):
+                try:
+                    return (gp + int(ops[1][:-5] or "0", 0)) & ((1 << self.bin.bits) - 1)
+                except ValueError:
+                    return None
+            return None
+        return None
+
     def _is_noreturn_call(self, i: Insn) -> bool:
+        if i.target is None and i.mem_target is None and i.mnemonic == "jalr" and self.dis.delay_slots:
+            i.mem_target = self._mips_call_slot(i)
         tgt = i.target
         name = None
         if tgt is not None:
+            if tgt in self.noreturn:
+                return True
             fn = self.funcs.get(tgt)
             if fn is not None and fn.noreturn:
                 return True
@@ -468,12 +546,87 @@ class FunctionAnalyzer:
                 return []
         return []
 
+    def _mips_jump_table(self, jmp: Insn) -> list[int]:
+        """`jr $v0` after `lw $v0, 0(table + idx * 4)`: the table address built with `lui` + `addiu`
+        or read from the GOT (`lw $v0, %got(table)($gp)` + `addiu`), entries absolute or -- PIC
+        `.gpword` tables -- relative to `$gp` (`addu $v0, $v0, $gp`). The bound comes from the
+        `sltiu $t, idx, N` that guards it."""
+        b = self.bin
+        msk = self.dis._mask
+        hist = self._back(jmp.addr, 20)[::-1]                     # oldest first
+        regs: dict[str, tuple] = {}                               # register -> ("c", v) / ("idx",) / ...
+        gp = b.mips_gp
+        bound = None
+
+        def ops_of(i):
+            return [o.strip().lstrip("$") for o in i.op_str.split(",")]
+
+        def val(r):
+            if r == "zero":
+                return ("c", 0)
+            if r == "gp" and gp is not None:
+                return ("c", gp)
+            return regs.get(r)
+
+        for i in hist:
+            m, ops = i.mnemonic, ops_of(i)
+            if not ops or not ops[0]:
+                continue
+            d = ops[0]
+            new = None
+            if m == "lui" and len(ops) == 2:
+                new = ("c", (int(ops[1], 0) << 16) & msk)
+            elif m in ("addiu", "ori") and len(ops) == 3 and (v := val(ops[1])) and v[0] == "c":
+                k = int(ops[2], 0)
+                new = ("c", (v[1] | k if m == "ori" else v[1] + k) & msk)
+            elif m == "sll" and len(ops) == 3 and ops[2] == "2":
+                new = ("scaled",)
+            elif m == "sltiu" and len(ops) == 3:
+                bound = int(ops[2], 0)
+            elif m == "addu" and len(ops) == 3:
+                a, c = val(ops[1]), val(ops[2])
+                if a and c and {a[0], c[0]} == {"c", "scaled"}:
+                    new = ("elem", a[1] if a[0] == "c" else c[1])
+                elif a and c and a[0] == "entry" and c == ("c", gp):
+                    new = ("gprel", a[1])
+                elif a and c and c[0] == "entry" and a == ("c", gp):
+                    new = ("gprel", c[1])
+            elif m == "lw" and len(ops) == 2 and "(" in ops[1]:
+                off, base = ops[1].rstrip(")").split("(")
+                off = int(off or "0", 0)
+                v = val(base.lstrip("$"))
+                if v and v[0] == "elem" and off == 0:
+                    new = ("entry", v[1])
+                elif v and v[0] == "c":
+                    w = b.read_int((v[1] + off) & msk, 4)       # a GOT entry holding the table's page
+                    new = ("c", w) if w is not None else None
+            if new is not None:
+                regs[d] = new
+            elif d in regs and m not in ("sw", "sh", "sb", "beqz", "bnez", "beq", "bne", "sltiu"):
+                del regs[d]
+        target = val(ops_of(jmp)[0]) if jmp.op_str else None
+        if not target or target[0] not in ("entry", "gprel"):
+            return []
+        table, rel = target[1], target[0] == "gprel"
+        out = []
+        for k in range(bound if bound else 256):
+            w = b.read_int((table + 4 * k) & msk, 4)
+            if w is None:
+                break
+            t = (w + gp) & msk if rel else w
+            if not b.is_exec(t) or t & 3:
+                break
+            out.append(t)
+        return out if bound is None or len(out) == bound else []
+
     def _jump_table(self, jmp: Insn) -> list[int]:
         """Resolve `jmp reg` / `jmp [table+reg*N]` switch dispatch on x86."""
         if self.dis.arch == "arm":
             return self._arm_jump_table(jmp)
         if self.dis.arch == "arm64":
             return self._arm64_jump_table(jmp)
+        if self.dis.arch == "mips" and self.bin.bits == 32:
+            return self._mips_jump_table(jmp)
         if self.dis.arch not in ("x86", "x64"):
             return []
         ptr = self.bin.bits // 8
@@ -565,6 +718,8 @@ class FunctionAnalyzer:
                 continue
             imp = b.imports_by_got.get(i.mem_target) if i.mem_target else None
             name = imp.name if imp else (b.name_of(i.target) if i.target else None)
+            if name is None and i.target in self.funcs:       # (named by a library signature)
+                name = self.funcs[i.target].name
             if name != "__libc_start_main":
                 continue
             for j in reversed(hist[:k]):
@@ -598,40 +753,50 @@ class FunctionAnalyzer:
         return cand
 
     def _scan_gaps(self):
-        """Pick up functions only reachable indirectly (prologue scan: x86, ARM, AArch64)."""
-        if self.dis.arch not in ("x86", "x64", "arm", "arm64"):
+        """Pick up functions only reachable indirectly (prologue scan: x86, ARM, AArch64, MIPS)."""
+        if self.dis.arch not in ("x86", "x64", "arm", "arm64", "mips"):
             return
         prologues = (b"\xf3\x0f\x1e\xfa", b"\xf3\x0f\x1e\xfb", b"\x55\x48\x89\xe5", b"\x55\x89\xe5")
         tried: set[int] = set()
         for sec in self.bin.exec_sections:
             if sec.name in (".plt", ".plt.sec", ".plt.got", ".init", ".fini"):
                 continue
-            changed = True
-            while changed:
+            # block ranges, not [first, last) of each function: a function's cold blocks
+            # (assert paths, .text.unlikely) can lie far away, past other functions
+            cover = _Cover()
+            for f in self.funcs.values():
+                if not f.is_import:
+                    cover.add_blocks(f, sec)
+            known = set(self.funcs)
+            pos = sec.addr
+            while True:
                 checkpoint()
-                changed = False
-                # block ranges, not [first, last) of each function: a function's cold blocks
-                # (assert paths, .text.unlikely) can lie far away, past other functions
-                covered = sorted((b.addr, b.end) for f in self.funcs.values() if not f.is_import
-                                 for b in f.blocks.values() if sec.contains(b.addr))
-                gaps, cur = [], sec.addr
-                for s, e in covered:
-                    if s > cur:
-                        gaps.append((cur, s))
-                    cur = max(cur, e)
-                if cur < sec.end:
-                    gaps.append((cur, sec.end))
-                for s, e in gaps:
-                    if self.dis.arch in ("arm", "arm64"):
-                        start = self._arm_gap_function(s, e)
-                    else:
-                        start = self._gap_function(s, e, prologues)
-                    if start is not None and start not in tried:
-                        tried.add(start)
-                        self._queue.append(start)
-                        self._drain()
-                        changed = True
-                        break
+                gap = cover.next_gap(pos, sec.end)
+                if gap is None:
+                    break
+                s, e = gap
+                if self.dis.arch in ("arm", "arm64"):
+                    start = self._arm_gap_function(s, e)
+                elif self.dis.arch == "mips":
+                    start = self._mips_gap_function(s, e)
+                else:
+                    start = self._gap_function(s, e, prologues)
+                if start is None or start in tried:
+                    pos = e
+                    continue
+                tried.add(start)
+                self._queue.append(start)
+                self._drain()
+                # only the functions just found change what is covered; gaps before this one can
+                # shrink too (a new function's callees), so scanning resumes from the earliest
+                new = [self.funcs[a] for a in set(self.funcs) - known]
+                known.update(a for a in self.funcs)
+                lo = min((b.addr for f in new if not f.is_import for b in f.blocks.values()
+                          if sec.contains(b.addr)), default=s)
+                for f in new:
+                    if not f.is_import:
+                        cover.add_blocks(f, sec)
+                pos = max(sec.addr, min(s, lo))
 
     def _arm_gap_function(self, s: int, e: int) -> int | None:
         """First prologue in [s, e) (an odd result is a Thumb start).
@@ -674,6 +839,28 @@ class FunctionAnalyzer:
                                      (w & 0x0F000000) == 0x0A000000 and w >> 28 == 0xE))
             at_start = False
             a += step
+        return None
+
+    def _mips_gap_function(self, s: int, e: int) -> int | None:
+        """First prologue in [s, e) past `nop` padding: `addiu $sp, $sp, -n` (a frame) or
+        `lui $gp, hi` (PIC: `$gp` from `$t9`, the frame right after)."""
+        a = s
+        while a < e and self.bin.read_int(a, 4) == 0:
+            a += 4
+        for _ in range(4):
+            if a >= e:
+                return None
+            i = self.dis.decode(a)
+            if i is None:
+                return None
+            ops = [o.strip() for o in i.op_str.split(",")]
+            if i.mnemonic == "addiu" and ops[:2] == ["$sp", "$sp"] and ops[2].startswith("-"):
+                return a
+            if i.mnemonic == "lui" and ops[0] == "$gp":
+                return a
+            if i.kind != "normal" or i.mnemonic != "nop":
+                return None
+            a = i.end
         return None
 
     def _gap_function(self, s: int, e: int, prologues: tuple[bytes, ...]) -> int | None:

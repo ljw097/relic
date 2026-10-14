@@ -6,7 +6,6 @@ break them. The recompilation test is the strongest one: the pseudocode for
 `checksum` and `classify` is fed back to a C compiler and must compute the
 same results as the original source.
 """
-import os
 import shutil
 import subprocess
 

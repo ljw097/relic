@@ -14,9 +14,13 @@ Two steps on the out-of-SSA IR:
 from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import TYPE_CHECKING
 
-from .ir import (Assign, BinOp, CallStmt, Cast, Const, Expr, IRFunction, Ite, Load, Return, StackAddr, StackVar,
-                 Store, UnOp, Var, map_stmt, stmt_exprs, transform, walk)
+from .ir import (Assign, BinOp, Call, CallStmt, Cast, Const, Expr, IRFunction, Ite, Load, Return, StackVar,
+                 Store, UnOp, Var, children, map_stmt, stmt_exprs, transform, walk)
+
+if TYPE_CHECKING:
+    from .sigs import Sig
 
 _INT = {1: "bool", 8: "char", 16: "short", 32: "int", 64: "int64_t", 128: "__int128"}
 _UINT = {1: "bool", 8: "unsigned char", 16: "unsigned short", 32: "unsigned int", 64: "uint64_t",
@@ -56,46 +60,41 @@ def simplify_low(e: Expr) -> Expr:
     return transform(e, node)
 
 
-def _narrow_width(fn: IRFunction, v: Var) -> int | None:
-    """The width every use of `v` agrees on, if all uses only read its low bits."""
-    width = None
-    passthrough = False
+def _narrow_widths(fn: IRFunction, cands: dict[str, Var]) -> dict[str, int]:
+    """For every candidate variable, the width all its uses agree on, when every use only reads
+    its low bits (`low_n(v)`) or hands it on whole (a call argument, `return`). One walk."""
+    width: dict[str, int] = {}
+    bad: set[str] = set()
 
-    def visit(e: Expr, top: bool) -> bool:
-        nonlocal width, passthrough
-        if isinstance(e, Cast) and e.kind == "low" and e.a == v:
-            if width is not None and width != e.bits:
-                return False
-            width = e.bits
-            return True
-        if e == v:
-            if top:
-                passthrough = True      # handed on whole: call argument / return value / copy
-                return True
-            return False
-        return all(visit(k, False) for k in _kids(e))
+    def visit(e: Expr, top: bool):
+        if isinstance(e, Cast) and e.kind == "low" and isinstance(e.a, Var):
+            v = cands.get(e.a.name)
+            if v is not None and e.a == v:
+                if width.setdefault(v.name, e.bits) != e.bits:
+                    bad.add(v.name)
+                return
+        elif isinstance(e, Var):
+            if not top and cands.get(e.name) == e:
+                bad.add(e.name)
+            return
+        for k in children(e):
+            visit(k, False)
 
     for s in fn.stmts():
         if isinstance(s, CallStmt):
-            tops = [(a, True) for a in s.call.args] + [(s.call.target, False)]
+            for a in s.call.args:
+                visit(a, True)
+            visit(s.call.target, False)
         elif isinstance(s, Return):
-            tops = [(s.value, True)] if s.value is not None else []
+            if s.value is not None:
+                visit(s.value, True)
         else:
-            tops = [(x, False) for x in stmt_exprs(s)]
-        for e, top in tops:
-            if not visit(e, top):
-                return None
-    return width
+            for x in stmt_exprs(s):
+                visit(x, False)
+    return {n: w for n, w in width.items() if n not in bad}
 
 
-def _kids(e):
-    from .ir import children
-    return children(e)
-
-
-def narrow(fn: IRFunction, keep: set[str] = frozenset()) -> dict[str, int]:
-    """Narrow wide variables that are only read as their low bits (in place); name -> new width."""
-    done: dict[str, int] = {}
+def _collect_vars(fn: IRFunction) -> dict[str, Var]:
     seen: dict[str, Var] = {}
     for s in fn.stmts():
         for top in stmt_exprs(s):
@@ -105,35 +104,51 @@ def narrow(fn: IRFunction, keep: set[str] = frozenset()) -> dict[str, int]:
         for d in _defs(s):
             if isinstance(d, Var):
                 seen.setdefault(d.name, d)
-    for name, v in seen.items():
-        if name in keep or v.bits <= 8:
-            continue
-        w = _narrow_width(fn, v)
-        if w is None or w >= v.bits:
-            continue
-        nv = Var(v.name, v.version, w)
+    return seen
 
-        def sub(e: Expr, v=v, nv=nv, w=w) -> Expr:
-            def node(x: Expr) -> Expr:
-                if isinstance(x, Cast) and x.kind == "low" and x.a == nv:
-                    return nv if x.bits == w else Cast("low", nv, x.bits)
-                if x == v:
-                    return Cast("zext", nv, v.bits)
-                return x
+
+def narrow(fn: IRFunction, keep: set[str] = frozenset()) -> dict[str, int]:
+    """Narrow wide variables that are only read as their low bits (in place); name -> new width.
+
+    Narrowing one variable can expose another (`v1 = v2 + 1` becomes `v1 = low32(v2) + 1`), so
+    rounds repeat until nothing more narrows."""
+    done: dict[str, int] = {}
+    while True:
+        cands = {n: v for n, v in _collect_vars(fn).items() if n not in keep and n not in done and v.bits > 8}
+        found = {n: w for n, w in _narrow_widths(fn, cands).items() if w < cands[n].bits}
+        if not found:
+            break
+        olds = {cands[n]: Var(n, cands[n].version, w) for n, w in found.items()}
+        news = {nv: v for v, nv in olds.items()}
+
+        def low_first(x: Expr) -> Expr:
+            if isinstance(x, Cast) and x.kind == "low" and x.a in olds:
+                nv = olds[x.a]
+                if x.bits == nv.bits:
+                    return nv
+            return x
+
+        def node(x: Expr) -> Expr:
+            if isinstance(x, Cast) and x.kind == "low" and x.a in news:
+                return x.a if x.bits == x.a.bits else Cast("low", x.a, x.bits)
+            if isinstance(x, Var) and x in olds:
+                return Cast("zext", olds[x], x.bits)
+            return x
+
+        def sub(e: Expr) -> Expr:
             # replace `low_w(v)` first so the zext placeholder does not swallow it
-            e = transform(e, lambda x: nv if isinstance(x, Cast) and x.kind == "low" and x.a == v
-                          and x.bits == w else x)
-            return transform(e, node)
+            return transform(transform(e, low_first), node)
 
         for b in fn.blocks.values():
             for s in b.stmts:
                 map_stmt(s, sub)
-                if isinstance(s, Assign) and s.dst == v:
+                if isinstance(s, Assign) and isinstance(s.dst, Var) and s.dst in olds:
+                    nv = olds[s.dst]
                     s.dst = nv
-                    s.src = simplify_low(Cast("low", s.src, w))
+                    s.src = simplify_low(Cast("low", s.src, nv.bits))
                 elif hasattr(s, "defs") and not isinstance(s, Assign):
-                    s.defs = [(r, nv if d == v else d) for r, d in s.defs]
-        done[name] = w
+                    s.defs = [(r, olds.get(d, d) if isinstance(d, Var) else d) for r, d in s.defs]
+        done.update(found)
     if done:
         for b in fn.blocks.values():
             for s in b.stmts:
@@ -159,6 +174,27 @@ class CType:
 
     def __str__(self) -> str:
         return self.base + (" " + "*" * self.ptr if self.ptr else "")
+
+
+_BASES = {"void", "char", "short", "int", "long", "bool", "float", "double", "size_t", "ssize_t", "FILE",
+          "int8_t", "int16_t", "int32_t", "int64_t", "uint8_t", "uint16_t", "uint32_t", "uint64_t",
+          "unsigned char", "unsigned short", "unsigned int", "unsigned long", "unsigned", "signed char",
+          "long long", "unsigned long long", "__int128", "unsigned __int128"}
+
+
+def parse_ctype(text: str) -> CType:
+    """`int`, `unsigned int`, `char *`, `struct note *`, `void **` -> CType; ValueError otherwise."""
+    import re
+    t = " ".join(text.replace("*", " * ").split())
+    m = re.fullmatch(r"(?:const )?((?:struct )?[A-Za-z_][A-Za-z0-9_]*(?: [A-Za-z_][A-Za-z0-9_]*)*)((?: \*)*)", t)
+    if m is None:
+        raise ValueError(f"not a C type: {text!r}")
+    base, ptr = m.group(1), m.group(2).count("*")
+    if not base.startswith("struct ") and base not in _BASES:
+        raise ValueError(f"unknown type {base!r} (an integer type, void, char, or struct NAME)")
+    if base == "void" and not ptr:
+        raise ValueError("void is only a pointer target")
+    return CType(base, ptr)
 
 
 def _addr_base(a: Expr, is_addr=lambda v: False):
@@ -241,4 +277,73 @@ def infer_types(fn: IRFunction, ptr_bits: int, is_addr=lambda v: False,
     return out
 
 
-__all__ = ["narrow", "simplify_low", "infer_types", "int_type", "CType"]
+# the more a type says, the more it wins when several calls disagree
+_HINT_RANK = {"void *": 1, "size_t": 1, "ssize_t": 1}
+
+
+def library_types(fn: IRFunction, ptr_bits: int, ret_reg: str, callee=lambda call: None,
+                  cstring=lambda addr: None) -> dict[str, CType]:
+    """Types variables get from the library calls they meet: an argument of `strlen` is a
+    `char *`, of `malloc` a `size_t`, the result of `fopen` a `FILE *` (sigs.SIGS), what a
+    constant format string's `%s` consumes a `char *`. Only plain variables of the type's width
+    count; copies carry a type both ways. A variable two calls give different equally specific
+    types gets none. `callee(call)` names a call's target, `cstring(addr)` reads a string."""
+    from .sigs import arg_type, format_types, lookup
+    widths = {"char *": ptr_bits, "void *": ptr_bits, "FILE *": ptr_bits, "size_t": ptr_bits,
+              "ssize_t": ptr_bits}
+    found: dict[str, str | None] = {}
+
+    def give(v: Expr, t: str | None):
+        if t not in widths or not isinstance(v, (Var, StackVar)) or v.bits != widths[t]:
+            return
+        old = found.get(v.name, "")
+        if old is None or old == t:
+            return
+        if old == "" or _HINT_RANK.get(old, 2) < _HINT_RANK.get(t, 2):
+            found[v.name] = t
+        elif _HINT_RANK.get(old, 2) == _HINT_RANK.get(t, 2):
+            found[v.name] = None              # disagreement: no hint
+
+    def call(c: Call, name: str | None) -> Sig | None:
+        sig = lookup(name)
+        if sig is None:
+            return None
+        for k, a in enumerate(c.args):
+            give(a, arg_type(sig, k))
+        if sig.fmt is not None and sig.fmt < len(c.args) and isinstance(c.args[sig.fmt], Const):
+            fmt = cstring(c.args[sig.fmt].value)
+            if fmt:
+                rest = c.args[sig.fmt + 1:]
+                for a, t in zip(rest, format_types(fmt, "scanf" in (name or ""))):
+                    give(a, t)
+        return sig
+
+    copies: list[tuple[Expr, Expr]] = []
+    for s in fn.stmts():
+        for top in stmt_exprs(s):
+            for x in walk(top):
+                if isinstance(x, Call) and not (isinstance(s, CallStmt) and x is s.call):
+                    call(x, callee(x))      # a call inside an expression: `return strlen(p) + 1`
+        if isinstance(s, CallStmt):
+            sig = call(s.call, s.name or callee(s.call))
+            if sig is None:
+                continue
+            for r, d in s.defs:
+                if r == ret_reg:
+                    give(d, sig.ret)
+        elif isinstance(s, Assign) and isinstance(s.dst, (Var, StackVar)) and \
+                isinstance(s.src, (Var, StackVar)) and s.dst.bits == s.src.bits:
+            copies.append((s.dst, s.src))
+    changed = True
+    while changed:
+        changed = False
+        for x, y in copies:
+            for p, q in ((x, y), (y, x)):
+                t = found.get(p.name)
+                if t and found.get(q.name, "") == "":
+                    found[q.name] = t
+                    changed = True
+    return {n: parse_ctype(t) for n, t in found.items() if t}
+
+
+__all__ = ["library_types", "narrow", "simplify_low", "infer_types", "int_type", "parse_ctype", "CType"]

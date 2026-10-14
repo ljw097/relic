@@ -4,6 +4,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 
 import bisect
+import threading
 
 import capstone as cs
 
@@ -29,15 +30,38 @@ class Insn:
     target: int | None = None  # direct branch / call target
     refs: list[int] = field(default_factory=list)  # data addresses referenced
     mem_target: int | None = None  # `call/jmp [mem]`: address of the pointer slot
-    regs_write: tuple[str, ...] = ()
-    regs_read: tuple[str, ...] = ()
+    _regs: tuple | None = field(default=None, repr=False, compare=False)    # (read, write), on first use
     cs: object = field(default=None, repr=False, compare=False)  # underlying capstone insn (detail available)
     cond: bool = False  # ARM: executes only when its condition holds
     thumb: bool = False  # ARM: decoded as Thumb
+    delay: bool = False  # MIPS: in the delay slot of the branch before it (runs before the branch takes effect)
 
     @property
     def end(self) -> int:
         return self.addr + self.size
+
+    def _access(self) -> tuple:
+        """Registers read and written (capstone's `regs_access`, worked out on first use: most
+        instructions never need it)."""
+        if self._regs is None:
+            r = w = ()
+            if self.cs is not None:
+                try:
+                    a, b = self.cs.regs_access()
+                    r = tuple(self.cs.reg_name(x) for x in a)
+                    w = tuple(self.cs.reg_name(x) for x in b)
+                except cs.CsError:
+                    pass
+            self._regs = (r, w)
+        return self._regs
+
+    @property
+    def regs_read(self) -> tuple[str, ...]:
+        return self._access()[0]
+
+    @property
+    def regs_write(self) -> tuple[str, ...]:
+        return self._access()[1]
 
     @property
     def is_branch(self) -> bool:
@@ -90,6 +114,9 @@ class Disassembler:
         self.md = capstone_for(binary.arch, binary.endian)
         self.delay_slots = binary.arch in ("mips", "mips64")
         self._cache: dict[int, Insn | None] = {}
+        # capstone handles are not thread-safe: the GUI decodes while a background job (the
+        # decompiler, the vulnerability scan) does
+        self._lock = threading.RLock()
         # ARM / Thumb interworking: the instruction set is a property of the address
         self.md_thumb = capstone_for("thumb", binary.endian) if binary.arch == "arm" else None
         self.modes: dict[int, bool] = {a: True for a in getattr(binary, "thumb_code", ())}  # addr -> thumb
@@ -123,17 +150,41 @@ class Disassembler:
             addr &= ~1
         if addr in self._cache:
             return self._cache[addr]
-        insn = None
-        if self.bin.is_exec(addr) or self.bin.format == "RAW":
-            thumb = self.is_thumb(addr)
-            md = self.md_thumb if thumb else self.md
-            code = self.bin.read(addr, 16)
-            for c in md.disasm(code, addr, 1):
-                insn = self._convert(c, thumb)
-            if thumb and insn is not None and insn.mnemonic.startswith("it"):
-                return self._it_block(insn)
-        self._cache[addr] = insn
-        return insn
+        with self._lock:
+            insn = None
+            if self.bin.is_exec(addr) or self.bin.format == "RAW":
+                thumb = self.is_thumb(addr)
+                if not thumb and self.md_thumb is None:
+                    return self._decode_run(addr)
+                md = self.md_thumb if thumb else self.md
+                code = self.bin.read(addr, 16)
+                for c in md.disasm(code, addr, 1):
+                    insn = self._convert(c, thumb)
+                if thumb and insn is not None and insn.mnemonic.startswith("it"):
+                    return self._it_block(insn)
+            self._cache[addr] = insn
+            return insn
+
+    RUN = 8      # instructions decoded per capstone call on a miss
+
+    def _decode_run(self, addr: int) -> Insn | None:
+        """Decode the instruction at `addr` and the few after it in one capstone call (an
+        instruction decodes the same however it is reached, so they are cached for later)."""
+        first = None
+        for c in self.md.disasm(self.bin.read(addr, 16 * self.RUN), addr, self.RUN):
+            if first is not None and not (self.bin.is_exec(c.address) or self.bin.format == "RAW"):
+                break                              # (decode() answers None outside code)
+            i = self._cache.get(c.address)
+            if i is None and c.address not in self._cache:
+                i = self._convert(c)
+                self._cache[c.address] = i
+            if first is None:
+                first = i
+            if i is not None and i.kind in (JMP, RET):
+                break                              # what follows may be data or padding
+        if first is None:
+            self._cache[addr] = None
+        return first
 
     def _it_block(self, it: Insn) -> Insn:
         """Thumb `it`: capstone only applies its conditions within one decode run, so decode the
@@ -160,12 +211,13 @@ class Disassembler:
             return out
         out = []
         code = self.bin.read(addr, end - addr)
-        for c in self.md.disasm(code, addr):
-            i = self._cache.get(c.address)
-            if i is None:
-                i = self._convert(c)
-                self._cache[c.address] = i
-            out.append(i)
+        with self._lock:
+            for c in self.md.disasm(code, addr):
+                i = self._cache.get(c.address)
+                if i is None:
+                    i = self._convert(c)
+                    self._cache[c.address] = i
+                out.append(i)
         return out
 
     def linear(self, addr: int, count: int) -> list[Insn]:
@@ -183,12 +235,6 @@ class Disassembler:
     # ------------------------------------------------------------- classify
     def _convert(self, c, thumb: bool = False) -> Insn:
         i = Insn(c.address, c.size, c.mnemonic, c.op_str, bytes(c.bytes), cs=c, thumb=thumb)
-        try:
-            r, w = c.regs_access()
-            i.regs_read = tuple(c.reg_name(x) for x in r)
-            i.regs_write = tuple(c.reg_name(x) for x in w)
-        except cs.CsError:
-            pass
         if self.arch in ("x86", "x64"):
             self._classify_x86(c, i)
         else:
@@ -256,7 +302,8 @@ class Disassembler:
                 (arch.startswith("mips") and m == "jr" and c.op_str.strip() == "$ra") or \
                 (arch == "arm" and (m == "bx" and c.op_str == "lr" or (m.startswith("pop") and "pc" in c.op_str))):
             i.kind = RET
-        elif cs.CS_GRP_CALL in groups or m in ("bl", "blx", "blr", "jal", "jalr", "bctrl"):
+        elif cs.CS_GRP_CALL in groups or m in ("bl", "blx", "blr", "jal", "jalr", "bctrl") or \
+                (arch.startswith("mips") and m in ("bal", "bgezal", "bltzal", "jalx", "jalr.hb")):
             i.kind = CALL
         elif cs.CS_GRP_JUMP in groups or cs.CS_GRP_BRANCH_RELATIVE in groups:
             cond = False
@@ -274,6 +321,9 @@ class Disassembler:
         elif m in _HALT:
             i.kind = HALT
         imms = [op.imm for op in c.operands if op.type == OP_IMM]
+        if arch.startswith("mips") and m == "bal" and imms and imms[-1] & self._mask == i.addr + 8:
+            i.kind = NORMAL                       # `bal .+8`: reads pc into $ra (PIC startup), not a call
+            return
         if i.kind in (CALL, JMP, CJMP) and imms:
             i.target = imms[-1] & self._mask
         elif m == "adrp" or (arch in ("arm", "thumb", "arm64") and m != "adr"):

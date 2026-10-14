@@ -9,7 +9,7 @@ def _sizes(*nodes, w=100.0, h=40.0):
 def _overlaps(lay, sizes, gap=0.0):
     for row in lay.order:
         xs = sorted((lay.pos[n][0], lay.pos[n][0] + sizes[n][0]) for n in row)
-        for (a0, a1), (b0, b1) in zip(xs, xs[1:]):
+        for (_a0, a1), (b0, _b1) in zip(xs, xs[1:]):
             if b0 < a1 + gap - 1e-6:
                 return True
     return False
@@ -83,3 +83,19 @@ def test_real_cfg_reduces_crossings(flow_O2):
         lay = layered_layout(sizes, edges, f.addr)
         assert lay.crossings <= base.crossings, f.name
         assert not _overlaps(lay, sizes), f.name
+
+
+def test_crossing_count_matches_pairwise_count():
+    import random
+
+    from relic.gui.layout import _count
+    rnd = random.Random(7)
+    for _ in range(300):
+        upper = list(range(rnd.randint(0, 12)))
+        lower = list(range(100, 100 + rnd.randint(1, 12)))
+        rnd.shuffle(lower)
+        down = {u: rnd.sample(lower, rnd.randint(0, len(lower))) for u in upper}
+        idx = {n: k for k, n in enumerate(lower)}
+        ends = [idx[m] for n in upper for m in sorted(down[n], key=idx.__getitem__)]
+        pairs = sum(ends[i] > ends[j] for i in range(len(ends)) for j in range(i + 1, len(ends)))
+        assert _count(upper, lower, down) == pairs

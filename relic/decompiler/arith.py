@@ -131,7 +131,7 @@ def _recognise(full: Expr, x: Expr) -> Expr | None:
         c0 = round(probe / q)
         cands += [c for c in (c0, c0 - 1, c0 + 1) if 2 <= abs(c) < (1 << (w - 1))]
     for c in cands:
-        for signed, kind in ((True, "sext"), (False, "zext")):
+        for signed in (True, False):
             if c < 0 and not signed:
                 continue
             f = (lambda v, c=c: _sdiv(v, c, w)) if signed else (lambda v, c=c: (v & mask(w)) // c)
@@ -146,6 +146,14 @@ def _recognise(full: Expr, x: Expr) -> Expr | None:
     # a power of two: the remainder keeps the low bits (`& 7` for `% 8`)
     divisors |= {n.b.value + 1 for n in walk(full) if isinstance(n, BinOp) and n.op == "&"
                  and isinstance(n.b, Const) and n.b.value and (n.b.value + 1) & n.b.value == 0}
+    # ... keeping the sign bit too (`& 0x80000007`, then `| -8` for negative inputs: MIPS)
+    for n in walk(full):
+        if isinstance(n, BinOp) and n.op in ("&", "|") and isinstance(n.b, Const):
+            low = n.b.value & (mask(n.b.bits) >> 1) if n.op == "&" else -n.b.value & mask(n.b.bits)
+            if n.op == "&" and n.b.value >> (n.b.bits - 1) and low and (low + 1) & low == 0:
+                divisors.add(low + 1)
+            elif n.op == "|" and low > 1 and low & (low - 1) == 0:
+                divisors.add(low)
     for c in sorted(divisors):
         for signed in (True, False):
             f = (lambda v, c=c: _smod(v, c, w)) if signed else (lambda v, c=c: (v & mask(w)) % c)
@@ -196,9 +204,18 @@ def _divisibility(full: Expr, x: Expr) -> Expr | None:
 
 def recover_division(fn: IRFunction) -> int:
     """Rewrite division / remainder sequences by constants (non-SSA input, in place)."""
+    from .ssa import reachable_order
     count = 0
-    for b in fn.blocks.values():
-        avail: dict[Expr, Expr] = {}        # single-def variable -> its definition (one level)
+    out_avail: dict[int, dict] = {}
+    order = [fn.blocks[a] for a in reachable_order(fn) if a in fn.blocks]
+    order += [b for b in fn.blocks.values() if b not in order]
+    for b in order:
+        # single-def variable -> its definition (one level); a straight-line predecessor's
+        # definitions still hold here (an epilogue block after the computation, -O0)
+        pred = fn.blocks.get(b.preds[0]) if len(b.preds) == 1 else None
+        avail: dict[Expr, Expr] = dict(out_avail.get(pred.addr, {})) if pred is not None and \
+            pred.succs == [b.addr] else {}
+        out_avail[b.addr] = avail
 
         def expand(e: Expr, keep=None) -> Expr:
             """Substitute block-local definitions (except `keep`, the dividend), following chains."""
@@ -230,20 +247,15 @@ def recover_division(fn: IRFunction) -> int:
                     nonlocal count
                     if not isinstance(n, (BinOp, Cast, Ite, UnOp)) or not children(n):
                         return n
-                    found = None
                     for x in candidates(n):
                         full = expand(n, keep=x)
                         if _leaves(full) == {x} and _pure(full) and _interesting(full):
-                            found = (full, x)
-                            break
-                    if found is None:
-                        return n
-                    full, x = found
-                    rep = _recognise(full, x)
-                    if rep is None:
-                        return n
-                    count += 1
-                    return rep
+                            # the first dividend that explains it (`v1 = a1 & 0x80000007` is not one)
+                            rep = _recognise(full, x)
+                            if rep is not None:
+                                count += 1
+                                return rep
+                    return n
                 return transform(e, node)
 
             map_stmt(st, rewrite)

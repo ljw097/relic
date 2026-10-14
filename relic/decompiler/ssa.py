@@ -209,7 +209,7 @@ def to_ssa(fn: IRFunction, arch: ArchInfo) -> IRFunction:
                     new.append((r, v))
                 s.defs = new
         for succ in blk.succs:
-            for name, ph in phis[succ].items():
+            for name in phis[succ]:
                 phi_args.setdefault((succ, name), {})[a] = cur(Reg(name, width[name]))
         for k in kids[a]:
             yield k

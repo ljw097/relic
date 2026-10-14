@@ -8,20 +8,21 @@ signal. The program's own output arrives through `output`.
 
 Panels: `BreakpointsPanel`, `RegistersPanel`, `StackPanel`, `BacktracePanel`, `CodePanel` (gdb's
 disassembly at pc, for code outside the analysed binary too), `VmmapPanel`,
-`MemoryPanel` (a hexdump at an address or expression) and `ConsolePanel` (program output, a line to type the program's input, and a gdb
-command line).
+`MemoryPanel` (a hexdump at an address or expression) and `ConsolePanel` (program output, a
+line to type the program's input, and a gdb command line).
 """
 from __future__ import annotations
 
 import queue
 import threading
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 
 from PySide6.QtCore import QObject, Qt, Signal
 from PySide6.QtGui import QColor, QFontMetrics, QTextCursor
 from PySide6.QtWidgets import (QAbstractItemView, QHBoxLayout, QHeaderView, QLabel, QLineEdit, QPlainTextEdit,
                                QTableWidget, QTableWidgetItem, QVBoxLayout, QWidget)
 
+from ..debugger.session import describe_stop, watch_key
 from .views import THEME, mono_font
 
 # pwndbg's colours for where a pointer leads
@@ -31,11 +32,34 @@ _KIND_COLOR = {"stack": "call", "heap": "mnem", "code": "jump", "data": "ret", "
 
 @dataclass
 class Breakpoint:
-    """A breakpoint at an address of the analysed binary (kept across runs)."""
-    addr: int                      # static
+    """A breakpoint or watchpoint, kept across runs: at an address of the analysed binary,
+    on a gdb location outside it (`puts` in libc), or on memory (`notes`, `*(int *)($rbp-4)`)."""
+    addr: int | None = None        # static, for a breakpoint in the analysed binary
     enabled: bool = True
     condition: str = ""
     hits: int = 0
+    location: str = ""             # gdb location, for a breakpoint by name outside the binary
+    watch: str = ""                # watched expression, for a watchpoint
+    access: str = "write"          # watchpoint: write / read / access
+    size: int | None = None        # watchpoint: bytes watched at an address (None: a word)
+
+    @property
+    def key(self):
+        """The static address, the gdb location, or the watch key (`write:notes`)."""
+        if self.addr is not None:
+            return self.addr
+        return self.location or watch_key(self.watch, self.access, self.size)
+
+    @property
+    def kind(self) -> str:
+        return f"{self.access} watch" if self.watch else "break"
+
+    def describe(self, an=None) -> str:
+        if self.watch:
+            return f"{self.access} {self.watch}" + (f" ({self.size} bytes)" if self.size else "")
+        if self.addr is not None:
+            return an.location(self.addr) if an is not None else f"{self.addr:#x}"
+        return self.location
 
 
 @dataclass
@@ -43,6 +67,7 @@ class Snapshot:
     running: bool = False
     exited: str = ""                     # "exited normally" / "exited with code N" / "killed"
     reason: str = ""
+    stop: str = ""                       # why it stopped, for people: `watchpoint 3 notes: 0 -> 0x4052a0`
     pc: int | None = None                # live
     pc_static: int | None = None         # in the analysed image, when pc is there
     regs: list = field(default_factory=list)        # (name, value, changed, note)
@@ -69,7 +94,8 @@ class DebugController(QObject):
         self.an = None
         self.path = ""
         self.args: list[str] = []
-        self.static_bps: dict[int, Breakpoint] = {}
+        self.static_bps: dict[int, Breakpoint] = {}      # in the analysed binary, by static address
+        self.other_bps: dict[str, Breakpoint] = {}       # by gdb location / watch key, in insertion order
         self.mem_addr: int | None = None   # the memory view's address (None: follow the stack pointer)
         self.last = Snapshot()
         self._jobs: queue.Queue = queue.Queue()
@@ -127,12 +153,29 @@ class DebugController(QObject):
             from ..debugger import Session
             self._close()
             self.path, self.an, self.args = path, analysis, list(args or [])
-            self.session = Session(path, self.args, analysis, on_output=self.output.emit)
+            run = path
+            if analysis is not None and analysis.patches:
+                # run what the listing shows: the patched image, written next to nothing else
+                import os
+                import tempfile
+
+                from ..patch import export
+                self._tmpdir = tempfile.mkdtemp(prefix="relic-dbg-")
+                run = export(analysis.bin, os.path.join(self._tmpdir, os.path.basename(path)))
+                n = len(analysis.patches)
+                self.log.emit(f"[ debugging the patched image ({n} patch{'es' if n != 1 else ''}): {run} ]\n")
+            self.session = Session(run, self.args, analysis, on_output=self.output.emit)
             self.mem_addr = None
             self.session.start(stop_at)
             for bp in sorted(self.static_bps.values(), key=lambda b: b.addr):
                 bp.hits = 0
                 self.session.add_breakpoint(self.session.to_live(bp.addr), bp.condition, bp.enabled)
+            for bp in self.other_bps.values():
+                bp.hits = 0
+                try:
+                    self._apply(bp)
+                except Exception as e:  # noqa: BLE001 - e.g. `$rbp-4` before there is a frame
+                    self.log.emit(f"{bp.describe()}: {e}\n")
         self._submit(go)
 
     def _close(self):
@@ -141,6 +184,11 @@ class DebugController(QObject):
                 self.session.close()
             finally:
                 self.session = None
+        tmp = getattr(self, "_tmpdir", None)
+        if tmp:
+            import shutil
+            shutil.rmtree(tmp, ignore_errors=True)
+            self._tmpdir = None
 
     def _run(self, name: str, *args):
         def go():
@@ -198,9 +246,105 @@ class DebugController(QObject):
         self._submit(go, snapshot=False)
         return on
 
-    def set_breakpoint(self, static_addr: int, enabled: bool | None = None, condition: str | None = None):
-        """Enable / disable a breakpoint or change its condition (`$rdi == 5`)."""
-        bp = self.static_bps.get(static_addr)
+    @property
+    def breakpoint_list(self) -> list[Breakpoint]:
+        """Breakpoints in the binary by address, then the others in the order they were added."""
+        return sorted(self.static_bps.values(), key=lambda b: b.addr) + list(self.other_bps.values())
+
+    def _find(self, key) -> Breakpoint | None:
+        return self.static_bps.get(key) if isinstance(key, int) else self.other_bps.get(key)
+
+    def _live_key(self, key):
+        return self.session.to_live(key) if isinstance(key, int) else key
+
+    def _apply(self, bp: Breakpoint):
+        """Set `bp` in the running session (worker thread)."""
+        s = self.session
+        if bp.watch:
+            s.add_watchpoint(bp.watch, bp.access, bp.size, bp.condition, bp.enabled)
+        elif bp.addr is not None:
+            s.add_breakpoint(s.to_live(bp.addr), bp.condition, bp.enabled)
+        else:
+            s.add_named_breakpoint(bp.location, bp.condition, bp.enabled)
+
+    def breakpoint_at(self, text: str, analysis=None) -> Breakpoint | None:
+        """A breakpoint on what the user typed: a function of the binary (`vuln`, `sub_401136`),
+        `name@plt` or an address there stop in the binary; a library function (`puts`, an import
+        of the binary) or anything else Relic cannot place is left to gdb (`libc.so.6:system`)."""
+        text = text.strip()
+        if not text:
+            return None
+        an = analysis if analysis is not None else self.an
+        a = None
+        if an is not None:
+            imports = {i.name for i in an.bin.imports}
+            try:
+                if text.endswith("@plt"):
+                    a = an.resolve(text[:-4])
+                elif text not in imports:
+                    a = an.resolve(text)
+            except ValueError:                  # `name+junk`: gdb may still know it
+                a = None
+            if a is not None and not an.bin.is_mapped(a):
+                a = None
+        if a is not None:
+            if a not in self.static_bps:
+                self.toggle_breakpoint(a)
+            return self.static_bps[a]
+        bp = self.other_bps.get(text)
+        if bp is not None:
+            return bp
+        bp = self.other_bps[text] = Breakpoint(location=text)
+        self._add_live(bp)
+        return bp
+
+    def add_watchpoint(self, expr: str, access: str = "write", size: int | None = None) -> Breakpoint | None:
+        """Watch memory: a name or address of the binary (`notes`, `0x404040`, `size` bytes) or a
+        gdb expression (`*(int *)($rbp-4)`); kept across runs like breakpoints."""
+        expr = expr.strip()
+        if not expr:
+            return None
+        bp = Breakpoint(watch=expr, access=access, size=size)
+        if bp.key in self.other_bps:
+            return self.other_bps[bp.key]
+        self.other_bps[bp.key] = bp
+        self._add_live(bp)
+        return bp
+
+    def _add_live(self, bp: Breakpoint):
+        def go():
+            if self.session is not None and self.session.regs:
+                try:
+                    self._apply(bp)
+                except Exception:
+                    # gdb refused it (no such function, no free debug register): forget it
+                    self.other_bps.pop(bp.key, None)
+                    raise
+        self._submit(go, snapshot=self.active)
+
+    def remove_breakpoint(self, key):
+        """Delete a breakpoint or watchpoint by its `key`."""
+        if isinstance(key, int):
+            if key in self.static_bps:
+                self.toggle_breakpoint(key)
+            return
+        bp = self.other_bps.pop(key, None)
+        if bp is None:
+            return
+
+        def go():
+            s = self.session
+            if s is not None and s.regs:
+                if bp.watch:
+                    s.remove_watchpoint(key)
+                else:
+                    s.remove_named_breakpoint(key)
+        self._submit(go, snapshot=self.active)
+
+    def set_breakpoint(self, key, enabled: bool | None = None, condition: str | None = None):
+        """Enable / disable a breakpoint or watchpoint (by `key`: a static address, a gdb location
+        or a watch key) or change its condition (`$rdi == 5`)."""
+        bp = self._find(key)
         if bp is None:
             return
         if enabled is not None:
@@ -211,12 +355,37 @@ class DebugController(QObject):
         def go():
             s = self.session
             if s is not None and s.regs:
-                live = s.to_live(static_addr)
+                live = self._live_key(key)
                 if enabled is not None:
-                    s.set_breakpoint_enabled(live, enabled)
+                    s.set_enabled(live, enabled)
                 if condition is not None:
-                    s.set_breakpoint_condition(live, bp.condition)
+                    s.set_condition(live, bp.condition)
         self._submit(go, snapshot=False)
+
+    def set_register(self, name: str, value: str):
+        """Change a register to a number or gdb expression; the panels refresh."""
+        def go():
+            if self.session is None or not self.session.regs:
+                raise RuntimeError("no stopped program to change")
+            self.session.set_register(name, value)
+        self._submit(go)
+
+    def write_memory(self, where: str | int, data: str | bytes):
+        """Write bytes (`41 42`, `"AAAA\\n"`, `0x401136` as a word) at a live address or an
+        expression (`$rsp+8`, `notes`); the memory view moves there."""
+        def go():
+            from ..debugger import parse_bytes
+            s = self.session
+            if s is None or not s.regs:
+                raise RuntimeError("no stopped program to change")
+            a = s.address_of(where) if isinstance(where, str) else where
+            if a is None:
+                raise RuntimeError(f"cannot evaluate {where!r}")
+            raw = data if isinstance(data, bytes) else parse_bytes(data, s.word)
+            s.write_memory(a, raw)
+            self.mem_addr = a
+            self.log.emit(f"wrote {len(raw)} bytes at {a:#x}\n")
+        self._submit(go)
 
     def send_input(self, text: str):
         if self.session is not None:
@@ -260,16 +429,18 @@ class DebugController(QObject):
     def _snapshot(self) -> Snapshot:
         s = self.session
         if s is not None and s.regs:
-            hits = s.breakpoint_hits()
-            for bp in self.static_bps.values():
-                bp.hits = hits.get(s.to_live(bp.addr), bp.hits)
-        snap = Snapshot(breakpoints=[Breakpoint(b.addr, b.enabled, b.condition, b.hits)
-                                     for b in sorted(self.static_bps.values(), key=lambda b: b.addr)])
+            hits = s.hits_by_number()
+            for bp in self.breakpoint_list:
+                n = s.number_of(self._live_key(bp.key))
+                if n is not None:
+                    bp.hits = hits.get(n, bp.hits)
+        snap = Snapshot(breakpoints=[replace(b) for b in self.breakpoint_list])
         if s is None:
             snap.exited = "not running"
             return snap
         stop = s.mi.last_stop.results if s.mi.last_stop is not None else {}
         snap.reason = stop.get("reason", "")
+        snap.stop = describe_stop(stop) if stop else ""
         if snap.reason.startswith("exited") or s.mi.exited or not s.regs:
             code = stop.get("exit-code")
             snap.exited = f"exited with code {int(code, 8)}" if code else "exited normally"
@@ -329,9 +500,36 @@ def _hex(v: int, word: int) -> str:
 
 
 class RegistersPanel(QTableWidget):
+    """General-purpose registers; the context menu (or `E`) edits the selected one."""
+
+    edit_requested = Signal(str, int)      # register name, current value
+
     def __init__(self, parent=None):
         super().__init__(parent)
         _setup(self, ["Reg", "Value", ""])
+        self.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        self.customContextMenuRequested.connect(self._menu)
+
+    def selected_register(self) -> tuple[str, int] | None:
+        row = self.currentRow()
+        name, value = self.item(row, 0), item_value(self.item(row, 1))
+        return (name.text(), value) if name is not None and value is not None else None
+
+    def _menu(self, pos):
+        from PySide6.QtWidgets import QMenu
+        self.setCurrentCell(self.rowAt(pos.y()), 1)
+        reg = self.selected_register()
+        if reg is None:
+            return
+        menu = QMenu(self)
+        menu.addAction(f"Set {reg[0]}...", lambda: self.edit_requested.emit(*reg))
+        menu.exec(self.viewport().mapToGlobal(pos))
+
+    def keyPressEvent(self, e):
+        if e.key() == Qt.Key.Key_E and self.selected_register() is not None:
+            self.edit_requested.emit(*self.selected_register())
+            return
+        super().keyPressEvent(e)
 
     def show_snapshot(self, snap: Snapshot):
         self.setRowCount(len(snap.regs))
@@ -464,35 +662,38 @@ class MemoryPanel(QWidget):
 
 
 class BreakpointsPanel(QTableWidget):
-    """Breakpoints: a check box to enable each, its location, a condition to edit, the hit count."""
+    """Breakpoints and watchpoints: a check box to enable each, its kind and location, a condition
+    to edit, the hit count; `Delete` removes the selected ones."""
 
-    changed = Signal(int, object, object)    # static address, enabled or None, condition or None
+    changed = Signal(object, object, object)    # key (Breakpoint.key), enabled or None, condition or None
+    removed = Signal(object)                    # key
 
     def __init__(self, analysis=None, parent=None):
         super().__init__(parent)
-        _setup(self, ["On", "Address", "Location", "Condition", "Hits"])
+        _setup(self, ["On", "Type", "Address", "Location", "Condition", "Hits"])
         self.setEditTriggers(QAbstractItemView.EditTrigger.DoubleClicked | QAbstractItemView.EditTrigger.EditKeyPressed)
         self.an = analysis
+        self.keys: list = []                    # Breakpoint.key of each row
         self._filling = False
         self.itemChanged.connect(self._edited)
 
     def show_breakpoints(self, bps: list):
         self._filling = True
         try:
+            self.keys = [b.key for b in bps]
             self.setRowCount(len(bps))
             for k, b in enumerate(bps):
                 on = QTableWidgetItem()
                 on.setFlags(Qt.ItemFlag.ItemIsUserCheckable | Qt.ItemFlag.ItemIsEnabled)
                 on.setCheckState(Qt.CheckState.Checked if b.enabled else Qt.CheckState.Unchecked)
-                on.setData(Qt.ItemDataRole.UserRole, str(b.addr))
                 self.setItem(k, 0, on)
-                self.setItem(k, 1, _item(f"{b.addr:#x}", THEME["addr"], b.addr))
-                self.setItem(k, 2, _item(self.an.location(b.addr) if self.an is not None else "", THEME["func"],
-                                         b.addr))
-                cond = _item(b.condition, None, b.addr)
+                self.setItem(k, 1, _item(b.kind, THEME["mnem"] if b.watch else THEME["comment"]))
+                self.setItem(k, 2, _item(f"{b.addr:#x}" if b.addr is not None else "", THEME["addr"], b.addr))
+                self.setItem(k, 3, _item(b.describe(self.an), THEME["func"], b.addr))
+                cond = _item(b.condition)
                 cond.setFlags(cond.flags() | Qt.ItemFlag.ItemIsEditable)
-                self.setItem(k, 3, cond)
-                self.setItem(k, 4, _item(str(b.hits), None, b.addr))
+                self.setItem(k, 4, cond)
+                self.setItem(k, 5, _item(str(b.hits)))
         finally:
             self._filling = False
 
@@ -500,15 +701,22 @@ class BreakpointsPanel(QTableWidget):
         self.show_breakpoints(snap.breakpoints)
 
     def _edited(self, it: QTableWidgetItem):
-        if self._filling:
+        if self._filling or not 0 <= it.row() < len(self.keys):
             return
-        a = item_value(it)
-        if a is None:
-            return
+        key = self.keys[it.row()]
         if it.column() == 0:
-            self.changed.emit(a, it.checkState() == Qt.CheckState.Checked, None)
-        elif it.column() == 3:
-            self.changed.emit(a, None, it.text())
+            self.changed.emit(key, it.checkState() == Qt.CheckState.Checked, None)
+        elif it.column() == 4:
+            self.changed.emit(key, None, it.text())
+
+    def keyPressEvent(self, e):
+        editing = self.state() == QAbstractItemView.State.EditingState
+        if e.key() in (Qt.Key.Key_Delete, Qt.Key.Key_Backspace) and not editing:
+            for row in sorted({ix.row() for ix in self.selectedIndexes()}, reverse=True):
+                if row < len(self.keys):
+                    self.removed.emit(self.keys[row])
+            return
+        super().keyPressEvent(e)
 
 
 class ConsolePanel(QWidget):
@@ -562,5 +770,5 @@ class ConsolePanel(QWidget):
             self.gdb_line.emit(line)
 
 
-__all__ = ["Breakpoint", "BreakpointsPanel", "BacktracePanel", "CodePanel", "ConsolePanel", "DebugController", "MemoryPanel", "RegistersPanel",
-           "Snapshot", "StackPanel", "VmmapPanel", "hexdump", "item_value"]
+__all__ = ["Breakpoint", "BreakpointsPanel", "BacktracePanel", "CodePanel", "ConsolePanel", "DebugController",
+           "MemoryPanel", "RegistersPanel", "Snapshot", "StackPanel", "VmmapPanel", "hexdump", "item_value"]

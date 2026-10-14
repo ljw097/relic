@@ -64,6 +64,17 @@ def _canon_arm():
     return canon
 
 
+def _canon_mips():
+    from .lift.mips import MipsLifter
+
+    def canon(name: str) -> tuple[str, ...]:
+        n = MipsLifter.canon(name)
+        if n in ("ac0", "hi0", "lo0"):
+            return ("hi", "lo")
+        return (n,)
+    return canon
+
+
 def _canon_for(an: "Analysis"):
     arch = an.bin.arch
     if arch in ("x86", "x64"):
@@ -72,6 +83,8 @@ def _canon_for(an: "Analysis"):
         return _canon_arm64()
     if arch == "arm":
         return _canon_arm()
+    if arch == "mips" and an.bin.bits == 32:
+        return _canon_mips()
     return None
 
 
@@ -82,14 +95,24 @@ def _own_writes(an: "Analysis", f, canon):
     """(registers f's instructions write, callees whose writes add to them) or None if unknown."""
     regs: set[str] = set()
     callees: set[int] = set(f.tail_calls)
+    lifter = None
     for blk in f.blocks.values():
         for i in blk.insns:
             if i.mnemonic in _SYSCALLS or i.cs is None:
                 return None
             try:
                 _, written = i.cs.regs_access()
-            except Exception:                       # noqa: BLE001 - capstone cannot tell
-                return None
+            except Exception:                       # noqa: BLE001 - capstone cannot tell (MIPS)
+                if an.bin.arch != "mips":
+                    return None
+                if lifter is None:
+                    from .lift.mips import MipsLifter
+                    lifter = MipsLifter(an)
+                written_names = _lifted_writes(lifter, i)
+                if written_names is None:
+                    return None
+                regs.update(written_names)
+                written = ()
             for r in written:
                 regs.update(canon(i.cs.reg_name(r)))
             if i.kind == CALL:
@@ -99,6 +122,20 @@ def _own_writes(an: "Analysis", f, canon):
             elif i.kind == JMP and i.target is None and i.addr not in f.jump_tables:
                 return None                         # unresolved indirect jump (tail call?)
     return regs, callees
+
+
+def _lifted_writes(lifter, i) -> set[str] | None:
+    """Registers an instruction writes, from its lifted statements (None: it did not lift)."""
+    from .ir import Assign, Reg, Unknown
+    out: set[str] = set()
+    for s in lifter.lift_insn(i):
+        if isinstance(s, Unknown):
+            out.update(n for n, _ in s.defs)
+            if not s.defs:
+                return None
+        elif isinstance(s, Assign) and isinstance(s.dst, Reg) and not s.dst.name.startswith("tmp"):
+            out.add(s.dst.name)
+    return out
 
 
 def callee_clobbers(an: "Analysis", addr: int) -> frozenset[str] | None:

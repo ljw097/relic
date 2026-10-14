@@ -10,7 +10,7 @@ from dataclasses import dataclass
 from ..disasm import CALL, CJMP, JMP, Disassembler, Insn
 from ..loader.base import Binary
 from ..progress import report
-from .functions import Block, Function, FunctionAnalyzer
+from .functions import NORETURN, Block, Function, FunctionAnalyzer
 from .strings import String, find_strings
 
 
@@ -33,16 +33,42 @@ class Analysis:
         self.renames: dict[int, str] = {}
         # decompiler variable names: function address -> {generated name: user name}
         self.var_names: dict[int, dict[str, str]] = {}
+        # user types of decompiler variables: function address -> {generated name: C type}
+        self.var_types: dict[int, dict[str, str]] = {}
+        # recovered structs: generated struct name -> {"name": user name, "fields": {f_8: user name},
+        # "types": {f_8: C type}}
+        self.struct_names: dict[str, dict] = {}
+        # byte patches: address -> (original bytes, new bytes), applied to `bin.data`
+        self.patches: dict[int, tuple[bytes, bytes]] = {}
+        # undo / redo of patch edits: (address, the patch there before the edit, or None)
+        self.patch_undo: list[tuple[int, tuple | None]] = []
+        self.patch_redo: list[tuple[int, tuple | None]] = []
         self._fstarts: list[int] = []
         self._strings_by_addr: dict[int, String] = {}
+        # library signature files to name functions with (None: those in libsigs.sig_dirs())
+        self.sig_paths: list[str] | None = None
+        # functions named by a library signature: address -> name
+        self.lib_names: dict[int, str] = {}
 
     # ------------------------------------------------------------------ run
-    def run(self) -> "Analysis":
+    def run(self, load_project: bool = True) -> "Analysis":
+        if load_project:
+            self._apply_saved_patches()
         report("functions", 0, force=True)
-        finder = FunctionAnalyzer(self.bin, self.dis)
-        self.functions = finder.run()
-        if "main" not in self.bin.name_to_addr:
-            main = self._main_from_start()
+        finder = self._find_functions()
+        stops = self._library_names()
+        if stops:
+            # library functions known not to return (exit, abort, __chk_fail) that the analysis
+            # did not know: calls to them end their blocks, which changes where functions end --
+            # find them again knowing that
+            report("functions", 0, force=True)
+            finder = self._find_functions(stops)
+            self._library_names()
+        if "main" not in self.bin.name_to_addr and not any(f.name == "main" for f in self.functions.values()):
+            # (after library names: a static binary's `__libc_start_main` has one only then)
+            main = finder._find_main() if self.lib_names else None
+            if main is None:
+                main = self._main_from_start()
             if main is not None:
                 finder.add_function(main, "main")
         self._fstarts = sorted(self.functions)
@@ -53,8 +79,131 @@ class Analysis:
         self.strings = find_strings(self.bin)
         self._strings_by_addr = {s.addr: s for s in self.strings}
         self._build_xrefs()
-        self.load_project()
+        if load_project:
+            self.load_project()
         return self
+
+    def _find_functions(self, noreturn: set[int] = frozenset()) -> FunctionAnalyzer:
+        finder = FunctionAnalyzer(self.bin, self.dis, noreturn)
+        self.functions = finder.run()
+        return finder
+
+    def _library_names(self) -> set[int]:
+        """Name functions without a symbol by library signatures (libsigs); the ones named as
+        not returning that were not known to be so."""
+        from .libsigs import apply, available
+        dbs = available(self.bin.arch, self.sig_paths)
+        self.lib_names = apply(self, dbs) if dbs else {}
+        new = set()
+        for a in self.lib_names:
+            f = self.functions[a]
+            if f.name in NORETURN and not f.noreturn:
+                f.noreturn = True
+                new.add(a)
+        # only worth finding functions again if some call to one of them was taken to return
+        falls = any(b.last.kind == CALL and b.last.target in new and b.succs
+                    for g in self.functions.values() for b in g.blocks.values() if b.insns)
+        return new if falls else set()
+
+    def reanalyze(self) -> "Analysis":
+        """Analyse again (after a patch), keeping names, comments, variable names and patches."""
+        keep = (self.renames, self.comments, self.var_names, self.patches, self.struct_names, self.var_types,
+                self.patch_undo, self.patch_redo, self.sig_paths)
+        b = self.bin
+        self.__dict__.clear()                    # decompiler caches live on the instance too
+        self.__init__(b)
+        (self.renames, self.comments, self.var_names, self.patches, self.struct_names, self.var_types,
+         self.patch_undo, self.patch_redo, self.sig_paths) = keep
+        return self.run(load_project=False)
+
+    # ------------------------------------------------------------- patches
+    def patch(self, addr: int, data: bytes, reanalyze: bool = True, _record: bool = True) -> bytes:
+        """Write `data` at `addr` (see `relic.patch`); returns the bytes it replaced. Patching
+        the same address again replaces the earlier patch; overlapping another one is refused."""
+        from ..patch import PatchError, write
+        end = addr + len(data)
+        for a, (_old, new) in self.patches.items():
+            if a != addr and a < end and addr < a + len(new):
+                raise PatchError(f"overlaps the patch at {a:#x} (revert it first)")
+        before = self.patches.get(addr)
+        if before is not None:
+            self.revert(addr, reanalyze=False, _record=False)
+        old = write(self.bin, addr, data)
+        self.patches[addr] = (old, bytes(data))
+        if _record:
+            self.patch_undo.append((addr, before))
+            self.patch_redo.clear()
+        if reanalyze:
+            self.reanalyze()
+        return old
+
+    def revert(self, addr: int, reanalyze: bool = True, _record: bool = True) -> bool:
+        """Put back the original bytes of the patch at `addr`."""
+        from ..patch import write
+        p = self.patches.pop(addr, None)
+        if p is None:
+            return False
+        write(self.bin, addr, p[0])
+        if _record:
+            self.patch_undo.append((addr, p))
+            self.patch_redo.clear()
+        if reanalyze:
+            self.reanalyze()
+        return True
+
+    def _set_patch(self, addr: int, state: tuple | None):
+        """Make the patch at `addr` be `state` ((original, new) or None: none)."""
+        if addr in self.patches:
+            self.revert(addr, reanalyze=False, _record=False)
+        if state is not None:
+            self.patch(addr, state[1], reanalyze=False, _record=False)
+
+    def undo_patch(self, reanalyze: bool = True) -> int | None:
+        """Undo the last patch edit (a patch or a revert); its address, or None if nothing to undo."""
+        if not self.patch_undo:
+            return None
+        addr, before = self.patch_undo.pop()
+        self.patch_redo.append((addr, self.patches.get(addr)))
+        self._set_patch(addr, before)
+        if reanalyze:
+            self.reanalyze()
+        return addr
+
+    def redo_patch(self, reanalyze: bool = True) -> int | None:
+        """Redo the last undone patch edit."""
+        if not self.patch_redo:
+            return None
+        addr, after = self.patch_redo.pop()
+        self.patch_undo.append((addr, self.patches.get(addr)))
+        self._set_patch(addr, after)
+        if reanalyze:
+            self.reanalyze()
+        return addr
+
+    def patched_at(self, addr: int) -> bool:
+        return any(a <= addr < a + len(new) for a, (_, new) in self.patches.items())
+
+    def _apply_saved_patches(self):
+        """Patches kept in the project file, applied before the analysis sees the code. One whose
+        original bytes no longer match (the binary changed) is skipped."""
+        path = self.project_path
+        if not os.path.exists(path):
+            return
+        try:
+            with open(path) as fp:
+                saved = json.load(fp).get("patches", {})
+        except (OSError, ValueError):
+            return
+        from ..patch import PatchError, write
+        for a, p in saved.items():
+            addr, old, new = int(a, 16), bytes.fromhex(p["old"]), bytes.fromhex(p["new"])
+            if self.bin.read(addr, len(old)) != old or addr in self.patches:
+                continue
+            try:
+                write(self.bin, addr, new)
+            except PatchError:
+                continue
+            self.patches[addr] = (old, new)
 
     def _main_from_start(self) -> int | None:
         """`main` of a stripped binary: the first argument `_start` passes to __libc_start_main,
@@ -244,6 +393,79 @@ class Analysis:
         if not names:
             self.var_names.pop(func, None)
 
+    def rename_struct(self, generated: str, name: str):
+        """Name a recovered struct (`s_notes`); empty resets."""
+        d = self.struct_names.setdefault(generated, {})
+        if name and name != generated:
+            d["name"] = name
+        else:
+            d.pop("name", None)
+        self._tidy_struct_names(generated)
+
+    def rename_field(self, struct: str, generated: str, name: str):
+        """Name a field (`f_8`) of a recovered struct (by its generated name); empty resets."""
+        fields = self.struct_names.setdefault(struct, {}).setdefault("fields", {})
+        if name and name != generated:
+            fields[generated] = name
+        else:
+            fields.pop(generated, None)
+        self._tidy_struct_names(struct)
+
+    def set_var_type(self, func: int, generated: str, ctype: str):
+        """Give a decompiler variable / parameter of the function at `func` a C type (`char *`,
+        `struct note *`); empty resets to the inferred one. ValueError for what is not a type."""
+        from ..decompiler.vartypes import parse_ctype
+        types = self.var_types.setdefault(func, {})
+        if ctype.strip():
+            t = parse_ctype(ctype)
+            types[generated] = str(t)
+            if t.base.startswith("struct "):
+                # keep an entry (and so the struct's layout) for a struct applied by its own name
+                name = t.base[7:]
+                if not any(d.get("name") == name for d in self.struct_names.values()):
+                    self.struct_names.setdefault(name, {})["applied"] = True
+        else:
+            types.pop(generated, None)
+        if not types:
+            self.var_types.pop(func, None)
+
+    def set_field_type(self, struct: str, generated: str, ctype: str):
+        """Give a field of a recovered struct a C type; empty resets it."""
+        from ..decompiler.vartypes import parse_ctype
+        types = self.struct_names.setdefault(struct, {}).setdefault("types", {})
+        if ctype.strip():
+            types[generated] = str(parse_ctype(ctype))
+        else:
+            types.pop(generated, None)
+        self._tidy_struct_names(struct)
+
+    def add_field(self, struct: str, offset: int, ctype: str, name: str = ""):
+        """Add (or replace) a field of a recovered struct by hand: `int`, `char *`, `char[16]`."""
+        from ..decompiler.structs import field_layout
+        field_layout(ctype, self.bin.bits)                       # ValueError for what is not a type
+        d = self.struct_names.setdefault(struct, {})
+        d.setdefault("added", {})[f"{offset:#x}"] = [ctype.strip(), name.strip()]
+        d["removed"] = [o for o in d.get("removed", []) if o != f"{offset:#x}"]
+        if name.strip():
+            self.rename_field(struct, f"f_{offset:x}", name)
+        self._tidy_struct_names(struct)
+
+    def remove_field(self, struct: str, offset: int):
+        """Drop a field of a recovered struct (it is shown as a plain memory access again)."""
+        d = self.struct_names.setdefault(struct, {})
+        d.get("added", {}).pop(f"{offset:#x}", None)
+        if f"{offset:#x}" not in d.setdefault("removed", []):
+            d["removed"].append(f"{offset:#x}")
+        self._tidy_struct_names(struct)
+
+    def _tidy_struct_names(self, struct: str):
+        d = self.struct_names.get(struct, {})
+        for k in ("fields", "types", "added", "removed"):
+            if not d.get(k):
+                d.pop(k, None)
+        if set(d) <= {"layout"}:                 # nothing the user set: no entry
+            self.struct_names.pop(struct, None)
+
     def comment(self, addr: int, text: str):
         if text:
             self.comments[addr] = text
@@ -257,6 +479,9 @@ class Analysis:
             "renames": {f"{a:#x}": n for a, n in sorted(self.renames.items())},
             "comments": {f"{a:#x}": c for a, c in sorted(self.comments.items())},
             "variables": {f"{a:#x}": dict(sorted(v.items())) for a, v in sorted(self.var_names.items())},
+            "patches": {f"{a:#x}": {"old": o.hex(), "new": n.hex()} for a, (o, n) in sorted(self.patches.items())},
+            "structs": dict(sorted(self.struct_names.items())),
+            "types": {f"{a:#x}": dict(sorted(v.items())) for a, v in sorted(self.var_types.items())},
         }
         with open(path or self.project_path, "w") as fp:
             json.dump(data, fp, indent=2)
@@ -270,12 +495,18 @@ class Analysis:
         self.renames = {int(a, 16): n for a, n in data.get("renames", {}).items()}
         self.comments = {int(a, 16): c for a, c in data.get("comments", {}).items()}
         self.var_names = {int(a, 16): dict(v) for a, v in data.get("variables", {}).items()}
+        self.struct_names = {k: dict(v) for k, v in data.get("structs", {}).items()}
+        self.var_types = {int(a, 16): dict(v) for a, v in data.get("types", {}).items()}
         return True
 
 
-def analyze(path: str, arch: str | None = None, base: int = 0) -> Analysis:
+def analyze(path: str, arch: str | None = None, base: int = 0, sigs: list[str] | None = None) -> Analysis:
+    """Load and analyse a binary. `sigs`: library signature files to name functions with
+    (default: the .sig files in libsigs.sig_dirs())."""
     from ..loader import load
-    return Analysis(load(path, arch, base)).run()
+    an = Analysis(load(path, arch, base))
+    an.sig_paths = sigs
+    return an.run()
 
 
 __all__ = ["Analysis", "Block", "Function", "String", "Xref", "analyze"]

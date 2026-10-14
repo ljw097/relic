@@ -38,16 +38,31 @@ VARIANTS = {
     "flow_arm_O2": ["-O2", "-marm", "-fno-tree-vectorize"],
     "flow_thumb_O0": ["-O0", "-mthumb"],
     "flow_thumb_O2": ["-O2", "-mthumb", "-fno-tree-vectorize"],
+    # MIPS32 little-endian (cross compiler; skipped without it): non-PIC with .MIPS.stubs, and PIE
+    "vuln_mips": ["-O0"],
+    "vuln_mips_pie": ["-O1", "-fstack-protector-strong", "-pie", "-fPIE"],
+    "flow_mips_O0": ["-O0"],
+    "flow_mips_O2": ["-O2", "-fno-tree-vectorize"],
+    # struct recovery
+    "structs_O0": ["-O0", "-fno-stack-protector", "-no-pie"],
+    "structs_O2": ["-O2", "-fno-stack-protector", "-no-pie", "-fno-inline"],
+    # library argument / result types
+    "libtypes_O0": ["-O0", "-fno-stack-protector", "-no-pie"],
+    "libtypes_O2": ["-O2", "-fno-stack-protector", "-no-pie"],
     # C++ (demangling)
     "shapes": ["-O0", "-no-pie", "-fno-inline"],
 }
 COMPILERS = {"vuln64_pe": "x86_64-w64-mingw32-gcc", "vuln32_pe": "i686-w64-mingw32-gcc", "shapes": "g++",
              **{n: "aarch64-linux-gnu-gcc" for n in ("vuln_a64", "vuln_a64_pie", "flow_a64_O0", "flow_a64_O2")},
+             **{n: "mipsel-linux-gnu-gcc" for n in ("vuln_mips", "vuln_mips_pie", "flow_mips_O0", "flow_mips_O2")},
              **{n: "arm-linux-gnueabihf-gcc" for n in ("vuln_arm", "vuln_thumb", "flow_arm_O0", "flow_arm_O2",
                                                        "flow_thumb_O0", "flow_thumb_O2")}}
-SOURCES = {"flow_O0": FLOW_SRC, "flow_O2": FLOW_SRC, "flow32_O0": FLOW_SRC, "flow32_O2": FLOW_SRC,
+SOURCES = {"structs_O0": os.path.join(HERE, "src", "structs.c"), "structs_O2": os.path.join(HERE, "src", "structs.c"),
+           **{n: os.path.join(HERE, "src", "libtypes.c") for n in ("libtypes_O0", "libtypes_O2")},
+           "flow_O0": FLOW_SRC, "flow_O2": FLOW_SRC, "flow32_O0": FLOW_SRC, "flow32_O2": FLOW_SRC,
            "shapes": os.path.join(HERE, "src", "shapes.cpp"), "flow_a64_O0": FLOW_SRC, "flow_a64_O2": FLOW_SRC,
-           **{n: FLOW_SRC for n in ("flow_arm_O0", "flow_arm_O2", "flow_thumb_O0", "flow_thumb_O2")}}
+           **{n: FLOW_SRC for n in ("flow_arm_O0", "flow_arm_O2", "flow_thumb_O0", "flow_thumb_O2",
+                                    "flow_mips_O0", "flow_mips_O2")}}
 
 
 def _build(name: str) -> str:
@@ -121,6 +136,8 @@ flow32_O2 = _fixture("flow32_O2")
 vuln64_pe = _fixture("vuln64_pe")
 vuln32_pe = _fixture("vuln32_pe")
 shapes = _fixture("shapes")
+libtypes_O0 = _fixture("libtypes_O0")
+libtypes_O2 = _fixture("libtypes_O2")
 vuln_a64 = _fixture("vuln_a64")
 vuln_a64_pie = _fixture("vuln_a64_pie")
 flow_a64_O0 = _fixture("flow_a64_O0")
@@ -135,3 +152,17 @@ flow_arm_O0 = _fixture("flow_arm_O0")
 flow_arm_O2 = _fixture("flow_arm_O2")
 flow_thumb_O0 = _fixture("flow_thumb_O0")
 flow_thumb_O2 = _fixture("flow_thumb_O2")
+vuln_mips = _fixture("vuln_mips")
+vuln_mips_pie = _fixture("vuln_mips_pie")
+vuln_mips_stripped = _fixture("vuln_mips_stripped")
+structs_O0 = _fixture("structs_O0")
+structs_O2 = _fixture("structs_O2")
+flow_mips_O0 = _fixture("flow_mips_O0")
+flow_mips_O2 = _fixture("flow_mips_O2")
+
+
+@pytest.fixture(autouse=True)
+def _no_user_signatures(monkeypatch):
+    """Analyses in tests use no library signature files of the user's (~/.relic/sigs)."""
+    from relic.analysis import libsigs
+    monkeypatch.setattr(libsigs, "sig_dirs", lambda: [])

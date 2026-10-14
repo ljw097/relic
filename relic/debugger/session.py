@@ -95,6 +95,8 @@ class Session:
         self.word = 8
         self.slide = 0
         self.breakpoints: dict[int, int] = {}       # live address -> gdb breakpoint number
+        self.named: dict[str, int] = {}             # gdb location (`puts`, `libc.so.6:system`) -> number
+        self.watchpoints: dict[str, int] = {}       # watch key (`write:counter/4`) -> number
         self.prev_regs: dict[str, int] = {}
         self.regs: dict[str, int] = {}
         self._reg_names: list[str] = []
@@ -238,18 +240,14 @@ class Session:
         return n
 
     def set_breakpoint_enabled(self, live_addr: int, enabled: bool):
-        n = self.breakpoints.get(live_addr)
-        if n is not None:
-            self.mi.command(f"-break-{'enable' if enabled else 'disable'} {n}")
+        self.set_enabled(live_addr, enabled)
 
     def set_breakpoint_condition(self, live_addr: int, condition: str):
         """Stop only when the gdb expression is true (`$rdi == 5`); empty: always."""
-        n = self.breakpoints.get(live_addr)
-        if n is not None:
-            self.mi.command(f"-break-condition {n} {condition}".rstrip())
+        self.set_condition(live_addr, condition)
 
-    def breakpoint_hits(self) -> dict[int, int]:
-        """live address -> how many times the breakpoint was hit."""
+    def hits_by_number(self) -> dict[int, int]:
+        """gdb breakpoint / watchpoint number -> how many times it was hit."""
         try:
             r = self.mi.command("-break-list")
         except MIError:
@@ -262,7 +260,108 @@ class Session:
                 by_number[int(b["number"])] = int(b.get("times", "0"))
             except (KeyError, ValueError):
                 continue
+        return by_number
+
+    def breakpoint_hits(self) -> dict[int, int]:
+        """live address -> how many times the breakpoint was hit."""
+        by_number = self.hits_by_number()
         return {a: by_number.get(n, 0) for a, n in self.breakpoints.items()}
+
+    def _set_enabled(self, n: int, enabled: bool):
+        self.mi.command(f"-break-{'enable' if enabled else 'disable'} {n}")
+
+    def _set_condition(self, n: int, condition: str):
+        self.mi.command(f"-break-condition {n} {condition}".rstrip())
+
+    # ------------------------------------------- breakpoints on names, watchpoints
+    def add_named_breakpoint(self, location: str, condition: str = "", enabled: bool = True) -> int:
+        """A breakpoint on a gdb location (`puts`, `puts@plt`, `libc.so.6:system`), resolved by gdb
+        (pending until the library that defines it is loaded): `puts` stops in libc itself."""
+        location = location.strip()
+        if not location:
+            raise DebugError("empty location")
+        cond = f'-c "{_mi_quote(condition)}" ' if condition else ""
+        off = "-d " if not enabled else ""
+        try:
+            r = self.mi.command(f'-break-insert -f {off}{cond}"{_mi_quote(location)}"')
+        except MIError as e:
+            raise DebugError(str(e)) from None
+        n = int(r.results["bkpt"]["number"])
+        self.named[location] = n
+        return n
+
+    def remove_named_breakpoint(self, location: str):
+        n = self.named.pop(location, None)
+        if n is not None:
+            self.mi.command(f"-break-delete {n}")
+
+    def watch_expression(self, expr: str, size: int | None = None) -> str:
+        """What gdb watches for `expr`: an address or a name Relic knows (`counter`, `notes+8`,
+        `0x404040`) becomes `*(long *)live` of `size` bytes (default: a word); anything else
+        (`*(int *)($rbp-4)`, `$rsp`) is a gdb expression as is."""
+        text = expr.strip()
+        a = None
+        if re.fullmatch(r"(0x)?[0-9a-fA-F]+", text) and (text.startswith("0x") or not text.isalpha()):
+            a = int(text, 16)
+        elif self.an is not None and re.fullmatch(r"[\w.@$]+(\+(0x)?[0-9a-fA-F]+)?", text) \
+                and not text.startswith("$"):
+            try:
+                s = self.an.resolve(text)
+            except ValueError:
+                s = None
+            if s is not None:
+                a = self.to_live(s)
+        if a is None:
+            return text
+        ctype = _WATCH_TYPES.get(size or self.word)
+        if ctype is None:
+            raise DebugError(f"cannot watch {size} bytes (1, 2, 4 or 8)")
+        return f"*({ctype} *){a:#x}"
+
+    def add_watchpoint(self, expr: str, access: str = "write", size: int | None = None,
+                       condition: str = "", enabled: bool = True) -> int:
+        """Stop when memory is written (`write`), read (`read`) or either (`access`); hardware
+        watchpoints when the CPU has a free debug register. Returns the gdb number."""
+        flag = {"write": "", "read": "-r ", "access": "-a "}.get(access)
+        if flag is None:
+            raise DebugError(f"unknown watchpoint kind {access!r}")
+        what = self.watch_expression(expr, size)
+        try:
+            r = self.mi.command(f'-break-watch {flag}"{_mi_quote(what)}"')
+        except MIError as e:
+            raise DebugError(str(e)) from None
+        wpt = next((v for k, v in r.results.items() if k in ("wpt", "hw-rwpt", "hw-awpt")), {})
+        n = int(wpt["number"])
+        if condition:
+            self._set_condition(n, condition)
+        if not enabled:
+            self._set_enabled(n, False)
+        self.watchpoints[watch_key(expr, access, size)] = n
+        return n
+
+    def remove_watchpoint(self, key: str):
+        n = self.watchpoints.pop(key, None)
+        if n is not None:
+            try:
+                self.mi.command(f"-break-delete {n}")
+            except MIError:
+                pass                    # gone already (a watchpoint on a local leaves with its frame)
+
+    def number_of(self, key) -> int | None:
+        """gdb number of a breakpoint by live address, gdb location or watch key."""
+        if isinstance(key, int):
+            return self.breakpoints.get(key)
+        return self.named.get(key, self.watchpoints.get(key))
+
+    def set_enabled(self, key, enabled: bool):
+        n = self.number_of(key)
+        if n is not None:
+            self._set_enabled(n, enabled)
+
+    def set_condition(self, key, condition: str):
+        n = self.number_of(key)
+        if n is not None:
+            self._set_condition(n, condition)
 
     def remove_breakpoint(self, live_addr: int):
         n = self.breakpoints.pop(live_addr, None)
@@ -376,6 +475,29 @@ class Session:
         for ins in r.results.get("asm_insns", [])[:count]:
             out.append((int(ins["address"], 16), ins.get("inst", "")))
         return out
+
+    def set_register(self, name: str, value: int | str):
+        """Change a register (`rax`, `$rip`) to a number or a gdb expression (`$rsp+8`); the
+        registers are read again, while what changed is still measured from the last stop."""
+        name = name.strip().lstrip("$")
+        if not re.fullmatch(r"\w+", name):
+            raise DebugError(f"not a register: {name!r}")
+        if isinstance(value, int):
+            value = f"{value & ((1 << (8 * self.word)) - 1):#x}"
+        try:
+            self.mi.command(f'-data-evaluate-expression "${name} = {_mi_quote(value.strip())}"')
+        except MIError as e:
+            raise DebugError(str(e)) from None
+        self.regs = self.read_registers()
+
+    def write_memory(self, addr: int, data: bytes):
+        """Write bytes into the process."""
+        if not data:
+            return
+        try:
+            self.mi.command(f"-data-write-memory-bytes {addr:#x} {data.hex()}")
+        except MIError as e:
+            raise DebugError(str(e)) from None
 
     def evaluate(self, expr: str) -> str:
         r = self.mi.command(f'-data-evaluate-expression "{expr}"')
@@ -501,8 +623,67 @@ class Session:
         return None
 
 
+_WATCH_TYPES = {1: "char", 2: "short", 4: "int", 8: "long long"}
+
+
+def watch_key(expr: str, access: str = "write", size: int | None = None) -> str:
+    """How a watchpoint is named across runs: `write:counter`, `read:0x404040/4`."""
+    return f"{access}:{expr.strip()}" + (f"/{size}" if size else "")
+
+
+def parse_bytes(text: str, word: int = 8) -> bytes:
+    """Bytes to write, as typed: hex bytes (`41 42 ff`, `4142ff`), a quoted string with escapes
+    (`"AAAA\\n"`, `b'\\x00'`), or a number written as a little-endian word (`0x401136`, `-1`)."""
+    import ast
+    text = text.strip()
+    if not text:
+        return b""
+    if text[0] in "\"'" or text[:2] in ("b'", 'b"'):
+        try:
+            v = ast.literal_eval(text if text[0] == "b" else "b" + text)
+        except (ValueError, SyntaxError) as e:
+            raise DebugError(f"bad string: {e}") from None
+        return v
+    if text.lower().startswith(("0x", "-0x", "-")) and " " not in text:
+        try:
+            v = int(text, 0)
+        except ValueError:
+            raise DebugError(f"bad number: {text!r}") from None
+        return (v & ((1 << (8 * word)) - 1)).to_bytes(word, "little")
+    hexes = text.replace(" ", "").replace(",", "")
+    try:
+        return bytes.fromhex(hexes)
+    except ValueError:
+        raise DebugError(f"bad bytes: {text!r} (hex bytes, \"text\" or 0x number)") from None
+
+
+def describe_stop(stop: dict) -> str:
+    """One line for why the program stopped: `breakpoint 2`, `watchpoint 3 *(int *)0x4040: 0 -> 5`,
+    `signal SIGSEGV (Segmentation fault)`."""
+    reason = stop.get("reason", "")
+    if reason.endswith("watchpoint-trigger"):
+        wpt = next((stop[k] for k in ("wpt", "hw-rwpt", "hw-awpt") if k in stop), {})
+        val = stop.get("value", {})
+        kind = {"read-watchpoint-trigger": "read watchpoint",
+                "access-watchpoint-trigger": "access watchpoint"}.get(reason, "watchpoint")
+        text = f"{kind} {wpt.get('number', '?')} {wpt.get('exp', '')}".rstrip()
+        if "old" in val and "new" in val:
+            return f"{text}: {val['old']} -> {val['new']}"
+        if "new" in val or "value" in val:
+            return f"{text}: {val.get('new', val.get('value'))}"
+        return text
+    if reason == "watchpoint-scope":
+        return f"watchpoint {stop.get('wpnum', '?')} went out of scope"
+    if reason == "breakpoint-hit":
+        return f"breakpoint {stop.get('bkptno', '?')}"
+    if reason == "signal-received":
+        return f"signal {stop.get('signal-name', '?')} ({stop.get('signal-meaning', '')})".replace(" ()", "")
+    return reason.replace("-", " ")
+
+
 def _quote(a: str) -> str:
     return a if re.fullmatch(r"[\w./:=+-]+", a) else '"' + a.replace("\\", "\\\\").replace('"', '\\"') + '"'
 
 
-__all__ = ["DebugError", "Frame", "Mapping", "Session", "TeleRow"]
+__all__ = ["DebugError", "Frame", "Mapping", "Session", "TeleRow", "describe_stop", "parse_bytes",
+           "watch_key"]

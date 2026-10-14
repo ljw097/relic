@@ -126,3 +126,76 @@ def test_hexdump():
     assert lines[0].startswith("0x000000001000  68 65 6c 6c 6f 2c 20 77  6f 72")
     assert lines[0].endswith("|hello, world!...|")
     assert lines[1].startswith("0x000000001010  41 41 41 41") and lines[1].endswith("|AAAA|")
+
+
+@needs_gdb
+@pytest.mark.parametrize("fixture", ["vuln64", "vuln64_pie"])
+def test_watchpoints_and_named_breakpoints(request, fixture):
+    from relic.debugger import Session, describe_stop, watch_key
+    path = request.getfixturevalue(fixture)
+    an = analyze(path)
+    s = Session(path, analysis=an)
+    try:
+        s.start("entry")
+        notes = an.resolve("notes")
+        assert s.watch_expression("notes") == f"*(long long *){s.to_live(notes):#x}"
+        assert s.watch_expression("notes+8", 4) == f"*(int *){s.to_live(notes) + 8:#x}"
+        assert s.watch_expression("*(int *)($rbp-4)") == "*(int *)($rbp-4)"
+        # a library function by name stops in libc itself, not at the PLT stub
+        s.add_named_breakpoint("puts")
+        st = s.cont(timeout=20)
+        assert st.get("reason") == "breakpoint-hit" and describe_stop(st) == f"breakpoint {s.named['puts']}"
+        assert s.to_static(s.pc) is None and "puts" in s.symbolize(s.pc)
+        s.remove_named_breakpoint("puts")
+        # add_note: the while loop reads notes[0], then notes[0] = malloc(...) writes it
+        s.add_watchpoint("notes", "read")
+        s.add_watchpoint("notes", "write")
+        s.send_input("1\n8\nAAAA\n4\n")
+        st = s.cont(timeout=20)
+        assert st.get("reason") == "read-watchpoint-trigger"
+        assert s.symbolize(s.pc).startswith("add_note+")
+        s.remove_watchpoint(watch_key("notes", "read"))
+        st = s.cont(timeout=20)
+        assert st.get("reason") == "watchpoint-trigger" and s.symbolize(s.pc).startswith("add_note+")
+        text = describe_stop(st)
+        assert text.startswith("watchpoint ") and ": 0 -> " in text
+        new = int(st["value"]["new"])
+        assert s.read_word(s.to_live(notes)) == new and s.mapping_at(new).kind == "heap"
+        assert s.hits_by_number()[s.watchpoints[watch_key("notes")]] == 1
+        s.set_enabled(watch_key("notes"), False)
+        assert s.cont(timeout=20).get("reason", "").startswith("exited")
+    finally:
+        s.close()
+
+
+def test_parse_bytes():
+    from relic.debugger import DebugError, parse_bytes
+    assert parse_bytes("41 42 ff") == parse_bytes("4142ff") == b"AB\xff"
+    assert parse_bytes('"AA\\n"') == b"AA\n" and parse_bytes("b'\\x00a'") == b"\x00a"
+    assert parse_bytes("0x401136") == bytes.fromhex("3611400000000000")
+    assert parse_bytes("-1", 4) == b"\xff" * 4
+    with pytest.raises(DebugError):
+        parse_bytes("zz")
+
+
+@needs_gdb
+def test_set_register_and_write_memory(vuln64):
+    from relic.debugger import Session
+    an = analyze(vuln64)
+    s = Session(vuln64, args=["5"], analysis=an)
+    try:
+        s.start("entry")
+        s.add_breakpoint(s.to_live(an.function_by_name("classify").addr))
+        s.send_input("x\n")
+        s.cont(timeout=20)
+        assert s.regs["rdi"] == 5
+        s.write_memory(s.sp - 0x40, b"relic\0")
+        assert s.read_memory(s.sp - 0x40, 6) == b"relic\0" and s._string_at(s.sp - 0x40) == "relic"
+        s.set_register("rdi", "$rdi - 5")          # classify(0) returns 10, classify(5) 63
+        assert s.regs["rdi"] == 0
+        s.set_register("$rax", -1)
+        assert s.regs["rax"] == (1 << 64) - 1
+        st = s.cont(timeout=20)
+        assert st.get("reason") == "exited" and int(st["exit-code"], 8) == 10
+    finally:
+        s.close()

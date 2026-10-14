@@ -1,4 +1,4 @@
-"""Register constant propagation for data references (AArch64, ARM / Thumb, x86-32 PIC).
+"""Register constant propagation for data references (AArch64, ARM / Thumb, x86-32 PIC, MIPS).
 
 x86-64 code names its data directly (`lea rax, [rip + x]`), so every string
 or global it touches already is an instruction reference. Elsewhere the
@@ -8,6 +8,8 @@ address is built over several instructions:
     ARM PIC     ldr r3, [pc, #k] ; add r3, pc            (a literal-pool offset from pc)
     ARM         ldr r0, =addr / movw + movt              (absolute, non-PIE)
     x86-32 PIC  call __x86.get_pc_thunk.bx ; add ebx, off ; lea eax, [ebx - k]
+    MIPS        lui v0, hi ; addiu a0, v0, lo             (absolute, non-PIC)
+                lw t9, -0x7fc0(gp) ; jalr t9              (a call through the GOT)
 
 This pass follows constant register values through each function (a forward
 dataflow over its CFG: a value survives a join only when every predecessor
@@ -25,7 +27,7 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
-from ..disasm import CALL, Insn
+from ..disasm import CALL, JMP, Insn
 from ..progress import checkpoint
 
 if TYPE_CHECKING:
@@ -50,6 +52,14 @@ class _Target:
         return name
 
     clobbered_by_call: frozenset = frozenset()
+    delay_slots = False             # a call takes effect after the next instruction (MIPS)
+
+    def entry_state(self) -> dict:
+        return {}
+
+    def clobber(self, st: dict):
+        for k in self.clobbered_by_call:
+            st.pop(k, None)
 
     def transfer(self, i: Insn, st: dict, refs: list) -> None:
         raise NotImplementedError
@@ -271,6 +281,101 @@ class _X86PIC(_Target):
         self.kill_written(i, st)
 
 
+class _Mips(_Target):
+    """`$gp` is the same everywhere in a module (`_gp`, GOT + 0x7ff0): it is pinned to that,
+    whatever the code does to it (PIC prologues rebuild it from `$t9`, calls reload it from the
+    stack). A word loaded from the GOT keeps the slot it came from (`@reg`), so `jalr $t9`
+    can be named after the import that slot belongs to."""
+    clobbered_by_call = frozenset(["at", "v0", "v1", "a0", "a1", "a2", "a3", "t0", "t1", "t2", "t3", "t4", "t5",
+                                   "t6", "t7", "t8", "t9", "ra"])
+    delay_slots = True
+    _LOADS = {"lw": 4, "ld": 8}
+    _MEM = ("lw", "sw", "lb", "lbu", "lh", "lhu", "sb", "sh", "ld", "sd", "lwu", "lwl", "lwr", "swl", "swr",
+            "lwc1", "swc1", "ldc1", "sdc1", "ll", "sc")
+
+    def __init__(self, an):
+        super().__init__(an)
+        self.gp = an.bin.mips_gp
+        self.calls: dict[int, tuple[int | None, Val | None]] = {}     # jalr / jr address -> (slot, value)
+        got = next((s for s in an.bin.sections if s.name == ".got"), None)
+        self.got = (got.addr, got.end) if got is not None else (0, 0)
+
+    def canon(self, name: str) -> str:
+        name = name.lstrip("$")
+        return {"s8": "fp", "30": "fp", "29": "sp", "28": "gp", "25": "t9", "31": "ra"}.get(name, name)
+
+    def entry_state(self) -> dict:
+        return {"gp": (self.gp, True)} if self.gp is not None else {}
+
+    def kill_written(self, i: Insn, st: dict):
+        for r in i.regs_write:
+            r = self.canon(r)
+            if r != "gp":
+                st.pop(r, None)
+                st.pop("@" + r, None)
+
+    def clobber(self, st: dict):
+        for k in self.clobbered_by_call:
+            st.pop(k, None)
+            st.pop("@" + k, None)
+
+    def transfer(self, i, st, refs):
+        c = i.cs
+        ops = c.operands
+        m = i.mnemonic
+        name = c.reg_name
+        regs = [self.canon(name(o.reg)) for o in ops if o.type == OP_REG]
+        dst = regs[0] if ops and ops[0].type == OP_REG else None
+        if dst == "gp" and m not in ("jalr", "jr"):
+            return
+        if m in ("jalr", "jr", "jalr.hb", "jr.hb") and regs:
+            r = regs[-1]
+            self.calls[i.addr] = (st.get("@" + r), st.get(r))
+            self.kill_written(i, st)
+            return
+        if m == "lui" and len(ops) == 2 and ops[1].type == OP_IMM:
+            st[dst] = ((ops[1].imm << 16) & self.mask, not self.pie)
+            st.pop("@" + dst, None)
+            return
+        if m in ("addiu", "daddiu", "addi", "ori") and len(ops) == 3 and ops[2].type == OP_IMM:
+            src = st.get(regs[1])
+            if src is not None:
+                v = (src[0] | ops[2].imm if m == "ori" else src[0] + ops[2].imm) & self.mask
+                self.kill_written(i, st)
+                st[dst] = (v, src[1])
+                if src[1] and v != src[0]:
+                    refs.append(v)
+                return
+        if m == "move" and len(regs) == 2:
+            src = st.get(regs[1])
+            self.kill_written(i, st)
+            if src is not None:
+                st[dst] = src
+                if "@" + regs[1] in st:
+                    st["@" + dst] = st["@" + regs[1]]
+            return
+        if m in self._MEM:
+            for o in ops:
+                if o.type != OP_MEM:
+                    continue
+                base = st.get(self.canon(name(o.mem.base)))
+                if base is None or not base[1]:
+                    break
+                addr = (base[0] + o.mem.disp) & self.mask
+                refs.append(addr)
+                self.kill_written(i, st)
+                size = self._LOADS.get(m)
+                if size and dst and dst != "gp" and \
+                        (self.got[0] <= addr < self.got[1] or self.readonly(addr)):
+                    v = self.bin.read_int(addr, size)
+                    if v is not None:
+                        st[dst] = (v, bool(v) and self.bin.is_mapped(v))
+                        if self.got[0] <= addr < self.got[1]:
+                            st["@" + dst] = addr
+                return
+        self.kill_written(i, st)
+
+
 def _target_for(an: "Analysis") -> _Target | None:
     arch = an.bin.arch
     if arch == "arm64":
@@ -279,6 +384,8 @@ def _target_for(an: "Analysis") -> _Target | None:
         return _Arm(an)
     if arch == "x86":
         return _X86PIC(an)
+    if arch in ("mips", "mips64"):
+        return _Mips(an)
     return None
 
 
@@ -302,16 +409,22 @@ def _function_refs(t: _Target, f: "Function") -> dict[int, list[int]]:
         changed = False
         for a in order:
             blk = f.blocks[a]
-            st = _meet([out_state[p] for p in blk.preds if p in out_state]) if a != f.addr else {}
+            st = _meet([out_state[p] for p in blk.preds if p in out_state]) if a != f.addr else t.entry_state()
+            pending = False             # a MIPS call clobbers registers after its delay slot
             for i in blk.insns:
                 refs: list[int] = []
                 try:
                     t.transfer(i, st, refs)
                 except (AttributeError, IndexError, TypeError, ValueError):
                     t.kill_written(i, st)
+                if pending:
+                    t.clobber(st)
+                    pending = False
                 if i.kind == CALL and not (isinstance(t, _X86PIC) and t.thunk(i)):
-                    for k in t.clobbered_by_call:
-                        st.pop(k, None)
+                    if t.delay_slots:
+                        pending = True
+                    else:
+                        t.clobber(st)
                 if refs:
                     found[i.addr] = refs
             if out_state.get(a) != st:
@@ -341,6 +454,29 @@ def propagate_refs(an: "Analysis") -> int:
                             i.refs[:] = [x for x in i.refs if x != i.cs.operands[2].imm]   # the lo12 offset
                         i.refs.append(r)
                         n += 1
+    if isinstance(t, _Mips):
+        n += _name_mips_calls(an, t)
+    return n
+
+
+def _name_mips_calls(an: "Analysis", t: _Mips) -> int:
+    """`jalr $t9` after `lw $t9, slot($gp)`: a call of the import that owns the slot (named
+    through `mem_target`, like an x86 `call [slot]`), or of the function the slot holds."""
+    n = 0
+    for f in an.functions.values():
+        for blk in f.blocks.values():
+            for i in blk.insns:
+                slot, val = t.calls.get(i.addr, (None, None))
+                if i.kind not in (CALL, JMP) or i.target is not None:
+                    continue
+                if slot is not None and slot in an.bin.imports_by_got:
+                    i.mem_target = slot
+                    n += 1
+                elif val is not None and val[1] and val[0] in an.functions:
+                    i.target = val[0]
+                    if i.kind == CALL:
+                        f.calls.add(val[0])
+                    n += 1
     return n
 
 

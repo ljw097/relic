@@ -15,9 +15,9 @@ from typing import TYPE_CHECKING
 
 from .arch import ArchInfo, arch_for
 from .arith import recover_division
-from .cleanup import (cached_ir, drop_return_values, drop_stack_pointer_chains, fold_short_circuits, forward_empty_blocks, hide_canary,
-                      inline_single_use,
-                      narrow_library_results, narrow_returns, return_width, returns_value, rewrite_locals)
+from .cleanup import (cached_ir, drop_return_values, drop_stack_pointer_chains, fold_short_circuits,
+                      forward_empty_blocks, hide_canary, inline_single_use, narrow_library_results, narrow_returns,
+                      return_width, returns_value, rewrite_locals)
 from .ir import IRFunction
 from .outssa import out_of_ssa
 from .passes import _dce, _fold_pass
@@ -76,7 +76,8 @@ def prepare(an: "Analysis", func: "Function") -> Prepared:
     narrow(fn)
     inline_single_use(fn)
     _fold_pass(fn)          # constants exposed by narrowing and inlining
-    recover_division(fn)    # magic-number multiplies -> x / c, x % c
+    if recover_division(fn):    # magic-number multiplies -> x / c, x % c
+        _fold_pass(fn)
     _dce(fn)
     fold_short_circuits(fn)
     st = Structurer(fn)
