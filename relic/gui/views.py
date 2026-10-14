@@ -663,6 +663,19 @@ class PseudocodeView(QPlainTextEdit):
         cur.select(QTextCursor.SelectionType.WordUnderCursor)
         return cur.selectedText()
 
+    def struct_under_cursor(self) -> tuple[str, str, str | None] | None:
+        """(shown name, generated struct, generated field or None) for a struct or field name
+        under the cursor; a field shared by several structs resolves to the first shown."""
+        word = self.word_under_cursor()
+        if self.result is None or not word:
+            return None
+        if word in self.result.structs:
+            return word, self.result.structs[word], None
+        pairs = self.result.fields.get(word)
+        if pairs:
+            return word, pairs[0][0], pairs[0][1]
+        return None
+
     def variable_under_cursor(self) -> tuple[str, str] | None:
         """(shown name, generated name) of the local / parameter under the cursor."""
         word = self.word_under_cursor()

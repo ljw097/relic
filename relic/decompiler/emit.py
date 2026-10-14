@@ -41,6 +41,8 @@ class Decompiled:
     addr: int
     lines: list[Line] = field(default_factory=list)
     variables: dict[str, str] = field(default_factory=dict)   # shown name -> generated name
+    structs: dict[str, str] = field(default_factory=dict)     # shown struct name -> generated name
+    fields: dict[str, list] = field(default_factory=dict)     # shown field -> [(struct, field), ...]
 
     @property
     def text(self) -> str:
@@ -88,6 +90,14 @@ class CWriter:
         self.p = prep
         self.ptr_bits = prep.arch.bits
         self.types: dict[str, CType] = infer_types(prep.fn, self.ptr_bits, self.is_addr)
+        self.shown_structs: dict[str, str] = {}
+        self.shown_fields: dict[str, list] = {}
+        from .structs import StructView
+        self.structs = StructView(an, prep.fn, self.ptr_bits)
+        for name in list(self.types):
+            st = self.structs.var_struct(name)
+            if st is not None and self.types[name].ptr <= 1:
+                self.types[name] = CType(f"struct {self.sname(st)}", 1)
         self.names: dict[str, str] = {}
         # user names for variables (Analysis.var_names), keyed by the generated name
         self.user: dict[str, str] = dict(an.var_names.get(prep.fn.addr, {}))
@@ -95,6 +105,19 @@ class CWriter:
         self.commented: set[int] = set()
         self.out: list[Line] = []
         self._name_vars()
+
+    # ------------------------------------------------------------- structs
+    def sname(self, st) -> str:
+        shown = self.an.struct_names.get(st.name, {}).get("name") or st.name
+        self.shown_structs[shown] = st.name
+        return shown
+
+    def fname(self, st, f) -> str:
+        shown = self.an.struct_names.get(st.name, {}).get("fields", {}).get(f.name) or f.name
+        pairs = self.shown_fields.setdefault(shown, [])
+        if (st.name, f.name) not in pairs:
+            pairs.append((st.name, f.name))
+        return shown
 
     # ------------------------------------------------------------- naming
     def _name_vars(self):
@@ -133,9 +156,32 @@ class CWriter:
             sym = self.symbol(v)
             if sym:
                 return sym if v in self.an.functions else f"&{sym}"
+        if c.bits == self.ptr_bits and v:
+            inside = self._inside_object(v)
+            if inside is not None:                # in or just past a data object (an end pointer)
+                return f"(char *)&{inside[0]} + {number(inside[1])}"
         if c.bits >= 8 and v >> (c.bits - 1) and c.signed > -0x10000:
             return "-" + number(-c.signed)
         return number(v)
+
+    def _inside_object(self, v: int) -> tuple[str, int] | None:
+        """(object symbol, offset) for an address inside a sized data object or one past its
+        end (`&pool[4]`, a loop's end pointer)."""
+        objs = self.__dict__.get("_objs")
+        if objs is None:
+            import bisect
+            objs = sorted((s.addr, s.size, s.name) for s in self.an.bin.symbols.values()
+                          if s.kind == "object" and s.size)
+            self._objs = objs
+            self._obj_starts = [o[0] for o in objs]
+            self._bisect = bisect
+        k = self._bisect.bisect_left(self._obj_starts, v) - 1
+        if k < 0:
+            return None
+        a, size, name = self._objs[k]
+        if a < v <= a + size:
+            return base_name(self.an.name(a) or name), v - a
+        return None
 
     def string(self, v: int) -> str | None:
         from ..analysis.strings import escape
@@ -181,6 +227,9 @@ class CWriter:
             imp = self.an.bin.imports_by_got.get(addr.addr.value)
             if imp is not None and imp.name:
                 return base_name(imp.name)
+        fa = self.structs.field(addr, bits)
+        if fa is not None:
+            return f"{self.expr(fa[0], PREC_POSTFIX)}->{self.fname(*fa[1:])}"
         idx = self._indexed(addr, size)
         if idx is not None:
             base, i = idx
@@ -270,6 +319,10 @@ class CWriter:
         return str(e), PREC_POSTFIX
 
     def _binop(self, e: BinOp) -> tuple[str, int]:
+        if e.op == "+" and e.bits == self.ptr_bits:
+            fa = self.structs.field_addr(e)
+            if fa is not None:                    # the address of a field: `&p->f_8`
+                return f"&{self.expr(fa[0], PREC_POSTFIX)}->{self.fname(*fa[1:])}", PREC_UNARY
         if e.op not in BIN:                       # carry / sborrow ... : flag helpers
             return f"__{e.op}({self.expr(e.a)}, {self.expr(e.b)})", PREC_POSTFIX
         if e.op in _NUMERIC_OPS:
@@ -559,6 +612,10 @@ class CWriter:
         if len(self.out) >= 2 and self.out[-1].text == "return;" and self.out[-1].depth == 1:
             self.out.pop()
         self.emit("}", None, 0)
+        if self.structs.used:                     # the structs the body refers to, above it
+            head = [Line(t, None, 0) for st in self.structs.used
+                    for t in st.declaration(self.sname(st), lambda f, st=st: self.fname(st, f)) + [""]]
+            self.out[:0] = head
         return self.out
 
 
@@ -689,7 +746,8 @@ def decompile(an: "Analysis", func: "Function") -> Decompiled:
     prep = prepare(an, func)
     w = CWriter(an, prep)
     lines = w.render()
-    return Decompiled(an.name(func.addr) or func.name, func.addr, lines, dict(w.shown))
+    return Decompiled(an.name(func.addr) or func.name, func.addr, lines, dict(w.shown), dict(w.shown_structs),
+                      {k: list(v) for k, v in w.shown_fields.items()})
 
 
 __all__ = ["Decompiled", "Line", "decompile", "number"]

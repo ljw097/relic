@@ -33,6 +33,8 @@ class Analysis:
         self.renames: dict[int, str] = {}
         # decompiler variable names: function address -> {generated name: user name}
         self.var_names: dict[int, dict[str, str]] = {}
+        # recovered structs: generated struct name -> {"name": user name, "fields": {f_8: user name}}
+        self.struct_names: dict[str, dict] = {}
         # byte patches: address -> (original bytes, new bytes), applied to `bin.data`
         self.patches: dict[int, tuple[bytes, bytes]] = {}
         self._fstarts: list[int] = []
@@ -63,11 +65,11 @@ class Analysis:
 
     def reanalyze(self) -> "Analysis":
         """Analyse again (after a patch), keeping names, comments, variable names and patches."""
-        keep = (self.renames, self.comments, self.var_names, self.patches)
+        keep = (self.renames, self.comments, self.var_names, self.patches, self.struct_names)
         b = self.bin
         self.__dict__.clear()                    # decompiler caches live on the instance too
         self.__init__(b)
-        self.renames, self.comments, self.var_names, self.patches = keep
+        self.renames, self.comments, self.var_names, self.patches, self.struct_names = keep
         return self.run(load_project=False)
 
     # ------------------------------------------------------------- patches
@@ -311,6 +313,31 @@ class Analysis:
         if not names:
             self.var_names.pop(func, None)
 
+    def rename_struct(self, generated: str, name: str):
+        """Name a recovered struct (`s_notes`); empty resets."""
+        d = self.struct_names.setdefault(generated, {})
+        if name and name != generated:
+            d["name"] = name
+        else:
+            d.pop("name", None)
+        self._tidy_struct_names(generated)
+
+    def rename_field(self, struct: str, generated: str, name: str):
+        """Name a field (`f_8`) of a recovered struct (by its generated name); empty resets."""
+        fields = self.struct_names.setdefault(struct, {}).setdefault("fields", {})
+        if name and name != generated:
+            fields[generated] = name
+        else:
+            fields.pop(generated, None)
+        self._tidy_struct_names(struct)
+
+    def _tidy_struct_names(self, struct: str):
+        d = self.struct_names.get(struct, {})
+        if not d.get("fields"):
+            d.pop("fields", None)
+        if not d:
+            self.struct_names.pop(struct, None)
+
     def comment(self, addr: int, text: str):
         if text:
             self.comments[addr] = text
@@ -325,6 +352,7 @@ class Analysis:
             "comments": {f"{a:#x}": c for a, c in sorted(self.comments.items())},
             "variables": {f"{a:#x}": dict(sorted(v.items())) for a, v in sorted(self.var_names.items())},
             "patches": {f"{a:#x}": {"old": o.hex(), "new": n.hex()} for a, (o, n) in sorted(self.patches.items())},
+            "structs": dict(sorted(self.struct_names.items())),
         }
         with open(path or self.project_path, "w") as fp:
             json.dump(data, fp, indent=2)
@@ -338,6 +366,7 @@ class Analysis:
         self.renames = {int(a, 16): n for a, n in data.get("renames", {}).items()}
         self.comments = {int(a, 16): c for a, c in data.get("comments", {}).items()}
         self.var_names = {int(a, 16): dict(v) for a, v in data.get("variables", {}).items()}
+        self.struct_names = {k: dict(v) for k, v in data.get("structs", {}).items()}
         return True
 
 

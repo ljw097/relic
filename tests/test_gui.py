@@ -633,3 +633,30 @@ def test_python_console_and_plugins(app, vuln64, tmp_path, monkeypatch):
     finally:
         w.dirty = False
         w.close()
+
+
+def test_pseudocode_struct_field_rename(app, win):
+    from PySide6.QtGui import QTextCursor
+    win.goto(win.an.function_by_name("add_note").addr)
+    win.toggle_decompile()
+    assert win.decomp.wait_idle()
+    text = win.decomp.toPlainText()
+    assert "struct s_notes {" in text and "->f_8 = " in text
+    pos = text.index("->f_8") + 3
+    cur = win.decomp.textCursor()
+    cur.setPosition(pos)
+    win.decomp.setTextCursor(cur)
+    assert win.decomp.struct_under_cursor() == ("f_8", "s_notes", "f_8")
+    assert win.rename_struct("s_notes", "f_8", "size")
+    assert win.rename_struct("s_notes", None, "note")
+    assert not win.rename_struct("s_notes", None, "not valid")
+    assert win.decomp.wait_idle()
+    text = win.decomp.toPlainText()
+    assert "struct note {" in text and "->size = " in text and "*" in win.windowTitle()
+    cur = win.decomp.textCursor()
+    cur.setPosition(text.index("struct note") + 8)
+    win.decomp.setTextCursor(cur)
+    assert win.decomp.struct_under_cursor() == ("note", "s_notes", None)
+    win.save_project()
+    import json
+    assert json.load(open(win.an.project_path))["structs"] == {"s_notes": {"name": "note", "fields": {"f_8": "size"}}}

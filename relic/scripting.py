@@ -80,6 +80,20 @@ class Api:
         else:
             self.an.rename(a, new)
 
+    def rename_struct(self, struct: str, name: str):
+        """Name a recovered struct by its generated name (`s_notes`)."""
+        if self.win is not None:
+            self.win.rename_struct(struct, None, name)
+        else:
+            self.an.rename_struct(struct, name)
+
+    def rename_field(self, struct: str, field: str, name: str):
+        """Name a field (`f_8`) of a recovered struct (`s_notes`)."""
+        if self.win is not None:
+            self.win.rename_struct(struct, field, name)
+        else:
+            self.an.rename_field(struct, field, name)
+
     def comment(self, where, text: str):
         a = self.addr(where)
         if self.win is not None:
@@ -167,7 +181,8 @@ def namespace(an: "Analysis", win=None) -> dict:
     """Globals for console / plugin / script code."""
     api = Api(an, win)
     ns = {"an": an, "bin": an.bin, "api": api, "win": win}
-    for n in ("addr", "here", "goto", "name", "rename", "comment", "func", "functions", "xrefs_to", "xrefs_from",
+    for n in ("addr", "here", "goto", "name", "rename", "rename_struct", "rename_field", "comment", "func",
+              "functions", "xrefs_to", "xrefs_from",
               "disasm", "decompile", "strings", "search", "patch", "nop", "invert", "assemble", "revert", "save"):
         ns[n] = getattr(api, n)
     return ns

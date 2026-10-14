@@ -1122,6 +1122,14 @@ class MainWindow(QMainWindow):
                 if ok:
                     self.rename_variable(gen, text.strip())
                 return
+            st = self.decomp.struct_under_cursor()
+            if st is not None:
+                shown, struct, fld = st
+                what = f"field {shown} of struct {struct}" if fld else f"struct {shown}"
+                text, ok = QInputDialog.getText(self, "Rename", f"Name for {what} (empty to reset):", text=shown)
+                if ok:
+                    self.rename_struct(struct, fld, text.strip())
+                return
         a = self._rename_subject()
         if a is None:
             return
@@ -1145,6 +1153,20 @@ class MainWindow(QMainWindow):
             self.statusBar().showMessage(f"'{name}' is not a free C identifier here", 3000)
             return False
         self.an.rename_var(func.addr, generated, name)
+        self._after_edit()
+        return True
+
+    def rename_struct(self, struct: str, field: str | None, name: str) -> bool:
+        """Name a recovered struct (field None) or one of its fields, by generated names."""
+        import keyword
+        import re
+        if name and (not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", name) or keyword.iskeyword(name)):
+            self.statusBar().showMessage(f"'{name}' is not a C identifier", 3000)
+            return False
+        if field is None:
+            self.an.rename_struct(struct, name)
+        else:
+            self.an.rename_field(struct, field, name)
         self._after_edit()
         return True
 
