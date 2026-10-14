@@ -13,6 +13,7 @@
     relic ir FILE [WHERE]         decompiler IR of a function (debugging aid)
     relic opt FILE [WHERE]        optimised SSA IR, with strings/xrefs resolved
     relic decompile FILE [WHERE]  structured C-like pseudocode of a function
+    relic search FILE --bytes P   byte pattern (`48 8b ?? 05`), --text, --imm or --insn REGEX
 """
 from __future__ import annotations
 
@@ -22,7 +23,7 @@ import sys
 from . import __version__
 
 COMMANDS = ("info", "checksec", "funcs", "disasm", "cfg", "strings", "imports", "xrefs", "vulns", "ir", "opt",
-            "decompile", "gui")
+            "decompile", "search", "gui")
 
 
 def _parser() -> argparse.ArgumentParser:
@@ -60,6 +61,14 @@ def _parser() -> argparse.ArgumentParser:
     s = add("decompile", "C-like pseudocode", where=True)
     s.add_argument("-a", "--all", action="store_true", help="every function in the binary")
     s.add_argument("--addrs", action="store_true", help="prefix each line with its instruction address")
+    s = add("search", "search bytes, text, immediates or instructions")
+    how = s.add_mutually_exclusive_group(required=True)
+    how.add_argument("--bytes", metavar="PATTERN", help="hex bytes, `??` for any byte: '48 8b ?? 05'")
+    how.add_argument("--text", help="a string (ASCII / UTF-8 and UTF-16LE, case-insensitive)")
+    how.add_argument("--imm", metavar="VALUE", type=lambda v: int(v, 0),
+                     help="instructions using this immediate or displacement")
+    how.add_argument("--insn", metavar="REGEX", help="instructions whose text matches: 'call.*system'")
+    s.add_argument("--case", action="store_true", help="case-sensitive --text")
     g = sub.add_parser("gui", help="open the GUI")
     g.add_argument("file", nargs="?")
     g.add_argument("--arch", help="architecture for raw blobs (x86, x64, arm, arm64, mips, ...)")
@@ -275,6 +284,26 @@ def cmd_decompile(args):
                 print(f"{tag}  {'    ' * ln.depth}{ln.text}".rstrip())
         else:
             print(d.text)
+
+
+def cmd_search(args):
+    from .analysis.search import PatternError, find_bytes, find_imm, find_insn, find_text
+    an = _analyze(args)
+    try:
+        if args.bytes is not None:
+            hits = find_bytes(an, args.bytes)
+        elif args.text is not None:
+            hits = find_text(an, args.text, case=args.case)
+        elif args.imm is not None:
+            hits = find_imm(an, args.imm)
+        else:
+            hits = find_insn(an, args.insn)
+    except PatternError as e:
+        sys.exit(f"relic: {e}")
+    if not hits:
+        print("not found")
+    for h in hits:
+        print(f"{h.addr:#x}  {an.location(h.addr):28} {h.text}")
 
 
 def cmd_gui(args):

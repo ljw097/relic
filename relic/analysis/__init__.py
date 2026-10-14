@@ -178,7 +178,9 @@ class Analysis:
         """`func+0x12` form, for describing where an instruction lives."""
         f = self.function_at(addr)
         if f is None or addr == f.addr:
-            return self.label(addr)
+            lbl = self.label(addr)
+            sec = self.bin.section_at(addr) if f is None and lbl.startswith("0x") else None
+            return f"{sec.name}+{addr - sec.addr:#x}" if sec is not None and sec.name else lbl
         return f"{self.name(f.addr)}+{addr - f.addr:#x}"
 
     def call_name(self, i: Insn) -> str | None:

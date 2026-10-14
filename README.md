@@ -2,8 +2,39 @@
 
 리버싱과 포너블을 위한 디스어셈블러 / 디컴파일러 (WIP).
 
-현재는 **분석 엔진, CLI, GUI**와 x86-64/x86-32/AArch64/ARM32(A32·Thumb-2) **디컴파일러**(`relic decompile`, GUI Pseudocode 탭)가 동작합니다. 다른 아키텍처 리프터는 개발 중입니다.
-진행 상황은 [TODO.md](TODO.md), 디컴파일러 설계는 [docs/decompiler-plan.md](docs/decompiler-plan.md)를 참고하세요.
+**목표: IDA Pro(+ Hex-Rays) 이상.** 아래 표는 IDA Pro를 기준선으로 한 현재 스펙과 진행률입니다.
+진행 상황 세부는 [TODO.md](TODO.md), 디컴파일러 설계는 [docs/decompiler-plan.md](docs/decompiler-plan.md)를 참고하세요.
+
+## 목표 대비 진행률 (기준: IDA Pro 9 + Hex-Rays)
+
+진행률은 "IDA Pro가 그 영역에서 하는 일 중 Relic이 같은 수준으로 하는 비율"을 어림한 값입니다.
+전체 값은 영역 가중 평균(가중치는 리버싱 실무에서의 비중)입니다.
+
+**전체: 약 30%** — 분석·디컴파일 핵심 경로는 x86/ARM 계열에서 실사용 가능, 타입 시스템·라이브러리 식별·디버거·스크립팅 콘솔이 큰 격차.
+
+| 영역 (가중치) | IDA Pro 기준 | Relic 현재 | 진행률 |
+|---|---|---|---|
+| 파일 포맷 (8) | ELF, PE, Mach-O, COFF/OMF, 펌웨어·raw 등 수십 종 | ELF, PE(import/export/COFF 심볼/.pdata), RAW | 35% |
+| 프로세서 (8) | 60여 개 CPU 계열 | 디스어셈블 7종(x86, x64, ARM/Thumb, AArch64, MIPS, RISC-V, PPC), 분석·리프팅은 x86/x64/ARM/AArch64 | 35% |
+| 자동 분석 (14) | 함수·CFG·xref·점프 테이블·noreturn·문자열·stripped 복구 | 재귀 하강 + 프롤로그 스캔, 점프 테이블(x86/ARM/AArch64), 레지스터 상수 전파로 데이터 xref, stripped `main` 복구, ARM/Thumb 상호 운용 | 55% |
+| 라이브러리 식별 (8) | FLIRT 시그니처, Lumina | 없음 (심볼·import·PLT 이름만) | 0% |
+| 타입 시스템 (10) | 구조체·열거형·로컬 타입, 타입 라이브러리, 타입 전파 | int/포인터/unsigned 추론, libc 시그니처 일부 | 10% |
+| 디컴파일러 (20) | Hex-Rays: 다수 아키텍처, 타입·구조체 대화형 수정, 부동소수점 | x86-64/x86-32/AArch64/ARM32, 재컴파일 검증, 구조화(switch·for·&&), 상수 나눗셈, -fipa-ra 레지스터 보존; 구조체·부동소수점·대화형 재타입 없음 | 40% |
+| 대화형 UI (12) | 리스팅·그래프·xref·이름/주석·검색·패치·undo·북마크·구조체 창 | 리스팅·그래프(층별 레이아웃)·의사 코드·헥스, 이름/주석/변수 이름, xref, 이동 기록, 테마·확대, 검색(바이트·텍스트·즉치값·명령어); 패치·undo·북마크 없음 | 47% |
+| 스크립팅·확장 (8) | IDAPython, IDC, SDK, 플러그인 | Python 라이브러리 API (`relic.analysis`, `relic.decompiler`), CLI | 20% |
+| 디버거 (7) | 로컬·원격(gdbserver 등) 디버깅 | 없음 | 0% |
+| 프로젝트·협업 (5) | IDB, 스냅숏, Teams, Lumina | `<binary>.relic.json`(이름·주석·변수 이름) | 15% |
+
+IDA Pro에 없는 Relic 쪽 기능: checksec(ELF/PE 보호 기법), 포너블 휴리스틱(위험 함수, 비상수 포맷 스트링, 폭 없는 `scanf("%s")`, ret2win 후보), 디컴파일 결과의 재컴파일 검증 하네스.
+
+### 다음 단계 (격차가 큰 순)
+
+1. ~~검색(텍스트·바이트 패턴·즉치값·명령어)~~ (완료), 바이트 패치·패치된 바이너리 저장
+2. GUI 안의 Python 콘솔과 플러그인 진입점 (IDAPython 대응)
+3. 정적 링크 라이브러리 함수 식별 (FLIRT 대응 시그니처)
+4. 구조체·타입 시스템과 디컴파일러 연동 (필드 접근 `p->size`)
+5. Mach-O 로더, MIPS / RISC-V 리프터
+6. gdb 원격 프로토콜 기반 디버거
 
 ## 기능
 
@@ -49,6 +80,7 @@ relic vulns     ./chall              # 포너블 휴리스틱
 relic ir        ./chall vuln         # 디컴파일러 IR (리프팅 직후, 디버깅용)
 relic opt       ./chall checksum --xrefs  # SSA + 최적화 IR, 문자열·교차참조, 스택 프레임
 relic decompile ./chall main         # C 유사 의사 코드 (--addrs: 줄마다 명령어 주소, -a: 모든 함수)
+relic search    ./chall --bytes '48 8b ?? 05'   # 바이트 패턴 (--text, --imm 0x186a0, --insn 'call.*system')
 relic disasm    sc.bin --arch x64 --base 0x1000 -n 30   # RAW blob
 ```
 
@@ -99,7 +131,10 @@ relic sc.bin --arch x64 --base 0x1000
 | `;` | 주석 |
 | `X` | xref 패널 |
 | `Ctrl+S` | 프로젝트 저장 (`<binary>.relic.json`) |
-| `Ctrl+.` | 실행 중인 분석 / 취약점 스캔 취소 |
+| `Alt+B` / `Alt+T` / `Alt+I` / `Ctrl+Alt+I` | 바이트 패턴(`48 8b ?? 05`) / 텍스트 / 즉치값 / 명령어 정규식 검색 (결과는 Search 패널) |
+| `Ctrl+.` | 실행 중인 분석 / 취약점 스캔 / 검색 취소 |
+| `Ctrl+Shift+L` | 라이트 / 다크 테마 전환 |
+| `Ctrl+=` / `Ctrl+-` / `Ctrl+0` | 코드 글꼴 크게 / 작게 / 기본 (테마·크기는 저장됨) |
 
 더블클릭으로 분기 대상·심볼(의사 코드에서는 함수·전역 이름, `loc_` 레이블)을 따라갑니다. 의사 코드는 탭을 열 때 함수 단위로 백그라운드에서 디컴파일하고(그동안 GUI는 멈추지 않음) 캐시하며, 이름 변경은 바로 반영됩니다. 문자열 테이블에서 더블클릭하면 그 문자열을 참조하는 코드로 이동합니다.
 

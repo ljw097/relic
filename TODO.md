@@ -10,7 +10,7 @@
 - [x] 취약점 스캔 실패를 "발견 없음"과 구분해 표시(`VulnsThread.failed`, 표에 오류 행)
 - [x] CFG 레이아웃: Sugiyama 방식(`relic/gui/layout.py`) — back edge 역전, 최장 경로 층, 긴 간선 더미 노드 경로, barycenter 교차 최소화(`/bin/ls` 큰 함수 교차 16656 → 1248), isotonic 좌표 배치, 층 하단까지 수직으로 내린 뒤 꺾는 간선
 - [ ] **P2** CFG: 노드 수천 개 함수에서 교차 계산(층 쌍마다 O(E²)) 가속, 간선 묶음(bundling), 접기
-- [ ] **P2** 테마 전환(라이트/다크), 폰트 크기 설정
+- [x] 테마 전환(라이트/다크, `Ctrl+Shift+L`)과 코드 글꼴 크기(`Ctrl+=`/`Ctrl+-`/`Ctrl+0`): 모든 뷰·표·앱 팔레트에 즉시 반영, `QSettings`에 저장
 
 ## 아키텍처별 분석 보강
 
@@ -69,7 +69,8 @@
   - [x] 루프 밖 합류점 → 명시적 `break`, 작은 공유 꼬리 블록·반환 블록은 goto 대신 복제
   - [x] 모든 도달 가능 블록이 정확히 한 번 출력되는지 구조 불변식으로 검증
   - [x] `X = init; while (c) { ...; X += k; }` → `for` (본문에 그 루프의 `continue`가 있으면 만들지 않음)
-  - [ ] **P2** if-else-if 사슬 → switch
+  - [x] if-else-if 사슬 → switch(`decompiler/chains.py`): 빠져나가는 `if (x == C)` 연속(나머지는 switch 뒤에), 일관성을 검사한 범위 분할 병합(gcc 이진 탐색 비교 트리), 본문이 이어지는 else-if 사슬은 `break`·`default`; 루프를 겨냥한 `break`가 든 본문은 변환하지 않음. AArch64 -O2 `sw_calls`가 8-case switch로
+  - [ ] **P2** -O0 비교 트리(범위 검사 분기마다 꼬리 블록이 복제된 형태)
   - [x] `-O2` goto 줄이기 1차: 단락 평가 `&&`/`||` 결합, 후지배자 없는 if의 합류점 선택, 작은 비순환 꼬리 영역 복제(6블록/12문장) — `/usr/bin/{true,cat,gzip}` goto 1911 → 1469
   - [ ] **P2** 남은 goto는 대부분 370–480블록 상태 기계 함수(gnulib `quotearg`, gzip deflate/inflate)에 몰려 있음 — 조건 기반 구조화(DREAM 계열) 검토
   - [x] 상수 나눗셈·나머지 복원(`arith.py`): 매직 넘버 곱셈 → `x / c`, `x % c`, 곱셈 역원 비교 → `x % c == r` (부호·음수 제수·64비트, 평가로 검증)
