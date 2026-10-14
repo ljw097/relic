@@ -129,3 +129,15 @@ def test_recovered_layout_recompiles_and_matches(request, variant, tmp_path):
     assert r.returncode == 0, f"{variant}: does not compile:\n{r.stderr[:3000]}\n{code}"
     r = subprocess.run([str(exe)], capture_output=True, text=True, timeout=30)
     assert r.stdout.strip().endswith("ok"), f"{variant}:\n{r.stdout}\n{code}"
+
+
+@pytest.mark.parametrize("variant", ["structs_O0", "structs_O2"])
+def test_nested_and_self_referential_structs(request, variant):
+    an = analyze(request.getfixturevalue(variant))
+    text = _c(an, "chain_sum")
+    node = re.search(r"struct (s_chain_sum_\d+) \{", text).group(1)
+    item = re.search(r"struct (s_chain_sum_\d+_8) \{", text).group(1)
+    assert f"    struct {item} *f_8;\n    struct {node} *f_10;" in text, text       # it, next
+    assert text.index(f"struct {item} {{") < text.index(f"struct {node} {{")        # declared first
+    assert f"int chain_sum(struct {node} *a1)" in text
+    assert re.search(r"->f_8->f_8|v\d+->f_8;", text), text                          # n->it->count

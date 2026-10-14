@@ -38,6 +38,7 @@ class Field:
     bits: int
     ctype: str = ""
     name: str = ""
+    child: "Struct | None" = None            # the struct a pointer field points to
 
     @property
     def end(self) -> int:
@@ -59,9 +60,10 @@ class Struct:
         return f if f is not None and f.bits == bits else None
 
     def declaration(self, sname=None, fname=None) -> list[str]:
-        """C lines; `sname` / `fname(field)` give the names to show (user renames)."""
+        """C lines; `sname(struct)` / `fname(field)` give the names to show (user renames)."""
         fname = fname or (lambda f: f.name)
-        out = [f"struct {sname or self.name} {{  // recovered, {self.size} bytes"]
+        sname = sname or (lambda st: st.name)
+        out = [f"struct {sname(self)} {{  // recovered, {self.size} bytes"]
         pos = 0
         for off in sorted(self.fields):
             f = self.fields[off]
@@ -69,7 +71,7 @@ class Struct:
                 out.append(f"    char _pad_{pos:x}[{off - pos}];")
             elif off < pos:
                 continue                     # overlaps the previous field: shown through casts
-            t = f.ctype or int_type(f.bits)
+            t = f"struct {sname(f.child)} *" if f.child is not None else (f.ctype or int_type(f.bits))
             sep = "" if t.endswith("*") else " "
             out.append(f"    {t}{sep}{fname(f)};")
             pos = f.end
@@ -125,7 +127,9 @@ def _single_defs(fn: IRFunction) -> dict[str, Expr]:
             for _, d in getattr(s, "defs", ()):
                 if isinstance(d, (Var, StackVar)):
                     count[d.name] = count.get(d.name, 0) + 2
-    return {n: e for n, e in src.items() if count[n] == 1}
+    # `a1 = a1->next` defines a1 once, but in terms of itself (a loop over a list): not a copy
+    return {n: e for n, e in src.items() if count[n] == 1
+            and not any(isinstance(x, (Var, StackVar)) and x.name == n for x in walk(e))}
 
 
 def _resolve(e: Expr, defs: dict[str, Expr], depth: int = 4) -> Expr:
@@ -143,9 +147,10 @@ def _resolve(e: Expr, defs: dict[str, Expr], depth: int = 4) -> Expr:
 
 
 def base_key(base: Expr, fn_addr: int, defs: dict[str, Expr], ptr_bits: int,
-             aliases: dict[str, tuple] | None = None) -> tuple | None:
+             aliases: dict[str, tuple] | None = None, depth: int = 3) -> tuple | None:
     """What identifies the struct a base points to (see the module docstring). `aliases` are
-    variables stored into a global's slot (`notes[i] = v3`): they point to the global's struct."""
+    variables stored into a global's slot (`notes[i] = v3`): they point to the global's struct.
+    A pointer read out of another struct's field is ("field", that struct's key, offset)."""
     seen = 0
     while isinstance(base, (Var, StackVar)) and seen < 4:
         if aliases and base.name in aliases:
@@ -158,9 +163,23 @@ def base_key(base: Expr, fn_addr: int, defs: dict[str, Expr], ptr_bits: int,
     g = _global_of(_resolve(base, defs), ptr_bits)
     if g is not None:
         return g
+    # a pointer loaded from a field (`v4 = n->it`, or `n->it` used directly at -O0)
+    loaded = defs.get(base.name) if isinstance(base, (Var, StackVar)) else base
+    if depth and isinstance(loaded, Load) and loaded.bits == ptr_bits:
+        sp = split_addr(loaded.addr)
+        if sp is not None:
+            parent = base_key(sp[0], fn_addr, defs, ptr_bits, aliases, depth - 1)
+            if parent is not None:
+                return ("field", parent, sp[1])
     if isinstance(base, (Var, StackVar)) and base.bits == ptr_bits:
         return ("var", fn_addr, base.name)
     return None
+
+
+def root(key: tuple) -> tuple:
+    while key[0] == "field":
+        key = key[1]
+    return key
 
 
 def store_aliases(fn: IRFunction, defs: dict[str, Expr], ptr_bits: int) -> dict[str, tuple]:
@@ -189,10 +208,13 @@ class _Use:
 
 
 def scan(fn: IRFunction, fn_addr: int, ptr_bits: int) -> dict[tuple, _Use]:
-    """Fixed-offset accesses per base key in one (non-SSA, prepared) function."""
+    """Fixed-offset accesses per base key in one (non-SSA, prepared) function. The entry
+    ("links",) maps (key, offset) to the key of a variable assigned that field's pointer
+    (`n = n->next`: the field points to the same struct)."""
     defs = _single_defs(fn)
     aliases = store_aliases(fn, defs, ptr_bits)
     uses: dict[tuple, _Use] = {}
+    links: dict[tuple, tuple] = {}
 
     def access(addr: Expr, bits: int) -> tuple | None:
         sp = split_addr(addr)
@@ -223,12 +245,18 @@ def scan(fn: IRFunction, fn_addr: int, ptr_bits: int) -> dict[tuple, _Use]:
                 t = _call_ret_type(fn, s.src)
                 if t:
                     uses[r[0]].hint(r[1], t)
+        if isinstance(s, Assign) and isinstance(s.dst, (Var, StackVar)) and isinstance(s.src, Load) \
+                and s.src in loaded and s.dst.name not in defs and s.dst.bits == ptr_bits:
+            dst_key = base_key(s.dst, fn_addr, defs, ptr_bits, aliases)
+            if dst_key is not None:
+                links[loaded[s.src]] = dst_key
         if isinstance(s, CallStmt):
             sig = lookup(s.name)
             for k, a in enumerate(s.call.args):
                 if a in loaded and sig is not None and (sig.fmt == k or s.name and _string_arg(s.name, k)):
                     key, o = loaded[a]
                     uses[key].hint(o, "char *")
+    uses[("links",)] = links                 # type: ignore[assignment]
     return uses
 
 
@@ -249,9 +277,12 @@ def _call_ret_type(fn: IRFunction, v: Expr) -> str:
     return ""
 
 
-def _is_struct(use: _Use, global_elem: bool = False) -> bool:
+def _is_struct(use: _Use, global_elem: bool = False, field: bool = False) -> bool:
     """Several offsets that do not look like an array: different widths, a pointer field next to
-    a non-pointer one, or the elements of a global pointer array (`notes[i]->...`)."""
+    a non-pointer one, or the elements of a global pointer array (`notes[i]->...`). A pointer
+    read out of a struct field is one already at a single access past its start."""
+    if field and use.sizes and max(use.sizes) > 0:
+        return True
     if len(use.sizes) < 2:
         return False
     widths = {b for bs in use.sizes.values() for b in bs}
@@ -289,28 +320,48 @@ def _global_name(an: "Analysis", g: int) -> str:
     return "s_" + "".join(c if c.isalnum() or c == "_" else "_" for c in n)
 
 
+def _key_name(an: "Analysis", key: tuple, local_names: dict | None = None) -> str:
+    if key[0] == "field":
+        return f"{_key_name(an, key[1], local_names)}_{key[2]:x}"
+    if key[0] in ("gptr", "gelem"):
+        return _global_name(an, key[1])
+    return (local_names or {}).get(key, "s_" + key[2])
+
+
 def global_struct(an: "Analysis", key: tuple, ptr_bits: int) -> Struct | None:
-    """The struct behind a global (`gptr` / `gelem` key), from every function referencing it."""
+    """The struct behind a global (`gptr` / `gelem` key, or a field chain from one), from every
+    function referencing the global."""
     reg = an.__dict__.setdefault("_structs", {})
     if key in reg:
         return reg[key]
     reg[key] = None                          # (being computed: no recursion through prepare)
+    g = root(key)
     funcs = []
-    for x in an.xrefs_to.get(key[1], ()):
+    for x in an.xrefs_to.get(g[1], ()):
         f = an.function_at(x.frm)
         if f is not None and f not in funcs and not f.is_import:
             funcs.append(f)
     use = _Use()
+    links: dict[tuple, tuple] = {}
     for f in funcs[:MAX_SCAN]:
-        u = _scan_function(an, f).get(key)
+        res = _scan_function(an, f)
+        links.update(res.get(("links",), {}))
+        u = res.get(key)
         if u is None:
             continue
         for off, bs in u.sizes.items():
             use.sizes.setdefault(off, set()).update(bs)
         for off, t in u.hints.items():
             use.hint(off, t)
-    st = _build(_global_name(an, key[1]), key, use, ptr_bits) if _is_struct(use, key[0] == "gelem") else None
+    st = _build(_key_name(an, key), key, use, ptr_bits) \
+        if _is_struct(use, key[0] == "gelem", key[0] == "field") else None
     reg[key] = st
+    if st is not None:
+        for off, f in st.fields.items():
+            if f.bits == ptr_bits:
+                target = links.get((key, off), ("field", key, off))
+                f.child = st if target == key else global_struct(an, target, ptr_bits) if root(target)[0] != "var" \
+                    else None
     return st
 
 
@@ -326,25 +377,51 @@ class StructView:
         self.local: dict[tuple, Struct] = {}
         self.used: list[Struct] = []
         self._vars: dict[str, Expr] = {}
+        self._copies: dict[str, list[str]] = {}
         for s in fn.stmts():
+            if isinstance(s, Assign) and isinstance(s.dst, (Var, StackVar)) and isinstance(s.src, (Var, StackVar)):
+                self._copies.setdefault(s.src.name, []).append(s.dst.name)
             for top in stmt_exprs(s):
                 for x in walk(top):
                     if isinstance(x, (Var, StackVar)) and x.bits == ptr_bits:
                         self._vars.setdefault(x.name, x)
         n = 0
-        for key, use in scan(fn, fn.addr, ptr_bits).items():
-            if key[0] == "var" and _is_struct(use):
-                n += 1
-                fname = "".join(c if c.isalnum() else "_" for c in (an.name(fn.addr) or f"{fn.addr:x}"))
-                self.local[key] = _build(f"s_{fname}_{n}", key, use, ptr_bits)
+        res = scan(fn, fn.addr, ptr_bits)
+        links = res.pop(("links",), {})
+        fname = "".join(c if c.isalnum() else "_" for c in (an.name(fn.addr) or f"{fn.addr:x}"))
+        names: dict[tuple, str] = {}
+        for key in sorted((k for k in res if k[0] == "var"), key=str):
+            n += 1
+            names[key] = f"s_{fname}_{n}"
+        for key, use in res.items():
+            if root(key)[0] == "var" and _is_struct(use, field=key[0] == "field"):
+                self.local[key] = _build(_key_name(an, key, names), key, use, ptr_bits)
+        for key, st in self.local.items():
+            for off, f in st.fields.items():
+                if f.bits == ptr_bits:
+                    target = links.get((key, off), ("field", key, off))
+                    f.child = st if target == key else self._struct_for_key(target)
+
+    def _struct_for_key(self, key: tuple) -> Struct | None:
+        return self.local.get(key) if root(key)[0] == "var" else global_struct(self.an, key, self.ptr_bits)
+
+    def _use(self, st: Struct):
+        """Record a struct shown, and those its fields point to (declared before it)."""
+        if st in self.used:
+            return
+        for f in st.fields.values():
+            if f.child is not None and f.child is not st and f.child not in self.used:
+                self._use(f.child)
+        if st not in self.used:
+            self.used.append(st)
 
     def struct_of(self, base: Expr) -> Struct | None:
         key = base_key(base, self.fn.addr, self.defs, self.ptr_bits, self.aliases)
         if key is None:
             return None
-        st = self.local.get(key) if key[0] == "var" else global_struct(self.an, key, self.ptr_bits)
-        if st is not None and st not in self.used:
-            self.used.append(st)
+        st = self._struct_for_key(key)
+        if st is not None:
+            self._use(st)
         return st
 
     def var_struct(self, name: str) -> Struct | None:
@@ -355,6 +432,10 @@ class StructView:
             return None
         if self.aliases.get(name) is None and name not in self.defs and \
                 not any(k[2] == name for k in self.local if k[0] == "var"):
+            # copied into a variable that is one (`var_20 = a1`, var_20 walking a list)
+            for dst in self._copies.get(name, ()):
+                if dst != name and any(k[2] == dst for k in self.local if k[0] == "var"):
+                    return self.struct_of(self._vars[dst])
             return None
         return self.struct_of(v)
 

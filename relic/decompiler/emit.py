@@ -614,7 +614,7 @@ class CWriter:
         self.emit("}", None, 0)
         if self.structs.used:                     # the structs the body refers to, above it
             head = [Line(t, None, 0) for st in self.structs.used
-                    for t in st.declaration(self.sname(st), lambda f, st=st: self.fname(st, f)) + [""]]
+                    for t in st.declaration(self.sname, lambda f, st=st: self.fname(st, f)) + [""]]
             self.out[:0] = head
         return self.out
 
