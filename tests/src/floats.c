@@ -69,6 +69,18 @@ NI double hyp(double a, double b) { return sqrt(a * a + b * b); }
 
 NI double twice(double x) { return poly(x) + poly(-x); }
 
+/* more arguments than registers: the rest go on the stack */
+NI long many(int a, int b, int c, int d, int e, int f, int g, int h, double x)
+{
+    return a + 2 * b + 3 * c + 4 * d + 5 * e + 6 * f + 7 * g + 8 * h + (long)x;
+}
+
+NI double many_f(double a, double b, double c, double d, double e, double f, double g, double h, double i,
+                 double j)
+{
+    return a + b * 2 + c * 3 + d * 4 + e * 5 + f * 6 + g * 7 + h * 8 + i * 9 - j;
+}
+
 int main(int argc, char **argv)
 {
     int v[4] = {1, 2, 3, argc};
@@ -77,5 +89,7 @@ int main(int argc, char **argv)
     printf("%f %f %d %f %ld %d %f %f %f %f %d %f %d %f %f\n", avg(v, 4), scale(2.0f, 3.0f), cmpd(1.0, 2.0),
            poly(2.0), to_long(3.7), to_int(-2.5f), mix(3, 1.5, 0.25f, 10), clampd(argc, 0, 1), narrow(3.0),
            absneg(-argc), count_above(d, 3, 0.5), sum_f(f, 2), is_equal(argc, 1.0), hyp(3, 4), twice(argc));
+    printf("%ld %f\n", many(1, 2, 3, 4, 5, 6, 7, argc, 2.5),
+           many_f(1, 2, 3, 4, 5, 6, 7, 8, argc, 0.5));
     return argv[0] == 0;
 }

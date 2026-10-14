@@ -16,7 +16,7 @@ from relic.decompiler.ir import BinOp, Const, UnOp, Var
 
 HERE = os.path.dirname(__file__)
 FUNCS = ["poly", "avg", "scale", "cmpd", "to_long", "to_int", "mix", "clampd", "narrow", "absneg",
-         "count_above", "sum_f", "is_equal", "hyp", "twice"]     # callees first
+         "count_above", "sum_f", "is_equal", "hyp", "twice", "many", "many_f"]     # callees first
 
 
 def _c(an, name):
@@ -59,6 +59,38 @@ def test_expressions(an):
         assert "__asm" not in text and "__f" not in text and "xmm" not in text, f"{name} {f}:\n{text}"
 
 
+def test_stack_arguments(an):
+    """More arguments than registers: the callee's stack parameters, the caller's stores to the
+    outgoing argument area (floats among them shown as floats)."""
+    name, a = an
+    assert _c(a, "many_f").startswith("double many_f(double a1, double a2, double a3, double a4, double a5, "
+                                      "double a6, double a7, double a8, double a9, double a10)")
+    assert _c(a, "many").count(", ") == 8                       # nine parameters
+    text = _c(a, "main")
+    assert re.search(r"many_f\(1\.0, 2\.0, 3\.0, 4\.0, 5\.0, 6\.0, 7\.0, 8\.0, [^,]+, 0\.5\)", text), text
+    assert '"%ld %f\\n"' in text, text
+    printf = next(ln for ln in text.splitlines() if "printf" in ln and "%f %f %d" in ln)
+    assert len(_args(printf)) == 16 + printf.count("__printf_chk"), printf     # format + 15 values
+
+
+def _args(call: str) -> list[str]:
+    """Top-level arguments of the first call on a line."""
+    inner = call[call.index("(") + 1:call.rindex(")")]
+    out, depth, cur, quoted = [], 0, "", False
+    for ch in inner:
+        quoted ^= ch == '"'
+        if not quoted and ch in "([":
+            depth += 1
+        elif not quoted and ch in ")]":
+            depth -= 1
+        if ch == "," and depth == 0 and not quoted:
+            out.append(cur.strip())
+            cur = ""
+        else:
+            cur += ch
+    return out + [cur.strip()]
+
+
 def test_call_arguments_and_results(an):
     name, a = an
     text = _c(a, "main")
@@ -66,7 +98,7 @@ def test_call_arguments_and_results(an):
     assert "scale(2.0f, 3.0f)" in text, text
     assert "mix(3, 10, 1.5, 0.25f)" in text, text
     assert "to_long(3.7)" in text, text
-    assert re.search(r"\w+ = twice\(", text), text           # the result is kept (xmm0 / d0)
+    assert re.search(r"(= |, |\()twice\(", text), text       # the result is used (xmm0 / d0)
 
 
 _HARNESS = r"""
@@ -119,6 +151,11 @@ int main(void)
             SAME("is_equal", ref_is_equal(x, y), p_is_equal(x, y));
             SAME("clampd", ref_clampd(x, -y, y), p_clampd(x, -y, y));
             SAME("count_above", ref_count_above(ds, n, y), p_count_above(ds, n, y));
+            SAME("many_f", ref_many_f(x, y, 1.5, -x, 2, y, 3, 0.25, x * y, y - x),
+                 p_many_f(x, y, 1.5, -x, 2, y, 3, 0.25, x * y, y - x));
+            for (int k = 0; k < 6; k++)
+                SAME("many", ref_many(is[k], 2, 3, 4, is[(k + 1) %% 6], 6, 7, is[(k + j) %% 6], x / 1e290),
+                     p_many(is[k], 2, 3, 4, is[(k + 1) %% 6], 6, 7, is[(k + j) %% 6], x / 1e290));
             for (int k = 0; k < 6; k++)
                 SAME("mix", ref_mix(is[k], x, (float)y, is[(k + j) %% 6]), p_mix(is[k], x, (float)y, is[(k + j) %% 6]));
         }

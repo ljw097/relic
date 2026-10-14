@@ -282,27 +282,29 @@ def arg_classes(sig, fmt: str | None, fsig=None, scan: bool = False) -> list[str
     return out
 
 
-def assign_regs(arch: ArchInfo, classes: list[str], int_regs: tuple[str, ...]) -> list[str] | None:
-    """Registers carrying arguments of these classes, in argument order (None past the registers)."""
+def place_args(arch: ArchInfo, classes: list[str], int_regs: tuple[str, ...]) -> list[str | None]:
+    """Where each argument goes, in argument order: its register, or None for the stack. SysV /
+    AAPCS64 fill integer and float registers separately (a float after the seventh integer still
+    gets an xmm register); Win64 gives argument k the k-th register of its kind."""
     fpr = FP_ARGS.get(arch.name, ())
-    out = []
+    out: list[str | None] = []
     if arch.name == "x64-win":
         for k, c in enumerate(classes):
             regs = fpr if c in "df" else int_regs
-            if k >= len(regs):
-                break
-            out.append(regs[k])
+            out.append(regs[k] if k < len(regs) else None)
         return out
     ni = nf = 0
     for c in classes:
         if c in "df":
-            if nf >= len(fpr):
-                break
-            out.append(fpr[nf])
+            out.append(fpr[nf] if nf < len(fpr) else None)
             nf += 1
         else:
-            if ni >= len(int_regs):
-                break
-            out.append(int_regs[ni])
+            out.append(int_regs[ni] if ni < len(int_regs) else None)
             ni += 1
     return out
+
+
+def stack_arg_base(arch: ArchInfo) -> int:
+    """Offset of the first stack argument from the stack pointer at the call (Win64 leaves the
+    callee 32 bytes of home space for the register arguments)."""
+    return 32 if arch.name == "x64-win" else 0

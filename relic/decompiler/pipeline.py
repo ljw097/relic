@@ -74,6 +74,15 @@ def prepare(an: "Analysis", func: "Function") -> Prepared:
         params = list(regs[:max((k + 1 for k, r in enumerate(regs) if r in live), default=0)])
     else:
         params = _livein_arg_regs(an, arch, func.addr) + [r for r, _ in fp_params(an, arch, func.addr)]
+        from .calls import param_base, stack_param_count, stack_params_used
+        if stack_params_used(arch):
+            # parameters past the registers, on the stack (above the return address on x86-64,
+            # and past Win64's home space for the four register parameters)
+            from .fpabi import stack_arg_base
+            word = arch.bits // 8
+            first = param_base(arch) + stack_arg_base(arch)
+            params += [frame.slots[o].name() if o in frame.slots else f"arg_{o:x}"
+                       for o in range(first, first + word * stack_param_count(an, arch, func.addr), word)]
     narrow_library_results(fn)
     from .calls import narrow_call_args
     narrow_call_args(an, arch, fn)

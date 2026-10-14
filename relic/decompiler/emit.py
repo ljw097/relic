@@ -292,6 +292,14 @@ class CWriter:
                 return f'"{escape(text)}"'
         return None
 
+    def _declared_string(self, v: int) -> str | None:
+        from ..analysis.strings import escape
+        sec = self.an.bin.section_at(v)
+        if sec is None or not sec.loaded or sec.x:
+            return None
+        text = self.an.bin.read_cstring(v, 256)
+        return f'"{escape(text)}"' if text and all(ch.isprintable() or ch in "\n\t\r" for ch in text) else None
+
     def _num(self, c: Const) -> str:
         if c.bits >= 8 and c.value >> (c.bits - 1) and c.signed > -0x10000:
             return "-" + number(-c.signed)
@@ -615,7 +623,20 @@ class CWriter:
     def call(self, c: ir.Call) -> str:
         name = self._callee_name(c) or f"(*{self.expr(c.target, PREC_UNARY)})"
         fl = dict(c.fargs)
-        args = [self.fexpr(a, 0, fl[k]) if k in fl else self.expr(_bare(a)) for k, a in enumerate(c.args)]
+        from .sigs import arg_type, lookup
+        sig = lookup(name)
+        args = []
+        for k, a in enumerate(c.args):
+            if k in fl:
+                args.append(self.fexpr(a, 0, fl[k]))
+                continue
+            if sig is not None and arg_type(sig, k) == "char *" and isinstance(a, Const) and \
+                    self.string(a.value) is None:
+                lit = self._declared_string(a.value)     # a string by the signature, wherever it sits
+                if lit is not None:
+                    args.append(lit)
+                    continue
+            args.append(self.expr(_bare(a)))
         return f"{name}({', '.join(args)})"
 
     # --------------------------------------------------------- statements

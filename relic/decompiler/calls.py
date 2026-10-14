@@ -13,7 +13,7 @@ from typing import TYPE_CHECKING
 
 from .arch import ArchInfo
 from .ir import Assign, Call, CallStmt, Cast, Const, Expr, IRFunction, Phi, Return, Var, children, stmt_exprs, walk
-from .fpabi import arg_classes, assign_regs, fp_params, fp_sig, is_fp_arch, is_fp_reg
+from .fpabi import arg_classes, fp_params, fp_sig, is_fp_arch, is_fp_reg, place_args
 from .sigs import arg_count, lookup
 
 if TYPE_CHECKING:
@@ -208,7 +208,8 @@ def _set_before_call(fn: IRFunction, argregs, uses: dict, params=()) -> list[str
 
 # ------------------------------------------------------------------ cdecl (x86-32)
 def stack_param_count(an: "Analysis", arch: ArchInfo, target: int) -> int:
-    """How many 4-byte stack parameters an internal cdecl callee reads (`[esp_0 + 4k]`)."""
+    """How many word-sized stack parameters an internal callee reads (cdecl `[esp_0 + 4k]`, the
+    stack arguments past the registers on x86-64 / AArch64)."""
     cache = getattr(an, "_stack_params", None)
     if cache is None:
         cache = an._stack_params = {}
@@ -226,18 +227,76 @@ def stack_param_count(an: "Analysis", arch: ArchInfo, target: int) -> int:
     except Exception:
         return 0
     frame = Frame(arch, _build_spoff(ssa, arch))
+    from .fpconst import float_operands
     from .ir import Load
     word = arch.bits // 8
+    base = param_base(arch)
     top = 0
+    floats: dict[int, int] = {}            # stack parameter index -> float width
+    shadow = 4 if arch.name == "x64-win" else 0   # the home slots of rcx, rdx, r8, r9
+    defs = {st.dst: st.src for st in ssa.stmts() if isinstance(st, Assign) and isinstance(st.dst, Var)}
+
+    def loaded(k):
+        """The load a float operand comes from: directly, or through the register it went to."""
+        for _ in range(3):
+            while isinstance(k, Cast) and k.kind in ("low", "zext"):
+                k = k.a
+            if isinstance(k, Var) and k in defs:
+                k = defs[k]
+            else:
+                break
+        return k
+
     for st in ssa.stmts():
         for e in stmt_exprs(st):
             for x in walk(e):
                 if isinstance(x, Load):
                     off = frame.offset_of(x.addr)
-                    if off is not None and off > 0:
-                        top = max(top, (off + x.bits // 8 + word - 1) // word - 1)
+                    if off is not None and off >= base:
+                        top = max(top, (off - base + x.bits // 8 + word - 1) // word)
+                for k in float_operands(x):
+                    k = loaded(k)
+                    if isinstance(k, Load):
+                        off = frame.offset_of(k.addr)
+                        if off is not None and off >= base and off % word == 0:
+                            floats[(off - base) // word - shadow] = k.bits
+    top = max(0, top - shadow)
+    an.__dict__.setdefault("_stack_param_floats", {})[target] = floats
     cache[target] = top
     return top
+
+
+def param_base(arch: ArchInfo) -> int:
+    """Entry-stack-pointer offset of the first stack parameter: above the return address on x86,
+    at the stack pointer itself where the return address is in a register (AArch64)."""
+    return arch.bits // 8 if arch.name.startswith(("x86", "x64")) else 0
+
+
+def stack_params_used(arch: ArchInfo) -> bool:
+    """Whether calls on this convention get stack arguments recovered (cdecl has its own path)."""
+    return arch.name.startswith("x64") or arch.name.startswith("arm64")
+
+
+def stack_param_floats(an: "Analysis", arch: ArchInfo, target: int) -> dict[int, int]:
+    """Which stack parameters of an internal callee it reads as floats: index -> width."""
+    stack_param_count(an, arch, target)
+    return an.__dict__.get("_stack_param_floats", {}).get(target, {})
+
+
+def _arg_stores(b, k: int, frame, base: int, word: int) -> dict[int, int]:
+    """Most recent store to each word-aligned outgoing argument slot at or above `base` (frame
+    offsets) since the previous call in the block: offset -> statement index."""
+    from .ir import Store
+    stores: dict[int, int] = {}
+    for j in range(k - 1, -1, -1):
+        t = b.stmts[j]
+        if isinstance(t, CallStmt):
+            break
+        if isinstance(t, Store):
+            off = frame.offset_of(t.dst)
+            if off is not None and off >= base and (off - base) % word == 0 and off not in stores:
+                stores[off] = j
+    return stores
 
 
 def _recover_cdecl(fn: IRFunction, an: "Analysis", arch: ArchInfo):
@@ -313,62 +372,102 @@ def recover_calls(fn: IRFunction, an: "Analysis", arch: ArchInfo) -> IRFunction:
         return fn
     argregs = int_arg_regs(arch)
     own: list[str] | None = None
+    frame = None
     for b in fn.blocks.values():
-        for s in b.stmts:
+        consumed: set[int] = set()
+        for k, s in enumerate(b.stmts):
             if not isinstance(s, CallStmt) or s.call.args:
                 continue
             fps: list = []
             widths: dict = {}
+            classes: list[str] = []
             uses = dict(s.uses)
             tgt = s.call.target.value if isinstance(s.call.target, Const) else None
             name = s.name or (an.name(tgt) if tgt is not None else None)
             sig = lookup(name)
             f = an.functions.get(tgt) if tgt is not None else None
             fsig = fp_sig(name) if is_fp_arch(arch) else None
+            placed: list | None = None          # per argument: register, or None (on the stack)
             if fsig is not None:
-                selected = assign_regs(arch, arg_classes(None, None, fsig), argregs)
+                classes = arg_classes(None, None, fsig)
+                placed = place_args(arch, classes, argregs)
             elif sig is not None:
                 fmt = _read_format(an, uses.get(argregs[sig.fmt])) if sig.fmt is not None and \
                     sig.fmt < len(argregs) else None
                 if is_fp_arch(arch) and fmt is not None:
-                    scan = "scanf" in (name or "")
-                    selected = assign_regs(arch, arg_classes(sig, fmt, scan=scan), argregs)
+                    classes = arg_classes(sig, fmt, scan="scanf" in (name or ""))
+                    placed = place_args(arch, classes, argregs)
                 else:
                     selected = list(argregs[:arg_count(sig, fmt)])
             elif f is not None and not f.is_import:
                 selected = _livein_arg_regs(an, arch, tgt)
                 fps = fp_params(an, arch, tgt)
-                if fps:
-                    selected = selected + [r for r, _ in fps]
-                    widths = dict(fps)
+                widths = dict(fps)
+                nstack = stack_param_count(an, arch, tgt) if stack_params_used(arch) else 0
+                if fps or nstack:
+                    placed = selected + [r for r, _ in fps] + [None] * nstack
+                    sf = stack_param_floats(an, arch, tgt)
+                    classes = ["i"] * len(selected) + ["d"] * len(fps) + \
+                        [("f" if sf.get(j) == 32 else "d") if j in sf else "i" for j in range(nstack)]
             else:
                 if own is None:
                     own = _livein_arg_regs(an, arch, fn.addr)
                 selected = _set_before_call(fn, argregs, uses, own)
+            if placed is None:
+                placed = selected
+            stack_vals = iter(())
+            if None in placed:
+                if frame is None:
+                    from .stack import Frame, _build_spoff
+                    frame = Frame(arch, _build_spoff(fn, arch))
+                stack_vals = _stack_values(b, k, s, frame, arch, placed.count(None), consumed)
             args = []
             fargs = []
-            for r in selected:
+            for pos, r in enumerate(placed):
+                if r is None:                     # the next stack argument
+                    v = next(stack_vals, None)
+                    if v is None:
+                        break
+                    if pos < len(classes) and classes[pos] in "df":
+                        fargs.append((len(args), 32 if classes[pos] == "f" else 64))
+                        v = Cast("low", v, 64) if v.bits > 64 else v
+                    args.append(v)
+                    continue
                 if r not in uses:
                     continue
                 v = uses[r]
                 if is_fp_reg(r):                  # the float in the register's low lanes
-                    w = widths.get(r) or (32 if _float_class(fsig, selected, r) else 64)
+                    w = widths.get(r) or (32 if pos < len(classes) and classes[pos] == "f" else 64)
                     v = Cast("low", v, w)
                     fargs.append((len(args), w))
                 args.append(v)
             s.call = Call(s.call.target, tuple(args), s.call.bits, tuple(fargs))
-            s.uses = [(r, uses[r]) for r in selected if r in uses]
+            s.uses = [(r, uses[r]) for r in placed if r is not None and r in uses]
+        if consumed:
+            b.stmts = [t for j, t in enumerate(b.stmts) if j not in consumed]
     return fn
 
 
-def _float_class(fsig, selected: list[str], reg: str) -> bool:
-    """A libc argument declared `float` (`f`), by its place among the float arguments."""
-    if fsig is None:
-        return False
-    floats = [ch for ch in fsig[0] if ch in "df"]
-    xmms = [r for r in selected if is_fp_reg(r)]
-    k = xmms.index(reg)
-    return k < len(floats) and floats[k] == "f"
+def _stack_values(b, k: int, s: CallStmt, frame, arch: ArchInfo, n: int, consumed: set[int]):
+    """The values stored to the first `n` outgoing stack argument slots before call `s` (statement
+    `k` of block `b`), in order, stopping at the first slot not written; their stores are
+    marked consumed (they become the call's arguments)."""
+    from .fpabi import stack_arg_base
+    if s.tail:
+        return
+    sp = dict(s.uses).get(arch.sp)
+    sp_off = frame.offset_of(sp) if sp is not None else None
+    if sp_off is None:
+        return
+    word = arch.bits // 8
+    base = sp_off + stack_arg_base(arch)
+    stores = _arg_stores(b, k, frame, base, word)
+    for a in range(n):
+        j = stores.get(base + a * word)
+        if j is None:
+            return
+        consumed.add(j)
+        yield b.stmts[j].src
 
 
 __all__ = ["recover_calls", "int_arg_regs"]

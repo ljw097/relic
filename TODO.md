@@ -30,7 +30,7 @@
 
 ## P2
 
-- [ ] 부동소수점: ARM VFP 리프터(`vadd.f64`, `vcmp` + `vmrs`), x87(`fld`/`fstp`, 32비트 cdecl의 `double` 반환), SysV에서 레지스터가 모자라 스택으로 넘어간 인자, `unsigned` ↔ `double` 변환 관용구(`cvtsi2sd` + 보정 분기)
+- [ ] 부동소수점: ARM VFP 리프터(`vadd.f64`, `vcmp` + `vmrs`), x87(`fld`/`fstp`, 32비트 cdecl의 `double` 반환), `unsigned` ↔ `double` 변환 관용구(`cvtsi2sd` + 보정 분기)
 
 - [ ] 플러그인 훅: 리스팅 줄 꾸미기(주석·색), 분석 완료 이벤트
 - [ ] 열거형·공용체 타입
