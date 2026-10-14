@@ -863,3 +863,31 @@ def test_apply_library_signatures(app, vuln64_stripped, tmp_path):
     assert "checksum" in [r[0] for r in _rows(w.funcs.table)]
     w.dirty = False
     w.close()
+
+
+def test_undo_redo_and_bookmarks(app, win):
+    an = win.an
+    vuln = an.function_by_name("vuln").addr
+    win.goto(vuln)
+    win.rename(vuln, "read_name")
+    assert "read_name:" in win.disasm.toPlainText()
+    win.comment(vuln, "look here")
+    win.set_bookmark(vuln, "the overflow")
+    assert _rows(win.bookmarks) == [[f"{vuln:#x}", "read_name", "the overflow"]]
+    win.goto(an.function_by_name("main").addr)
+    assert win.undo() and not _rows(win.bookmarks)           # the bookmark
+    assert win.cur == vuln                                   # the cursor goes to what was undone
+    assert win.undo() and "look here" not in win.disasm.toPlainText()
+    assert win.undo() and "vuln:" in win.disasm.toPlainText()
+    assert "vuln" in [r[0] for r in _rows(win.funcs.table)]
+    assert not win.undo()
+    assert win.redo() and win.redo() and win.redo()
+    assert _rows(win.bookmarks)[0][2] == "the overflow" and "read_name" in [r[0] for r in _rows(win.funcs.table)]
+    # patches undo through the same Ctrl+Z
+    win.goto(vuln)
+    assert win.patch_with("nop")
+    assert win.undo() and not an.patches
+    # Delete in the bookmarks table removes the selected bookmark
+    win.bookmarks.selectRow(0)
+    win.remove_selected_bookmarks()
+    assert not an.bookmarks and not _rows(win.bookmarks)

@@ -2,6 +2,8 @@
 from __future__ import annotations
 
 import bisect
+import copy
+import functools
 import json
 import os
 from collections import defaultdict
@@ -43,6 +45,13 @@ class Analysis:
         # undo / redo of patch edits: (address, the patch there before the edit, or None)
         self.patch_undo: list[tuple[int, tuple | None]] = []
         self.patch_redo: list[tuple[int, tuple | None]] = []
+        # bookmarked addresses -> description
+        self.bookmarks: dict[int, str] = {}
+        # undo / redo of every user edit, in order: ("notes", annotations before, address) for
+        # names, comments, types, struct edits and bookmarks; ("patch",) for a patch edit
+        self.edit_undo: list[tuple] = []
+        self.edit_redo: list[tuple] = []
+        self._in_edit = False
         self._fstarts: list[int] = []
         self._strings_by_addr: dict[int, String] = {}
         # library signature files to name functions with (None: those in libsigs.sig_dirs())
@@ -108,12 +117,12 @@ class Analysis:
     def reanalyze(self) -> "Analysis":
         """Analyse again (after a patch), keeping names, comments, variable names and patches."""
         keep = (self.renames, self.comments, self.var_names, self.patches, self.struct_names, self.var_types,
-                self.patch_undo, self.patch_redo, self.sig_paths)
+                self.patch_undo, self.patch_redo, self.sig_paths, self.bookmarks, self.edit_undo, self.edit_redo)
         b = self.bin
         self.__dict__.clear()                    # decompiler caches live on the instance too
         self.__init__(b)
         (self.renames, self.comments, self.var_names, self.patches, self.struct_names, self.var_types,
-         self.patch_undo, self.patch_redo, self.sig_paths) = keep
+         self.patch_undo, self.patch_redo, self.sig_paths, self.bookmarks, self.edit_undo, self.edit_redo) = keep
         return self.run(load_project=False)
 
     # ------------------------------------------------------------- patches
@@ -133,6 +142,7 @@ class Analysis:
         if _record:
             self.patch_undo.append((addr, before))
             self.patch_redo.clear()
+            self._record_edit(("patch",))
         if reanalyze:
             self.reanalyze()
         return old
@@ -147,6 +157,7 @@ class Analysis:
         if _record:
             self.patch_undo.append((addr, p))
             self.patch_redo.clear()
+            self._record_edit(("patch",))
         if reanalyze:
             self.reanalyze()
         return True
@@ -179,6 +190,54 @@ class Analysis:
         if reanalyze:
             self.reanalyze()
         return addr
+
+    # ------------------------------------------------------ undo of all edits
+    UNDO_MAX = 500
+    NOTES = ("renames", "comments", "var_names", "var_types", "struct_names", "bookmarks")
+
+    def _notes(self) -> tuple:
+        return copy.deepcopy(tuple(getattr(self, k) for k in self.NOTES))
+
+    def _set_notes(self, state: tuple):
+        for k, v in zip(self.NOTES, copy.deepcopy(state)):
+            setattr(self, k, v)
+
+    def _record_edit(self, entry: tuple):
+        self.edit_undo.append(entry)
+        del self.edit_undo[:-self.UNDO_MAX]
+        self.edit_redo.clear()
+
+    def undo(self, reanalyze: bool = True) -> tuple[str, int | None] | None:
+        """Undo the last edit of any kind: ("notes", address it was at) for a name / comment /
+        type / struct / bookmark edit, ("patch", address) for a patch edit; None: nothing left."""
+        while self.edit_undo:
+            e = self.edit_undo.pop()
+            if e[0] == "patch":
+                addr = self.undo_patch(reanalyze)
+                if addr is None:              # (undone directly with undo_patch)
+                    continue
+                self.edit_redo.append(e)
+                return "patch", addr
+            _, state, where = e
+            self.edit_redo.append(("notes", self._notes(), where))
+            self._set_notes(state)
+            return "notes", where
+        return None
+
+    def redo(self, reanalyze: bool = True) -> tuple[str, int | None] | None:
+        while self.edit_redo:
+            e = self.edit_redo.pop()
+            if e[0] == "patch":
+                addr = self.redo_patch(reanalyze)
+                if addr is None:
+                    continue
+                self.edit_undo.append(e)
+                return "patch", addr
+            _, state, where = e
+            self.edit_undo.append(("notes", self._notes(), where))
+            self._set_notes(state)
+            return "notes", where
+        return None
 
     def patched_at(self, addr: int) -> bool:
         return any(a <= addr < a + len(new) for a, (_, new) in self.patches.items())
@@ -415,9 +474,9 @@ class Analysis:
         """Give a decompiler variable / parameter of the function at `func` a C type (`char *`,
         `struct note *`); empty resets to the inferred one. ValueError for what is not a type."""
         from ..decompiler.vartypes import parse_ctype
+        t = parse_ctype(ctype) if ctype.strip() else None     # ValueError before anything changes
         types = self.var_types.setdefault(func, {})
-        if ctype.strip():
-            t = parse_ctype(ctype)
+        if t is not None:
             types[generated] = str(t)
             if t.base.startswith("struct "):
                 # keep an entry (and so the struct's layout) for a struct applied by its own name
@@ -432,9 +491,10 @@ class Analysis:
     def set_field_type(self, struct: str, generated: str, ctype: str):
         """Give a field of a recovered struct a C type; empty resets it."""
         from ..decompiler.vartypes import parse_ctype
+        t = parse_ctype(ctype) if ctype.strip() else None
         types = self.struct_names.setdefault(struct, {}).setdefault("types", {})
-        if ctype.strip():
-            types[generated] = str(parse_ctype(ctype))
+        if t is not None:
+            types[generated] = str(t)
         else:
             types.pop(generated, None)
         self._tidy_struct_names(struct)
@@ -472,6 +532,13 @@ class Analysis:
         else:
             self.comments.pop(addr, None)
 
+    def bookmark(self, addr: int, text: str | None):
+        """Bookmark `addr` with a description (None or empty removes the bookmark)."""
+        if text is None or not text.strip():
+            self.bookmarks.pop(addr, None)
+        else:
+            self.bookmarks[addr] = text.strip()
+
     def save_project(self, path: str | None = None):
         data = {
             "version": 1,
@@ -482,6 +549,7 @@ class Analysis:
             "patches": {f"{a:#x}": {"old": o.hex(), "new": n.hex()} for a, (o, n) in sorted(self.patches.items())},
             "structs": dict(sorted(self.struct_names.items())),
             "types": {f"{a:#x}": dict(sorted(v.items())) for a, v in sorted(self.var_types.items())},
+            "bookmarks": {f"{a:#x}": t for a, t in sorted(self.bookmarks.items())},
         }
         with open(path or self.project_path, "w") as fp:
             json.dump(data, fp, indent=2)
@@ -497,7 +565,33 @@ class Analysis:
         self.var_names = {int(a, 16): dict(v) for a, v in data.get("variables", {}).items()}
         self.struct_names = {k: dict(v) for k, v in data.get("structs", {}).items()}
         self.var_types = {int(a, 16): dict(v) for a, v in data.get("types", {}).items()}
+        self.bookmarks = {int(a, 16): t for a, t in data.get("bookmarks", {}).items()}
         return True
+
+
+def _undoable(method):
+    """Record the user annotations before an edit, so `Analysis.undo` can put them back (nested
+    edits -- `add_field` naming the field -- are one step; an edit that changes nothing is none)."""
+    @functools.wraps(method)
+    def edit(self, *args, **kwargs):
+        if self._in_edit:
+            return method(self, *args, **kwargs)
+        before = self._notes()
+        self._in_edit = True
+        try:
+            result = method(self, *args, **kwargs)
+        finally:
+            self._in_edit = False
+        if self._notes() != before:
+            where = args[0] if args and isinstance(args[0], int) else None
+            self._record_edit(("notes", before, where))
+        return result
+    return edit
+
+
+for _name in ("rename", "rename_var", "rename_struct", "rename_field", "set_var_type", "set_field_type",
+              "add_field", "remove_field", "comment", "bookmark"):
+    setattr(Analysis, _name, _undoable(getattr(Analysis, _name)))
 
 
 def analyze(path: str, arch: str | None = None, base: int = 0, sigs: list[str] | None = None) -> Analysis:

@@ -267,7 +267,17 @@ class MainWindow(QMainWindow):
         self.search_results = Table(["Address", "Location", "Match"])
         self.search_results.activated_addr.connect(self.goto)
         self.search_dock = self._dock("Search", self.search_results, Qt.DockWidgetArea.RightDockWidgetArea)
+        self.bookmarks = Table(["Address", "Location", "Description"])
+        self.bookmarks.activated_addr.connect(self.goto)
+        self.bookmarks.setContextMenuPolicy(Qt.ContextMenuPolicy.ActionsContextMenu)
+        rm = QAction("Remove bookmark", self.bookmarks)
+        rm.setShortcut(QKeySequence(QKeySequence.StandardKey.Delete))
+        rm.setShortcutContext(Qt.ShortcutContext.WidgetShortcut)
+        rm.triggered.connect(self.remove_selected_bookmarks)
+        self.bookmarks.addAction(rm)
+        self.bookmarks_dock = self._dock("Bookmarks", self.bookmarks, Qt.DockWidgetArea.RightDockWidgetArea)
         self.tabifyDockWidget(self.xrefs_dock, self.search_dock)
+        self.tabifyDockWidget(self.xrefs_dock, self.bookmarks_dock)
         self.xrefs_dock.raise_()
         self.search_thread: SearchThread | None = None
 
@@ -390,6 +400,9 @@ class MainWindow(QMainWindow):
         self.back_act = act(m, "&Back", ("Esc", "Alt+Left"), self.go_back)
         self.fwd_act = act(m, "&Forward", ("Ctrl+Return", "Alt+Right"), self.go_forward)
         m.addSeparator()
+        act(m, "&Mark position...", "Alt+M", self.bookmark_dialog)
+        act(m, "B&ookmarks", "Ctrl+M", self.show_bookmarks)
+        m.addSeparator()
         act(m, "Toggle &graph / listing", "Space", self.toggle_graph)
         act(m, "Toggle &pseudocode / listing", ("Tab", "F5"), self.toggle_decompile)
         act(m, "&Hex view", "Ctrl+H", lambda: self.tabs.setCurrentIndex(self.TAB_HEX))
@@ -405,8 +418,8 @@ class MainWindow(QMainWindow):
         act(m, "&NOP instruction", "Ctrl+Alt+N", lambda: self.patch_with("nop"))
         act(m, "In&vert branch", "Ctrl+Alt+J", lambda: self.patch_with("invert"))
         act(m, "Re&vert patch", None, self.revert_patch_here)
-        act(m, "&Undo patch", "Ctrl+Z", self.undo_patch)
-        act(m, "Redo patc&h", ("Ctrl+Shift+Z", "Ctrl+Y"), self.redo_patch)
+        act(m, "&Undo", "Ctrl+Z", self.undo)
+        act(m, "Redo", ("Ctrl+Shift+Z", "Ctrl+Y"), self.redo)
         act(m, "&Export patched file...", None, self.export_patched_dialog)
         m = mb.addMenu("&Search")
         act(m, "Sequence of &bytes...", "Alt+B", lambda: self.search_dialog("bytes"))
@@ -648,6 +661,7 @@ class MainWindow(QMainWindow):
         self.disasm.func = self.graph.func = None
         self.setWindowTitle(f"Relic - {os.path.basename(an.bin.path)}  [{an.bin.describe()}]")
         self._fill_functions()
+        self._fill_bookmarks()
         self._fill_tables(extra.get("checksec") or an.checksec())
         if "vulns" in extra:
             self._fill_vulns(extra["vulns"])
@@ -1298,6 +1312,86 @@ class MainWindow(QMainWindow):
             self._after_edit()
             self._fill_functions()
         return len(named)
+
+    # ------------------------------------------------------------- undo / bookmarks
+    def undo(self) -> bool:
+        """Undo the last edit -- rename, comment, type, struct edit, bookmark or patch (Ctrl+Z)."""
+        return self._undo_redo(self.an.undo if self.an is not None else None, "undid", "undo")
+
+    def redo(self) -> bool:
+        return self._undo_redo(self.an.redo if self.an is not None else None, "redid", "redo")
+
+    def _undo_redo(self, step, done: str, what: str) -> bool:
+        if step is None:
+            return False
+        QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
+        try:
+            r = step()                            # a patch step analyses again
+        finally:
+            QApplication.restoreOverrideCursor()
+        if r is None:
+            self.statusBar().showMessage(f"nothing to {what}", 3000)
+            return False
+        kind, addr = r
+        if kind == "patch":
+            self._after_patch(addr)
+            self.statusBar().showMessage(f"{done} the patch edit at {addr:#x}", 4000)
+        else:
+            self._after_edit()
+            self._fill_functions()
+            self._fill_bookmarks()
+            if getattr(self, "structs_dialog", None) is not None and self.structs_dialog.isVisible():
+                self.structs_dialog.refresh()
+            if addr is not None and self.an.bin.is_mapped(addr) and addr != self.cur:
+                self.goto(addr)
+            self.statusBar().showMessage(f"{done} the edit" + (f" at {addr:#x}" if addr is not None else ""), 4000)
+        self._fill_bookmarks()
+        return True
+
+    def bookmark_dialog(self):
+        """Bookmark the cursor position (Alt+M); an empty description removes the bookmark."""
+        a = self._subject()
+        if a is None:
+            return
+        cur = self.an.bookmarks.get(a) or self.an.location(a)
+        text, ok = QInputDialog.getText(self, "Mark position", f"Bookmark at {a:#x} (empty to remove):", text=cur)
+        if ok:
+            self.set_bookmark(a, text)
+
+    def set_bookmark(self, addr: int, text: str | None):
+        self.an.bookmark(addr, text)
+        self._fill_bookmarks()
+        self._mark_dirty()
+        if text:
+            self.statusBar().showMessage(f"bookmarked {addr:#x}", 3000)
+
+    def show_bookmarks(self):
+        self.bookmarks_dock.show()
+        self.bookmarks_dock.raise_()
+        self.bookmarks.setFocus()
+
+    def remove_selected_bookmarks(self):
+        rows = {i.row() for i in self.bookmarks.selectionModel().selectedRows()}
+        addrs = [int(self.bookmarks.proxy.index(r, 0).data(ADDR_ROLE)) for r in rows]
+        for a in addrs:
+            self.an.bookmark(a, None)
+        if addrs:
+            self._fill_bookmarks()
+            self._mark_dirty()
+
+    def _fill_bookmarks(self):
+        t = self.bookmarks
+        t.setSortingEnabled(False)
+        t.clear_rows()
+        if self.an is not None:
+            for a, text in sorted(self.an.bookmarks.items()):
+                t.add_row([a, self.an.location(a), text], a)
+        t.setSortingEnabled(True)
+        t.fit()
+
+    def _mark_dirty(self):
+        self.dirty = True
+        self.setWindowTitle(self.windowTitle().rstrip(" *") + " *")
 
     def _after_edit(self):
         self.dirty = True
