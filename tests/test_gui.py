@@ -434,7 +434,8 @@ def test_debugger_panels_breakpoints_and_console(app, win):
     win.debug_start()
     assert _debug_wait(app, win, lambda: win.dbg_regs.rowCount() > 0)
     assert all(d.isVisibleTo(win) for d in win.dbg_docks)
-    assert win.dbg_docks[1] not in win.tabifiedDockWidgets(win.dbg_docks[0])    # stack beside registers
+    assert not win.tabifiedDockWidgets(win.dbg_docks[0])                     # registers, stack: own docks
+    assert not win.tabifiedDockWidgets(win.dbg_docks[1])
     win.debug_start_or_continue()                       # F9: continue to the breakpoint
     assert _debug_wait(app, win, lambda: win.disasm.debug_pc == vuln)
     assert win.cur == vuln

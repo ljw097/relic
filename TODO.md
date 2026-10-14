@@ -18,6 +18,7 @@
 - [x] GUI(`relic/gui/debugger.py`): 작업 스레드 컨트롤러, Registers·Stack·Backtrace·Code·Console 패널, Debug 메뉴(F9/F7/F8/F4/F2), 리스팅 pc·중단점 표시
 - [x] vmmap 패널, 메모리(hexdump) 뷰(주소·gdb 식·Relic 이름), 레지스터·스택 값 더블클릭으로 리스팅/메모리 따라가기
 - [x] 중단점 목록 패널(조건·활성/비활성·적중 횟수, 재실행 시 유지)
+- [x] README 스크린샷과 사용 흐름·디버거 따라 하기(`docs/screenshots/make_screenshots.py`로 재생성)
 - [ ] **P1** 하드웨어 watchpoint(쓰기/읽기), 라이브러리 함수 중단점(`puts@plt` 등 이름)
 - [ ] **P2** glibc 힙 정보(bins/chunks), 의사 코드 뷰에서 현재 줄 표시
 - [ ] **P2** 레지스터·메모리 값 편집

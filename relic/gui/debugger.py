@@ -18,7 +18,7 @@ import threading
 from dataclasses import dataclass, field
 
 from PySide6.QtCore import QObject, Qt, Signal
-from PySide6.QtGui import QColor, QTextCursor
+from PySide6.QtGui import QColor, QFontMetrics, QTextCursor
 from PySide6.QtWidgets import (QAbstractItemView, QHBoxLayout, QHeaderView, QLabel, QLineEdit, QPlainTextEdit,
                                QTableWidget, QTableWidgetItem, QVBoxLayout, QWidget)
 
@@ -304,6 +304,9 @@ def _setup(t: QTableWidget, headers: list[str]):
     t.setFont(mono_font())
     t.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.ResizeToContents)
     t.horizontalHeader().setStretchLastSection(True)
+    t.verticalHeader().setDefaultSectionSize(QFontMetrics(t.font()).height() + 4)   # dense, like a terminal
+    t.setWordWrap(False)
+    t.setTextElideMode(Qt.TextElideMode.ElideNone)     # pointer chains scroll instead of ending in "..."
 
 
 def _item(text: str, color: str | None = None, data=None) -> QTableWidgetItem:
