@@ -341,10 +341,9 @@ def scan(fn: IRFunction, fn_addr: int, ptr_bits: int, name_of=None) -> dict[tupl
 
 
 def _string_arg(name: str, k: int) -> bool:
-    from .sigs import base_name
-    n = base_name(name)
-    return (n in ("puts", "strlen", "strdup", "atoi", "atol", "strtol", "system", "fputs", "perror") and k == 0) or \
-        (n in ("strcpy", "strncpy", "strcat", "strncat", "strcmp", "strncmp") and k in (0, 1))
+    from .sigs import arg_type
+    sig = lookup(name)
+    return sig is not None and arg_type(sig, k) == "char *"
 
 
 def _call_ret_type(fn: IRFunction, v: Expr) -> str:

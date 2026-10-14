@@ -16,7 +16,7 @@
 
 ## P1 — 출력 품질
 
-- [ ] libc 인자 타입으로 매개변수·변수 타입 지정(`strlen(a1)` → `char *a1`, `malloc` 크기 → `size_t` 등)
+- [x] libc 인자·결과 타입으로 매개변수·변수 타입 지정(`strlen(a1)` → `char *a1`, `malloc(n)` → `size_t n`, `void *` 결과, `fopen` → `FILE *`, 상수 형식 문자열의 `%s`/`%p`/`%zu`, 식 안의 호출 포함) — 메모리 접근으로 복원한 포인터 타입이 우선
 - [ ] 품질 지표 기준선: `/usr/bin/{true,cat,gzip,grep}`의 goto 수를 bench로 기록하고 줄이기
   - [ ] -O0 비교 트리(범위 검사 분기마다 꼬리 블록이 복제된 형태)를 switch로
   - [ ] 큰 상태 기계 함수의 goto(gnulib `quotearg`, gzip deflate/inflate) — 조건 기반 구조화 검토

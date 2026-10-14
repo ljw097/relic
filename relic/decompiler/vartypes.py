@@ -14,9 +14,13 @@ Two steps on the out-of-SSA IR:
 from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import TYPE_CHECKING
 
-from .ir import (Assign, BinOp, CallStmt, Cast, Const, Expr, IRFunction, Ite, Load, Return, StackVar,
+from .ir import (Assign, BinOp, Call, CallStmt, Cast, Const, Expr, IRFunction, Ite, Load, Return, StackVar,
                  Store, UnOp, Var, children, map_stmt, stmt_exprs, transform, walk)
+
+if TYPE_CHECKING:
+    from .sigs import Sig
 
 _INT = {1: "bool", 8: "char", 16: "short", 32: "int", 64: "int64_t", 128: "__int128"}
 _UINT = {1: "bool", 8: "unsigned char", 16: "unsigned short", 32: "unsigned int", 64: "uint64_t",
@@ -273,4 +277,73 @@ def infer_types(fn: IRFunction, ptr_bits: int, is_addr=lambda v: False,
     return out
 
 
-__all__ = ["narrow", "simplify_low", "infer_types", "int_type", "parse_ctype", "CType"]
+# the more a type says, the more it wins when several calls disagree
+_HINT_RANK = {"void *": 1, "size_t": 1, "ssize_t": 1}
+
+
+def library_types(fn: IRFunction, ptr_bits: int, ret_reg: str, callee=lambda call: None,
+                  cstring=lambda addr: None) -> dict[str, CType]:
+    """Types variables get from the library calls they meet: an argument of `strlen` is a
+    `char *`, of `malloc` a `size_t`, the result of `fopen` a `FILE *` (sigs.SIGS), what a
+    constant format string's `%s` consumes a `char *`. Only plain variables of the type's width
+    count; copies carry a type both ways. A variable two calls give different equally specific
+    types gets none. `callee(call)` names a call's target, `cstring(addr)` reads a string."""
+    from .sigs import arg_type, format_types, lookup
+    widths = {"char *": ptr_bits, "void *": ptr_bits, "FILE *": ptr_bits, "size_t": ptr_bits,
+              "ssize_t": ptr_bits}
+    found: dict[str, str | None] = {}
+
+    def give(v: Expr, t: str | None):
+        if t not in widths or not isinstance(v, (Var, StackVar)) or v.bits != widths[t]:
+            return
+        old = found.get(v.name, "")
+        if old is None or old == t:
+            return
+        if old == "" or _HINT_RANK.get(old, 2) < _HINT_RANK.get(t, 2):
+            found[v.name] = t
+        elif _HINT_RANK.get(old, 2) == _HINT_RANK.get(t, 2):
+            found[v.name] = None              # disagreement: no hint
+
+    def call(c: Call, name: str | None) -> Sig | None:
+        sig = lookup(name)
+        if sig is None:
+            return None
+        for k, a in enumerate(c.args):
+            give(a, arg_type(sig, k))
+        if sig.fmt is not None and sig.fmt < len(c.args) and isinstance(c.args[sig.fmt], Const):
+            fmt = cstring(c.args[sig.fmt].value)
+            if fmt:
+                rest = c.args[sig.fmt + 1:]
+                for a, t in zip(rest, format_types(fmt, "scanf" in (name or ""))):
+                    give(a, t)
+        return sig
+
+    copies: list[tuple[Expr, Expr]] = []
+    for s in fn.stmts():
+        for top in stmt_exprs(s):
+            for x in walk(top):
+                if isinstance(x, Call) and not (isinstance(s, CallStmt) and x is s.call):
+                    call(x, callee(x))      # a call inside an expression: `return strlen(p) + 1`
+        if isinstance(s, CallStmt):
+            sig = call(s.call, s.name or callee(s.call))
+            if sig is None:
+                continue
+            for r, d in s.defs:
+                if r == ret_reg:
+                    give(d, sig.ret)
+        elif isinstance(s, Assign) and isinstance(s.dst, (Var, StackVar)) and \
+                isinstance(s.src, (Var, StackVar)) and s.dst.bits == s.src.bits:
+            copies.append((s.dst, s.src))
+    changed = True
+    while changed:
+        changed = False
+        for x, y in copies:
+            for p, q in ((x, y), (y, x)):
+                t = found.get(p.name)
+                if t and found.get(q.name, "") == "":
+                    found[q.name] = t
+                    changed = True
+    return {n: parse_ctype(t) for n, t in found.items() if t}
+
+
+__all__ = ["library_types", "narrow", "simplify_low", "infer_types", "int_type", "parse_ctype", "CType"]

@@ -21,7 +21,7 @@ from .ir import (Assign, BinOp, CallStmt, Cast, Const, Effect, Expr, Extract, In
                  StackAddr, StackVar, Store, UnOp, Unknown, Var)
 from .sigs import base_name
 from .structure import Block, If, Jump1, Loop, Ret, Seq, Switch, _negate, case_labels
-from .vartypes import CType, infer_types, int_type, parse_ctype
+from .vartypes import CType, infer_types, int_type, library_types, parse_ctype
 
 if TYPE_CHECKING:
     from ..analysis import Analysis, Function
@@ -91,6 +91,13 @@ class CWriter:
         self.p = prep
         self.ptr_bits = prep.arch.bits
         self.types: dict[str, CType] = infer_types(prep.fn, self.ptr_bits, self.is_addr)
+        # library calls name what plain integers really are (`strlen(a1)`: a1 is a `char *`); a
+        # pointer type recovered from how memory is accessed says more and is kept
+        for name, t in library_types(prep.fn, self.ptr_bits, prep.arch.ret, self._callee_name,
+                                     lambda a: an.bin.read_cstring(a, 512)).items():
+            cur = self.types.get(name)
+            if cur is not None and cur.ptr == 0:
+                self.types[name] = t
         self.shown_structs: dict[str, str] = {}
         self.shown_fields: dict[str, list] = {}
         self.names: dict[str, str] = {}
@@ -423,7 +430,8 @@ class CWriter:
     def _struct_ptr(self, e: Expr) -> bool:
         if isinstance(e, (Var, StackVar)):
             t = self.types.get(e.name)
-            return t is not None and t.ptr >= 1 and t.base.startswith("struct ")
+            # (a `FILE *` too: C would scale arithmetic on it by an unknown size)
+            return t is not None and t.ptr >= 1 and (t.base.startswith("struct ") or t.base == "FILE")
         return False
 
     def _ptr_size(self, e: Expr) -> int:
@@ -450,20 +458,21 @@ class CWriter:
     def _unsigned(self, e: Expr) -> bool:
         if isinstance(e, (Var, StackVar)):
             t = self.types.get(e.name)
-            return t is not None and t.base.startswith("unsigned") or (t is not None and t.base.startswith("uint"))
+            return t is not None and t.ptr == 0 and (t.base.startswith(("unsigned", "uint")) or t.base == "size_t")
         return isinstance(e, Cast) and e.kind == "zext"
 
-    def call(self, c: ir.Call) -> str:
+    def _callee_name(self, c: ir.Call) -> str | None:
         t = c.target
-        imp = None
         if isinstance(t, Load) and isinstance(t.addr, Const):
             imp = self.an.bin.imports_by_got.get(t.addr.value)
+            if imp is not None:                 # through the import's GOT slot (MIPS `jalr $t9`)
+                return base_name(imp.name)
         if isinstance(t, Const):
-            name = self.symbol(t.value) or f"sub_{t.value:x}"
-        elif imp is not None:                   # through the import's GOT slot (MIPS `jalr $t9`)
-            name = base_name(imp.name)
-        else:
-            name = f"(*{self.expr(t, PREC_UNARY)})"
+            return self.symbol(t.value) or f"sub_{t.value:x}"
+        return None
+
+    def call(self, c: ir.Call) -> str:
+        name = self._callee_name(c) or f"(*{self.expr(c.target, PREC_UNARY)})"
         return f"{name}({', '.join(self.expr(_bare(a)) for a in c.args)})"
 
     # --------------------------------------------------------- statements
@@ -618,12 +627,17 @@ class CWriter:
                 ret = int_type(self.p.ret_bits)
             else:
                 ret = self._ret_type(vals[0]) if vals else "int"
-        return f"{ret} {name}({', '.join(params) or 'void'})"
+        return f"{ret}{'' if ret.endswith('*') else ' '}{name}({', '.join(params) or 'void'})"
 
     def _ret_type(self, v: Expr) -> str:
         v = _bare(v)
         if isinstance(v, (Var, StackVar)) and v.name in self.types:
             return str(self.types[v.name])
+        if isinstance(v, ir.Call):               # `return strdup(s)`: the library's result type
+            from .sigs import lookup
+            sig = lookup(self._callee_name(v))
+            if sig is not None and sig.ret.endswith("*") and v.bits == self.ptr_bits:
+                return sig.ret
         return int_type(v.bits) if v.bits != 1 else "bool"
 
     @property
