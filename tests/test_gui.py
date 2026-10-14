@@ -404,3 +404,13 @@ def test_graph_keeps_its_selection_across_a_restyle(win):
         assert win.graph.backgroundBrush().color().name() == views.THEMES["light"]["bg"]
     finally:
         win.set_appearance(theme="dark")
+
+
+def test_search_panel(app, win):
+    assert win.search("insn", r"call\s+gets")
+    assert win.wait()
+    rows = _rows(win.search_results)
+    assert rows and "vuln+0x" in rows[0][1] and "call gets" in rows[0][2]
+    assert not win.search("imm", "not-a-number")
+    assert win.search("bytes", "e8 ?? ?? ?? ??") and win.wait()
+    assert len(_rows(win.search_results)) > 5

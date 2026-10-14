@@ -106,6 +106,23 @@ class VulnsThread(WorkThread):
         self.done.emit(self.an.vulns())
 
 
+class SearchThread(WorkThread):
+    """Runs one search (relic.analysis.search) off the GUI thread."""
+
+    done = Signal(object, str)          # hits, description
+
+    def __init__(self, an: Analysis, kind: str, query, parent=None):
+        super().__init__(parent)
+        self.an, self.kind, self.query = an, kind, query
+
+    def work(self):
+        from ..analysis import search
+        fn = {"bytes": search.find_bytes, "text": search.find_text, "imm": search.find_imm,
+              "insn": search.find_insn}[self.kind]
+        self.done.emit(fn(self.an, self.query), f"{self.kind} {self.query!r}" if self.kind != "imm"
+                       else f"immediate {self.query:#x}")
+
+
 class Table(QTableView):
     """Read-only sortable table; double-click emits the row's address."""
 
@@ -218,6 +235,12 @@ class MainWindow(QMainWindow):
         self.xrefs = Table(["From", "Type", "Location", "Instruction"])
         self.xrefs.activated_addr.connect(self.goto)
         self.xrefs_dock = self._dock("Xrefs", self.xrefs, Qt.DockWidgetArea.RightDockWidgetArea)
+        self.search_results = Table(["Address", "Location", "Match"])
+        self.search_results.activated_addr.connect(self.goto)
+        self.search_dock = self._dock("Search", self.search_results, Qt.DockWidgetArea.RightDockWidgetArea)
+        self.tabifyDockWidget(self.xrefs_dock, self.search_dock)
+        self.xrefs_dock.raise_()
+        self.search_thread: SearchThread | None = None
 
         self.strings = FilteredTable(["Address", "Section", "Encoding", "Value"], "Filter strings")
         self.imports = FilteredTable(["Address", "GOT / IAT", "Name", "Library"], "Filter imports")
@@ -300,6 +323,11 @@ class MainWindow(QMainWindow):
         act(m, "&Rename...", "N", self.rename_dialog)
         act(m, "&Comment...", ";", self.comment_dialog)
         act(m, "&Xrefs to...", "X", self.show_xrefs_here)
+        m = mb.addMenu("&Search")
+        act(m, "Sequence of &bytes...", "Alt+B", lambda: self.search_dialog("bytes"))
+        act(m, "&Text...", "Alt+T", lambda: self.search_dialog("text"))
+        act(m, "&Immediate value...", "Alt+I", lambda: self.search_dialog("imm"))
+        act(m, "I&nstruction (regex)...", "Ctrl+Alt+I", lambda: self.search_dialog("insn"))
         m = mb.addMenu("&View")
         self.light_act = act(m, "&Light theme", "Ctrl+Shift+L",
                              lambda on: self.set_appearance(theme="light" if on else "dark"), False)
@@ -460,7 +488,8 @@ class MainWindow(QMainWindow):
             self.progress.setFormat(f"{what}: {stage} {done}" if done else f"{what}: {stage}")
 
     def running_work(self) -> list[WorkThread]:
-        return [t for t in (self.thread, self.vulns_thread) if t is not None and t.isRunning()]
+        return [t for t in (self.thread, self.vulns_thread, getattr(self, "search_thread", None))
+                if t is not None and t.isRunning()]
 
     def _work_finished(self):
         if self.running_work():
@@ -492,6 +521,9 @@ class MainWindow(QMainWindow):
             QApplication.processEvents()
         if self.vulns_thread is not None:
             ok = self.vulns_thread.wait(ms) and ok
+            QApplication.processEvents()
+        if getattr(self, "search_thread", None) is not None:
+            ok = self.search_thread.wait(ms) and ok
             QApplication.processEvents()
         return ok
 
@@ -654,6 +686,58 @@ class MainWindow(QMainWindow):
         self._fill_xrefs(addr)
         self.xrefs_dock.show()
         self.goto(refs[0].frm if refs else addr)
+
+    # ---------------------------------------------------------------- search
+    _SEARCH_PROMPTS = {
+        "bytes": ("Search bytes", "Hex bytes, ?? for any byte (48 8b ?? 05):"),
+        "text": ("Search text", "Text (ASCII / UTF-8 and UTF-16LE, case-insensitive):"),
+        "imm": ("Search immediate", "Value used as an immediate or displacement (0x186a0, 100000, -1):"),
+        "insn": ("Search instructions", "Regular expression over the listing text (call.*system):"),
+    }
+
+    def search_dialog(self, kind: str):
+        if self.an is None:
+            return
+        title, label = self._SEARCH_PROMPTS[kind]
+        text, ok = QInputDialog.getText(self, title, label)
+        if ok and text.strip():
+            self.search(kind, text.strip())
+
+    def search(self, kind: str, text: str) -> bool:
+        """Start a search; the hits fill the Search panel when it finishes."""
+        if self.an is None:
+            return False
+        if self.search_thread is not None and self.search_thread.isRunning():
+            self.statusBar().showMessage("a search is already running", 3000)
+            return False
+        query = text
+        if kind == "imm":
+            try:
+                query = int(text, 0)
+            except ValueError:
+                self.statusBar().showMessage(f"'{text}' is not a number", 3000)
+                return False
+        self.search_thread = SearchThread(self.an, kind, query, self)
+        self.search_thread.done.connect(self._search_done)
+        self.search_thread.failed.connect(self._search_failed)
+        self._track(self.search_thread, "searching")
+        self.search_thread.start()
+        return True
+
+    def _search_failed(self, msg: str):
+        self.statusBar().showMessage(f"search failed: {msg.split(chr(10))[0]}", 6000)
+
+    def _search_done(self, hits, what: str):
+        t = self.search_results
+        t.setSortingEnabled(False)
+        t.clear_rows()
+        for h in hits:
+            t.add_row([h.addr, self.an.location(h.addr), h.text], h.addr)
+        t.setSortingEnabled(True)
+        t.fit()
+        self.search_dock.show()
+        self.search_dock.raise_()
+        self.statusBar().showMessage(f"{len(hits)} hit(s) for {what}", 5000)
 
     def goto_dialog(self):
         text, ok = QInputDialog.getText(self, "Go to", "Address or symbol (main, 0x401000, main+0x10):")
