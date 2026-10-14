@@ -12,7 +12,7 @@ from __future__ import annotations
 from typing import TYPE_CHECKING
 
 from .arch import ArchInfo
-from .ir import Assign, Call, CallStmt, Const, IRFunction, Phi, Var, stmt_exprs, walk
+from .ir import Assign, Call, CallStmt, Cast, Const, Expr, IRFunction, Phi, Var, children, stmt_exprs, walk
 from .sigs import arg_count, lookup
 
 if TYPE_CHECKING:
@@ -49,15 +49,86 @@ def _livein_arg_regs(an: "Analysis", arch: ArchInfo, target: int) -> list[str]:
     return cache[target]
 
 
+def _entry_ssa(an: "Analysis", arch: ArchInfo, target: int):
+    """The callee's lifted SSA (unoptimised, cached): what it does with its entry registers."""
+    cache = an.__dict__.setdefault("_entry_ssa_cache", {})
+    if target not in cache:
+        f = an.functions.get(target)
+        ssa = None
+        if f is not None and not f.is_import:
+            from .lift import lift_function
+            from .ssa import to_ssa
+            try:
+                ssa = to_ssa(lift_function(an, f), arch)
+            except Exception:  # noqa: BLE001 - no summary for a function that does not lift
+                ssa = None
+        cache[target] = ssa
+    return cache[target]
+
+
+def param_bits(an: "Analysis", arch: ArchInfo, target: int) -> dict[str, int]:
+    """Argument register -> width the callee reads it at (32 for an `int` parameter on a 64-bit
+    target: every read of the entry value is its low half). Registers it never reads are absent."""
+    cache = an.__dict__.setdefault("_param_bits_cache", {})
+    if target in cache:
+        return cache[target]
+    out: dict[str, int] = {}
+    ssa = _entry_ssa(an, arch, target)
+    regs = set(int_arg_regs(arch))
+    if ssa is not None and regs:
+        widths: dict[str, int] = {}
+
+        def visit(e: Expr, under: int | None):
+            if isinstance(e, Var) and e.version == 0 and e.name in regs:
+                widths[e.name] = max(widths.get(e.name, 0), under if under is not None else e.bits)
+                return
+            if isinstance(e, Cast) and e.kind == "low":
+                visit(e.a, e.bits)
+                return
+            for k in children(e):
+                visit(k, None)
+        for s in ssa.stmts():
+            if isinstance(s, CallStmt):
+                # implicit uses of a call list every argument register: not a read of a parameter,
+                # unless the value really is an argument (args are recovered later)
+                for k in children(s.call):
+                    visit(k, None)
+                continue
+            for top in stmt_exprs(s):
+                visit(top, None)
+        out = widths
+    cache[target] = out
+    return out
+
+
+def narrow_call_args(an: "Analysis", arch: ArchInfo, fn) -> int:
+    """`gcd(v2, 0xfffffffb)` -> `gcd(v2, -5)`: a 64-bit constant passed in a register the local
+    callee only reads as 32 bits is that 32-bit value (`mov w1, #-5` zero-extends into x1)."""
+    if arch.bits != 64:
+        return 0
+    regs = int_arg_regs(arch)
+    n = 0
+    for s in fn.stmts():
+        call = s.call if isinstance(s, CallStmt) else None
+        if call is None or not isinstance(call.target, Const) or call.target.value not in an.functions:
+            continue
+        widths = param_bits(an, arch, call.target.value)
+        args = list(call.args)
+        changed = False
+        for k, a in enumerate(args):
+            if k < len(regs) and widths.get(regs[k]) == 32 and isinstance(a, Const) and a.bits == 64 \
+                    and a.value >> 32 == 0:
+                args[k] = Const(a.value, 32)
+                changed = True
+        if changed:
+            n += 1
+            s.call = Call(call.target, tuple(args), call.bits)
+    return n
+
+
 def _compute_livein(an: "Analysis", arch: ArchInfo, target: int) -> list[str]:
-    f = an.functions.get(target)
-    if f is None or f.is_import:
-        return []
-    from .lift import lift_function
-    from .ssa import to_ssa
-    try:
-        ssa = to_ssa(lift_function(an, f), arch)
-    except Exception:
+    ssa = _entry_ssa(an, arch, target)
+    if ssa is None:
         return []
     # a call's implicit `uses` list every argument register the convention allows, which
     # would make every register look like a parameter; only count what the callee really

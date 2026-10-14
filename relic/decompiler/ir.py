@@ -199,6 +199,8 @@ class CallStmt(Stmt):
     # implicit register traffic: (architectural name, value read / variable written)
     uses: list[tuple[str, Expr]] = field(default_factory=list)
     defs: list[tuple[str, Expr]] = field(default_factory=list)
+    # registers the callee can change (a local function, see clobbers.py); None: the ABI's set
+    clobbers: frozenset | None = None
 
 
 @dataclass(slots=True)

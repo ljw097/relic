@@ -20,7 +20,8 @@ from relic.decompiler.emit import decompile
 
 HERE = os.path.dirname(__file__)
 FUNCS = ["sc_or", "sc_and3", "find", "collatz", "nested", "sw_fall", "dowhile", "clamp", "gcd", "classify2", "scan",
-         "div3", "udiv10", "mod10", "ldiv1000", "div_neg7", "is_mult6", "digsum", "div16", "mod8", "sw_calls"]
+         "div3", "udiv10", "mod10", "ldiv1000", "div_neg7", "is_mult6", "digsum", "div16", "mod8", "sw_calls",
+         "sw_big"]
 
 _HARNESS = r"""
 #include <stdint.h>
@@ -58,7 +59,7 @@ int main(void) {
 #define CHK2(f, x, y) if (f(x, y) != ref_##f(x, y)) { printf(#f "(%%d,%%d) = %%d, want %%d\n", x, y, (int)f(x, y), ref_##f(x, y)); bad++; }
             CHK2(sc_or, a, b)
             CHK2(classify2, a, b)
-            if (b > -100000 && b < 100000 && b != 0 && b != -2147483647 - 1) { CHK2(sw_calls, a & 15, b) }
+            if (b > -100000 && b < 100000 && b != 0 && b != -2147483647 - 1) { CHK2(sw_calls, a & 15, b) CHK2(sw_big, a & 15, b) }
             if (a > 0 && b > 0 && a < 60 && b < 60) { CHK2(nested, a, b) }
             if (b != 0 && a != -2147483647 - 1 && b != -2147483647 - 1) { CHK2(gcd, a, b) }
             for (int k = 0; k < nv; k += 3) {
@@ -143,3 +144,24 @@ def test_jump_table_switch(flow):
     for callee in ("sc_or(", "gcd(", "clamp(", "collatz(", "mod10("):
         assert callee in text, f"{name}: {callee}\n{text}"
     assert "goto" not in text, f"{name}:\n{text}"
+
+
+def test_big_switch_is_a_switch_everywhere(flow):
+    """sw_big has 12 cases: a jump table on every target (AArch64: byte offsets from `adr`)."""
+    name, an = flow
+    text = decompile(an, an.function_by_name("sw_big")).text
+    assert "switch (" in text and "case 11:" in text and "default:" in text, f"{name}:\n{text}"
+    assert "unresolved" not in text and "goto" not in text, f"{name}:\n{text}"
+    if name.endswith("O2") and not name.startswith(("flow32", "flow_arm", "flow_thumb")):
+        # a negative int argument in a 64-bit register: printed as the int the callee reads
+        assert "clamp(" in text and ", -5, 50)" in text, f"{name}:\n{text}"
+
+
+def test_calls_keep_registers_the_callee_never_writes(flow):
+    """-fipa-ra: gcc keeps values in caller-saved registers across calls to functions that do
+    not touch them; the decompiler must not treat those registers as clobbered."""
+    name, an = flow
+    text = decompile(an, an.function_by_name("sw_big")).text
+    assert "gcd(" in text and "sc_or(" in text
+    case9 = text.split("case 9:")[1].split("case 10:")[0]
+    assert "gcd(" in case9 and "sc_or(" in case9 and "-" in case9, f"{name}:\n{case9}"

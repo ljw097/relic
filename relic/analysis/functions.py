@@ -207,11 +207,16 @@ class FunctionAnalyzer:
                         leaders.add(t)
                         work.append(t)
                     self.prev[nxt] = a
+                    if i.target is not None:
+                        # a branch target's first predecessor: lets jump-table matching look past
+                        # `b.ls table_block` back to the bounds check (`cmp w0, #11`)
+                        self.prev.setdefault(i.target, a)
                     a = nxt
                     continue
-                # function pointers taken by address (not on ARM: its immediates are offsets and
-                # masks, addresses come from literal pools)
-                for r in (i.refs if self.dis.md_thumb is None else ()):
+                # function pointers taken by address -- not on ARM (its immediates are offsets and
+                # masks, addresses come from literal pools) nor from AArch64 `adr` (local labels
+                # such as a jump table's base; function pointers come from `adrp` + `add`)
+                for r in (i.refs if self.dis.md_thumb is None and i.mnemonic != "adr" else ()):
                     if r not in self.funcs and self.bin.is_exec(r) and r != start and self._looks_like_code(r):
                         self._queue.append(r)
                 self.prev[nxt] = a
@@ -280,6 +285,97 @@ class FunctionAnalyzer:
                 break
             out.append(i)
             a = self.prev.get(a)
+        return out
+
+    def _arm64_jump_table(self, jmp: Insn) -> list[int]:
+        """gcc's AArch64 switch dispatch, bounded by a `cmp wI, #n` before it:
+
+            adrp xT, table ; add xT, xT, :lo12:table
+            ldrb wE, [xT, wI, uxtw]          (ldrh ... lsl #1 / ldr ... lsl #2: wider entries)
+            adr  xB, base
+            add  xD, xB, wE, sxtb #2         (entries are signed offsets from `base`, in words)
+            br   xD
+        """
+        import capstone.arm64 as A64
+        c = jmp.cs
+        if jmp.mnemonic != "br" or not c.operands or c.operands[0].type != 1:
+            return []
+
+        def reg(name: str) -> str:              # w5 and x5 are the same register
+            return name[1:] if name[:1] in ("w", "x") and name[1:].isdigit() else name
+
+        def ops(i):
+            return i.cs.operands
+
+        hist = self._back(jmp.addr, 16)
+        want = reg(c.reg_name(c.operands[0].reg))
+        k = 0
+
+        def find(pred):
+            nonlocal k
+            while k < len(hist):
+                i = hist[k]
+                k += 1
+                if pred(i):
+                    return i
+            return None
+
+        add = find(lambda i: i.mnemonic == "add" and len(ops(i)) == 3 and ops(i)[2].type == 1
+                   and reg(i.cs.reg_name(ops(i)[0].reg)) == want)
+        if add is None:
+            return []
+        o = ops(add)
+        base_reg, off_reg = reg(add.cs.reg_name(o[1].reg)), reg(add.cs.reg_name(o[2].reg))
+        ext, shift = o[2].ext, o[2].shift.value
+        signed = ext in (A64.ARM64_EXT_SXTB, A64.ARM64_EXT_SXTH, A64.ARM64_EXT_SXTW)
+        save = k
+        adr = find(lambda i: i.mnemonic == "adr" and reg(i.cs.reg_name(ops(i)[0].reg)) == base_reg)
+        if adr is None:
+            return []
+        base = ops(adr)[1].imm
+        k = save
+        load = find(lambda i: i.mnemonic in ("ldrb", "ldrh", "ldr", "ldrsb", "ldrsh", "ldrsw")
+                    and reg(i.cs.reg_name(ops(i)[0].reg)) == off_reg and len(ops(i)) == 2
+                    and ops(i)[1].type == 3 and ops(i)[1].mem.index)
+        if load is None:
+            return []
+        m = ops(load)[1].mem
+        tab_reg, idx = reg(load.cs.reg_name(m.base)), reg(load.cs.reg_name(m.index))
+        size = {"ldrb": 1, "ldrsb": 1, "ldrh": 2, "ldrsh": 2, "ldrsw": 4}.get(
+            load.mnemonic, 4 if load.cs.reg_name(ops(load)[0].reg).startswith("w") else 8)
+        lo = find(lambda i: i.mnemonic == "add" and len(ops(i)) == 3 and ops(i)[2].type == 2
+                  and reg(i.cs.reg_name(ops(i)[0].reg)) == tab_reg)
+        page = find(lambda i: i.mnemonic == "adrp" and reg(i.cs.reg_name(ops(i)[0].reg)) == tab_reg)
+        if lo is None or page is None:
+            return []
+        table = ops(page)[1].imm + ops(lo)[2].imm
+        # the bound: `cmp` on the index or on the register it was copied from (`mov w5, w0`)
+        aliases = {idx}
+        for _ in range(3):
+            for i in hist:
+                o = ops(i)
+                if i.mnemonic == "mov" and len(o) == 2 and o[1].type == 1:
+                    a, b = reg(i.cs.reg_name(o[0].reg)), reg(i.cs.reg_name(o[1].reg))
+                    if a in aliases or b in aliases:
+                        aliases |= {a, b}
+        n = None
+        for i in hist:
+            o = ops(i)
+            if i.mnemonic == "cmp" and len(o) == 2 and o[0].type == 1 and o[1].type == 2 and \
+                    reg(i.cs.reg_name(o[0].reg)) in aliases:
+                n = o[1].imm
+                break
+        if n is None or not 0 <= n < 4096:
+            return []
+        out = []
+        for e in range(n + 1):
+            v = self.bin.read_int(table + size * e, size, signed=signed)
+            if v is None:
+                return []
+            t = base + (v << shift)
+            if not self.bin.is_exec(t):
+                return []
+            out.append(t)
         return out
 
     def _arm_jump_table(self, jmp: Insn) -> list[int]:
@@ -376,6 +472,8 @@ class FunctionAnalyzer:
         """Resolve `jmp reg` / `jmp [table+reg*N]` switch dispatch on x86."""
         if self.dis.arch == "arm":
             return self._arm_jump_table(jmp)
+        if self.dis.arch == "arm64":
+            return self._arm64_jump_table(jmp)
         if self.dis.arch not in ("x86", "x64"):
             return []
         ptr = self.bin.bits // 8

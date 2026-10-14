@@ -151,7 +151,24 @@ def _terminator(blk):
 # ------------------------------------------------------------------- structurer
 def _switch_index(expr):
     """(index expression, bias) of a jump-table address `table[idx - bias]`, if recognisable."""
-    from .ir import Cast, Const
+    from .ir import Cast, Const, Load
+
+    def strip(e):
+        while isinstance(e, Cast) and e.kind in ("zext", "sext"):
+            e = e.a
+        return e
+    # `base + (table[idx] << 2)` (AArch64, Thumb tbh): the index is inside the loaded entry
+    for x in walk(expr):
+        if isinstance(x, Load) and x is not expr:
+            idx, bias = _switch_index(x.addr) if any(isinstance(n, BinOp) and n.op in ("*", "<<")
+                                                     for n in walk(x.addr)) else (None, 0)
+            if idx is None and isinstance(x.addr, BinOp) and x.addr.op == "+":
+                a, b = x.addr.a, x.addr.b
+                if isinstance(a, Const) != isinstance(b, Const):
+                    idx = strip(b if isinstance(a, Const) else a)
+            if idx is not None:
+                return idx, bias
+            break
     for x in walk(expr):
         if isinstance(x, BinOp) and isinstance(x.b, Const) and (
                 (x.op == "*" and x.b.value in (1, 2, 4, 8)) or (x.op == "<<" and x.b.value in (0, 1, 2, 3))):

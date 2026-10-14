@@ -66,6 +66,8 @@ def prepare(an: "Analysis", func: "Function") -> Prepared:
     else:
         params = _livein_arg_regs(an, arch, func.addr)
     narrow_library_results(fn)
+    from .calls import narrow_call_args
+    narrow_call_args(an, arch, fn)
     w = None
     if rets:
         w = return_width(an, func, arch.ret)

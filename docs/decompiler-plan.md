@@ -53,7 +53,8 @@ relic/decompiler/
   passes.py       상수/복사 전파, load 전달, 조건식 복원, DCE
   interp.py       IR 인터프리터 (각 변환의 의미 보존 테스트용)
   refs.py         IR 문자열/교차참조 추출, 주석 포함 출력
-  calls.py        호출 인자 복원 (시그니처 / 피호출자 live-in / 호출 직전 설정 레지스터)
+  calls.py        호출 인자 복원 (시그니처 / 피호출자 live-in / 호출 직전 설정 레지스터), 매개변수 폭
+  clobbers.py     피호출 함수가 실제로 바꾸는 레지스터 (-fipa-ra 대응, 호출 그래프 고정점)
   sigs.py         libc 시그니처 표, 포맷 문자열 인자 수
   stack.py        스택 프레임 분석: 오프셋 정규화, 슬롯 분류, 버퍼 크기, 카나리
   cleanup.py      출력용 정리: 카나리 숨김, void/반환 폭, 스택 지역 변수, 빈 블록 우회, 임시 변수 인라인
