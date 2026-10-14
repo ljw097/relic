@@ -110,7 +110,8 @@ def _prepare(fn: IRFunction, arch: ArchInfo) -> IRFunction:
                     widths[x.name] = x.bits
     for name in (arch.sp, arch.ret, *arch.call_reads, *arch.call_clobbers):
         widths.setdefault(name, 1 if len(name) == 2 and name.endswith("f") else
-                          (128 if name.startswith("xmm") else arch.bits))
+                          128 if name.startswith("xmm") or name[:1] == "v" and name[1:].isdigit() and arch.bits == 64
+                          else 64 if name[:1] == "d" and name[1:].isdigit() else arch.bits)
 
     def reg(n):
         return Reg(n, widths[n])

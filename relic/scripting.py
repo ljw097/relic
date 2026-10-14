@@ -21,10 +21,14 @@ Plugins are `.py` files in the directories of `RELIC_PLUGINS` (separated
 like PATH) and in `~/.relic/plugins`. A plugin defines `register(api)`; the
 `PluginAPI` it receives can add menu actions (`api.add_action("Rename
 all", callback, "Ctrl+Alt+R")`) whose callbacks get the scripting
-namespace; `api.on_analysis(callback)` runs a callback when a binary's
-analysis is shown, `api.add_listing_comment(callback)` adds text to listing
-comments. Loading errors are collected, not raised: a broken plugin must
-not keep the GUI from starting.
+namespace. Hooks: `api.add_line_decorator(fn)` -- `fn(an, line)` returns a
+comment and / or a background colour for a listing line (`{"comment": "...",
+"color": "#402020"}`); `api.add_listing_comment(fn)` -- the simple form,
+`fn(an, addr)` returns text for an instruction's comment; `api.on_analysis(fn)`
+-- `fn(ns)` after a binary is analysed (and again after a patch re-analyses
+it); `api.on_cursor(fn)` -- `fn(ns, addr)` when the cursor moves. Loading
+errors are collected, not raised, and an exception in a hook is reported once
+in the Python console: a broken plugin must not keep the GUI from starting.
 """
 from __future__ import annotations
 
@@ -281,14 +285,37 @@ class PluginAPI:
                 self.win.report_plugin_error(self.plugin, traceback.format_exc())
         return self.win.add_plugin_action(text, run, shortcut)
 
-    def on_analysis(self, callback: Callable[[dict], object]):
-        """`callback(ns)` each time a binary's analysis is shown (opened, re-analysed)."""
-        self.win.add_analysis_hook(self.plugin, callback)
+    def _guarded(self, fn, default=None):
+        """`fn` with its exceptions reported (once per hook) instead of raised."""
+        reported = []
 
-    def add_listing_comment(self, callback: Callable[["Analysis", int], str | None]):
-        """`callback(an, addr)` for every listed instruction; text it returns is added to the
-        line's comment (`lambda an, a: "hot" if a in hot else None`)."""
-        self.win.add_listing_hook(self.plugin, callback)
+        def call(*args):
+            try:
+                return fn(*args)
+            except Exception:  # noqa: BLE001 - a plugin bug is reported, the GUI stays up
+                if not reported:
+                    reported.append(True)
+                    self.win.report_plugin_error(self.plugin, traceback.format_exc())
+                return default
+        return call
+
+    def add_line_decorator(self, fn: Callable):
+        """`fn(an, line)` -> None, a comment, or {"comment": str, "color": "#rrggbb"} for each
+        instruction / data line of the listing (`line.addr`, `line.mnemonic`, `line.operands`)."""
+        self.win.add_line_decorator(self._guarded(fn))
+
+    def on_analysis(self, fn: Callable[[dict], object]):
+        """`fn(ns)` once a binary has been analysed, and after a patch re-analyses it."""
+        self.win.plugin_hooks["analysis"].append(self._guarded(fn))
+
+    def on_cursor(self, fn: Callable[[dict, int], object]):
+        """`fn(ns, addr)` whenever the cursor moves to another address."""
+        self.win.plugin_hooks["cursor"].append(self._guarded(fn))
+
+    def add_listing_comment(self, fn: Callable[["Analysis", int], str | None]):
+        """`fn(an, addr)` for every listed instruction; text it returns is added to the line's
+        comment (`lambda an, a: "hot" if a in hot else None`) -- add_line_decorator's simple form."""
+        self.add_line_decorator(lambda an, line: fn(an, line.addr) if line.kind == "insn" else None)
 
 
 def load_plugins(win) -> tuple[list[str], list[tuple[str, str]]]:

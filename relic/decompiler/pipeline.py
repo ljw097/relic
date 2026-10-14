@@ -39,6 +39,7 @@ class Prepared:
     tree: object            # structure.Seq
     gotos: set
     ret_bits: int | None = None   # width of the result, when known
+    ret_float: bool = False       # the result is a float / double (in xmm0)
 
 
 def prepare(an: "Analysis", func: "Function") -> Prepared:
@@ -48,7 +49,9 @@ def prepare(an: "Analysis", func: "Function") -> Prepared:
     from .cleanup import stack_guards
     frame = analyze_frame(fn, arch, stack_guards(an))
     hide_canary(fn, frame)
-    rets = returns_value(an, func, fn, arch.ret)
+    from .fpabi import fp_params, fp_return
+    fret = fp_return(an, func)
+    rets = fret is not None or returns_value(an, func, fn, arch.ret)
     if not rets:
         drop_return_values(fn)
     rewrite_locals(fn, frame)
@@ -63,17 +66,37 @@ def prepare(an: "Analysis", func: "Function") -> Prepared:
         n = stack_param_count(an, arch, func.addr)
         params = [frame.slots[o].name() if o in frame.slots else f"arg_{o:x}"
                   for o in range(word, word * (n + 1), word)]
+    elif (an.name(func.addr) or "") == "main":
+        # main(argc, argv, envp): an unused argc before a used argv is still the first parameter
+        from .calls import int_arg_regs, livein_regs
+        regs = int_arg_regs(arch)[:3]
+        live = livein_regs(an, arch, func.addr)
+        params = list(regs[:max((k + 1 for k, r in enumerate(regs) if r in live), default=0)])
     else:
-        params = _livein_arg_regs(an, arch, func.addr)
+        params = _livein_arg_regs(an, arch, func.addr) + [r for r, _ in fp_params(an, arch, func.addr)]
+        from .calls import param_base, stack_param_count, stack_params_used
+        if stack_params_used(arch):
+            # parameters past the registers, on the stack (above the return address on x86-64,
+            # and past Win64's home space for the four register parameters)
+            from .fpabi import stack_arg_base
+            word = arch.bits // 8
+            first = param_base(arch) + stack_arg_base(arch)
+            from .calls import stack_param_slots
+            params += [frame.slots[first + rel].name() if first + rel in frame.slots else f"arg_{first + rel:x}"
+                       for rel, _, _ in stack_param_slots(an, arch, func.addr)]
     narrow_library_results(fn)
     from .calls import narrow_call_args
     narrow_call_args(an, arch, fn)
     w = None
-    if rets:
+    if fret is not None:
+        w = fret
+    elif rets:
         w = return_width(an, func, arch.ret)
         if w is not None:
             narrow_returns(fn, w)
     narrow(fn)
+    from .fpconst import fold_float_constants
+    fold_float_constants(an, fn)
     inline_single_use(fn)
     _fold_pass(fn)          # constants exposed by narrowing and inlining
     if recover_division(fn):    # magic-number multiplies -> x / c, x % c
@@ -84,7 +107,7 @@ def prepare(an: "Analysis", func: "Function") -> Prepared:
     tree = st.run()
     from .chains import switchify
     tree = switchify(tree, frozenset(st.gotos))     # compare chains on one value -> switch
-    return Prepared(fn, arch, frame, params, rets, tree, st.gotos, w)
+    return Prepared(fn, arch, frame, params, rets, tree, st.gotos, w, fret is not None)
 
 
 __all__ = ["Prepared", "prepare"]

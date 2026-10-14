@@ -49,17 +49,28 @@ def _defs(fn: IRFunction) -> dict[Var, Expr]:
     return {s.dst: s.src for s in fn.stmts() if isinstance(s, Assign) and isinstance(s.dst, Var)}
 
 
-def _reaches_tls(e: Expr, defs: dict[Var, Expr], depth: int = 4, guards=frozenset()) -> bool:
+def _reaches_tls(e: Expr, defs: dict[Var, Expr], depth: int = 4, guards=frozenset(), memo=None) -> bool:
     """Does `e` (through up to `depth` SSA definitions) read the stack-protector value -- the
-    thread pointer on x86, `__stack_chk_guard` (an address in `guards`) elsewhere?"""
+    thread pointer on x86, `__stack_chk_guard` (an address in `guards`) elsewhere?
+
+    `memo` ((var, depth) -> answer) shares the work between calls over one function: phis make
+    the definitions a graph, and walking it afresh from every use is exponential in `depth`."""
+    if memo is None:
+        memo = {}
     for x in walk(e):
         if isinstance(x, Const) and x.value in guards:
             return True
         if isinstance(x, Var):
             if x.name in ("fs_base", "gs_base"):
                 return True
-            if depth and x in defs and _reaches_tls(defs[x], defs, depth - 1, guards):
-                return True
+            if depth and x in defs:
+                key = (x, depth)
+                r = memo.get(key)
+                if r is None:
+                    memo[key] = False            # (a cycle through phis reads nothing new)
+                    r = memo[key] = _reaches_tls(defs[x], defs, depth - 1, guards, memo)
+                if r:
+                    return True
     return False
 
 
@@ -86,12 +97,13 @@ def hide_canary(fn: IRFunction, frame: Frame) -> bool:
     if frame.canary is None:
         return False
     defs = _defs(fn)
+    memo: dict = {}
     changed = False
     for b in list(fn.blocks.values()):
         if not b.stmts:
             continue
         last = b.stmts[-1]
-        if isinstance(last, Branch) and _reaches_tls(last.cond, defs, guards=frame.guards):
+        if isinstance(last, Branch) and _reaches_tls(last.cond, defs, guards=frame.guards, memo=memo):
             for fail, ok in ((last.true, last.false), (last.false, last.true)):
                 fb = fn.blocks.get(fail)
                 if fb is not None and _is_fail_block(fb):
@@ -105,7 +117,8 @@ def hide_canary(fn: IRFunction, frame: Frame) -> bool:
             if isinstance(s, Store) and frame.offset_of(s.dst) == frame.canary:
                 changed = True
                 continue
-            if isinstance(s, Return) and s.value is not None and _reaches_tls(s.value, defs, guards=frame.guards):
+            if isinstance(s, Return) and s.value is not None and \
+                    _reaches_tls(s.value, defs, guards=frame.guards, memo=memo):
                 s.value = None   # `return canary - fs:[0x28]` is the check's leftover, not a result
             kept.append(s)
         b.stmts = kept
@@ -154,6 +167,21 @@ def _read_form(e: Expr, reg: str):
     return forms[0] if all(f == forms[0] for f in forms) else "whole"
 
 
+def _callee_args(an: "Analysis", call: CallStmt) -> set[str]:
+    """Argument registers an internal callee reads (its parameters)."""
+    from .arch import arch_for
+    from .calls import livein_regs
+    from .fpabi import fp_params, fp_part
+    t = call.call.target
+    if not isinstance(t, Const) or t.value not in an.functions:
+        return set()
+    try:
+        arch = arch_for(an.bin)
+    except NotImplementedError:
+        return set()
+    return livein_regs(an, arch, t.value) | {fp_part(r)[0] for r, _ in fp_params(an, arch, t.value)}
+
+
 def result_reads(an: "Analysis", func: "Function", reg: str) -> list:
     """For every call to `func`, how the caller first reads the result register.
 
@@ -184,7 +212,15 @@ def result_reads(an: "Analysis", func: "Function", reg: str) -> list:
                 if isinstance(t, CallStmt):
                     reads = [_read_form(a, reg) for a in [t.call.target, *t.call.args]]
                     reads = [r for r in reads if r is not None]
-                    return reads[0] if reads else "none"   # a call clobbers the result register
+                    if reads:
+                        return reads[0]
+                    if t.clobbers is not None and reg not in t.clobbers and not t.tail:
+                        # a local callee that leaves the register alone (gcc -fipa-ra keeps the
+                        # result there across it), unless it takes it as an argument
+                        if reg in _callee_args(an, t):
+                            return "whole"
+                        continue
+                    return "none"                          # a call clobbers the result register
                 forms = [r for r in (_read_form(x, reg) for x in stmt_exprs(t)) if r is not None]
                 if forms:
                     return forms[0] if all(f == forms[0] for f in forms) else "whole"
@@ -470,7 +506,7 @@ def inline_single_use(fn: IRFunction) -> bool:
                     k += 1
                     continue
                 v, src = cand
-                if uses.get(v.name) != 1 or defs.get(v.name) != 1 or v.version != 0 or not v.name.startswith("v"):
+                if uses.get(v.name) != 1 or defs.get(v.name) != 1 or v.version != 0 or not v.name.startswith("_v"):
                     k += 1
                     continue
                 names, mem = _reads(src)

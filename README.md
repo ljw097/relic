@@ -25,20 +25,20 @@
 진행률은 "IDA Pro가 그 영역에서 하는 일 중 Relic이 같은 수준으로 하는 비율"을 어림한 값입니다.
 전체 값은 영역 가중 평균(가중치는 리버싱 실무에서의 비중)입니다.
 
-**전체: 약 42%** — 분석·디컴파일 핵심 경로는 x86/ARM 계열에서 실사용 가능, 타입 시스템·라이브러리 식별·스크립팅 콘솔이 큰 격차.
+**전체: 약 43%** — 분석·디컴파일 핵심 경로는 x86/ARM/MIPS 계열에서 실사용 가능, 파일 포맷(Mach-O)·타입 시스템(열거형·공용체·헤더)·디컴파일 품질(goto, SIMD)이 큰 격차.
 
 | 영역 (가중치) | IDA Pro 기준 | Relic 현재 | 진행률 |
 |---|---|---|---|
 | 파일 포맷 (8) | ELF, PE, Mach-O, COFF/OMF, 펌웨어·raw 등 수십 종 | ELF, PE(import/export/COFF 심볼/.pdata), RAW | 35% |
 | 프로세서 (8) | 60여 개 CPU 계열 | 디스어셈블 7종(x86, x64, ARM/Thumb, AArch64, MIPS, RISC-V, PPC), 분석·리프팅·디컴파일은 x86/x64/ARM/AArch64/MIPS32 | 42% |
 | 자동 분석 (14) | 함수·CFG·xref·점프 테이블·noreturn·문자열·stripped 복구 | 재귀 하강 + 프롤로그 스캔, 점프 테이블(x86/ARM/AArch64), 레지스터 상수 전파로 데이터 xref, stripped `main` 복구, ARM/Thumb 상호 운용 | 55% |
-| 라이브러리 식별 (8) | FLIRT 시그니처, Lumina | 없음 (심볼·import·PLT 이름만) | 0% |
+| 라이브러리 식별 (8) | FLIRT 시그니처, Lumina | FLIRT 방식 시그니처(`relic sigs build`로 정적 라이브러리에서 생성, stripped 정적 바이너리의 libc 함수 이름), 심볼·import·PLT 이름 | 30% |
 | 타입 시스템 (10) | 구조체·열거형·로컬 타입, 타입 라이브러리, 타입 전파 | int/포인터/unsigned 추론, libc 시그니처 일부, 구조체 자동 복원(필드 오프셋·폭·포인터 타입, 중첩·자기 참조, 전역을 통해 함수 간 공유, 이름 변경), 배열 필드(`l->vals[i]`), 호출을 통한 구조체 공유(전역·지역), 변수·필드 타입 직접 지정(`Y`, 구조체를 다른 함수에 적용), 구조체 편집 창 | 40% |
-| 디컴파일러 (20) | Hex-Rays: 다수 아키텍처, 타입·구조체 대화형 수정, 부동소수점 | x86-64/x86-32/AArch64/ARM32/MIPS32, 재컴파일 검증, 구조화(switch·for·&&), 상수 나눗셈, -fipa-ra 레지스터 보존; 구조체·부동소수점·대화형 재타입 없음 | 40% |
-| 대화형 UI (12) | 리스팅·그래프·xref·이름/주석·검색·패치·undo·북마크·구조체 창 | 리스팅·그래프(층별 레이아웃)·의사 코드·헥스, 이름/주석/변수 이름, xref, 이동 기록, 테마·확대, 검색(바이트·텍스트·즉치값·명령어), 바이트 패치(NOP·분기 반전·어셈블, 되돌리기, 프로젝트에 저장, 패치된 파일 내보내기); undo·북마크 없음 | 52% |
-| 스크립팅·확장 (8) | IDAPython, IDC, SDK, 플러그인 | Python 라이브러리 API, 스크립팅 API(`here()`·`rename()`·`decompile()`·`patch()` …), GUI Python 콘솔, 플러그인(`register(api)` → Plugins 메뉴), `relic script` 배치 실행, CLI | 40% |
+| 디컴파일러 (20) | Hex-Rays: 다수 아키텍처, 타입·구조체 대화형 수정, 부동소수점 | x86-64/x86-32/AArch64/ARM32/MIPS32, 재컴파일 검증, 구조화(switch·for·&&), 상수 나눗셈, -fipa-ra 레지스터 보존, 구조체 복원·대화형 재타입(`Y`), x86-64 SSE·AArch64·ARM VFP(armhf) 부동소수점(`float`/`double` 인자·반환값·리터럴·변환·비교·`fma`, 레지스터보다 많은 인자, 비트 단위 재컴파일 검증); x87 부동소수점, SIMD 없음 | 52% |
+| 대화형 UI (12) | 리스팅·그래프·xref·이름/주석·검색·패치·undo·북마크·구조체 창 | 리스팅·그래프(층별 레이아웃)·의사 코드·헥스, 이름/주석/변수 이름, xref, 이동 기록, 테마·확대, 검색(바이트·텍스트·즉치값·명령어), 바이트 패치(NOP·분기 반전·어셈블, 프로젝트에 저장, 패치된 파일 내보내기), 모든 편집(이름·주석·타입·구조체·북마크·패치)의 undo/redo, 북마크, 함수 안 데이터(리터럴 풀·인라인 점프 테이블·패딩) 표시 | 62% |
+| 스크립팅·확장 (8) | IDAPython, IDC, SDK, 플러그인 | Python 라이브러리 API, 스크립팅 API(`here()`·`rename()`·`decompile()`·`patch()` …), GUI Python 콘솔, 플러그인(`register(api)` → Plugins 메뉴, 리스팅 줄 꾸미기·분석 완료·커서 이동 훅), `relic script` 배치 실행, CLI | 40% |
 | 디버거 (7) | 로컬·원격(gdbserver 등) 디버깅 | 로컬 GUI 디버거(GDB/MI): 실행·단계 실행·중단점(조건·활성화·적중 횟수, 라이브러리 함수 이름)·하드웨어 watchpoint·리스팅/의사 코드 동기화, pwndbg식 레지스터·스택 telescope·vmmap·메모리 hexdump·백트레이스·콘솔, 레지스터·메모리 편집, PIE 슬라이드 보정; 원격·힙 뷰 없음 | 40% |
-| 프로젝트·협업 (5) | IDB, 스냅숏, Teams, Lumina | `<binary>.relic.json`(이름·주석·변수 이름·패치) | 18% |
+| 프로젝트·협업 (5) | IDB, 스냅숏, Teams, Lumina | `<binary>.relic.json`(이름·주석·변수 이름·타입·구조체·패치·북마크) | 22% |
 
 IDA Pro에 없는 Relic 쪽 기능: checksec(ELF/PE 보호 기법), 포너블 휴리스틱(위험 함수, 비상수 포맷 스트링, 폭 없는 `scanf("%s")`, ret2win 후보), 디컴파일 결과의 재컴파일 검증 하네스.
 
@@ -46,7 +46,7 @@ IDA Pro에 없는 Relic 쪽 기능: checksec(ELF/PE 보호 기법), 포너블 �
 
 1. ~~검색(텍스트·바이트 패턴·즉치값·명령어)~~, ~~바이트 패치·패치된 바이너리 저장~~ (완료)
 2. ~~GUI 안의 Python 콘솔과 플러그인 진입점 (IDAPython 대응)~~ (완료: `relic.scripting`)
-3. 정적 링크 라이브러리 함수 식별 (FLIRT 대응 시그니처)
+3. ~~정적 링크 라이브러리 함수 식별 (FLIRT 대응 시그니처)~~ (완료: x86/x64; 다른 아키텍처 남음)
 4. 구조체·타입 시스템과 디컴파일러 연동 (~~자동 복원·필드 접근·중첩·배열·이름 변경·타입 지정·편집 창~~ 완료; 열거형, 공용체, C 헤더 가져오기 남음)
 5. Mach-O 로더, RISC-V / PPC 리프터 (MIPS32는 완료)
 6. ~~디버거 보강: watchpoint, 레지스터·메모리 값 편집~~ (완료)
@@ -189,7 +189,8 @@ relic sc.bin --arch x64 --base 0x1000
 | `Ctrl+Alt+Pause` / `Ctrl+F2` | 일시 정지 / 종료 |
 | `Ctrl+Alt+P` / `Ctrl+Alt+A` | 바이트 패치 / 어셈블해서 패치 (`pip install .[asm]`: keystone) |
 | `Ctrl+Alt+N` / `Ctrl+Alt+J` | 명령어를 NOP으로 / 조건 분기 반전 (Edit ▸ Revert patch, Export patched file) |
-| `Ctrl+Z` / `Ctrl+Shift+Z` | 패치 되돌리기 / 다시 하기 |
+| `Ctrl+Z` / `Ctrl+Shift+Z` | 마지막 편집 되돌리기 / 다시 하기 (이름·주석·타입·구조체·북마크·패치를 순서대로, 커서는 그 위치로) |
+| `Alt+M` / `Ctrl+M` | 커서 위치 북마크(설명 입력, 비우면 삭제) / Bookmarks 패널 (더블클릭 이동, `Delete`로 삭제) |
 | `Ctrl+Shift+S` | 구조체 창: 복원된 구조체의 필드 이름·타입 수정, 필드 추가(`0x10 char[8] tag`)·삭제 |
 | `Ctrl+Shift+P` | Python 콘솔 (`an`, `here()`, `goto()`, `rename()`, `decompile()`, `patch()` …, ↑/↓ 기록) |
 | `Ctrl+.` | 실행 중인 분석 / 취약점 스캔 / 검색 취소 |
@@ -245,9 +246,18 @@ def register(api):
             if "gets(" in ns["decompile"](f):
                 ns["comment"](f.addr, "calls gets")
     api.add_action("Mark gets() callers", run, "Ctrl+Alt+G")     # Plugins 메뉴에 추가
+
+    # 리스팅 줄 꾸미기: 주석 덧붙이기, 배경색
+    def deco(an, line):
+        if line.mnemonic == "call" and "gets" in line.operands:
+            return {"comment": "unbounded read", "color": "#5a1e1e"}
+    api.add_line_decorator(deco)
+
+    api.on_analysis(lambda ns: print(len(ns["functions"]()), "functions"))   # 분석이 끝날 때마다 (패치 후 재분석 포함)
+    api.on_cursor(lambda ns, a: None)                                        # 커서가 다른 주소로 갈 때
 ```
 
-플러그인을 불러오다 난 오류는 GUI를 막지 않고 Python 콘솔에 표시됩니다.
+플러그인을 불러오다 난 오류나 훅 안의 예외는 GUI를 막지 않고 Python 콘솔에 (훅마다 한 번) 표시됩니다.
 
 ## 라이브러리로 사용
 

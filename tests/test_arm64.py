@@ -34,7 +34,7 @@ def test_checksum_and_main(an):
     code = _c(a, "checksum")
     assert code.startswith("int checksum(char *a1)") and "> 100000" in code and "0x1337" in code
     code = _c(a, "main")
-    assert code.startswith("int main(int a1, ") and "while (1) {" in code and "break;" in code
+    assert code.startswith("int main(int argc, ") and "while (1) {" in code and "break;" in code
     assert "goto" not in code
 
 

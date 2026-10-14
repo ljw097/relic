@@ -49,7 +49,7 @@ def test_checksum(an):
 def test_main(an):
     _, a = an
     code = _c(a, "main")
-    assert code.startswith("int main(int a1, ") and "while (1) {" in code
+    assert code.startswith("int main(int argc, ") and "while (1) {" in code
     assert "setvbuf(" in code and "stdout" in code
     assert " r3" not in code                                         # alignment push of r3 hidden
 
@@ -84,7 +84,7 @@ def test_stripped_binary_finds_main_and_win(request, name):
     main = a.function_by_name("main")
     assert main is not None
     code = decompile(a, main).text
-    assert code.startswith("int main(int a1, ") and "setvbuf(" in code and "while (1) {" in code
+    assert code.startswith("int main(int argc, ") and "setvbuf(" in code and "while (1) {" in code
     kinds = {f.kind for f in a.vulns()}
     assert "win-function" in kinds and "dangerous-call" in kinds
     assert len([f for f in a.functions.values() if not f.is_import]) >= 14
@@ -101,7 +101,7 @@ def test_listing_shows_literal_pools_and_inline_tables(vuln_arm, flow_thumb_O2):
     assert all(not any(b.addr <= ln.addr < b.end for b in f.blocks.values()) for ln in pool)
     an = analyze(flow_thumb_O2)
     f = next(g for g in an.functions.values() if any(an.dis.decode(j).mnemonic == "tbb" for j in g.jump_tables))
-    cases = [ln for ln in function_lines(an, f) if ln.mnemonic == ".byte"]
+    cases = [ln for ln in function_lines(an, f) if ln.mnemonic == ".byte" and ln.target is not None]
     targets = [t for j, ts in f.jump_tables.items() if an.dis.decode(j).mnemonic == "tbb" for t in ts]
     assert [ln.target for ln in cases] == targets
     addrs = [ln.addr for ln in function_lines(an, f) if ln.kind == "insn"]

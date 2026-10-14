@@ -12,7 +12,9 @@ from __future__ import annotations
 from typing import TYPE_CHECKING
 
 from .arch import ArchInfo
-from .ir import Assign, Call, CallStmt, Cast, Const, Expr, IRFunction, Phi, Var, children, stmt_exprs, walk
+from .ir import (Assign, Call, CallStmt, Cast, Const, Expr, Extract, IRFunction, Phi, Return, Var, children,
+                 stmt_exprs, walk)
+from .fpabi import arg_classes, fp_params, fp_part, fp_sig, is_fp_arch, is_fp_reg, place_args
 from .sigs import arg_count, lookup
 
 if TYPE_CHECKING:
@@ -25,6 +27,7 @@ _INT_ARGS = {
     "x86-cdecl": (),  # arguments are passed on the stack (recovered with the frame, stage 3b)
     "arm64-aapcs": tuple(f"x{k}" for k in range(8)),
     "arm-aapcs": ("r0", "r1", "r2", "r3"),
+    "arm-aapcs-vfp": ("r0", "r1", "r2", "r3"),
     "mips-o32": ("a0", "a1", "a2", "a3"),
 }
 
@@ -123,30 +126,85 @@ def narrow_call_args(an: "Analysis", arch: ArchInfo, fn) -> int:
                 changed = True
         if changed:
             n += 1
-            s.call = Call(call.target, tuple(args), call.bits)
+            s.call = Call(call.target, tuple(args), call.bits, call.fargs)
     return n
 
 
-def _compute_livein(an: "Analysis", arch: ArchInfo, target: int) -> list[str]:
-    ssa = _entry_ssa(an, arch, target)
+def livein_regs(an: "Analysis", arch: ArchInfo, target: int) -> set[str]:
+    """Every argument register the callee really reads on entry (no prefix rule)."""
+    return _compute_livein(an, arch, target, prefix=False)
+
+
+def _entry_opt(an: "Analysis", arch: ArchInfo, target: int):
+    """The callee's SSA after the optimisation passes (no call recovery, so no recursion into
+    other callees): a register the code only seemed to read -- the old value a predicated
+    `movgt r0, #1; movle r0, #0` keeps, a scratch read that folds away -- is not read there."""
+    cache = an.__dict__.setdefault("_entry_opt_cache", {})
+    from .fpabi import fp_return_pending
+    if fp_return_pending(an, target):
+        return _entry_ssa(an, arch, target)      # its float result is not known yet: do not keep this
+    if target not in cache:
+        ssa = _entry_ssa(an, arch, target)
+        cache[target] = ssa                 # (while this one is worked out: the unoptimised reads)
+        opt = ssa
+        f = an.functions.get(target)
+        if ssa is not None and f is not None:
+            from .fpabi import set_fp_returns
+            from .lift import lift_function
+            from .passes import optimize
+            from .ssa import to_ssa
+            try:
+                fn = lift_function(an, f)
+                set_fp_returns(an, f, fn)   # a float result keeps the computation of it alive
+                opt = optimize(to_ssa(fn, arch), arch)
+            except Exception:  # noqa: BLE001 - fall back to the unoptimised reads
+                opt = ssa
+        cache[target] = opt
+    return cache[target]
+
+
+def _compute_livein(an: "Analysis", arch: ArchInfo, target: int, prefix: bool = True):
+    ssa = _entry_opt(an, arch, target)
     if ssa is None:
-        return []
+        return [] if prefix else set()
     # a call's implicit `uses` list every argument register the convention allows, which
     # would make every register look like a parameter; only count what the callee really
     # reads, plus the registers a known libc callee consumes (wrappers passing args along).
     # Phis are followed only from such real uses (clobbered registers merge at joins).
     phis: dict[Var, Phi] = {}
     used: set[Var] = set()
+    # a function returning a float does not return the integer register: its `return` (which
+    # reads that register until the float result is known) is no use of an argument register
+    float_result = None
     for s in ssa.stmts():
         if isinstance(s, Assign) and isinstance(s.src, Phi):
             phis[s.dst] = s.src
             continue
         tops = stmt_exprs(s)
+        if isinstance(s, Return) and isinstance(s.value, Var) and s.value.name == arch.ret:
+            if float_result is None:
+                f = an.functions.get(target)
+                from .fpabi import fp_return
+                float_result = f is not None and fp_return(an, f) is not None
+            if float_result:
+                continue
         if isinstance(s, CallStmt):
             tops = [s.call]
+            # a value computed for the call (folded into it by the optimiser) reads what it uses;
+            # a register handed on untouched says nothing
+            tops += [v for r, v in s.uses if not (isinstance(v, Var) and v.version == 0 and v.name == r)
+                     and not isinstance(v, (Var, Const))]
             sig = lookup(s.name or (an.name(s.call.target.value) if isinstance(s.call.target, Const) else None))
             if sig is not None:
-                keep = set(int_arg_regs(arch)[:sig.argc])
+                argregs = int_arg_regs(arch)
+                uses = dict(s.uses)
+                fmt = _read_format(an, uses.get(argregs[sig.fmt])) if sig.fmt is not None and \
+                    sig.fmt < len(argregs) else None
+                n = arg_count(sig, fmt)
+                keep = set(argregs[:n])
+                if is_fp_arch(arch) and fmt is not None:
+                    classes = arg_classes(sig, fmt, scan="scanf" in (s.name or ""))
+                    keep = {r for r in place_args(arch, classes, argregs, variadic=True) if r in argregs}
                 tops += [v for r, v in s.uses if r in keep]
         used |= {x for top in tops for x in walk(top) if isinstance(x, Var)}
     work = [v for v in used if v in phis]
@@ -157,6 +215,8 @@ def _compute_livein(an: "Analysis", arch: ArchInfo, target: int) -> list[str]:
                 if x in phis:
                     work.append(x)
     livein = {v.name for v in used if v.version == 0}
+    if not prefix:
+        return livein & set(int_arg_regs(arch))
     # take the contiguous prefix of argument registers: a gap means the later
     # ones are scratch (e.g. a partial write like `mov dl, al` reads rdx), not parameters
     params: list[str] = []
@@ -190,7 +250,8 @@ def _set_before_call(fn: IRFunction, argregs, uses: dict, params=()) -> list[str
 
 # ------------------------------------------------------------------ cdecl (x86-32)
 def stack_param_count(an: "Analysis", arch: ArchInfo, target: int) -> int:
-    """How many 4-byte stack parameters an internal cdecl callee reads (`[esp_0 + 4k]`)."""
+    """How many word-sized stack parameters an internal callee reads (cdecl `[esp_0 + 4k]`, the
+    stack arguments past the registers on x86-64 / AArch64)."""
     cache = getattr(an, "_stack_params", None)
     if cache is None:
         cache = an._stack_params = {}
@@ -208,18 +269,97 @@ def stack_param_count(an: "Analysis", arch: ArchInfo, target: int) -> int:
     except Exception:
         return 0
     frame = Frame(arch, _build_spoff(ssa, arch))
+    from .fpconst import float_operands
     from .ir import Load
     word = arch.bits // 8
+    base = param_base(arch)
     top = 0
+    floats: dict[int, int] = {}            # stack parameter index -> float width
+    sizes: dict[int, int] = {}             # stack parameter offset (from the first) -> widest load, bytes
+    shadow = 4 if arch.name == "x64-win" else 0   # the home slots of rcx, rdx, r8, r9
+    defs = {st.dst: st.src for st in ssa.stmts() if isinstance(st, Assign) and isinstance(st.dst, Var)}
+
+    def loaded(k):
+        """The load a float operand comes from: directly, or through the register it went to."""
+        for _ in range(3):
+            while isinstance(k, Cast) and k.kind in ("low", "zext"):
+                k = k.a
+            if isinstance(k, Var) and k in defs:
+                k = defs[k]
+            else:
+                break
+        return k
+
     for st in ssa.stmts():
         for e in stmt_exprs(st):
             for x in walk(e):
                 if isinstance(x, Load):
                     off = frame.offset_of(x.addr)
-                    if off is not None and off > 0:
-                        top = max(top, (off + x.bits // 8 + word - 1) // word - 1)
+                    if off is not None and off >= base:
+                        top = max(top, (off - base + x.bits // 8 + word - 1) // word)
+                        rel = off - base - shadow * word
+                        sizes[rel] = max(sizes.get(rel, 0), x.bits // 8)
+                for k in float_operands(x):
+                    k = loaded(k)
+                    if isinstance(k, Load):
+                        off = frame.offset_of(k.addr)
+                        if off is not None and off >= base and off % word == 0:
+                            floats[(off - base) // word - shadow] = k.bits
+    top = max(0, top - shadow)
+    an.__dict__.setdefault("_stack_param_floats", {})[target] = floats
+    # the parameters as slots: a double on a 32-bit target spans two words
+    slots, w = [], 0
+    while w < top:
+        rel = w * word
+        size = word * 2 if word == 4 and (sizes.get(rel) == 8 or floats.get(w) == 64) else word
+        slots.append((rel, size, floats.get(w)))
+        w += size // word
+    an.__dict__.setdefault("_stack_param_slots", {})[target] = slots
     cache[target] = top
     return top
+
+
+def stack_param_slots(an: "Analysis", arch: ArchInfo, target: int) -> list[tuple[int, int, int | None]]:
+    """The stack parameters of an internal callee: (offset from the first, size in bytes, float
+    width or None). The program's entry point has none: the kernel's argc / argv block is not a
+    C call's arguments."""
+    if target == an.bin.entry:
+        return []
+    stack_param_count(an, arch, target)
+    return an.__dict__.get("_stack_param_slots", {}).get(target, [])
+
+
+def param_base(arch: ArchInfo) -> int:
+    """Entry-stack-pointer offset of the first stack parameter: above the return address on x86,
+    at the stack pointer itself where the return address is in a register (AArch64)."""
+    return arch.bits // 8 if arch.name.startswith(("x86", "x64")) else 0
+
+
+def stack_params_used(arch: ArchInfo) -> bool:
+    """Whether calls on this convention get stack arguments recovered (cdecl has its own path)."""
+    return arch.name.startswith(("x64", "arm64", "arm-aapcs"))
+
+
+def stack_param_floats(an: "Analysis", arch: ArchInfo, target: int) -> dict[int, int]:
+    """Which stack parameters of an internal callee it reads as floats: index -> width."""
+    stack_param_count(an, arch, target)
+    return an.__dict__.get("_stack_param_floats", {}).get(target, {})
+
+
+def _arg_stores(b, k: int, frame, base: int, word: int) -> dict[int, int]:
+    """Most recent store to each word-aligned outgoing argument slot at or above `base` (frame
+    offsets) since the previous call in the block: offset -> statement index."""
+    from .ir import Store
+    stores: dict[int, int] = {}
+    for j in range(k - 1, -1, -1):
+        t = b.stmts[j]
+        if isinstance(t, CallStmt):
+            break
+        if isinstance(t, Store):
+            off = frame.offset_of(t.dst)
+            if off is not None and off >= base and (off - base) % word == 0 and off not in stores:
+                stores[off] = j
+    return stores
 
 
 def _recover_cdecl(fn: IRFunction, an: "Analysis", arch: ArchInfo):
@@ -295,29 +435,179 @@ def recover_calls(fn: IRFunction, an: "Analysis", arch: ArchInfo) -> IRFunction:
         return fn
     argregs = int_arg_regs(arch)
     own: list[str] | None = None
+    frame = None
+    defs: dict | None = None
     for b in fn.blocks.values():
-        for s in b.stmts:
+        consumed: set[int] = set()
+        for k, s in enumerate(b.stmts):
             if not isinstance(s, CallStmt) or s.call.args:
                 continue
+            fps: list = []
+            widths: dict = {}
+            classes: list[str] = []
+            stack_offs: list[int] | None = None      # offsets of the stack arguments (default: in order)
+            stack_sizes: list[int] | None = None
             uses = dict(s.uses)
             tgt = s.call.target.value if isinstance(s.call.target, Const) else None
             name = s.name or (an.name(tgt) if tgt is not None else None)
             sig = lookup(name)
             f = an.functions.get(tgt) if tgt is not None else None
-            if sig is not None:
+            fsig = fp_sig(name) if is_fp_arch(arch) else None
+            placed: list | None = None          # per argument: register, or None (on the stack)
+            if fsig is not None:
+                classes = arg_classes(None, None, fsig)
+                placed = place_args(arch, classes, argregs)
+            elif sig is not None:
                 fmt = _read_format(an, uses.get(argregs[sig.fmt])) if sig.fmt is not None and \
                     sig.fmt < len(argregs) else None
-                selected = list(argregs[:arg_count(sig, fmt)])
+                if is_fp_arch(arch) and fmt is not None:
+                    classes = arg_classes(sig, fmt, scan="scanf" in (name or ""))
+                    placed = place_args(arch, classes, argregs, variadic=True)
+                else:
+                    selected = list(argregs[:arg_count(sig, fmt)])
             elif f is not None and not f.is_import:
                 selected = _livein_arg_regs(an, arch, tgt)
+                fps = fp_params(an, arch, tgt)
+                widths = dict(fps)
+                slots = stack_param_slots(an, arch, tgt) if stack_params_used(arch) else []
+                if fps or slots:
+                    placed = selected + [r for r, _ in fps] + [None] * len(slots)
+                    classes = ["i"] * len(selected) + ["d"] * len(fps) + \
+                        [("f" if fw == 32 else "d") if fw else "i" for _, _, fw in slots]
+                    stack_offs = [rel for rel, _, _ in slots]
+                    stack_sizes = [size for _, size, _ in slots]
             else:
                 if own is None:
                     own = _livein_arg_regs(an, arch, fn.addr)
                 selected = _set_before_call(fn, argregs, uses, own)
-            args = [uses[r] for r in selected if r in uses]
-            s.call = Call(s.call.target, tuple(args), s.call.bits)
-            s.uses = [(r, uses[r]) for r in selected if r in uses]
+            if placed is None:
+                placed = selected
+            stack_vals = iter(())
+            if None in placed:
+                if frame is None:
+                    from .stack import Frame, _build_spoff
+                    frame = Frame(arch, _build_spoff(fn, arch))
+                if stack_offs is None:
+                    on_stack = [c for c, r in zip(classes or ["i"] * len(placed), placed) if r is None]
+                    stack_offs = stack_offsets(arch, on_stack)
+                    stack_sizes = [8 if c == "d" else arch.bits // 8 for c in on_stack]
+                stack_vals = _stack_values(b, k, s, frame, arch, stack_offs, consumed, stack_sizes)
+            args = []
+            fargs = []
+            for pos, r in enumerate(placed):
+                if r is None:                     # the next stack argument
+                    v = next(stack_vals, None)
+                    if v is None:
+                        break
+                    if pos < len(classes) and classes[pos] in "df":
+                        fargs.append((len(args), 32 if classes[pos] == "f" else 64))
+                        v = Cast("low", v, 64) if v.bits > 64 else v
+                    args.append(v)
+                    continue
+                if ":" in r:                      # a double in a pair of core registers (variadic ARM)
+                    lo_r, hi_r = r.split(":")
+                    if lo_r not in uses or hi_r not in uses:
+                        continue
+                    if defs is None:
+                        defs = {t.dst: t.src for t in fn.stmts() if isinstance(t, Assign) and isinstance(t.dst, Var)}
+                    v = _pair_value(uses[lo_r], uses[hi_r], defs)
+                    fargs.append((len(args), 64))
+                    args.append(v)
+                    continue
+                full, lo, part = fp_part(r) if is_fp_reg(r) else (r, 0, None)
+                if full not in uses:
+                    continue
+                v = uses[full]
+                if is_fp_reg(r):                  # the float in the register (its low lanes, or an ARM half)
+                    w = widths.get(r) or part or (32 if pos < len(classes) and classes[pos] == "f" else 64)
+                    v = Extract(v, lo, w) if lo else Cast("low", v, w) if v.bits > w else v
+                    fargs.append((len(args), w))
+                args.append(v)
+            s.call = Call(s.call.target, tuple(args), s.call.bits, tuple(fargs))
+            used = dict.fromkeys(x for r in placed if r is not None for x in fp_part(r)[0].split(":"))
+            s.uses = [(r, uses[r]) for r in used if r in uses]
+        if consumed:
+            b.stmts = [t for j, t in enumerate(b.stmts) if j not in consumed]
     return fn
+
+
+def _pair_value(lo: Expr, hi: Expr, defs: dict | None = None) -> Expr:
+    """The 64-bit value two core registers carry: `lo | hi << 32` -- the double itself when they
+    are its halves (`vmov r2, r3, d7`, or two loads of one double: `ldrd r2, r3, [sp, #8]`)."""
+    from .ir import BinOp, Load
+    if defs:
+        rlo = defs.get(lo, lo) if isinstance(lo, Var) else lo
+        rhi = defs.get(hi, hi) if isinstance(hi, Var) else hi
+        if isinstance(rlo, Load) and isinstance(rhi, Load):
+            la = defs.get(rlo.addr, rlo.addr) if isinstance(rlo.addr, Var) else rlo.addr
+            ha = _split_addr(rhi.addr)
+            ha = (defs.get(ha[0], ha[0]) if isinstance(ha[0], Var) else ha[0], ha[1])
+            hb = _split_addr(ha[0])
+            lb = _split_addr(la)
+            if rlo.bits == rhi.bits == 32 and hb[0] == lb[0] and hb[1] + ha[1] == lb[1] + 4:
+                return Load(la, 64)
+    if isinstance(lo, Cast) and lo.kind == "low" and isinstance(hi, Extract) and hi.lo == 32 and lo.a == hi.a \
+            and lo.a.bits == 64:
+        return lo.a
+    from .ir import Load
+    if isinstance(lo, Load) and isinstance(hi, Load) and lo.bits == hi.bits == 32 and \
+            _split_addr(hi.addr) == (_split_addr(lo.addr)[0], _split_addr(lo.addr)[1] + 4):
+        return Load(lo.addr, 64)                     # the two halves of one double in memory
+    return BinOp("|", Cast("zext", lo, 64), BinOp("<<", Cast("zext", hi, 64), Const(32, 8), 64), 64)
+
+
+def _split_addr(a: Expr) -> tuple[Expr, int]:
+    """`base + k` -> (base, k)."""
+    from .ir import BinOp
+    if isinstance(a, BinOp) and a.op in ("+", "-") and isinstance(a.b, Const):
+        base, k0 = _split_addr(a.a)
+        k = a.b.signed
+        return base, k0 + (k if a.op == "+" else -k)
+    return a, 0
+
+
+def stack_offsets(arch: ArchInfo, classes: list[str]) -> list[int]:
+    """Offsets of stack arguments of these classes, in order: a word each, a double two words
+    aligned to eight bytes on 32-bit targets."""
+    word = arch.bits // 8
+    out, off = [], 0
+    for c in classes:
+        size = 8 if c == "d" else word
+        if size == 8 and word == 4:
+            off = (off + 7) & ~7
+        out.append(off)
+        off += size
+    return out
+
+
+def _stack_values(b, k: int, s: CallStmt, frame, arch: ArchInfo, offs: list[int], consumed: set[int],
+                  sizes: list[int] | None = None):
+    """The values stored to the outgoing stack argument slots at `offs` (from the stack pointer at
+    the call) before call `s` (statement `k` of block `b`), in order, stopping at the first slot
+    not written; their stores are marked consumed (they become the call's arguments)."""
+    from .fpabi import stack_arg_base
+    if s.tail:
+        return
+    sp = dict(s.uses).get(arch.sp)
+    sp_off = frame.offset_of(sp) if sp is not None else None
+    if sp_off is None:
+        return
+    word = arch.bits // 8
+    base = sp_off + stack_arg_base(arch)
+    stores = _arg_stores(b, k, frame, base, word)
+    for n, rel in enumerate(offs):
+        j = stores.get(base + rel)
+        if j is None:
+            return
+        consumed.add(j)
+        v = b.stmts[j].src
+        if sizes is not None and sizes[n] == 8 and v.bits == 32:       # a double stored as two words
+            j2 = stores.get(base + rel + 4)
+            if j2 is None:
+                return
+            consumed.add(j2)
+            v = _pair_value(v, b.stmts[j2].src)
+        yield v
 
 
 __all__ = ["recover_calls", "int_arg_regs"]

@@ -514,9 +514,10 @@ def test_debugger_panels_breakpoints_and_console(app, win):
     win.dbg_console.cmd.setText("info registers rip")
     win.dbg_console._send_cmd()
     win.debug_start_or_continue()
-    assert _debug_wait(app, win, lambda: "exited" in win.dbg_console.out.toPlainText())
-    text = win.dbg_console.out.toPlainText()
-    assert "hello relic" in text and "gdb> info registers rip" in text and "exited" in text
+    # (the program's own output comes through its pty and can land after gdb's exit notice)
+    want = ("hello relic", "gdb> info registers rip", "exited")
+    assert _debug_wait(app, win, lambda: all(w in win.dbg_console.out.toPlainText() for w in want)), \
+        win.dbg_console.out.toPlainText()
     win.dbg.stop()
     assert _debug_wait(app, win, lambda: win.dbg.session is None)
     # breakpoints panel: disable and add a condition (kept for the next run)
@@ -863,6 +864,73 @@ def test_apply_library_signatures(app, vuln64_stripped, tmp_path):
     assert "checksum" in [r[0] for r in _rows(w.funcs.table)]
     w.dirty = False
     w.close()
+
+
+def test_undo_redo_and_bookmarks(app, win):
+    an = win.an
+    vuln = an.function_by_name("vuln").addr
+    win.goto(vuln)
+    win.rename(vuln, "read_name")
+    assert "read_name:" in win.disasm.toPlainText()
+    win.comment(vuln, "look here")
+    win.set_bookmark(vuln, "the overflow")
+    assert _rows(win.bookmarks) == [[f"{vuln:#x}", "read_name", "the overflow"]]
+    win.goto(an.function_by_name("main").addr)
+    assert win.undo() and not _rows(win.bookmarks)           # the bookmark
+    assert win.cur == vuln                                   # the cursor goes to what was undone
+    assert win.undo() and "look here" not in win.disasm.toPlainText()
+    assert win.undo() and "vuln:" in win.disasm.toPlainText()
+    assert "vuln" in [r[0] for r in _rows(win.funcs.table)]
+    assert not win.undo()
+    assert win.redo() and win.redo() and win.redo()
+    assert _rows(win.bookmarks)[0][2] == "the overflow" and "read_name" in [r[0] for r in _rows(win.funcs.table)]
+    # patches undo through the same Ctrl+Z
+    win.goto(vuln)
+    assert win.patch_with("nop")
+    assert win.undo() and not an.patches
+    # Delete in the bookmarks table removes the selected bookmark
+    win.bookmarks.selectRow(0)
+    win.remove_selected_bookmarks()
+    assert not an.bookmarks and not _rows(win.bookmarks)
+
+
+def test_plugin_hooks(app, vuln64, tmp_path, monkeypatch):
+    """Line decorators (comment and colour), the analysis-done and cursor events; a hook that
+    raises is reported once and the listing still renders."""
+    plugins = tmp_path / "plugins"
+    plugins.mkdir()
+    (plugins / "hooks.py").write_text(
+        "events = []\n"
+        "def register(api):\n"
+        "    def deco(an, line):\n"
+        "        if line.mnemonic == 'call' and 'gets' in line.operands:\n"
+        "            return {'comment': 'unbounded read', 'color': '#5a1e1e'}\n"
+        "    api.add_line_decorator(deco)\n"
+        "    api.add_line_decorator(lambda an, line: 1 / 0)\n"
+        "    api.on_analysis(lambda ns: events.append(('analysis', len(ns['functions']()))))\n"
+        "    api.on_cursor(lambda ns, a: events.append(('cursor', a)))\n"
+        "    api.win.test_events = events\n")
+    monkeypatch.setenv("RELIC_PLUGINS", str(plugins))
+    path = tmp_path / "vuln64"
+    shutil.copy(vuln64, path)
+    w = MainWindow()
+    try:
+        w.open_file(str(path))
+        assert w.wait()
+        events = w.test_events
+        assert events and events[0][0] == "analysis" and events[0][1] >= 10
+        vuln = w.an.function_by_name("vuln")
+        w.goto(vuln.addr)
+        assert ("cursor", vuln.addr) in events
+        line = next(ln for ln in w.disasm.lines if ln.kind == "insn" and "gets" in ln.operands)
+        assert line.color == "#5a1e1e" and "unbounded read" in line.comment
+        assert "unbounded read" in w.disasm.toPlainText()
+        assert w.pyconsole.out.toPlainText().count("ZeroDivisionError") == 1      # reported once
+        w.patch_with("nop")                                                     # re-analysis
+        assert sum(e[0] == "analysis" for e in events) == 2
+    finally:
+        w.dirty = False
+        w.close()
 
 
 def test_plugin_hooks_analysis_and_listing(app, vuln64, tmp_path, monkeypatch):

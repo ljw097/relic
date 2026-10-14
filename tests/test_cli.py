@@ -52,7 +52,7 @@ def test_opt_frame(capsys, vuln64):
 
 def test_decompile(capsys, vuln64):
     out = run(capsys, "decompile", vuln64, "main")
-    assert out.startswith("int main(int a1, ")
+    assert out.startswith("int main(int argc, ")
     assert "while (1) {" in out                         # structured menu loop
     assert "if (" in out and "menu()" in out
 

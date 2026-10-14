@@ -21,6 +21,7 @@ from collections import Counter
 
 from ..progress import checkpoint
 from .arch import ArchInfo
+from .fp import fold_fcmp, is_fcmp, negate_fcmp
 from .interp import InterpError, apply_binop, apply_cast, apply_unop
 from .ir import (BARRIERS, Assign, BinOp, Branch, Call, CallStmt, Cast, Const, Effect, Expr, Extract, IRFunction,
                  Ite, Jump, Load, Phi, Return, UnOp, Unknown, Var, children, mask, stmt_exprs, transform, walk)
@@ -143,6 +144,8 @@ def _not(c: Expr) -> Expr:
     """Logical negation, pushed through comparisons and (De Morgan) 1-bit `&` / `|`."""
     if isinstance(c, UnOp) and c.op == "!":
         return c.a
+    if is_fcmp(c):
+        return negate_fcmp(c)
     if isinstance(c, BinOp) and c.op in ("<s", "<=s", "<u", "<=u"):     # IR spelling: swap operands
         return BinOp({"<s": "<=s", "<=s": "<s", "<u": "<=u", "<=u": "<u"}[c.op], c.b, c.a, 1)
     if isinstance(c, BinOp) and c.op in _NEG_CMP:
@@ -175,7 +178,50 @@ def _negation(x: Expr, y: Expr) -> bool:
     return _same_cond(x, _not(y)) or _same_cond(_not(x), y)
 
 
+def _simp_extract(e: Extract) -> Expr:
+    """Bits [lo, lo+w) of a value built from parts (ARM `s15`, the high half of a `d7` that a
+    write of `s14` / `s15` merged): the part that supplies those bits."""
+    a, lo, w = e.a, e.lo, e.bits
+    span = mask(w) << lo
+    if isinstance(a, BinOp) and a.op == "|" and _droppable(a):
+        for x, y in ((a.a, a.b), (a.b, a.a)):
+            if isinstance(x, BinOp) and x.op == "&" and any(isinstance(k, Const) and not k.value & span
+                                                             for k in (x.a, x.b)):
+                return _simp_extract(Extract(y, lo, w))
+            if isinstance(x, Const) and not x.value & span:          # a constant in the other half
+                return _simp_extract(Extract(y, lo, w))
+    if isinstance(a, BinOp) and a.op == "&" and isinstance(a.b, Const) and a.b.value & span == span:
+        return _simp_extract(Extract(a.a, lo, w))                     # a mask that keeps these bits
+    if isinstance(a, BinOp) and a.op == "<<" and isinstance(a.b, Const) and a.b.value == lo:
+        v = a.a
+        if isinstance(v, Cast) and v.kind == "zext" and v.a.bits == w:
+            return v.a
+        if lo == 0:
+            return Cast("low", v, w) if v.bits > w else v
+    if isinstance(a, Cast) and a.kind == "zext" and lo >= a.a.bits:
+        return Const(0, w)
+    if isinstance(a, Const):
+        return Const((a.value >> lo) & mask(w), w)
+    return e
+
+
+def _has_fcmp(e: Expr) -> bool:
+    return any(is_fcmp(x) for x in walk(e))
+
+
 def _simp_node(e: Expr) -> Expr:
+    if e.bits == 1 and isinstance(e, (BinOp, UnOp, Ite)) and (not isinstance(e, BinOp) or e.op[0] != "f"):
+        f = fold_fcmp(e)
+        if f is not e:
+            return f
+    if isinstance(e, Ite) and e.bits > 1:
+        # `c ? 0 : zext(x)` (x 1-bit) -> `zext(c ? 0 : x)`: a condition that can fold further
+        k, x = (e.a, e.b) if isinstance(e.a, Const) else (e.b, e.a)
+        if isinstance(k, Const) and k.value in (0, 1) and isinstance(x, Cast) and x.kind == "zext" and \
+                x.a.bits == 1 and (_has_fcmp(e.cond) or _has_fcmp(x.a)):
+            kb = Const(k.value, 1)
+            inner = Ite(e.cond, kb, x.a, 1) if k is e.a else Ite(e.cond, x.a, kb, 1)
+            return Cast("zext", _simp_node(inner), e.bits)
     if isinstance(e, BinOp):
         a, b, op, w = e.a, e.b, e.op, e.bits
         z = lambda x: isinstance(x, Const) and x.value == 0
@@ -238,6 +284,10 @@ def _simp_node(e: Expr) -> Expr:
         return Ite(e.cond, e.a, e.b.b if e.b.cond == e.cond else e.b.a, e.bits)
     elif isinstance(e, Cast) and e.a.bits == e.bits:
         return e.a
+    elif isinstance(e, Extract):
+        r = _simp_extract(e)
+        if r is not e:
+            return r
     elif isinstance(e, Cast) and e.kind == "low" and isinstance(e.a, BinOp) and e.a.op in ("|", "^", "+"):
         # low_n((x & C) | y) == low_n(y) when C keeps none of the low n bits (a partial register
         # write such as `setle bl` merging into ebx)
@@ -260,7 +310,7 @@ def _fold_pass(fn: IRFunction, memo: dict | None = None) -> bool:
 
 
 # ----------------------------------------------------- constant / copy propagation
-_FLAG_NAMES = frozenset(("zf", "cf", "sf", "of", "pf"))
+_FLAG_NAMES = frozenset(("zf", "cf", "sf", "of", "pf", "fpscr_n", "fpscr_z", "fpscr_c", "fpscr_v"))
 
 
 def _propagate(fn: IRFunction) -> bool:
@@ -531,13 +581,202 @@ def _sign_fixups(fn: IRFunction) -> bool:
 
 
 # ---------------------------------------------------------------------- driver
+# ------------------------------------------------------- halves of a register
+_LO_KEEP, _HI_KEEP = 0xFFFFFFFF00000000, 0xFFFFFFFF
+
+
+def _merge(e: Expr):
+    """A 32-bit half written into a 64-bit register (ARM `s14` into `d7`, see the lifter's
+    `write_reg`): ("lo" | "hi", the rest of the register, the value), else None."""
+    if not (isinstance(e, BinOp) and e.op == "|" and e.bits == 64):
+        return None
+    for keep, v in ((e.a, e.b), (e.b, e.a)):
+        if isinstance(keep, BinOp) and keep.op == "&" and isinstance(keep.b, Const):
+            if keep.b.value == _LO_KEEP and isinstance(v, Cast) and v.kind == "zext" and v.a.bits == 32:
+                return "lo", keep.a, v.a
+            if keep.b.value == _LO_KEEP and isinstance(v, Const) and v.value >> 32 == 0:
+                return "lo", keep.a, Const(v.value, 32)
+            if keep.b.value == _HI_KEEP and isinstance(v, Const) and v.value & 0xFFFFFFFF == 0:
+                return "hi", keep.a, Const(v.value >> 32, 32)
+            if keep.b.value == _HI_KEEP and isinstance(v, BinOp) and v.op == "<<" and isinstance(v.b, Const) \
+                    and v.b.value == 32 and isinstance(v.a, Cast) and v.a.kind == "zext" and v.a.a.bits == 32:
+                return "hi", keep.a, v.a.a
+    return None
+
+
+def _read_halves(fn: IRFunction) -> bool:
+    """Reads of one half of a register assembled from halves read the value written there: the
+    written value goes into a temporary of its own (moving it could cross a store), and
+    `low32(d7)` / `d7[32:64]` become that temporary or, for the other half, the same read of the
+    register before the write. The 64-bit merges are then usually dead."""
+    changed = False
+    n = getattr(fn, "_half_temps", 0)
+    for b in fn.blocks.values():
+        out = []
+        for s in b.stmts:
+            if isinstance(s, Assign) and isinstance(s.dst, Var):
+                m = _merge(s.src)
+                if m is not None and not isinstance(m[2], (Var, Const)):
+                    n += 1
+                    t = Var("_h", n, 32)
+                    out.append(Assign(s.addr, t, m[2]))
+                    side, rest, _ = m
+                    s.src = BinOp("|", BinOp("&", rest, Const(_LO_KEEP if side == "lo" else _HI_KEEP, 64), 64),
+                                  Cast("zext", t, 64) if side == "lo" else
+                                  BinOp("<<", Cast("zext", t, 64), Const(32, 8), 64), 64)
+                    changed = True
+            out.append(s)
+        b.stmts = out
+    fn._half_temps = n
+    defs = {s.dst: s.src for s in fn.stmts() if isinstance(s, Assign) and isinstance(s.dst, Var)}
+
+    def half(v: Expr, want: str, depth: int = 12):
+        while depth:
+            if isinstance(v, Var) and v in defs:
+                v = defs[v]
+            m = _merge(v)
+            if m is None:
+                break
+            side, rest, val = m
+            if side == want:
+                return val if not _has(val, Load, Call) else None      # (hoisted into a temporary first)
+            v, depth = rest, depth - 1
+        return None
+
+    def node(e: Expr) -> Expr:
+        if isinstance(e, Cast) and e.kind == "low" and e.bits == 32 and e.a.bits == 64:
+            r = half(e.a, "lo")
+            return r if r is not None else e
+        if isinstance(e, Extract) and e.lo == 32 and e.bits == 32 and e.a.bits == 64:
+            r = half(e.a, "hi")
+            return r if r is not None else e
+        return e
+    return _rewrite(fn, lambda e: transform(e, node)) or changed
+
+
+def _pair_of_loads(lo: Expr, hi: Expr):
+    """`[a]:32` and `[a + 4]:32`: the address of the 64-bit value they are the halves of."""
+    if isinstance(lo, Load) and isinstance(hi, Load) and lo.bits == hi.bits == 32:
+        a = hi.addr
+        if isinstance(a, BinOp) and a.op == "+" and a.a == lo.addr and isinstance(a.b, Const) and a.b.value == 4:
+            return lo.addr
+    return None
+
+
+def _pair(e: Expr):
+    """`zext64(lo) | zext64(hi) << 32` -> (lo, hi), else None."""
+    if not (isinstance(e, BinOp) and e.op == "|" and e.bits == 64):
+        return None
+    for x, y in ((e.a, e.b), (e.b, e.a)):
+        if isinstance(x, Cast) and x.kind == "zext" and x.a.bits == 32 and isinstance(y, BinOp) and \
+                y.op == "<<" and isinstance(y.b, Const) and y.b.value == 32 and isinstance(y.a, Cast) and \
+                y.a.kind == "zext" and y.a.a.bits == 32:
+            return x.a, y.a.a
+    return None
+
+
+def _join_halves(fn: IRFunction) -> bool:
+    """A double moved through two core registers (ARM `ldrd r2, r3, [x]; vmov d7, r2, r3`) is the
+    64-bit value again: `zext(lo) | zext(hi) << 32` of the two halves of one value, of two adjacent
+    loads, or -- at a join -- of two phis whose sources are such load pairs (a 64-bit load is put
+    after each pair, where no store can come between)."""
+    defs = {s.dst: s.src for s in fn.stmts() if isinstance(s, Assign) and isinstance(s.dst, Var)}
+    where: dict[Var, tuple] = {}
+    for b in fn.blocks.values():
+        for k, s in enumerate(b.stmts):
+            if isinstance(s, Assign) and isinstance(s.dst, Var):
+                where[s.dst] = (b, k)
+    changed = False
+    n = getattr(fn, "_join_temps", 0)
+
+    def joined(e: Expr) -> Expr:
+        nonlocal changed, n
+        p = _pair(e)
+        if p is None:
+            return e
+        lo, hi = p
+        if isinstance(lo, Cast) and lo.kind == "low" and isinstance(hi, Extract) and hi.lo == 32 and \
+                lo.a == hi.a and lo.a.bits == 64:
+            changed = True
+            return lo.a
+        a = _pair_of_loads(lo, hi)
+        if a is not None:
+            changed = True
+            return Load(a, 64)
+        pl, ph = defs.get(lo), defs.get(hi)
+        if isinstance(pl, Phi) and isinstance(ph, Phi) and where.get(lo, (None,))[0] is where.get(hi, (None,))[0]:
+            sl, sh = dict(pl.sources), dict(ph.sources)
+            if set(sl) != set(sh):
+                return e
+            plan = []
+            for pred in sl:
+                x, y = sl[pred], sh[pred]
+                if not (isinstance(x, Var) and isinstance(y, Var) and x in where and y in where):
+                    return e
+                bx, kx = where[x]
+                by, ky = where[y]
+                addr = _pair_of_loads(defs[x], defs[y])
+                if addr is None or bx is not by or bx.addr != pred:
+                    return e
+                last = max(kx, ky)
+                # the 64-bit load goes after both halves: nothing may write memory in between
+                if any(isinstance(t, BARRIERS) for t in bx.stmts[min(kx, ky):last]):
+                    return e
+                plan.append((pred, bx, last, addr))
+            srcs = []
+            for pred, bx, last, addr in plan:
+                n += 1
+                t = Var("_j", n, 64)
+                bx.stmts.insert(last + 1, Assign(bx.stmts[last].addr, t, Load(addr, 64)))
+                srcs.append((pred, t))
+            n += 1
+            joined_var = Var("_j", n, 64)
+            blk = where[lo][0]
+            blk.stmts.insert(0, Assign(blk.addr, joined_var, Phi(tuple(srcs), 64)))
+            changed = True
+            return joined_var
+        return e
+
+    def simple(x: Expr) -> Expr:          # the halves of one value, adjacent loads: anywhere
+        nonlocal changed
+        p = _pair(x)
+        if p is None:
+            return x
+        lo, hi = p
+        if isinstance(lo, Cast) and lo.kind == "low" and isinstance(hi, Extract) and hi.lo == 32 and \
+                lo.a == hi.a and lo.a.bits == 64:
+            changed = True
+            return lo.a
+        a = _pair_of_loads(lo, hi)
+        if a is not None:
+            changed = True
+            return Load(a, 64)
+        return x
+    _rewrite(fn, lambda x: transform(x, simple))
+    for b in list(fn.blocks.values()):
+        for s in list(b.stmts):
+            if not isinstance(s, Assign) or not isinstance(s.src, BinOp):
+                continue
+            new = joined(s.src)
+            if new is not s.src:
+                s.src = new
+                fn._join_temps = n
+                return True                  # positions moved: one at a time, the loop comes back
+    fn._join_temps = n
+    return changed
+
+
 def optimize(fn: IRFunction, arch: ArchInfo | None = None) -> IRFunction:
     """Run every pass to a fixpoint. Mutates and returns `fn` (expects SSA input)."""
     folded: dict = {}
     conds: dict = {}
+    halves = arch is not None and arch.name.startswith("arm-aapcs")
     for _ in range(MAX_ITERS):
         checkpoint()                 # a cancelled decompilation stops between rounds
         changed = False
+        if halves:
+            changed |= _read_halves(fn)
+            changed |= _join_halves(fn)
         changed |= _fold_pass(fn, folded)
         changed |= _propagate(fn)
         changed |= _forward_loads(fn)

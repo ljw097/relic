@@ -130,6 +130,10 @@ def _negate(c):
     if isinstance(c, UnOp) and c.op == "!":
         return c.a
     if isinstance(c, BinOp):
+        if c.op[0] == "f":
+            from .fp import is_fcmp, negate_fcmp
+            if is_fcmp(c):
+                return negate_fcmp(c)
         if c.op == "==":
             return BinOp("!=", c.a, c.b, 1)
         if c.op == "!=":

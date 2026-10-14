@@ -91,6 +91,7 @@ class Binary:
         # mapping symbols (address -> "a" | "t" | "d")
         self.thumb_code: set[int] = set()
         self.arm_mapping: dict[int, str] = {}
+        self.arm_hard_float = False      # AAPCS-VFP (armhf): floats travel in s / d registers
         self.mips_gp: int | None = None     # MIPS: value of $gp (GOT + 0x7ff0)
         self.mips_local_got = (0, 0)         # MIPS: [start, end) of the GOT's local entries
 

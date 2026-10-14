@@ -11,6 +11,7 @@
 
 - [x] 측정 도구: `tools/bench.py` — 분석·전체 디컴파일 시간, 함수별 상위 시간(함수당 시간 상한), goto·미해결 점프·`__asm` 수
 - [x] `/usr/bin/grep`: 174개 함수 디컴파일 87.3초 → 43초대(goto 1723, 미해결 점프 8, `__asm` 18 그대로). 단독으로 처음 여는 경우 `main` 89초 → 27초, `sub_95b0` 32초 → 9초. 한 일: 필드 접근이 있는 매개변수만 호출자 조회, `narrow` 한 번의 순회(고정점 반복), DCE 사용 횟수 1회 계산 후 증감, 호출자 구조체 함수당 1회 생성, 피호출자가 요청한 호출자 구조체는 그 피호출자의 접근만 병합
+- [x] 카나리 검사 찾기의 지수 시간(메모): mawk 전체 620초 → 62초, 시간 초과 2 → 0
 - [ ] 남은 비용: 구조체 스캔이 관련 함수마다 전체 `decompile_ir`(lift→SSA→최적화→호출 복원)를 요구 — 큰 함수는 자기 피호출자들까지 준비. `_rewrite`/`transform`(최적화 반복마다 전체 재작성)과 `_compute_livein`(호출마다 피호출자 SSA)이 다음 후보
 - [x] 함수 하나가 오래 걸려도 GUI가 기다리지 않음: 다른 함수로 이동하면 실행 중인 디컴파일을 취소(취소 결과는 캐시하지 않음), 취소가 구조체·반환 폭 캐시의 재귀 가드를 "없음"으로 남기지 않음
 
@@ -18,9 +19,7 @@
 
 - [x] libc 인자·결과 타입으로 매개변수·변수 타입 지정(`strlen(a1)` → `char *a1`, `malloc(n)` → `size_t n`, `void *` 결과, `fopen` → `FILE *`, 상수 형식 문자열의 `%s`/`%p`/`%zu`, 식 안의 호출 포함) — 메모리 접근으로 복원한 포인터 타입이 우선
 - [ ] goto 줄이기 — 기준선(bench): true 153, cat 375, gzip 911, grep 1861. 구조화·출력 정확성은 무작위 CFG 실행 비교 테스트(`test_random_cfgs_run_like_the_cfg`: 구조화 트리, `test_emitted_c_runs_like_the_cfg`: 출력한 C를 gcc로 컴파일해 실행)로 지킴: 줄이는 변경도 이 테스트를 통과해야 함
-  - [ ] -O0 비교 트리(범위 검사 분기마다 꼬리 블록이 복제된 형태)를 switch로
   - [ ] 큰 상태 기계 함수의 goto(gnulib `quotearg`, gzip deflate/inflate) — 조건 기반 구조화 검토
-- [x] 함수 내부 데이터를 리스팅에 데이터로 표시: ARM 리터럴 풀(`ldr r0, [pc, #n]`, AArch64 `ldr x0, #addr`)은 `.word` + 값·참조, Thumb `tbb`/`tbh`·ARM `ldr pc` 점프 테이블은 항목마다 대상 레이블
 
 ## P1 — 분석
 
@@ -30,7 +29,8 @@
 
 ## P2
 
-- [x] 플러그인 훅: `api.on_analysis(cb)`(분석 결과가 표시될 때), `api.add_listing_comment(cb)`(리스팅 주석 덧붙이기) — 줄 색은 아직
+- [ ] 부동소수점: x87(`fld`/`fstp`, 32비트 cdecl의 `double` 반환), `unsigned` ↔ `double` 변환 관용구(`cvtsi2sd` + 보정 분기)
+
 - [ ] 열거형·공용체 타입
 - [ ] RISC-V / PPC 리프터(호출 인자 추출은 같은 경로로), PPC64 ELFv1 함수 디스크립터, RISC-V `auipc` 쌍
 - [ ] ARM 데이터 영역을 코드로 잘못 읽은 경우(coprocessor 명령 등) 감지

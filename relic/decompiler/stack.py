@@ -21,13 +21,25 @@ from .ir import (Assign, BinOp, CallStmt, Const, Expr, IRFunction, Load, Phi, Re
 _CANARY_OFF = 0x28  # glibc thread-pointer offset of the stack guard
 
 
+def _entry_part(e: Expr):
+    """The entry value of a register, whole or its low part (`d8` of `v8`): Var version 0, else None."""
+    from .ir import Cast
+    if isinstance(e, Cast) and e.kind == "low":
+        e = e.a
+    return e if isinstance(e, Var) and e.version == 0 else None
+
+
 def _callee_saved(arch: ArchInfo) -> set[str]:
     if arch.name.startswith("arm64"):
-        return {f"x{k}" for k in range(19, 31)}      # x19-x28, frame pointer x29, link register x30
+        # x19-x28, frame pointer x29, link register x30; the low halves of v8-v15 (d8-d15)
+        return {f"x{k}" for k in range(19, 31)} | {f"v{k}" for k in range(8, 16)}
     if arch.name.startswith("arm"):
-        return {f"r{k}" for k in range(4, 12)} | {"lr"}   # r4-r11 (r11 = frame pointer), link register
+        # r4-r11 (r11 = frame pointer), link register; d8-d15 (s16-s31)
+        return {f"r{k}" for k in range(4, 12)} | {"lr"} | {f"d{k}" for k in range(8, 16)}
     if arch.name.startswith("mips"):
         return {f"s{k}" for k in range(8)} | {"fp", "ra"}
+    if arch.name == "x64-win":
+        return {"rbp", "rbx", "rsi", "rdi", "r12", "r13", "r14", "r15", *(f"xmm{k}" for k in range(6, 16))}
     if arch.bits == 64:
         return {"rbp", "rbx", "r12", "r13", "r14", "r15"}
     return {"ebp", "ebx", "esi", "edi"}
@@ -182,7 +194,7 @@ def analyze_frame(fn: IRFunction, arch: ArchInfo, guards=frozenset()) -> Frame:
     # ARM `push {r3, r4, lr}`: an argument register pushed along with the link register only
     # keeps the stack 8-byte aligned
     lr_push = {s.addr for s in fn.stmts() if isinstance(s, Store) and isinstance(s.src, Var)
-               and s.src.version == 0 and s.src.name == "lr"} if arch.name == "arm-aapcs" else set()
+               and s.src.version == 0 and s.src.name == "lr"} if arch.name.startswith("arm-aapcs") else set()
 
     for s in fn.stmts():
         # dereferences: Load / Store addresses are real accesses (not address-taken)
@@ -199,9 +211,9 @@ def analyze_frame(fn: IRFunction, arch: ArchInfo, guards=frozenset()) -> Frame:
                 sl.width = max(sl.width, s.bits // 8)
                 if _is_canary(s.src, frame.guards, defs):
                     sl.kind, frame.canary = "canary", off
-                elif isinstance(s.src, Var) and s.src.version == 0 and sl.kind == "local" and (
-                        s.src.name in saved or s.addr in lr_push):
-                    sl.kind, sl.saved_reg = "saved", s.src.name
+                elif isinstance(_entry_part(s.src), Var) and sl.kind == "local" and (
+                        _entry_part(s.src).name in saved or s.addr in lr_push):
+                    sl.kind, sl.saved_reg = "saved", _entry_part(s.src).name
                 elif realign_entry and sl.kind == "local" and _frame_bookkeeping(frame, s.src):
                     # realigning prologue: keeps a copy of the return address and of the
                     # incoming stack pointer (`push [ecx-4]`, `push ecx`)

@@ -24,6 +24,8 @@ def decompile_ir(an, func, optimize: bool = True):
     except NotImplementedError:
         return fn
     from .passes import _dce
+    from .fpabi import set_fp_returns
+    set_fp_returns(an, func, fn)
     fn = recover_calls(run_passes(to_ssa(fn, arch), arch), an, arch)
     _dce(fn)  # call uses not selected as arguments (stack pointer, scratch registers) are gone
     return fn

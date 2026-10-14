@@ -82,6 +82,9 @@ _SSE_MOV = {"movaps", "movups", "movapd", "movupd", "movdqa", "movdqu", "vmovaps
             "vmovdqu", "movd", "movq", "vmovd", "vmovq", "lddqu"}
 
 
+_SIGN_OPS = {"xorpd", "xorps", "andpd", "andps", "vxorpd", "vxorps", "vandpd", "vandps"}
+
+
 class LiftError(Exception):
     pass
 
@@ -122,6 +125,10 @@ class X86Lifter:
         self.out: list[Stmt] = []
         self.insn: Insn | None = None
         self._tmp = 0
+        # xmm registers holding a constant loaded from read-only data, within the current run of
+        # instructions (`movq xmm1, [mask]; xorpd xmm0, xmm1` is a negation)
+        self._xmm_const: dict[str, int] = {}
+        self._last_end: int | None = None
 
     # ---------------------------------------------------------- helpers
     def emit(self, s: Stmt):
@@ -163,6 +170,7 @@ class X86Lifter:
         if name not in self.regs:
             raise LiftError(f"register {name}")
         f, lo, w = self.regs[name]
+        self._xmm_const.pop(f, None)
         r = Reg(f, self._full_bits(f))
         v = self.resize(v, w)
         if w >= r.bits:
@@ -267,6 +275,9 @@ class X86Lifter:
         """Statements for one instruction (control flow included)."""
         self.out = []
         self.insn = i
+        if i.addr != self._last_end:
+            self._xmm_const.clear()
+        self._last_end = i.end
         m = i.mnemonic
         for p in _PREFIXES:
             if m.startswith(p):
@@ -288,6 +299,8 @@ class X86Lifter:
                 self.write(i.cs.operands[0], Cast("zext", _CC[m[3:]](), 8))
             elif m.startswith("j") and m[1:] in _CC:
                 self.emit(Branch(i.addr, _CC[m[1:]](), i.target, i.end))
+            elif m in _SIGN_OPS and self._sign_op(i, i.cs.operands, m):
+                pass
             elif m in _SSE_ZERO or m in _SSE_MOV:
                 self._sse(i, i.cs.operands, m)
             elif i.cs.operands and i.cs.operands[0].type == OP_REG and \
@@ -396,8 +409,226 @@ class X86Lifter:
         if dst.type == OP_REG and i.cs.reg_name(dst.reg).startswith("xmm") and m in ("movd", "movq", "vmovd", "vmovq"):
             # GPR/mem -> xmm zeroes the rest of the register
             self.write_reg(i.cs.reg_name(dst.reg), self.resize(v, 128))
+            self._note_const(dst, src)
             return
         self.write(dst, self.resize(v, w))
+        self._note_const(dst, src)
+
+    # ------------------------------------------------------ scalar floating point
+    # A scalar result is written as the whole xmm register, zero-extended: the upper lanes the
+    # hardware keeps are only read by packed (SIMD) code, which is not modelled anyway.
+    def _xmm(self, op) -> bool:
+        return op.type == OP_REG and self.insn.cs.reg_name(op.reg).startswith("xmm")
+
+    def _fsrc(self, op, w: int) -> Expr:
+        """A float operand: the low `w` bits of an xmm register, or `w` bits of memory."""
+        if op.type == OP_MEM:
+            return Load(self.addr_of(op), w)
+        v = self.read(op)
+        return self.resize(v, w)
+
+    def _fdst(self, op, v: Expr):
+        if self._xmm(op):
+            self.write_reg(self.insn.cs.reg_name(op.reg), Cast("zext", v, 128) if v.bits < 128 else v)
+        else:
+            self.write(op, v)
+
+    def _fmov(self, i, ops, w: int):
+        if len(ops) != 2:
+            raise LiftError("string movsd")
+        dst, src = ops
+        if not self._xmm(dst) and not self._xmm(src):
+            raise LiftError("string movsd")
+        self._fdst(dst, self._fsrc(src, w))
+        self._note_const(dst, src)
+
+    def _note_const(self, dst, src):
+        if self._xmm(dst) and src.type == OP_MEM:
+            k = self._const_mask(src)
+            if k is not None:
+                self._xmm_const[self.full(self.insn.cs.reg_name(dst.reg)).name] = k
+
+    def _i_movss(self, i, ops):
+        self._fmov(i, ops, 32)
+
+    def _i_movsd(self, i, ops):
+        self._fmov(i, ops, 64)
+
+    _i_vmovss = _i_movss
+    _i_vmovsd = _i_movsd
+
+    def _farith(self, ops, op: str, w: int):
+        a, b = (ops[1], ops[2]) if len(ops) == 3 else (ops[0], ops[1])       # AVX: dst, src1, src2
+        self._fdst(ops[0], BinOp(op, self._fsrc(a, w), self._fsrc(b, w), w))
+
+    def _fminmax(self, ops, w: int, is_min: bool):
+        # minsd a, b = a < b ? a : b (b when unordered); maxsd a, b = a > b ? a : b
+        a, b = (ops[1], ops[2]) if len(ops) == 3 else (ops[0], ops[1])
+        x, y = self._fsrc(a, w), self._fsrc(b, w)
+        cond = BinOp("f<", x, y, 1) if is_min else BinOp("f<", y, x, 1)
+        self._fdst(ops[0], Ite(cond, x, y, w))
+
+    def _fcompare(self, ops, w: int):
+        a, b = self._fsrc(ops[0], w), self._fsrc(ops[1], w)
+        self.assign(ZF, BinOp("f==u", a, b, 1))
+        self.assign(PF, BinOp("funord", a, b, 1))
+        self.assign(CF, BinOp("f<u", a, b, 1))
+        self.assign(OF, Const(0, 1))
+        self.assign(SF, Const(0, 1))
+
+    def _i_comisd(self, i, ops):
+        self._fcompare(ops, 64)
+
+    def _i_comiss(self, i, ops):
+        self._fcompare(ops, 32)
+
+    _i_ucomisd = _i_vcomisd = _i_vucomisd = _i_comisd
+    _i_ucomiss = _i_vcomiss = _i_vucomiss = _i_comiss
+
+    def _i_cvtsi2sd(self, i, ops):
+        src = ops[-1]
+        self._fdst(ops[0], Intrinsic("sitofp", (self.read(src),), 64))
+
+    def _i_cvtsi2ss(self, i, ops):
+        self._fdst(ops[0], Intrinsic("sitofp", (self.read(ops[-1]),), 32))
+
+    _i_vcvtsi2sd = _i_cvtsi2sd
+    _i_vcvtsi2ss = _i_cvtsi2ss
+
+    def _to_int(self, ops, w: int, rounding: bool):
+        x = self._fsrc(ops[1], w)
+        bits = ops[0].size * 8
+        if rounding:         # current rounding mode (nearest even by default)
+            x = Intrinsic("rint" if w == 64 else "rintf", (x,), w)
+        self.write(ops[0], Intrinsic("fptosi", (x,), bits))
+
+    def _i_cvttsd2si(self, i, ops):
+        self._to_int(ops, 64, False)
+
+    def _i_cvttss2si(self, i, ops):
+        self._to_int(ops, 32, False)
+
+    def _i_cvtsd2si(self, i, ops):
+        self._to_int(ops, 64, True)
+
+    def _i_cvtss2si(self, i, ops):
+        self._to_int(ops, 32, True)
+
+    _i_vcvttsd2si, _i_vcvttss2si = _i_cvttsd2si, _i_cvttss2si
+
+    def _i_cvtss2sd(self, i, ops):
+        self._fdst(ops[0], Intrinsic("fpconv", (self._fsrc(ops[-1], 32),), 64))
+
+    def _i_cvtsd2ss(self, i, ops):
+        self._fdst(ops[0], Intrinsic("fpconv", (self._fsrc(ops[-1], 64),), 32))
+
+    _i_vcvtss2sd, _i_vcvtsd2ss = _i_cvtss2sd, _i_cvtsd2ss
+
+    def _i_sqrtsd(self, i, ops):
+        self._fdst(ops[0], Intrinsic("sqrt", (self._fsrc(ops[-1], 64),), 64))
+
+    def _i_sqrtss(self, i, ops):
+        self._fdst(ops[0], Intrinsic("sqrtf", (self._fsrc(ops[-1], 32),), 32))
+
+    _i_vsqrtsd, _i_vsqrtss = _i_sqrtsd, _i_sqrtss
+
+    _ROUND = {9: "floor", 10: "ceil", 11: "trunc", 4: "rint", 12: "rint", 0: "rint", 1: "floor", 2: "ceil",
+              3: "trunc", 8: "rint"}
+
+    def _round(self, ops, w: int):
+        mode = ops[-1].imm if ops[-1].type == OP_IMM else None
+        name = self._ROUND.get(mode)
+        if name is None:
+            raise LiftError("rounding mode")
+        self._fdst(ops[0], Intrinsic(name if w == 64 else name + "f", (self._fsrc(ops[-2], w),), w))
+
+    def _i_roundsd(self, i, ops):
+        self._round(ops, 64)
+
+    def _i_roundss(self, i, ops):
+        self._round(ops, 32)
+
+    def _const_mask(self, op) -> int | None:
+        """The low quadword of a constant xmm operand in read-only memory (sign masks), or of a
+        register just loaded with one."""
+        if self._xmm(op):
+            return self._xmm_const.get(self.full(self.insn.cs.reg_name(op.reg)).name)
+        if op.type != OP_MEM:
+            return None
+        a = self.addr_of(op)
+        if not isinstance(a, Const):
+            return None
+        sec = self.an.bin.section_at(a.value)
+        if sec is None or getattr(sec, "w", False):
+            return None
+        return self.an.bin.read_int(a.value, 8)
+
+    def _sign_op(self, i, ops, m) -> bool:
+        """`xorpd x, [-0.0]` -> `-x`, `andpd x, [~sign]` -> `fabs(x)` (and the `ps` / AVX forms)."""
+        if len(ops) not in (2, 3) or not self._xmm(ops[0]):
+            return False
+        src = ops[-1]
+        k = self._const_mask(src)
+        if k is None:
+            return False
+        a = ops[1] if len(ops) == 3 else ops[0]
+        single = m.endswith("ps")
+        w = 32 if single else 64
+        k &= (1 << w) - 1
+        sign = 1 << (w - 1)
+        if m.lstrip("v").startswith("xor") and k == sign:
+            self._fdst(ops[0], UnOp("fneg", self._fsrc(a, w), w))
+            return True
+        if m.lstrip("v").startswith("and") and k == sign - 1:
+            self._fdst(ops[0], Intrinsic("fabsf" if single else "fabs", (self._fsrc(a, w),), w))
+            return True
+        return False
+
+    def _i_addsd(self, i, ops):
+        self._farith(ops, "f+", 64)
+
+    def _i_addss(self, i, ops):
+        self._farith(ops, "f+", 32)
+
+    _i_vaddsd, _i_vaddss = _i_addsd, _i_addss
+
+    def _i_subsd(self, i, ops):
+        self._farith(ops, "f-", 64)
+
+    def _i_subss(self, i, ops):
+        self._farith(ops, "f-", 32)
+
+    _i_vsubsd, _i_vsubss = _i_subsd, _i_subss
+
+    def _i_mulsd(self, i, ops):
+        self._farith(ops, "f*", 64)
+
+    def _i_mulss(self, i, ops):
+        self._farith(ops, "f*", 32)
+
+    _i_vmulsd, _i_vmulss = _i_mulsd, _i_mulss
+
+    def _i_divsd(self, i, ops):
+        self._farith(ops, "f/", 64)
+
+    def _i_divss(self, i, ops):
+        self._farith(ops, "f/", 32)
+
+    _i_vdivsd, _i_vdivss = _i_divsd, _i_divss
+
+    def _i_minsd(self, i, ops):
+        self._fminmax(ops, 64, True)
+
+    def _i_minss(self, i, ops):
+        self._fminmax(ops, 32, True)
+
+    def _i_maxsd(self, i, ops):
+        self._fminmax(ops, 64, False)
+
+    def _i_maxss(self, i, ops):
+        self._fminmax(ops, 32, False)
+
+    _i_vminsd, _i_vminss, _i_vmaxsd, _i_vmaxss = _i_minsd, _i_minss, _i_maxsd, _i_maxss
 
     # ---------------------------------------------------------- arithmetic
     def _binop(self, ops, op: str, flags: str | None):

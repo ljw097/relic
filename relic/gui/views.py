@@ -152,14 +152,16 @@ class ListingHighlighter(QSyntaxHighlighter):
         if ln.kind == "xref":
             self.setFormat(0, len(text), self.f["comment"])
             return
-        if ln.kind != "insn":
+        if ln.kind not in ("insn", "data"):
             return
         c = self.view.columns
         self.setFormat(0, c["bytes"], self.f["addr"])
         self.setFormat(c["bytes"], c["mnem"] - c["bytes"], self.f["bytes"])
         m = ln.mnemonic
         key = "mnem"
-        if m.startswith("call") or m in ("bl", "blx", "jal", "jalr"):
+        if ln.kind == "data":
+            key = "label"
+        elif m.startswith("call") or m in ("bl", "blx", "jal", "jalr"):
             key = "call"
         elif m.startswith("j") or m.startswith("b") and m not in ("bswap", "bt", "bts", "btr", "btc", "bsf", "bsr"):
             key = "jump"
@@ -190,10 +192,8 @@ class DisasmView(QPlainTextEdit):
         self.columns = {"bytes": 20, "mnem": 44}
         self.debug_pc: int | None = None          # while debugging: the stopped-at instruction
         self.debug_bps: set[int] = set()
+        self.decorators: list = []                # plugin line decorators (listing.decorate)
         self.show_bytes = True
-        # plugins' (name, callback(an, addr) -> str | None): text added to instruction comments
-        self.decorators: list = []
-        self.on_decorator_error = None             # (plugin, traceback text) -> None
         self.highlighter = ListingHighlighter(self.document(), self)
         self.cursorPositionChanged.connect(self._moved)
 
@@ -217,40 +217,20 @@ class DisasmView(QPlainTextEdit):
     def reload(self):
         if self.an is None or self.func is None:
             return
-        lines = function_lines(self.an, self.func)
-        self._decorate(lines)
+        lines = function_lines(self.an, self.func, self.decorators)
         text = render(lines, self.show_bytes)
         if text.startswith("\n"):  # render() puts a blank line before the function header
             text = text[1:]
         self.lines = lines
         self.row_of = {}
         for k, ln in enumerate(lines):
-            if ln.kind == "insn" or (ln.kind == "func" and ln.addr not in self.row_of):
+            if ln.kind in ("insn", "data") or (ln.kind == "func" and ln.addr not in self.row_of):
                 self.row_of.setdefault(ln.addr, k)
         addr_w = 16 if any(ln.addr >> 32 for ln in lines) else 8
         self.columns = {"bytes": 2 + addr_w + 2, "mnem": 2 + addr_w + 2 + (24 if self.show_bytes else 0)}
         sb = self.verticalScrollBar().value()
         self.setPlainText(text)
         self.verticalScrollBar().setValue(sb)
-
-    def _decorate(self, lines):
-        failed = set()
-        for ln in lines:
-            if ln.kind != "insn":
-                continue
-            for plugin, cb in self.decorators:
-                if plugin in failed:
-                    continue
-                try:
-                    note = cb(self.an, ln.addr)
-                except Exception:  # noqa: BLE001 - one broken plugin must not break the listing
-                    failed.add(plugin)
-                    if self.on_decorator_error is not None:
-                        import traceback
-                        self.on_decorator_error(plugin, traceback.format_exc())
-                    continue
-                if note:
-                    ln.comment = f"{ln.comment}; {note}" if ln.comment else str(note)
 
     def goto(self, addr: int) -> bool:
         row = self.row_of.get(addr)
@@ -281,7 +261,9 @@ class DisasmView(QPlainTextEdit):
         self._highlight_row(self.textCursor().blockNumber())
 
     def _debug_selections(self) -> list:
-        marks = [(self.row_of.get(a), "bp_line") for a in getattr(self, "debug_bps", ())]
+        # plugin colours first: the debugger's marks show over them
+        marks = [(k, ln.color) for k, ln in enumerate(self.lines) if ln.color]
+        marks += [(self.row_of.get(a), "bp_line") for a in getattr(self, "debug_bps", ())]
         if getattr(self, "debug_pc", None) is not None:
             marks.append((self.row_of.get(self.debug_pc), "pc_line"))
         return _line_marks(self, marks)
@@ -754,7 +736,7 @@ def _line_marks(view: QPlainTextEdit, marks) -> list:
         if row is None:
             continue
         sel = QTextEdit.ExtraSelection()
-        sel.format.setBackground(QColor(THEME[key]))
+        sel.format.setBackground(QColor(THEME.get(key, key)))     # a theme key, or a colour itself
         sel.format.setProperty(QTextCharFormat.Property.FullWidthSelection, True)
         sel.cursor = QTextCursor(view.document().findBlockByNumber(row))
         out.append(sel)

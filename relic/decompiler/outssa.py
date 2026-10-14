@@ -220,7 +220,7 @@ def out_of_ssa(fn: IRFunction) -> IRFunction:
             names[r] = Var(e, 0, r.bits)
         else:
             counter += 1
-            names[r] = Var(f"v{counter}", 0, r.bits)
+            names[r] = Var(f"_v{counter}", 0, r.bits)      # (not `v1`: an AArch64 register)
 
     def rn(e: Expr) -> Expr:
         return transform(e, lambda x: names[cls(x)] if isinstance(x, Var) else x)

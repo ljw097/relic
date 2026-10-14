@@ -152,7 +152,7 @@ def _shape(n):
     return [(x.addr, tuple(map(id, x.stmts))) if isinstance(x, Block) else repr(x) for x in _flatten(n)]
 
 
-def _else_if_cases(n, x):
+def _else_if_cases(n, x, gotos=frozenset()):
     """Shape 3: `if (x == C1) T1 else if (x == C2) T2 ... else E` -> (cases, default).
 
     Range tests may sit in the chain (`else if (x > 8) E`, an unoptimised compare tree) when
@@ -171,6 +171,8 @@ def _else_if_cases(n, x):
                 break
             ranges.append((pred, n.then))
         items = _flatten(n.els)
+        while len(items) > 1 and _empty(items[0], gotos):     # a label-less empty block between tests
+            items = items[1:]
         n = items[0] if len(items) == 1 else (Seq(items) if items else None)
     if n is not None and _stray_break(n):
         return None
@@ -230,7 +232,7 @@ def switchify(n, gotos=frozenset()):
                 sw = _switch(n.addr, x, r[0])
                 if sw is not None:
                     return Seq([_inner(sw, gotos)] + [switchify(t, gotos) for t in lin[r[1]:]])
-            r = _else_if_cases(n, x)
+            r = _else_if_cases(n, x, gotos)
             if r is not None and len(r[0]) >= MIN_CASES:
                 sw = _switch(n.addr, x, r[0], r[1], add_break=True)
                 if sw is not None:

@@ -138,6 +138,7 @@ class Call(Expr):
     target: Expr
     args: tuple[Expr, ...] = ()
     bits: int = 64
+    fargs: tuple = ()      # arguments passed as floats: (index in args, width)
 
 
 @dataclass(frozen=True, slots=True)
@@ -263,7 +264,7 @@ def rebuild(e: Expr, kids: tuple[Expr, ...]) -> Expr:
     if isinstance(e, Intrinsic):
         return Intrinsic(e.name, tuple(kids), e.bits)
     if isinstance(e, Call):
-        return Call(kids[0], tuple(kids[1:]), e.bits)
+        return Call(kids[0], tuple(kids[1:]), e.bits, e.fargs)
     if isinstance(e, Phi):
         return Phi(tuple((a, k) for (a, _), k in zip(e.sources, kids)), e.bits)
     return e
@@ -408,7 +409,7 @@ def fmt(e: Expr, prec: int = 0) -> str:
         s = f"{fmt(e.a, p)} {e.op} {fmt(e.b, p + 1)}"
         return f"({s})" if p < prec else s
     if isinstance(e, UnOp):
-        return f"{e.op}{fmt(e.a, 11)}"
+        return f"{e.op}({fmt(e.a)})" if e.op.isalpha() else f"{e.op}{fmt(e.a, 11)}"
     if isinstance(e, Cast):
         return f"{e.kind}{e.bits}({fmt(e.a)})"
     if isinstance(e, Extract):
