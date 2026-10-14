@@ -1,6 +1,7 @@
 """Function discovery and control-flow graphs (recursive descent)."""
 from __future__ import annotations
 
+import bisect
 from dataclasses import dataclass, field
 
 from ..disasm import CALL, CJMP, HALT, JMP, RET, Disassembler, Insn
@@ -32,6 +33,43 @@ class Block:
         if len(self.insns) > 1 and self.insns[-1].delay:
             return self.insns[-2]
         return self.insns[-1]
+
+
+class _Cover:
+    """Sorted, disjoint [start, end) ranges of code already claimed by functions."""
+
+    def __init__(self):
+        self.starts: list[int] = []
+        self.ends: list[int] = []
+
+    def add(self, s: int, e: int):
+        if e <= s:
+            return
+        i = bisect.bisect_left(self.ends, s)          # first range that ends at or after s
+        j = bisect.bisect_right(self.starts, e)       # ranges starting after e stay
+        if i < j:
+            s = min(s, self.starts[i])
+            e = max(e, self.ends[j - 1])
+        self.starts[i:j] = [s]
+        self.ends[i:j] = [e]
+
+    def add_blocks(self, f: "Function", sec):
+        for b in f.blocks.values():
+            if sec.contains(b.addr):
+                self.add(b.addr, b.end)
+
+    def next_gap(self, pos: int, end: int) -> tuple[int, int] | None:
+        """The first uncovered range [s, e) at or after `pos`, before `end`."""
+        i = bisect.bisect_right(self.starts, pos) - 1
+        if i >= 0 and self.ends[i] > pos:
+            pos = self.ends[i]
+            i += 1
+        else:
+            i += 1
+        if pos >= end:
+            return None
+        e = self.starts[i] if i < len(self.starts) else end
+        return (pos, min(e, end)) if pos < min(e, end) else self.next_gap(min(e, end), end) if e < end else None
 
 
 @dataclass
@@ -717,34 +755,42 @@ class FunctionAnalyzer:
         for sec in self.bin.exec_sections:
             if sec.name in (".plt", ".plt.sec", ".plt.got", ".init", ".fini"):
                 continue
-            changed = True
-            while changed:
+            # block ranges, not [first, last) of each function: a function's cold blocks
+            # (assert paths, .text.unlikely) can lie far away, past other functions
+            cover = _Cover()
+            for f in self.funcs.values():
+                if not f.is_import:
+                    cover.add_blocks(f, sec)
+            known = set(self.funcs)
+            pos = sec.addr
+            while True:
                 checkpoint()
-                changed = False
-                # block ranges, not [first, last) of each function: a function's cold blocks
-                # (assert paths, .text.unlikely) can lie far away, past other functions
-                covered = sorted((b.addr, b.end) for f in self.funcs.values() if not f.is_import
-                                 for b in f.blocks.values() if sec.contains(b.addr))
-                gaps, cur = [], sec.addr
-                for s, e in covered:
-                    if s > cur:
-                        gaps.append((cur, s))
-                    cur = max(cur, e)
-                if cur < sec.end:
-                    gaps.append((cur, sec.end))
-                for s, e in gaps:
-                    if self.dis.arch in ("arm", "arm64"):
-                        start = self._arm_gap_function(s, e)
-                    elif self.dis.arch == "mips":
-                        start = self._mips_gap_function(s, e)
-                    else:
-                        start = self._gap_function(s, e, prologues)
-                    if start is not None and start not in tried:
-                        tried.add(start)
-                        self._queue.append(start)
-                        self._drain()
-                        changed = True
-                        break
+                gap = cover.next_gap(pos, sec.end)
+                if gap is None:
+                    break
+                s, e = gap
+                if self.dis.arch in ("arm", "arm64"):
+                    start = self._arm_gap_function(s, e)
+                elif self.dis.arch == "mips":
+                    start = self._mips_gap_function(s, e)
+                else:
+                    start = self._gap_function(s, e, prologues)
+                if start is None or start in tried:
+                    pos = e
+                    continue
+                tried.add(start)
+                self._queue.append(start)
+                self._drain()
+                # only the functions just found change what is covered; gaps before this one can
+                # shrink too (a new function's callees), so scanning resumes from the earliest
+                new = [self.funcs[a] for a in set(self.funcs) - known]
+                known.update(a for a in self.funcs)
+                lo = min((b.addr for f in new if not f.is_import for b in f.blocks.values()
+                          if sec.contains(b.addr)), default=s)
+                for f in new:
+                    if not f.is_import:
+                        cover.add_blocks(f, sec)
+                pos = max(sec.addr, min(s, lo))
 
     def _arm_gap_function(self, s: int, e: int) -> int | None:
         """First prologue in [s, e) (an odd result is a Thumb start).

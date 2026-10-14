@@ -29,8 +29,7 @@ class Insn:
     target: int | None = None  # direct branch / call target
     refs: list[int] = field(default_factory=list)  # data addresses referenced
     mem_target: int | None = None  # `call/jmp [mem]`: address of the pointer slot
-    regs_write: tuple[str, ...] = ()
-    regs_read: tuple[str, ...] = ()
+    _regs: tuple | None = field(default=None, repr=False, compare=False)    # (read, write), on first use
     cs: object = field(default=None, repr=False, compare=False)  # underlying capstone insn (detail available)
     cond: bool = False  # ARM: executes only when its condition holds
     thumb: bool = False  # ARM: decoded as Thumb
@@ -39,6 +38,29 @@ class Insn:
     @property
     def end(self) -> int:
         return self.addr + self.size
+
+    def _access(self) -> tuple:
+        """Registers read and written (capstone's `regs_access`, worked out on first use: most
+        instructions never need it)."""
+        if self._regs is None:
+            r = w = ()
+            if self.cs is not None:
+                try:
+                    a, b = self.cs.regs_access()
+                    r = tuple(self.cs.reg_name(x) for x in a)
+                    w = tuple(self.cs.reg_name(x) for x in b)
+                except cs.CsError:
+                    pass
+            self._regs = (r, w)
+        return self._regs
+
+    @property
+    def regs_read(self) -> tuple[str, ...]:
+        return self._access()[0]
+
+    @property
+    def regs_write(self) -> tuple[str, ...]:
+        return self._access()[1]
 
     @property
     def is_branch(self) -> bool:
@@ -184,12 +206,6 @@ class Disassembler:
     # ------------------------------------------------------------- classify
     def _convert(self, c, thumb: bool = False) -> Insn:
         i = Insn(c.address, c.size, c.mnemonic, c.op_str, bytes(c.bytes), cs=c, thumb=thumb)
-        try:
-            r, w = c.regs_access()
-            i.regs_read = tuple(c.reg_name(x) for x in r)
-            i.regs_write = tuple(c.reg_name(x) for x in w)
-        except cs.CsError:
-            pass
         if self.arch in ("x86", "x64"):
             self._classify_x86(c, i)
         else:
