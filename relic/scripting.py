@@ -21,7 +21,9 @@ Plugins are `.py` files in the directories of `RELIC_PLUGINS` (separated
 like PATH) and in `~/.relic/plugins`. A plugin defines `register(api)`; the
 `PluginAPI` it receives can add menu actions (`api.add_action("Rename
 all", callback, "Ctrl+Alt+R")`) whose callbacks get the scripting
-namespace. Loading errors are collected, not raised: a broken plugin must
+namespace; `api.on_analysis(callback)` runs a callback when a binary's
+analysis is shown, `api.add_listing_comment(callback)` adds text to listing
+comments. Loading errors are collected, not raised: a broken plugin must
 not keep the GUI from starting.
 """
 from __future__ import annotations
@@ -278,6 +280,15 @@ class PluginAPI:
             except Exception:  # noqa: BLE001 - a plugin bug is reported, the GUI stays up
                 self.win.report_plugin_error(self.plugin, traceback.format_exc())
         return self.win.add_plugin_action(text, run, shortcut)
+
+    def on_analysis(self, callback: Callable[[dict], object]):
+        """`callback(ns)` each time a binary's analysis is shown (opened, re-analysed)."""
+        self.win.add_analysis_hook(self.plugin, callback)
+
+    def add_listing_comment(self, callback: Callable[["Analysis", int], str | None]):
+        """`callback(an, addr)` for every listed instruction; text it returns is added to the
+        line's comment (`lambda an, a: "hot" if a in hot else None`)."""
+        self.win.add_listing_hook(self.plugin, callback)
 
 
 def load_plugins(win) -> tuple[list[str], list[tuple[str, str]]]:

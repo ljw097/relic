@@ -191,6 +191,9 @@ class DisasmView(QPlainTextEdit):
         self.debug_pc: int | None = None          # while debugging: the stopped-at instruction
         self.debug_bps: set[int] = set()
         self.show_bytes = True
+        # plugins' (name, callback(an, addr) -> str | None): text added to instruction comments
+        self.decorators: list = []
+        self.on_decorator_error = None             # (plugin, traceback text) -> None
         self.highlighter = ListingHighlighter(self.document(), self)
         self.cursorPositionChanged.connect(self._moved)
 
@@ -215,6 +218,7 @@ class DisasmView(QPlainTextEdit):
         if self.an is None or self.func is None:
             return
         lines = function_lines(self.an, self.func)
+        self._decorate(lines)
         text = render(lines, self.show_bytes)
         if text.startswith("\n"):  # render() puts a blank line before the function header
             text = text[1:]
@@ -228,6 +232,25 @@ class DisasmView(QPlainTextEdit):
         sb = self.verticalScrollBar().value()
         self.setPlainText(text)
         self.verticalScrollBar().setValue(sb)
+
+    def _decorate(self, lines):
+        failed = set()
+        for ln in lines:
+            if ln.kind != "insn":
+                continue
+            for plugin, cb in self.decorators:
+                if plugin in failed:
+                    continue
+                try:
+                    note = cb(self.an, ln.addr)
+                except Exception:  # noqa: BLE001 - one broken plugin must not break the listing
+                    failed.add(plugin)
+                    if self.on_decorator_error is not None:
+                        import traceback
+                        self.on_decorator_error(plugin, traceback.format_exc())
+                    continue
+                if note:
+                    ln.comment = f"{ln.comment}; {note}" if ln.comment else str(note)
 
     def goto(self, addr: int) -> bool:
         row = self.row_of.get(addr)

@@ -243,6 +243,7 @@ class MainWindow(QMainWindow):
         self.setWindowTitle("Relic")
 
         self.disasm = DisasmView()
+        self.disasm.on_decorator_error = self.report_plugin_error
         self.graph = GraphView()
         self.decomp = PseudocodeView()
         self.hex = HexView()
@@ -664,6 +665,7 @@ class MainWindow(QMainWindow):
         start = main.addr if main else an.bin.entry
         self._update_actions()
         self.goto(start, record=False)
+        self._run_analysis_hooks()
 
     def _fill_functions(self):
         t = self.funcs.table
@@ -1329,6 +1331,24 @@ class MainWindow(QMainWindow):
         a.triggered.connect(slot)
         self.plugins_menu.addAction(a)
         return a
+
+    def add_analysis_hook(self, plugin: str, callback):
+        """`callback(ns)` after a binary's analysis is shown (see PluginAPI.on_analysis)."""
+        self.__dict__.setdefault("analysis_hooks", []).append((plugin, callback))
+
+    def add_listing_hook(self, plugin: str, callback):
+        """`callback(an, addr) -> str | None`: text added to listing comments."""
+        self.disasm.decorators.append((plugin, callback))
+        if self.an is not None:
+            self.disasm.reload()
+
+    def _run_analysis_hooks(self):
+        from ..scripting import namespace
+        for plugin, cb in getattr(self, "analysis_hooks", ()):
+            try:
+                cb(namespace(self.an, self))
+            except Exception:  # noqa: BLE001 - a plugin bug is reported, the GUI stays up
+                self.report_plugin_error(plugin, traceback.format_exc())
 
     def report_plugin_error(self, plugin: str, error: str):
         self.pyconsole.append(f"[plugin {plugin}] {error}\n")

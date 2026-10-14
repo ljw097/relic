@@ -30,7 +30,7 @@
 
 ## P2
 
-- [ ] 플러그인 훅: 리스팅 줄 꾸미기(주석·색), 분석 완료 이벤트
+- [x] 플러그인 훅: `api.on_analysis(cb)`(분석 결과가 표시될 때), `api.add_listing_comment(cb)`(리스팅 주석 덧붙이기) — 줄 색은 아직
 - [ ] 열거형·공용체 타입
 - [ ] RISC-V / PPC 리프터(호출 인자 추출은 같은 경로로), PPC64 ELFv1 함수 디스크립터, RISC-V `auipc` 쌍
 - [ ] ARM 데이터 영역을 코드로 잘못 읽은 경우(coprocessor 명령 등) 감지
