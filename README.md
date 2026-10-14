@@ -5,6 +5,21 @@
 **목표: IDA Pro(+ Hex-Rays) 이상.** 아래 표는 IDA Pro를 기준선으로 한 현재 스펙과 진행률입니다.
 진행 상황 세부는 [TODO.md](TODO.md), 디컴파일러 설계는 [docs/decompiler-plan.md](docs/decompiler-plan.md)를 참고하세요.
 
+![Relic 디버거: vuln()에서 gets() 직후 멈춘 상태 — 레지스터·스택 telescope에 입력한 AAAA…가 보인다](docs/screenshots/debugger.png)
+
+## 스크린샷
+
+모두 테스트 샘플 [`tests/src/vuln.c`](tests/src/vuln.c)(`-O0 -no-pie -fno-stack-protector`)를 연 화면입니다.
+
+| | |
+|---|---|
+| ![리스팅](docs/screenshots/listing.png) | ![그래프](docs/screenshots/graph.png) |
+| **리스팅** — 주소·바이트·명령어, 문자열 참조는 주석으로(`; "name?"`), 호출 대상은 이름으로. 왼쪽 함수 목록(import는 흐리게), 오른쪽 xref 패널 | **CFG 그래프** — 층별 배치, 조건 분기의 분기함/안 함 간선은 초록/빨강, 무조건 이동은 파랑. 루프로 돌아가는 간선은 블록 옆을 돌아 위로 올라감 |
+| ![의사 코드](docs/screenshots/pseudocode.png) | ![취약점](docs/screenshots/vulns.png) |
+| **의사 코드** — 점프 테이블을 `switch`로 복원한 `classify()`. 변수 이름 변경(`N`)은 바로 반영 | **Vulns** — 비상수 포맷 스트링(`printf(notes[i]->data)`), `gets()`, ret2win 후보(`win`), `free()` 호출 위치 |
+| ![디버거 메모리](docs/screenshots/debugger-memory.png) | ![라이트 테마](docs/screenshots/light.png) |
+| **디버거 Memory / Stack** — `$rbp-0x40`(=`buf`)의 hexdump와 스택 telescope. 반환 주소 `main+0x3c`까지 거리를 바로 셀 수 있음 | **라이트 테마** (`Ctrl+Shift+L`), 코드 글꼴 크기 `Ctrl+=`/`Ctrl+-` |
+
 ## 목표 대비 진행률 (기준: IDA Pro 9 + Hex-Rays)
 
 진행률은 "IDA Pro가 그 영역에서 하는 일 중 Relic이 같은 수준으로 하는 비율"을 어림한 값입니다.
@@ -62,7 +77,7 @@ python3 -m venv .venv
 .venv/bin/pip install -e '.[dev]'
 ```
 
-Python 3.10 이상, 의존성: capstone, pyelftools, pefile, PySide6.
+Python 3.10 이상, 의존성: capstone, pyelftools, pefile, PySide6. 디버거를 쓰려면 `gdb`(또는 `gdb-multiarch`)가 PATH에 있어야 합니다(`sudo apt install gdb`).
 
 ## 사용법
 
@@ -141,6 +156,17 @@ relic ./chall                        # 또는 relic gui ./chall
 relic sc.bin --arch x64 --base 0x1000
 ```
 
+### 기본 흐름
+
+1. **열기** — `relic ./chall` 또는 File → Open(`Ctrl+O`). 분석은 백그라운드에서 돌고 상태 표시줄에 진행률이 나옵니다(`Ctrl+.`로 취소). 끝나면 `main`(stripped면 복구한 `main`, 없으면 entry)으로 이동합니다.
+2. **둘러보기** — 왼쪽 Functions에서 함수를 더블클릭(`Ctrl+F`로 이름 필터). 리스팅에서 `call`/`jmp` 대상이나 심볼을 더블클릭하면 따라가고 `Esc`로 돌아옵니다. `Space`는 그래프, `Tab`은 의사 코드(커서 위치를 서로 맞춰 줌), `Ctrl+H`는 헥스.
+3. **참조 찾기** — `X`로 커서 위치를 가리키는 xref 목록. Strings 탭의 문자열을 더블클릭하면 그 문자열을 쓰는 코드로 갑니다.
+4. **정리하기** — `N`으로 함수·라벨 이름(의사 코드에서는 지역 변수·매개변수 이름), `;`로 주석. `Ctrl+S`로 `<binary>.relic.json`에 저장되고 다시 열면 그대로 복원됩니다.
+5. **찾기** — Search 메뉴: 바이트 패턴 `48 8b ?? 05`(`Alt+B`), 텍스트(`Alt+T`, UTF-8/UTF-16), 즉치값(`Alt+I`), 명령어 정규식 `call.*(gets|system)`(`Ctrl+Alt+I`). 결과는 Search 패널에서 더블클릭으로 이동.
+6. **취약점 훑기** — 아래 Vulns 탭(위험 함수·포맷 스트링·ret2win 후보)과 Checksec 탭(NX·PIE·canary·RELRO).
+
+### 단축키
+
 | 키 | 동작 |
 |---|---|
 | `G` | 주소 / 심볼로 이동 |
@@ -188,6 +214,20 @@ Debug 메뉴(`F9`)가 열린 바이너리를 로컬 `gdb`(GDB/MI)로 실행합�
 - 패치가 있으면 디버거는 패치된 이미지(임시 사본)를 실행합니다 — 리스팅에 보이는 코드가 실제로 돕니다
 - 리스팅과 의사 코드에서 현재 pc 줄(의사 코드는 그 명령이 속한 문장)은 초록, 중단점은 빨강으로 표시하며 멈출 때마다 정적 주소로 따라갑니다(PIE 슬라이드는 자동 보정)
 - 값 바꾸기: Registers 패널에서 `E`(또는 우클릭 ▸ Set)로 레지스터를 숫자나 gdb 식(`$rsp+8`)으로, Debug ▸ Write memory로 메모리에 hex 바이트(`41 42 ff`)·문자열(`"AAAA\n"`)·워드(`0x401136`)를 씁니다
+
+#### 따라 해 보기: `vuln()`의 스택 오버플로 오프셋 구하기
+
+맨 위 스크린샷을 만드는 순서입니다(`tests/bins/vuln64.out`, 테스트를 한 번 돌리면 생깁니다).
+
+1. `relic tests/bins/vuln64.out`으로 열고 Debug → Program arguments에 `5`를 넣습니다(인자가 있으면 `main`이 메뉴 대신 `vuln()`을 부름).
+2. 함수 목록에서 `vuln`으로 가서 `F2` — 첫 줄이 빨갛게 바뀝니다(중단점은 실행 전에 걸어 둬도 됨).
+3. `F9`로 시작(entry에서 멈춤), 한 번 더 `F9`로 `vuln`의 중단점까지 갑니다. 리스팅의 초록 줄이 현재 위치이고, Registers/Stack/Code/Backtrace가 채워집니다.
+4. `call gets` 다음 줄(`lea rax, [rbp - 0x40]`)에 커서를 두고 `F4`(커서까지 실행). 프로그램이 입력을 기다리면 Console의 **stdin** 줄에 `AAAAAAAABBBBBBBB`를 입력하고 Enter.
+5. 멈추면 Registers의 `rax`가 버퍼를 가리키며 `'AAAAAAAABBBBBBBB'`를 보여 주고, Stack 패널에서는 `0x4141414141414141` 다음 몇 줄 아래에 반환 주소 `main+0x3c`가 보입니다.
+6. Memory 탭의 주소 칸에 `$rbp-0x40`을 입력하면 버퍼부터 hexdump가 나옵니다. 의사 코드의 `char buf_48[64]; // ret-0x48`과 같이, 버퍼 시작에서 반환 주소까지는 0x48바이트입니다.
+7. 값 위를 더블클릭하면 따라갑니다: 코드 주소는 리스팅으로, 그 밖은 Memory로. `F8`/`F7`로 계속 단계 실행하거나 `Ctrl+F2`로 종료합니다.
+
+Console의 **gdb>** 줄에는 일반 gdb 명령(`x/8gx $rsp`, `info proc mappings`, `p $rdi`)을 그대로 쓸 수 있습니다. 컨테이너 안에서는 gdb가 자식 프로세스를 추적할 수 있도록 ptrace 권한(`--cap-add=SYS_PTRACE`)이 필요할 수 있습니다.
 
 
 ## 스크립팅과 플러그인

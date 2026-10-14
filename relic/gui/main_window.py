@@ -851,8 +851,23 @@ class MainWindow(QMainWindow):
         """Run the analysed binary locally under gdb, stopped at its entry point (or `main`)."""
         if self.an is None:
             return
+        regs, stack = self.dbg_docks[:2]
+        first = not regs.isVisible() and not stack.isVisible()
         for d in self.dbg_docks:
             d.show()
+        if first and not regs.isFloating() and (self.tabifiedDockWidgets(regs) or self.tabifiedDockWidgets(stack)):
+            # docks hidden next to a tabbed one come back as tabs: lay registers and the stack
+            # out again, one above the other in a column of their own on the right
+            for d in (regs, stack):
+                self.removeDockWidget(d)
+            self.addDockWidget(Qt.DockWidgetArea.RightDockWidgetArea, regs, Qt.Orientation.Vertical)
+            self.splitDockWidget(regs, stack, Qt.Orientation.Vertical)
+            regs.show()
+            stack.show()
+        self.resizeDocks([regs], [max(regs.width(), 520)], Qt.Orientation.Horizontal)
+        if first:
+            h = self.height()
+            self.resizeDocks([self.xrefs_dock, regs, stack], [h // 6, h // 3, h // 3], Qt.Orientation.Vertical)
         self.dbg_docks[2].raise_()        # console
         self.dbg_console.append(f"$ {self.an.bin.path} {' '.join(self.dbg_args)}\n")
         self.dbg.start(self.an.bin.path, self.an, self.dbg_args, stop_at)
