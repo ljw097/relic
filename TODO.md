@@ -12,6 +12,15 @@
 - [ ] **P2** CFG: 노드 수천 개 함수에서 교차 계산(층 쌍마다 O(E²)) 가속, 간선 묶음(bundling), 접기
 - [x] 테마 전환(라이트/다크, `Ctrl+Shift+L`)과 코드 글꼴 크기(`Ctrl+=`/`Ctrl+-`/`Ctrl+0`): 모든 뷰·표·앱 팔레트에 즉시 반영, `QSettings`에 저장
 
+## 디버거 (로컬, GDB/MI, pwndbg식 GUI)
+
+- [x] GDB/MI 레코드 파서·프로세스 래퍼(`relic/debugger/mi.py`), 세션(`session.py`): pty 입출력, 시작(entry/main)·계속·단계 실행·커서까지·중단·종료, 중단점, PIE 슬라이드(`to_live`/`to_static`), 레지스터 변경 추적, `telescope`, 백트레이스
+- [x] GUI(`relic/gui/debugger.py`): 작업 스레드 컨트롤러, Registers·Stack·Backtrace·Code·Console 패널, Debug 메뉴(F9/F7/F8/F4/F2), 리스팅 pc·중단점 표시
+- [ ] **P1** vmmap 패널, 메모리(hexdump) 뷰와 레지스터·스택 값 따라가기
+- [ ] **P1** 중단점 목록 패널(조건·활성/비활성), 하드웨어 watchpoint
+- [ ] **P2** glibc 힙 정보(bins/chunks), 의사 코드 뷰에서 현재 줄 표시
+- [ ] **P2** 레지스터·메모리 값 편집
+
 ## 아키텍처별 분석 보강
 
 - [x] **P0** 함수 단위 레지스터 상수 전파 패스(`analysis/constprop.py`): CFG 위 전방 데이터 흐름(합류점은 모든 선행자가 같은 값일 때만, 호출은 caller-saved 소멸), "주소" 플래그(pc 유래 값, 비-PIE 절대 리터럴)가 붙은 값만 데이터 참조로 기록 → 문자열·전역·GOT 슬롯 xref와 리스팅 주석

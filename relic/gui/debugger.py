@@ -1,0 +1,368 @@
+"""pwndbg-style local debugging in the GUI: a controller and its context panels.
+
+`DebugController` owns a `relic.debugger.Session` and a worker thread: every
+gdb call runs there, and after each stop it gathers a `Snapshot` -- what
+pwndbg's `context` prints: registers (changed ones marked), the code at pc,
+the stack as a telescope, the backtrace -- and hands it to the GUI through a
+signal. The program's own output arrives through `output`.
+
+Panels: `RegistersPanel`, `StackPanel`, `BacktracePanel`, `CodePanel` (gdb's
+disassembly at pc, for code outside the analysed binary too) and
+`ConsolePanel` (program output, a line to type the program's input, and a gdb
+command line).
+"""
+from __future__ import annotations
+
+import queue
+import threading
+from dataclasses import dataclass, field
+
+from PySide6.QtCore import QObject, Qt, Signal
+from PySide6.QtGui import QColor, QTextCursor
+from PySide6.QtWidgets import (QAbstractItemView, QHBoxLayout, QHeaderView, QLabel, QLineEdit, QPlainTextEdit,
+                               QTableWidget, QTableWidgetItem, QVBoxLayout, QWidget)
+
+from .views import THEME, mono_font
+
+# pwndbg's colours for where a pointer leads
+_KIND_COLOR = {"stack": "call", "heap": "mnem", "code": "jump", "data": "ret", "anon": "fg", "vdso": "addr",
+               "vvar": "addr"}
+
+
+@dataclass
+class Snapshot:
+    running: bool = False
+    exited: str = ""                     # "exited normally" / "exited with code N" / "killed"
+    reason: str = ""
+    pc: int | None = None                # live
+    pc_static: int | None = None         # in the analysed image, when pc is there
+    regs: list = field(default_factory=list)        # (name, value, changed, note)
+    stack: list = field(default_factory=list)       # TeleRow
+    frames: list = field(default_factory=list)      # (level, addr, symbol)
+    code: list = field(default_factory=list)        # (addr, text, symbol)
+    breakpoints: list = field(default_factory=list)  # static addresses
+    word: int = 8
+
+
+class DebugController(QObject):
+    """Runs a debug session off the GUI thread; one command at a time."""
+
+    state = Signal(object)        # Snapshot after every stop (or exit)
+    output = Signal(bytes)        # program output
+    log = Signal(str)             # gdb command output, errors
+    busy = Signal(bool)
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.session = None
+        self.an = None
+        self.path = ""
+        self.args: list[str] = []
+        self.static_bps: set[int] = set()
+        self.last = Snapshot()
+        self._jobs: queue.Queue = queue.Queue()
+        self._worker = threading.Thread(target=self._loop, daemon=True)
+        self._worker.start()
+
+    # ----------------------------------------------------------- worker
+    def _loop(self):
+        while True:
+            job = self._jobs.get()
+            if job is None:
+                self._jobs.task_done()
+                return
+            fn, snapshot = job
+            self.busy.emit(True)
+            try:
+                fn()
+                if snapshot:
+                    self.last = self._snapshot()
+                    self.state.emit(self.last)
+            except Exception as e:  # noqa: BLE001 - shown in the console, the GUI stays up
+                self.log.emit(f"error: {e}\n")
+                if snapshot and self.session is not None:
+                    try:
+                        self.last = self._snapshot()
+                        self.state.emit(self.last)
+                    except Exception:  # noqa: BLE001
+                        pass
+            finally:
+                self._jobs.task_done()
+                self.busy.emit(False)
+
+    def _submit(self, fn, snapshot: bool = True):
+        self._jobs.put((fn, snapshot))
+
+    @property
+    def idle(self) -> bool:
+        """No command queued or running."""
+        return not self._jobs.unfinished_tasks
+
+    def shutdown(self, timeout: float = 5.0):
+        self._submit(self._close, snapshot=False)
+        self._jobs.put(None)
+        self._worker.join(timeout)
+
+    # -------------------------------------------------------- commands
+    @property
+    def active(self) -> bool:
+        return self.session is not None and bool(self.last.pc is not None and not self.last.exited)
+
+    def start(self, path: str, analysis=None, args: list[str] | None = None, stop_at: str = "entry"):
+        def go():
+            from ..debugger import Session
+            self._close()
+            self.path, self.an, self.args = path, analysis, list(args or [])
+            self.session = Session(path, self.args, analysis, on_output=self.output.emit)
+            self.session.start(stop_at)
+            for a in sorted(self.static_bps):
+                self.session.add_breakpoint(self.session.to_live(a))
+        self._submit(go)
+
+    def _close(self):
+        if self.session is not None:
+            try:
+                self.session.close()
+            finally:
+                self.session = None
+
+    def _run(self, name: str, *args):
+        def go():
+            if self.session is None:
+                raise RuntimeError("no program is being debugged (Debug > Start)")
+            getattr(self.session, name)(*args)
+        self._submit(go)
+
+    def cont(self):
+        self._run("cont", 3600)
+
+    def step_into(self):
+        self._run("step_into")
+
+    def step_over(self):
+        self._run("step_over")
+
+    def step_out(self):
+        self._run("step_out")
+
+    def run_to(self, static_addr: int):
+        def go():
+            if self.session is None:
+                raise RuntimeError("no program is being debugged (Debug > Start)")
+            self.session.run_to(self.session.to_live(static_addr), 3600)
+        self._submit(go)
+
+    def interrupt(self):
+        # not through the queue: the worker is blocked waiting for the stop this causes
+        if self.session is not None:
+            threading.Thread(target=self.session.interrupt, daemon=True).start()
+
+    def stop(self):
+        def go():
+            if self.session is not None:
+                self.session.kill()
+            self._close()
+        self._submit(go)
+
+    def toggle_breakpoint(self, static_addr: int) -> bool:
+        """Set or clear a breakpoint at an address of the analysed binary (before or while running)."""
+        on = static_addr not in self.static_bps
+        (self.static_bps.add if on else self.static_bps.discard)(static_addr)
+
+        def go():
+            if self.session is not None and self.session.regs:
+                live = self.session.to_live(static_addr)
+                if on and live not in self.session.breakpoints:
+                    self.session.add_breakpoint(live)
+                elif not on:
+                    self.session.remove_breakpoint(live)
+        self._submit(go, snapshot=False)
+        return on
+
+    def send_input(self, text: str):
+        if self.session is not None:
+            self.session.send_input(text)
+
+    def gdb(self, command: str):
+        def go():
+            if self.session is None:
+                raise RuntimeError("no program is being debugged (Debug > Start)")
+            self.log.emit(f"gdb> {command}\n{self.session.execute(command)}")
+        self._submit(go)
+
+    # -------------------------------------------------------- snapshot
+    def _snapshot(self) -> Snapshot:
+        s = self.session
+        snap = Snapshot(breakpoints=sorted(self.static_bps))
+        if s is None:
+            snap.exited = "not running"
+            return snap
+        stop = s.mi.last_stop.results if s.mi.last_stop is not None else {}
+        snap.reason = stop.get("reason", "")
+        if snap.reason.startswith("exited") or s.mi.exited or not s.regs:
+            code = stop.get("exit-code")
+            snap.exited = f"exited with code {int(code, 8)}" if code else "exited normally"
+            if snap.reason.startswith("exited-signalled"):
+                snap.exited = f"killed by {stop.get('signal-name', 'a signal')}"
+            return snap
+        snap.word = s.word
+        snap.pc = s.pc
+        snap.pc_static = s.to_static(snap.pc) if snap.pc is not None else None
+        for name, value, changed in s.gprs():
+            note = ""
+            m = s.mapping_at(value)
+            if m is not None:
+                note = s.symbolize(value) if "x" in m.perms else (repr(s._string_at(value))
+                                                                   if s._string_at(value) else m.kind)
+            snap.regs.append((name, value, changed, note))
+        snap.stack = s.telescope(count=16)
+        snap.frames = [(f.level, f.addr, s.symbolize(f.addr)) for f in s.backtrace()]
+        if snap.pc is not None:
+            snap.code = [(a, t, s.symbolize(a)) for a, t in s.disassemble(snap.pc, 10)]
+        return snap
+
+
+# ------------------------------------------------------------------ panels
+def _setup(t: QTableWidget, headers: list[str]):
+    t.setColumnCount(len(headers))
+    t.setHorizontalHeaderLabels(headers)
+    t.verticalHeader().setVisible(False)
+    t.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+    t.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
+    t.setFont(mono_font())
+    t.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.ResizeToContents)
+    t.horizontalHeader().setStretchLastSection(True)
+
+
+def _item(text: str, color: str | None = None, data=None) -> QTableWidgetItem:
+    it = QTableWidgetItem(text)
+    if color:
+        it.setForeground(QColor(color))
+    if data is not None:
+        it.setData(Qt.ItemDataRole.UserRole, data)
+    return it
+
+
+def _hex(v: int, word: int) -> str:
+    return f"{v:#0{word * 2 + 2}x}"
+
+
+class RegistersPanel(QTableWidget):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        _setup(self, ["Reg", "Value", ""])
+
+    def show_snapshot(self, snap: Snapshot):
+        self.setRowCount(len(snap.regs))
+        for k, (name, value, changed, note) in enumerate(snap.regs):
+            col = THEME["jump"] if changed else None
+            self.setItem(k, 0, _item(name, col))
+            self.setItem(k, 1, _item(_hex(value, snap.word), col))
+            self.setItem(k, 2, _item(note, THEME["comment"]))
+
+
+class StackPanel(QTableWidget):
+    """The telescope from the stack pointer: offset, address, the pointer chain."""
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        _setup(self, ["", "Address", "Value"])
+
+    def show_snapshot(self, snap: Snapshot):
+        rows = snap.stack
+        self.setRowCount(len(rows))
+        for k, r in enumerate(rows):
+            text = " —▸ ".join(_hex(v, snap.word) for v in r.chain)
+            if r.note:
+                text += f" ◂— {r.note}"
+            kind = r.kinds[0] if r.kinds else ""
+            self.setItem(k, 0, _item(f"{k:02}:{k * snap.word:04x}", THEME["addr"]))
+            self.setItem(k, 1, _item(_hex(r.addr, snap.word), THEME[_KIND_COLOR.get("stack", "fg")]))
+            self.setItem(k, 2, _item(text, THEME.get(_KIND_COLOR.get(kind, "fg"), THEME["fg"])))
+
+
+class BacktracePanel(QTableWidget):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        _setup(self, ["#", "Address", "Function"])
+
+    def show_snapshot(self, snap: Snapshot):
+        self.setRowCount(len(snap.frames))
+        for k, (level, addr, sym) in enumerate(snap.frames):
+            self.setItem(k, 0, _item(str(level), THEME["addr"]))
+            self.setItem(k, 1, _item(_hex(addr, snap.word), None, addr))
+            self.setItem(k, 2, _item(sym or "??", THEME["func"]))
+
+
+class CodePanel(QPlainTextEdit):
+    """gdb's disassembly at pc (works in libraries too, where the listing has nothing)."""
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setReadOnly(True)
+        self.setFont(mono_font())
+        self.setLineWrapMode(QPlainTextEdit.LineWrapMode.NoWrap)
+
+    def show_snapshot(self, snap: Snapshot):
+        lines = []
+        for a, text, sym in snap.code:
+            mark = "►" if a == snap.pc else " "
+            lines.append(f"{mark} {a:#x} {('<' + sym + '>') if sym else '':24} {text}")
+        if snap.exited:
+            lines = [f"[ {snap.exited} ]"]
+        self.setPlainText("\n".join(lines))
+
+
+class ConsolePanel(QWidget):
+    """Program output, the program's stdin, and a gdb command line."""
+
+    stdin_line = Signal(str)
+    gdb_line = Signal(str)
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.out = QPlainTextEdit()
+        self.out.setReadOnly(True)
+        self.out.setFont(mono_font())
+        self.out.setMaximumBlockCount(5000)
+        self.stdin = QLineEdit()
+        self.stdin.setPlaceholderText("input to the program (Enter sends the line + \\n)")
+        self.stdin.setFont(mono_font())
+        self.cmd = QLineEdit()
+        self.cmd.setPlaceholderText("gdb command (x/8gx $rsp, info proc mappings, ...)")
+        self.cmd.setFont(mono_font())
+        self.stdin.returnPressed.connect(self._send_stdin)
+        self.cmd.returnPressed.connect(self._send_cmd)
+        lay = QVBoxLayout(self)
+        lay.setContentsMargins(0, 0, 0, 0)
+        lay.addWidget(self.out)
+        row = QHBoxLayout()
+        row.addWidget(QLabel("stdin"))
+        row.addWidget(self.stdin)
+        lay.addLayout(row)
+        row = QHBoxLayout()
+        row.addWidget(QLabel("gdb>"))
+        row.addWidget(self.cmd)
+        lay.addLayout(row)
+
+    def append(self, text: str):
+        cur = self.out.textCursor()
+        cur.movePosition(QTextCursor.MoveOperation.End)
+        cur.insertText(text)
+        self.out.setTextCursor(cur)
+        self.out.ensureCursorVisible()
+
+    def _send_stdin(self):
+        line = self.stdin.text()
+        self.stdin.clear()
+        self.stdin_line.emit(line + "\n")
+
+    def _send_cmd(self):
+        line = self.cmd.text().strip()
+        self.cmd.clear()
+        if line:
+            self.gdb_line.emit(line)
+
+
+__all__ = ["BacktracePanel", "CodePanel", "ConsolePanel", "DebugController", "RegistersPanel", "Snapshot",
+           "StackPanel"]

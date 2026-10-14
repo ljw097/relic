@@ -414,3 +414,42 @@ def test_search_panel(app, win):
     assert not win.search("imm", "not-a-number")
     assert win.search("bytes", "e8 ?? ?? ?? ??") and win.wait()
     assert len(_rows(win.search_results)) > 5
+
+
+def _debug_wait(app, win, cond, ms=20000):
+    return _spin(app, lambda: win.dbg.idle and cond(), ms)
+
+
+def test_debugger_panels_breakpoints_and_console(app, win):
+    from test_debugger import _can_debug
+    if not _can_debug():
+        pytest.skip("gdb with ptrace permission is needed")
+    an = win.an
+    win.dbg_args = ["5"]
+    vuln = an.function_by_name("vuln").addr
+    win.goto(vuln)
+    win.debug_toggle_breakpoint()                       # before starting: applied at start
+    assert vuln in win.dbg.static_bps
+    win.debug_start()
+    assert _debug_wait(app, win, lambda: win.dbg_regs.rowCount() > 0)
+    assert all(d.isVisibleTo(win) for d in win.dbg_docks)
+    assert win.dbg_docks[1] not in win.tabifiedDockWidgets(win.dbg_docks[0])    # stack beside registers
+    win.debug_start_or_continue()                       # F9: continue to the breakpoint
+    assert _debug_wait(app, win, lambda: win.disasm.debug_pc == vuln)
+    assert win.cur == vuln
+    assert win.dbg_regs.rowCount() >= 16 and win.dbg_regs.item(0, 0).text() == "rax"
+    assert win.dbg_stack.rowCount() == 16 and "main+" in win.dbg_stack.item(0, 2).text()
+    assert win.dbg_bt.item(0, 2).text() == "vuln"
+    assert "►" in win.dbg_code.toPlainText()
+    win.dbg.step_over()
+    assert _debug_wait(app, win, lambda: win.disasm.debug_pc not in (None, vuln))
+    win.dbg_console.stdin.setText("relic")
+    win.dbg_console._send_stdin()
+    win.dbg_console.cmd.setText("info registers rip")
+    win.dbg_console._send_cmd()
+    win.debug_start_or_continue()
+    assert _debug_wait(app, win, lambda: "exited" in win.dbg_console.out.toPlainText())
+    text = win.dbg_console.out.toPlainText()
+    assert "hello relic" in text and "gdb> info registers rip" in text and "exited" in text
+    win.dbg.stop()
+    assert _debug_wait(app, win, lambda: win.dbg.session is None)
