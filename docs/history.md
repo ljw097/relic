@@ -136,3 +136,4 @@
 - [x] x86-64 디컴파일러 단계 1–5 (`relic decompile`)
 - [x] 구조화 정확성: 구조화된 트리를 실행해 CFG와 같은 블록 순서를 밟는지 무작위 그래프로 비교하는 테스트, 그것으로 찾은 버그 수정 — 한쪽이 건너뛰는 합류점, 분기 안에서 만난 do-while 래치(`continue`), 루프 follow이자 영역 끝인 꼬리(`break`), 바깥 루프의 헤더·follow로의 점프(`goto`), 영역 끝으로 바로 가는 분기; 점프 테이블(switch) 포함 — 다음 case로 이어지는(fall-through) 분기·복사된 꼬리, 서로 다른 끝으로 가는 두 분기
 - [x] 라이브러리 시그니처(FLIRT 방식): 정적 라이브러리(`ar` + 재배치 ELF)에서 재배치 바이트를 가린 함수 패턴, 앞 16바이트 마스크별 색인, 가장 긴 일치·끝 위치 확인·별칭 묶음·참조 이름으로 모호성 해소, IFUNC 리졸버와 IRELATIVE 스텁 이름, noreturn 이름이면 함수 다시 찾기, `relic sigs`, GUI 적용
+- [x] README 스크린샷과 사용 흐름·디버거 따라 하기(`docs/screenshots/make_screenshots.py`로 재생성)
