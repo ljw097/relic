@@ -276,8 +276,11 @@ class Disassembler:
         imms = [op.imm for op in c.operands if op.type == OP_IMM]
         if i.kind in (CALL, JMP, CJMP) and imms:
             i.target = imms[-1] & self._mask
-        elif m == "adrp":
-            pass  # a 4 KiB page, not an address: the `add`/`ldr` after it completes it
+        elif m == "adrp" or (arch in ("arm", "thumb", "arm64") and m != "adr"):
+            # ARM / AArch64 immediates are offsets, masks and pages (`mov w0, #0xffff` is not an
+            # address, even where a PIE maps it); the analysis' constant propagation finds the
+            # addresses built from them (adrp + add, literal pools, pc-relative adds)
+            pass
         else:
             for v in imms:
                 v &= self._mask

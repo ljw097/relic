@@ -610,7 +610,10 @@ class FunctionAnalyzer:
             while changed:
                 checkpoint()
                 changed = False
-                covered = sorted((f.addr, f.end) for f in self.funcs.values() if sec.contains(f.addr))
+                # block ranges, not [first, last) of each function: a function's cold blocks
+                # (assert paths, .text.unlikely) can lie far away, past other functions
+                covered = sorted((b.addr, b.end) for f in self.funcs.values() if not f.is_import
+                                 for b in f.blocks.values() if sec.contains(b.addr))
                 gaps, cur = [], sec.addr
                 for s, e in covered:
                     if s > cur:
@@ -631,33 +634,46 @@ class FunctionAnalyzer:
                         break
 
     def _arm_gap_function(self, s: int, e: int) -> int | None:
-        """First prologue in [s, e) after padding (an odd result is a Thumb start).
+        """First prologue in [s, e) (an odd result is a Thumb start).
 
         AArch64: `stp x29, x30, [sp, #-n]!`, `paciasp`, `bti c`. ARM: A32 `push {..., lr}`
         (`stmdb sp!` / `str lr, [sp, #-4]!`), Thumb `push {..., lr}` and Thumb-2 `push.w`.
-        Gaps also hold literal pools and tables, so only a real prologue counts here.
+        Gaps also hold literal pools, tables and unreached code, so a prologue counts only at the
+        start of the gap (after padding) or right after an instruction that ends a function.
         """
-        a = (s + 3) & ~3 if self.dis.arch == "arm64" else (s + 1) & ~1
+        arm64 = self.dis.arch == "arm64"
+        step = 4 if arm64 else 2
+        a = (s + 3) & ~3 if arm64 else (s + 1) & ~1
+        at_start = True
+        prev_end = False            # the word before ends control flow (ret / b / bx lr / pop {pc})
         while a + 4 <= e:
             w = self.bin.read_int(a, 4)
             if w is None:
                 return None
-            if self.dis.arch == "arm64":
-                if w == 0 or w == 0xD503201F:                       # padding, nop
+            h = w & 0xFFFF
+            if arm64:
+                if w == 0 or w == 0xD503201F:                        # padding, nop
                     a += 4
                     continue
-                if (w & 0xFFC07FFF) == 0xA9807BFD or w in (0xD503233F, 0xD503245F, 0xD503249F):
+                if ((w & 0xFFC07FFF) == 0xA9807BFD or w in (0xD503233F, 0xD503245F, 0xD503249F)) and \
+                        (at_start or prev_end):
                     return a
-                return None
-            h = w & 0xFFFF
-            if w == 0 or h == 0xBF00 or w == 0xE1A00000 or w == 0xE320F000:   # padding, nops
-                a += 2 if h in (0, 0xBF00) and w != 0 else 4
-                continue
-            if a % 4 == 0 and ((w & 0xFFFF4000) == 0xE92D4000 or w == 0xE52DE004):
-                return a                                            # A32 push {..., lr}
-            if (h & 0xFF00) == 0xB500 or (h == 0xE92D and (w >> 16) & 0x4000):
-                return a | 1                                        # Thumb push {..., lr}
-            return None
+                prev_end = w == 0xD65F03C0 or (w & 0xFC000000) == 0x14000000 or (w & 0xFFFFFC1F) == 0xD61F0000
+            else:
+                if w == 0 or h == 0xBF00 or w == 0xE1A00000 or w == 0xE320F000:   # padding, nops
+                    a += 2 if h in (0, 0xBF00) and w != 0 else 4
+                    continue
+                if at_start or prev_end:
+                    if a % 4 == 0 and ((w & 0xFFFF4000) == 0xE92D4000 or w == 0xE52DE004):
+                        return a                                     # A32 push {..., lr}
+                    if (h & 0xFF00) == 0xB500 or (h == 0xE92D and (w >> 16) & 0x4000):
+                        return a | 1                                 # Thumb push {..., lr}
+                # Thumb `bx lr`, `pop {..., pc}`, `b.n`; A32 `bx lr`, `pop {..., pc}`, `b`
+                prev_end = h == 0x4770 or (h & 0xFF00) == 0xBD00 or (h & 0xF800) == 0xE000 or \
+                    (a % 4 == 0 and (w == 0xE12FFF1E or (w & 0xFFFF8000) == 0xE8BD8000 or
+                                     (w & 0x0F000000) == 0x0A000000 and w >> 28 == 0xE))
+            at_start = False
+            a += step
         return None
 
     def _gap_function(self, s: int, e: int, prologues: tuple[bytes, ...]) -> int | None:

@@ -46,6 +46,9 @@ class Analysis:
             if main is not None:
                 finder.add_function(main, "main")
         self._fstarts = sorted(self.functions)
+        report("data references", 0, force=True)
+        from .constprop import propagate_refs
+        propagate_refs(self)     # addresses built over several instructions (adrp + add, ...)
         report("strings", 0, force=True)
         self.strings = find_strings(self.bin)
         self._strings_by_addr = {s.addr: s for s in self.strings}

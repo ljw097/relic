@@ -14,13 +14,13 @@
 
 ## 아키텍처별 분석 보강
 
-현재 함수 탐색은 모든 아키텍처에서 동작하지만, 아래 항목은 x86-64에서만 동작한다.
-
-- [ ] **P0** 함수 단위 레지스터 상수 전파 패스 (공통 기반)
-  - x86-32 PIC: `__x86.get_pc_thunk.*` + `add` 로 만든 GOT 기준 레지스터
-  - AArch64: `adrp` + `add` / `ldr`
-  - ARM: 리터럴 풀 `ldr rN, [pc, #off]`, `add rN, pc, rN`
-  - MIPS: `lui` + `addiu`, `$gp` 기준 접근
+- [x] **P0** 함수 단위 레지스터 상수 전파 패스(`analysis/constprop.py`): CFG 위 전방 데이터 흐름(합류점은 모든 선행자가 같은 값일 때만, 호출은 caller-saved 소멸), "주소" 플래그(pc 유래 값, 비-PIE 절대 리터럴)가 붙은 값만 데이터 참조로 기록 → 문자열·전역·GOT 슬롯 xref와 리스팅 주석
+  - [x] x86-32 PIC: `__x86.get_pc_thunk.*` + `add` 로 만든 GOT 기준 레지스터
+  - [x] AArch64: `adrp` + `add` / `ldr`
+  - [x] ARM / Thumb: 리터럴 풀 `ldr rN, [pc, #off]`, `add rN, pc`, `adr`, `movw`/`movt`
+  - [ ] MIPS: `lui` + `addiu`, `$gp` 기준 접근 (MIPS 지원과 함께)
+  - 문자열 xref 비율: armhf `ld.so` 1 → 513/842, aarch64 `ld.so` 0 → 409/836, `vuln32_pie` 0 → 10/10
+  - [x] ARM/AArch64 즉치값은 주소로 보지 않음(`mov w0, #0xffff`가 PIE에서 함수 시작으로 잡히던 문제), 빈 구간 계산은 함수 범위가 아니라 블록 구간으로(멀리 떨어진 cold 블록이 사이 함수들을 가리던 문제), 구간 중간의 프롤로그도 종결 명령 뒤라면 인정
 - [ ] **P0** 호출 규약별 인자 추출을 `vulns`에서 공통 사용
   - [x] x64 SysV / Win64, x86 cdecl: 디컴파일러가 복원한 호출 인자 사용 (x64는 블록 안 역추적으로 결론이 안 날 때만; GUI는 창을 먼저 띄우고 백그라운드에서 스캔)
   - [x] AArch64 x0–x7 (AArch64 리프터)
