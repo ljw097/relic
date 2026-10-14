@@ -5,6 +5,7 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
 from ..disasm import CALL, Insn
+from ..progress import report
 
 if TYPE_CHECKING:
     from . import Analysis
@@ -125,7 +126,9 @@ def find_vulns(an: "Analysis") -> list[Finding]:
     ir_cache: dict = {}
     # integer argument registers of the binary's calling convention (SysV or Win64)
     regs = ("rcx", "rdx", "r8", "r9") if b.format == "PE" else X64_ARGS
-    for f in an.functions.values():
+    total = len(an.functions)
+    for k, f in enumerate(an.functions.values()):
+        report("vulns", k, total)
         if f.is_import:
             continue
         for blk in f.blocks.values():

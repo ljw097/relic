@@ -15,6 +15,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 
+from ..progress import checkpoint
 from .ir import (BinOp, Branch, IndirectJump, IRFunction, Jump, Reg, Return, Stmt, UnOp, fmt, fmt_stmt, walk)
 
 EXIT = -1
@@ -374,6 +375,7 @@ class Structurer:
         return Jump1("goto", n)
 
     def _region(self, n, stop, ctx):
+        checkpoint()
         seq = Seq()
         stops = stop if isinstance(stop, (set, frozenset)) else {stop}
         while n is not None and n not in stops and n != EXIT:

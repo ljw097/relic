@@ -10,6 +10,7 @@ from PySide6.QtWidgets import (QGraphicsItem, QGraphicsPathItem, QGraphicsScene,
 from ..analysis import Analysis
 from ..analysis.functions import Function
 from ..listing import Line, function_lines, render
+from ..progress import Cancelled, Progress
 
 THEME = {
     "bg": "#1e1f22", "fg": "#d4d4d4", "addr": "#6c7086", "bytes": "#585b70", "mnem": "#89b4fa",
@@ -470,6 +471,8 @@ def _decompile_text(an: Analysis, f: Function):
     try:
         from ..decompiler.emit import decompile
         return decompile(an, f)
+    except Cancelled:
+        return "// decompilation cancelled"
     except NotImplementedError as e:
         return f"// {e}"
     except Exception as e:  # noqa: BLE001 - never take the GUI down with a decompiler bug
@@ -484,9 +487,17 @@ class DecompileJob(QThread):
     def __init__(self, gen: int, an: Analysis, f: Function, parent=None):
         super().__init__(parent)
         self.gen, self.an, self.f = gen, an, f
+        self.token = Progress()
+
+    def cancel(self):
+        self.token.cancel()
 
     def run(self):
-        self.finished_result.emit(self.gen, self.f.addr, _decompile_text(self.an, self.f))
+        handle = self.token.activate()
+        try:
+            self.finished_result.emit(self.gen, self.f.addr, _decompile_text(self.an, self.f))
+        finally:
+            Progress.deactivate(handle)
 
 
 class PseudocodeView(QPlainTextEdit):
@@ -619,9 +630,11 @@ class PseudocodeView(QPlainTextEdit):
             self._request(nxt)
 
     def shutdown(self):
-        """Wait for a running job before the view goes away (a QThread must not outlive it)."""
+        """Stop a running job before the view goes away (a QThread must not outlive it): it is
+        cancelled at its next checkpoint, between optimisation rounds or structuring steps."""
         self.queued = None
         if self.job is not None:
+            self.job.cancel()
             self.job.wait()
             self.job = None
 

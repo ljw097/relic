@@ -19,6 +19,7 @@ from __future__ import annotations
 
 from collections import Counter
 
+from ..progress import checkpoint
 from .arch import ArchInfo
 from .interp import InterpError, apply_binop, apply_cast, apply_unop
 from .ir import (BARRIERS, Assign, BinOp, Call, CallStmt, Cast, Const, Effect, Expr, Extract, IRFunction,
@@ -448,6 +449,7 @@ def _dce(fn: IRFunction) -> bool:
 def optimize(fn: IRFunction, arch: ArchInfo | None = None) -> IRFunction:
     """Run every pass to a fixpoint. Mutates and returns `fn` (expects SSA input)."""
     for _ in range(MAX_ITERS):
+        checkpoint()                 # a cancelled decompilation stops between rounds
         changed = False
         changed |= _fold_pass(fn)
         changed |= _propagate(fn)

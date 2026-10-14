@@ -9,6 +9,7 @@ from dataclasses import dataclass
 
 from ..disasm import CALL, CJMP, JMP, Disassembler, Insn
 from ..loader.base import Binary
+from ..progress import report
 from .functions import Block, Function, FunctionAnalyzer
 from .strings import String, find_strings
 
@@ -37,8 +38,10 @@ class Analysis:
 
     # ------------------------------------------------------------------ run
     def run(self) -> "Analysis":
+        report("functions", 0, force=True)
         self.functions = FunctionAnalyzer(self.bin, self.dis).run()
         self._fstarts = sorted(self.functions)
+        report("strings", 0, force=True)
         self.strings = find_strings(self.bin)
         self._strings_by_addr = {s.addr: s for s in self.strings}
         self._build_xrefs()
@@ -46,7 +49,9 @@ class Analysis:
         return self
 
     def _build_xrefs(self):
-        for f in self.functions.values():
+        total = len(self.functions)
+        for k, f in enumerate(self.functions.values()):
+            report("xrefs", k, total)
             for blk in f.blocks.values():
                 for i in blk.insns:
                     if i.kind in (CALL, JMP, CJMP) and i.target is not None:

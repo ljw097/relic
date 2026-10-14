@@ -5,6 +5,7 @@ from dataclasses import dataclass, field
 
 from ..disasm import CALL, CJMP, HALT, JMP, RET, Disassembler, Insn
 from ..loader.base import Binary, Symbol
+from ..progress import checkpoint, report
 
 NORETURN = {
     "exit", "_exit", "_Exit", "abort", "__stack_chk_fail", "__assert_fail", "__fortify_fail",
@@ -96,6 +97,7 @@ class FunctionAnalyzer:
 
     def _drain(self):
         while self._queue:
+            report("functions", len(self.funcs))
             a = self._queue.pop()
             if self.dis.md_thumb is not None and a & 1:      # ARM: a Thumb function pointer
                 self.dis.hint(a, True)
@@ -495,6 +497,7 @@ class FunctionAnalyzer:
                 continue
             changed = True
             while changed:
+                checkpoint()
                 changed = False
                 covered = sorted((f.addr, f.end) for f in self.funcs.values() if sec.contains(f.addr))
                 gaps, cur = [], sec.addr
