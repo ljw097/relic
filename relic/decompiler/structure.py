@@ -311,11 +311,13 @@ class Structurer:
                 return Seq([Block(n, body, copy=True), Ret(term)])
             nxt = self.succ[n][0] if len(self.succ[n]) == 1 else None
             if nxt is not None:
+                # a break / continue first: the loop's follow may also be this region's stop,
+                # and falling out of the region would run the loop's test instead
                 edge = self._edge(nxt, ctx)
-                if nxt in (stops if isinstance(stops, (set, frozenset)) else {stops}):
-                    return Seq([Block(n, body, copy=True)])
                 if edge is not None:
                     return Seq([Block(n, body, copy=True), edge])
+                if nxt in (stops if isinstance(stops, (set, frozenset)) else {stops}):
+                    return Seq([Block(n, body, copy=True)])
                 if _small_return(self.blocks[nxt]):
                     return Seq([Block(n, body, copy=True), Ret(self.blocks[nxt].stmts[0])])
         region = self._dup_region(n, stops, ctx)
@@ -373,6 +375,8 @@ class Structurer:
             return "continue"
         if target == loop.follow and top is loop:
             return "break"
+        if target == loop.follow or self._outer_exit(target, ctx, loop):
+            return "goto"
         return None
 
     def _duplicate(self, n, region, stops, ctx) -> Seq:
@@ -391,7 +395,9 @@ class Structurer:
         self.gotos.add(n)
         return Jump1("goto", n)
 
-    def _region(self, n, stop, ctx):
+    def _region(self, n, stop, ctx, loop_body: bool = False):
+        """Structure from `n` until a block in `stop`. `loop_body`: this is a do-while's body
+        itself, whose end is where its latch's test runs."""
         checkpoint()
         seq = Seq()
         stops = stop if isinstance(stop, (set, frozenset)) else {stop}
@@ -411,6 +417,11 @@ class Structurer:
                 node, follow = self._loop(n, ctx)
                 seq.items.append(node)
                 n = follow
+                # leaving it may leave (or restart) an enclosing loop too
+                edge = self._edge(n, ctx)
+                if edge is not None:
+                    seq.items.append(edge)
+                    break
                 continue
             self.emitted.add(n)
             blk = self.blocks[n]
@@ -418,7 +429,11 @@ class Structurer:
             seq.items.append(Block(n, body, copy=self._dup_depth > 0))
             inner = next((c for c in reversed(ctx) if c.kind == "loop"), None)
             if inner is not None and inner.latch_cond is not None and n == inner.latch:
-                break  # do-while latch: its test is the loop condition
+                # do-while latch: its test is the loop condition. Reached inside a branch (not
+                # at the end of the body), go to that test: `continue` in a do-while does
+                if not loop_body:
+                    seq.items.append(Jump1("continue"))
+                break
             if isinstance(term, Return):
                 seq.items.append(Ret(term))
                 n = None
@@ -455,7 +470,14 @@ class Structurer:
             return Jump1("continue")
         if target == loop.follow:
             return Jump1("break") if top is loop else self._goto(target)
+        if self._outer_exit(target, ctx, loop):
+            return self._goto(target)
         return None
+
+    def _outer_exit(self, target, ctx, inner) -> bool:
+        """`target` restarts or leaves a loop around the innermost one: C has no `continue 2`,
+        it is a `goto`."""
+        return any(c.kind == "loop" and c is not inner and target in (c.header, c.follow) for c in ctx)
 
     def _loop(self, h, ctx):
         info = self.loops[h]
@@ -480,7 +502,7 @@ class Structurer:
             lterm = _terminator(self.blocks[c.latch])[1]
             cond = lterm.cond if lterm.true == h else _negate(lterm.cond)
             c.latch_cond = cond
-            body = self._region(h, follow, ctx + [c])
+            body = self._region(h, follow, ctx + [c], loop_body=True)
             return Loop("dowhile", cond, body, h), follow
         # endless: structure the whole body starting at the header
         return Loop("inf", None, self._region(h, follow, ctx + [c]), h), follow
@@ -496,6 +518,13 @@ class Structurer:
         cond, t, f = term.cond, term.true, term.false
         if follow is None:
             follow = self._join(n, t, f, loop, sw, stops)
+        stop_set = stops if isinstance(stops, (set, frozenset)) else {stops}
+        if follow is not None and follow not in stop_set and (t in stop_set) != (f in stop_set) and \
+                self._edge_kind(t if t in stop_set else f, ctx) is None:      # (a break leaves on its own)
+            # one side leaves this region (to its stop), and the post-dominator lies beyond it:
+            # the stop is where the `if` ends, or the leaving side would fall into the code
+            # that follows instead of leaving
+            follow = t if t in stop_set else f
 
         # bounds check guarding a jump table -> switch with a default
         for tgt, other, _c in ((f, t, cond), (t, f, _negate(cond))):
@@ -536,13 +565,15 @@ class Structurer:
         stop_set = stops if isinstance(stops, (set, frozenset)) else {stops}
         limit = loop.body if loop is not None else None
 
-        def reach(start):
+        def reach(start, avoid=None):
+            if start == avoid:
+                return set()
             seen = {start}
             work = [start]
             while work:
                 a = work.pop()
                 for s in self.succ.get(a, ()):
-                    if s in seen or s == n or (limit is not None and s not in limit) or s in stop_set:
+                    if s in seen or s == n or (limit is not None and s not in limit) or s in stop_set or s == avoid:
                         continue
                     if self._dominates(s, a):        # back edge: not part of this acyclic region
                         continue
@@ -556,9 +587,14 @@ class Structurer:
 
         both = reach(t) & reach(f)
         cands = [m for m in both if m not in self.emitted and self._dominates(n, m) and m in self.rpo_index]
-        if not cands:
-            return None
-        return min(cands, key=self.rpo_index.__getitem__)
+
+        def joins(m) -> bool:
+            # neither side gets past `m` without going through it: code after the `if` (from m
+            # on) is then reached only through m, never also from inside a branch
+            after = reach(m)
+            return not (reach(t, m) & after) and not (reach(f, m) & after)
+        cands = [m for m in sorted(cands, key=self.rpo_index.__getitem__) if joins(m)]
+        return cands[0] if cands else None
 
     def _switch(self, n, term: IndirectJump, default, ctx, follow):
         """Switch on `term`'s jump table; `follow` is where every case ends up (or None)."""
