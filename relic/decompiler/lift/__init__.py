@@ -18,6 +18,9 @@ def lifter_for(an: Analysis):
     if an.bin.arch == "arm64":
         from .arm64 import Arm64Lifter
         return Arm64Lifter(an)
+    if an.bin.arch == "arm":
+        from .arm import ArmLifter
+        return ArmLifter(an)
     raise NotImplementedError(f"no lifter for {an.bin.arch} yet")
 
 
@@ -38,6 +41,25 @@ def lift_function(an: Analysis, f: Function) -> IRFunction:
         if not ends and len(blk.succs) == 1:
             ib.stmts.append(Jump(blk.last.addr, blk.succs[0]))
         out.blocks[a] = ib
+    # blocks the lifter split off an instruction (`blne f`, `addls pc, pc, ...`): the block
+    # ending in that instruction now branches to the synthetic block or falls through
+    extra = getattr(lifter, "extra_blocks", {})
+    for a, (stmts, succs) in sorted(extra.items()):
+        out.blocks[a] = IRBlock(a, list(stmts), succs=[s for s in succs if s in out.blocks])
+    if extra:
+        for ib in list(out.blocks.values()):
+            last = ib.stmts[-1] if ib.stmts else None
+            if not isinstance(last, Branch) or not ({last.true, last.false} & set(extra)):
+                continue
+            new = [t for t in dict.fromkeys((last.true, last.false)) if t in out.blocks]
+            for s in ib.succs:
+                if s not in new and s in out.blocks and ib.addr in out.blocks[s].preds:
+                    out.blocks[s].preds.remove(ib.addr)
+            ib.succs = new
+        for ib in out.blocks.values():
+            for s in ib.succs:
+                if s in out.blocks and ib.addr not in out.blocks[s].preds:
+                    out.blocks[s].preds.append(ib.addr)
     # a conditional jump into another function is a conditional tail call: give it a
     # block of its own (call + return) so every branch target is a block of this function
     bits = an.bin.bits

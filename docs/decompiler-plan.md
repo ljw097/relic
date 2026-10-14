@@ -47,6 +47,7 @@ relic/decompiler/
     __init__.py   리프터 선택, 다른 함수로 가는 조건 분기 → 꼬리 호출 블록
     x86.py        x86 / x64
     arm64.py      AArch64
+    arm.py        ARM32 (A32 / Thumb-2): 조건 실행은 Ite, 조건부 호출·리턴은 합성 블록(extra_blocks)
   arch.py         호출 규약 표
   ssa.py          지배자, phi 삽입, 이름 부여
   passes.py       상수/복사 전파, load 전달, 조건식 복원, DCE

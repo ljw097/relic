@@ -2,7 +2,7 @@
 
 리버싱과 포너블을 위한 디스어셈블러 / 디컴파일러 (WIP).
 
-현재는 **분석 엔진, CLI, GUI**와 x86-64/x86-32/AArch64 **디컴파일러**(`relic decompile`, GUI Pseudocode 탭)가 동작합니다. 다른 아키텍처 리프터는 개발 중입니다.
+현재는 **분석 엔진, CLI, GUI**와 x86-64/x86-32/AArch64/ARM32(A32·Thumb-2) **디컴파일러**(`relic decompile`, GUI Pseudocode 탭)가 동작합니다. 다른 아키텍처 리프터는 개발 중입니다.
 진행 상황은 [TODO.md](TODO.md), 디컴파일러 설계는 [docs/decompiler-plan.md](docs/decompiler-plan.md)를 참고하세요.
 
 ## 기능
@@ -19,9 +19,9 @@
 | 포너블 휴리스틱 | `gets`·`strcpy` 등 위험 함수, 비상수 포맷 스트링, 폭 없는 `scanf("%s")`, ret2win 후보 |
 | 프로젝트 | 이름 변경·주석·디컴파일러 변수 이름을 `<binary>.relic.json`에 저장 (CLI 출력에도 반영) |
 | GUI | 함수 목록, 디스어셈블리 / CFG 그래프 / 의사 코드 / 헥스, xref·문자열·import·vulns·checksec 패널 |
-| 디컴파일러 (x86-64, x86-32, AArch64) | 리프팅 → SSA·최적화 → 호출 인자·스택 버퍼·카나리 → out-of-SSA → 구조화 → C 출력(`relic decompile`) |
+| 디컴파일러 (x86-64, x86-32, AArch64, ARM32) | 리프팅 → SSA·최적화 → 호출 인자·스택 버퍼·카나리 → out-of-SSA → 구조화 → C 출력(`relic decompile`) |
 
-> 인자 추적 기반 탐지(포맷 스트링, ret2win)는 **x86-64·x86-32·AArch64**, 점프 테이블 복원은 **x86-64·x86-32**에서 동작합니다.
+> 인자 추적 기반 탐지(포맷 스트링, ret2win)는 **x86-64·x86-32·AArch64·ARM32**, 점프 테이블 복원은 **x86-64·x86-32·ARM32**에서 동작합니다.
 
 ## 설치
 
@@ -99,8 +99,11 @@ relic sc.bin --arch x64 --base 0x1000
 | `;` | 주석 |
 | `X` | xref 패널 |
 | `Ctrl+S` | 프로젝트 저장 (`<binary>.relic.json`) |
+| `Ctrl+.` | 실행 중인 분석 / 취약점 스캔 취소 |
 
 더블클릭으로 분기 대상·심볼(의사 코드에서는 함수·전역 이름, `loc_` 레이블)을 따라갑니다. 의사 코드는 탭을 열 때 함수 단위로 백그라운드에서 디컴파일하고(그동안 GUI는 멈추지 않음) 캐시하며, 이름 변경은 바로 반영됩니다. 문자열 테이블에서 더블클릭하면 그 문자열을 참조하는 코드로 이동합니다.
+
+분석과 취약점 스캔은 백그라운드에서 돌며 상태 표시줄에 진행 상황과 Cancel 버튼이 나옵니다. 창을 닫으면 실행 중인 작업을 기다리지 않고 취소합니다. 스캔이 실패하면 Vulns 표에 빈 결과 대신 오류가 표시됩니다. CFG 그래프는 층별 배치(루프는 위로 돌아가는 간선, 긴 간선은 블록 사이로 우회, 교차 최소화)로 그립니다.
 
 ## 라이브러리로 사용
 
@@ -123,9 +126,10 @@ relic/
   loader/      ELF / PE / RAW → 공통 Binary 모델 (섹션, 세그먼트, 심볼, import, 재배치)
   disasm.py    capstone 래퍼, 명령어 분류(call/jmp/cjmp/ret/halt), 분기 대상·데이터 참조 추출
   analysis/    함수 탐색·CFG(functions), 문자열, checksec, 취약점 휴리스틱, xref, 프로젝트 저장
-  decompiler/  IR, 리프터(x86/x64), SSA·최적화, 호출/스택 복원, 구조화, C 출력 (docs/decompiler-plan.md)
+  decompiler/  IR, 리프터(x86/x64, AArch64, ARM32), SSA·최적화, 호출/스택 복원, 구조화, C 출력 (docs/decompiler-plan.md)
   listing.py   심볼/문자열 주석이 붙은 디스어셈블리 리스팅 (CLI·GUI 공용)
-  gui/         PySide6 메인 윈도우와 뷰 위젯
+  gui/         PySide6 메인 윈도우와 뷰 위젯, CFG 층별 레이아웃(layout.py)
+  progress.py  백그라운드 작업 취소 토큰·진행 보고
   __main__.py  CLI
 tests/
   src/vuln.c   테스트용 포너블 샘플 (테스트 실행 시 tests/bins/에 빌드)

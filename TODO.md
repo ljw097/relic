@@ -6,6 +6,10 @@
 
 - [x] 커서 아래 단어 하이라이트 (리스팅·의사 코드, 레지스터는 rax/eax/ax/al 별칭까지)
 - [x] 최근 파일 목록(File ▸ Open Recent), 창 크기·dock 배치 저장 (`QSettings`, `RELIC_SETTINGS`로 ini 경로 지정 가능)
+- [x] 백그라운드 작업 취소·진행 표시: 상태 표시줄 진행 막대 + Cancel(`Ctrl+.`), 스레드별 취소 토큰(`relic/progress.py`)을 함수 탐색·xref·취약점 스캔·디컴파일 패스 사이에서 확인; 종료 시 기다리지 않고 취소(최대 2초, 넘으면 창을 숨기고 스레드 종료 후 닫음)
+- [x] 취약점 스캔 실패를 "발견 없음"과 구분해 표시(`VulnsThread.failed`, 표에 오류 행)
+- [x] CFG 레이아웃: Sugiyama 방식(`relic/gui/layout.py`) — back edge 역전, 최장 경로 층, 긴 간선 더미 노드 경로, barycenter 교차 최소화(`/bin/ls` 큰 함수 교차 16656 → 1248), isotonic 좌표 배치, 층 하단까지 수직으로 내린 뒤 꺾는 간선
+- [ ] **P2** CFG: 노드 수천 개 함수에서 교차 계산(층 쌍마다 O(E²)) 가속, 간선 묶음(bundling), 접기
 - [ ] **P2** 테마 전환(라이트/다크), 폰트 크기 설정
 
 ## 아키텍처별 분석 보강
@@ -20,17 +24,19 @@
 - [ ] **P0** 호출 규약별 인자 추출을 `vulns`에서 공통 사용
   - [x] x64 SysV / Win64, x86 cdecl: 디컴파일러가 복원한 호출 인자 사용 (x64는 블록 안 역추적으로 결론이 안 날 때만; GUI는 창을 먼저 띄우고 백그라운드에서 스캔)
   - [x] AArch64 x0–x7 (AArch64 리프터)
-  - [ ] ARM r0–r3, MIPS a0–a3, RISC-V a0–a7, PPC r3–r10 (해당 리프터가 생기면 같은 경로로)
-- [ ] **P1** 점프 테이블: ~~x86-32 PIC(GOT 기준 오프셋)~~ (완료), AArch64(`ldrb/ldrh` + `adr` + `add ..., lsl`), ARM(`ldrls pc, [pc, rN, lsl #2]`)
+  - [x] ARM r0–r3 (ARM32 리프터)
+  - [ ] MIPS a0–a3, RISC-V a0–a7, PPC r3–r10 (해당 리프터가 생기면 같은 경로로)
+- [ ] **P1** 점프 테이블: ~~x86-32 PIC(GOT 기준 오프셋)~~ (완료), AArch64(`ldrb/ldrh` + `adr` + `add ..., lsl`), ~~ARM(`addls pc, pc, rN, lsl #2`, `ldr pc, [pc, rN, lsl #2]`, Thumb `tbb`/`tbh`, `adr`+`ldr`+`add`+`bx` 오프셋 테이블)~~ (완료)
   - 상대 테이블은 후보 기준 주소들을 검증해서 선택
 - [ ] **P1** MIPS: `.MIPS.stubs` / GOT(`DT_MIPS_GOTSYM`, `DT_MIPS_LOCAL_GOTNO`) 기반 import 이름 해석, 지연 슬롯을 블록에 포함
-- [ ] **P1** ARM Thumb 모드 (심볼 LSB, `blx` 모드 전환)
+- [x] **P1** ARM Thumb 모드: 주소별 명령어 집합(`$a`/`$t` 매핑 심볼, 심볼·엔트리 LSB, `bl`은 유지·`blx label`은 전환), IT 블록(조건을 한 번에 디코딩), Thumb PLT 진입점(`bx pc`)
+  - [ ] **P2** 매핑 심볼 없는 stripped 바이너리: 리터럴 풀 함수 포인터(`func | 1`)로 시드, 데이터 영역 오디코딩(ldc/stc) 감지
 - [ ] **P2** PPC64 ELFv1 함수 디스크립터, RISC-V `auipc` 쌍
 
 ## 테스트 / 인프라
 
 - [x] **P0** GitHub Actions CI (pytest, gcc 설치, Python 3.10 / 3.12 / 3.13)
-- [ ] **P1** 멀티 아키텍처 샘플: `-m32`(완료: vuln32·flow32, CI에 gcc-multilib), `aarch64-linux-gnu-gcc`(완료: vuln_a64·flow_a64), `arm-linux-gnueabi-gcc`, `mipsel-linux-gnu-gcc` (툴체인 없으면 skip)
+- [ ] **P1** 멀티 아키텍처 샘플: `-m32`(완료: vuln32·flow32, CI에 gcc-multilib), `aarch64-linux-gnu-gcc`(완료: vuln_a64·flow_a64), `arm-linux-gnueabihf-gcc`(완료: vuln_arm·vuln_thumb·flow_arm·flow_thumb; CI는 교차 컴파일 job이 샘플을 만들고 본 job이 `-m32`로 재컴파일 검증), `mipsel-linux-gnu-gcc` (툴체인 없으면 skip)
 - [x] case마다 함수를 호출하는 `switch` 샘플(`flow.c`의 `sw_calls`): x86-64/x86-32 × -O0/-O2 모두 점프 테이블 → `switch`, 재컴파일 검증
 - [x] PE 테스트: MinGW x64/x86 샘플로 로더·COFF 심볼·IAT 호출 이름·checksec·vulns·디컴파일 (CI에 mingw 설치, 없으면 skip)
 - [ ] **P2** ruff 린트 / 포맷 설정
@@ -81,6 +87,8 @@
   - [x] 디컴파일은 백그라운드 스레드에서(한 번에 하나, 진행 중 표시, 오래된 결과 폐기)
   - [x] 의사 코드에서 변수·매개변수 이름 변경(`N`, 프로젝트 파일에 저장), 사용자 주석 표시
   - [x] AArch64 리프터(`lift/arm64.py`): 시프트·확장 피연산자, pre/post-index, ldp/stp, csel/cset/ccmp, 비트필드, cbz/tbz, NZCV(C=no-borrow); AAPCS64, `__stack_chk_guard` 카나리, `adrp` 페이지를 코드 참조로 오인하지 않음
+  - [x] ARM32 리프터(`lift/arm.py`): A32·Thumb-2, 조건 실행(`movgt` → `c ? new : old`, 조건부 호출/리턴은 합성 블록), 배럴 시프터 캐리, 리터럴 풀 상수, ldm/stm/push/pop, `__aeabi_idiv(mod)` → `/`·`%`, cbz/cbnz, strex; AAPCS(r0–r3), 정렬용 `push {r3, lr}` 숨김, ARM PLT 스텁 해석
+  - [x] 공통 개선(ARM에서 발견): 루프에서 스택 버퍼를 훑는 포인터 phi를 고정 스택 주소로 잘못 보던 버그 수정, 조건 플래그 중복 전파(술어 실행), `c ? x : !c` 류 정리, 단독 GOT 슬롯 → `&stdout`
   - [ ] **P1** AArch64 점프 테이블(`ldrb/ldrh` + `adr` + `add ..., lsl #2`) — gcc는 작은 switch를 비교 트리로 만들어 아직 샘플이 없음
   - [x] x86-32: cdecl 스택 인자, 스택 매개변수(`a1`…), PC 썽크(`__x86.get_pc_thunk.*`, stripped는 본문으로 인식), `main`의 스택 재정렬, GOT 경유 전역(`stdout`)
 

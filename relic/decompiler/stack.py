@@ -24,6 +24,8 @@ _CANARY_OFF = 0x28  # glibc thread-pointer offset of the stack guard
 def _callee_saved(arch: ArchInfo) -> set[str]:
     if arch.name.startswith("arm64"):
         return {f"x{k}" for k in range(19, 31)}      # x19-x28, frame pointer x29, link register x30
+    if arch.name.startswith("arm"):
+        return {f"r{k}" for k in range(4, 12)} | {"lr"}   # r4-r11 (r11 = frame pointer), link register
     if arch.bits == 64:
         return {"rbp", "rbx", "r12", "r13", "r14", "r15"}
     return {"ebp", "ebx", "esi", "edi"}
@@ -111,30 +113,40 @@ def _build_spoff(fn: IRFunction, arch: ArchInfo) -> dict[Var, int]:
 
 def build_frame(fn: IRFunction, arch: ArchInfo) -> Frame:
     """A frame with every stack-pointer-derived variable's offset (no slots yet)."""
-    spoff: dict[Var, int] = {}
+    entry: dict[Var, int] = {}
     for s in fn.stmts():
         for top in stmt_exprs(s):
             for x in walk(top):
                 if isinstance(x, Var) and x.name == arch.sp and x.version == 0:
-                    spoff[x] = 0
-    frame = Frame(arch, spoff)
-    changed = True
-    while changed:
-        changed = False
-        for s in fn.stmts():
-            if isinstance(s, Assign) and isinstance(s.dst, Var) and s.dst not in spoff:
-                if isinstance(s.src, Phi):
-                    # the stack pointer merged at a join (loop header): balanced paths agree.
-                    # Optimistic -- a source still unknown (computed from this phi around the
-                    # loop) is assumed to agree with the known ones
-                    offs = {frame.offset_of(v) for _, v in s.src.sources} - {None}
-                    off = offs.pop() if len(offs) == 1 else None
-                else:
-                    off = frame.offset_of(s.src)
-                if off is not None:
-                    spoff[s.dst] = off
-                    changed = True
-    return frame
+                    entry[x] = 0
+    phis = [s for s in fn.stmts() if isinstance(s, Assign) and isinstance(s.dst, Var) and isinstance(s.src, Phi)]
+    banned: set[Var] = set()
+    while True:
+        spoff = dict(entry)
+        frame = Frame(arch, spoff)
+        changed = True
+        while changed:
+            changed = False
+            for s in fn.stmts():
+                if isinstance(s, Assign) and isinstance(s.dst, Var) and s.dst not in spoff and s.dst not in banned:
+                    if isinstance(s.src, Phi):
+                        # the stack pointer merged at a join (loop header): balanced paths agree.
+                        # Optimistic -- a source still unknown (computed from this phi around the
+                        # loop) is assumed to agree with the known ones; checked below
+                        offs = {frame.offset_of(v) for _, v in s.src.sources} - {None}
+                        off = offs.pop() if len(offs) == 1 else None
+                    else:
+                        off = frame.offset_of(s.src)
+                    if off is not None:
+                        spoff[s.dst] = off
+                        changed = True
+        # a pointer walking a stack buffer (`ldrb r1, [r0, #1]!` in a loop) is a phi whose
+        # sources disagree once all are known: not a fixed stack address
+        bad = {s.dst for s in phis if s.dst in spoff and
+               any(frame.offset_of(v) not in (None, spoff[s.dst]) for _, v in s.src.sources)}
+        if not bad:
+            return frame
+        banned |= bad
 
 
 def _frame_bookkeeping(frame: Frame, value: Expr) -> bool:
@@ -155,6 +167,10 @@ def analyze_frame(fn: IRFunction, arch: ArchInfo, guards=frozenset()) -> Frame:
         return frame.slots.setdefault(off, Slot(off))
 
     frame.slots[0] = Slot(0, size=arch.bits // 8, width=arch.bits // 8, kind="retaddr")
+    # ARM `push {r3, r4, lr}`: an argument register pushed along with the link register only
+    # keeps the stack 8-byte aligned
+    lr_push = {s.addr for s in fn.stmts() if isinstance(s, Store) and isinstance(s.src, Var)
+               and s.src.version == 0 and s.src.name == "lr"} if arch.name == "arm-aapcs" else set()
 
     for s in fn.stmts():
         # dereferences: Load / Store addresses are real accesses (not address-taken)
@@ -171,7 +187,8 @@ def analyze_frame(fn: IRFunction, arch: ArchInfo, guards=frozenset()) -> Frame:
                 sl.width = max(sl.width, s.bits // 8)
                 if _is_canary(s.src, frame.guards):
                     sl.kind, frame.canary = "canary", off
-                elif isinstance(s.src, Var) and s.src.version == 0 and s.src.name in saved and sl.kind == "local":
+                elif isinstance(s.src, Var) and s.src.version == 0 and sl.kind == "local" and (
+                        s.src.name in saved or s.addr in lr_push):
                     sl.kind, sl.saved_reg = "saved", s.src.name
                 elif realign_entry and sl.kind == "local" and _frame_bookkeeping(frame, s.src):
                     # realigning prologue: keeps a copy of the return address and of the
@@ -192,6 +209,17 @@ def analyze_frame(fn: IRFunction, arch: ArchInfo, guards=frozenset()) -> Frame:
             if off is not None:
                 slot(off).taken = True
 
+    # `buf[1]` read directly (an inlined loop over a char buffer, peeled): a byte slot that is
+    # only loaded, right after an address-taken byte buffer, is part of that buffer
+    stored = {frame.offset_of(s.dst) for s in fn.stmts() if isinstance(s, Store)}
+    buf = None
+    for off in sorted(frame.slots):
+        sl = frame.slots[off]
+        if buf is not None and sl.kind == "local" and not sl.taken and sl.width == 1 and off not in stored \
+                and off - buf.offset < 16:
+            del frame.slots[off]
+            continue
+        buf = sl if sl.kind == "local" and sl.taken and sl.width <= 1 else None
     # size each slot by the distance to the next slot above it; classify leftovers
     offs = sorted(frame.slots)
     for i, off in enumerate(offs):

@@ -5,6 +5,7 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
 from ..disasm import CALL, Insn
+from ..progress import report
 
 if TYPE_CHECKING:
     from . import Analysis
@@ -100,7 +101,7 @@ def _ir_args(an: "Analysis", f, cache: dict) -> dict[int, tuple] | None:
     if f.addr in cache:
         return cache[f.addr]
     res = None
-    if an.bin.arch in ("x64", "x86", "arm64"):
+    if an.bin.arch in ("x64", "x86", "arm64", "arm"):
         try:
             from ..decompiler.cleanup import cached_ir
             from ..decompiler.ir import CallStmt
@@ -125,7 +126,9 @@ def find_vulns(an: "Analysis") -> list[Finding]:
     ir_cache: dict = {}
     # integer argument registers of the binary's calling convention (SysV or Win64)
     regs = ("rcx", "rdx", "r8", "r9") if b.format == "PE" else X64_ARGS
-    for f in an.functions.values():
+    total = len(an.functions)
+    for k, f in enumerate(an.functions.values()):
+        report("vulns", k, total)
         if f.is_import:
             continue
         for blk in f.blocks.values():
@@ -140,7 +143,7 @@ def find_vulns(an: "Analysis") -> list[Finding]:
                 if base in DANGEROUS:
                     sev, msg = DANGEROUS[base]
                     out.append(Finding(i.addr, f.name, sev, "dangerous-call", msg))
-                if b.arch not in ("x64", "x86", "arm64"):
+                if b.arch not in ("x64", "x86", "arm64", "arm"):
                     continue
 
                 def arg(k, reg, f=f, i=i, insns=insns, idx=idx):

@@ -5,6 +5,7 @@ from dataclasses import dataclass, field
 
 from ..disasm import CALL, CJMP, HALT, JMP, RET, Disassembler, Insn
 from ..loader.base import Binary, Symbol
+from ..progress import checkpoint, report
 
 NORETURN = {
     "exit", "_exit", "_Exit", "abort", "__stack_chk_fail", "__assert_fail", "__fortify_fail",
@@ -96,7 +97,11 @@ class FunctionAnalyzer:
 
     def _drain(self):
         while self._queue:
+            report("functions", len(self.funcs))
             a = self._queue.pop()
+            if self.dis.md_thumb is not None and a & 1:      # ARM: a Thumb function pointer
+                self.dis.hint(a, True)
+                a &= ~1
             if a in self.funcs or not self.bin.is_exec(a):
                 continue
             self._analyze(a)
@@ -148,6 +153,8 @@ class FunctionAnalyzer:
                     break
                 insns[a] = i
                 nxt = i.end
+                if self.dis.md_thumb is not None:
+                    self._hint_modes(i)
                 if i.kind == CALL:
                     tgt = i.target
                     if tgt is not None and self.bin.is_exec(tgt):
@@ -156,6 +163,12 @@ class FunctionAnalyzer:
                             self._queue.append(tgt)
                     if self._is_noreturn_call(i):
                         edges[a] = []
+                        break
+                    if i.cond:
+                        # ARM conditional call: the block ends so the lifter can branch around it
+                        edges[a] = [nxt]
+                        leaders.add(nxt)
+                        work.append(nxt)
                         break
                 elif i.kind == RET or i.kind == HALT:
                     edges[a] = []
@@ -175,6 +188,10 @@ class FunctionAnalyzer:
                         if table:
                             f.jump_tables[a] = table
                             succ = list(dict.fromkeys(table))
+                        if i.cond:                      # ARM `addls pc, pc, ...`: default falls through
+                            succ.append(nxt)
+                        for t in succ:
+                            self.dis.hint(t, i.thumb)
                     edges[a] = succ
                     for t in succ:
                         leaders.add(t)
@@ -192,7 +209,9 @@ class FunctionAnalyzer:
                     self.prev[nxt] = a
                     a = nxt
                     continue
-                for r in i.refs:  # function pointers taken by address
+                # function pointers taken by address (not on ARM: its immediates are offsets and
+                # masks, addresses come from literal pools)
+                for r in (i.refs if self.dis.md_thumb is None else ()):
                     if r not in self.funcs and self.bin.is_exec(r) and r != start and self._looks_like_code(r):
                         self._queue.append(r)
                 self.prev[nxt] = a
@@ -220,6 +239,13 @@ class FunctionAnalyzer:
                 f.blocks[s].preds.append(b.addr)
 
     # ------------------------------------------------------------- helpers
+    def _hint_modes(self, i: Insn):
+        """ARM interworking: successors run in the instruction set of `i`, except a `blx label`."""
+        self.dis.hint(i.end, i.thumb)
+        if i.target is not None:
+            flip = i.kind == CALL and i.mnemonic.startswith("blx") and not i.op_str.startswith(("r", "l", "s", "i"))
+            self.dis.hint(i.target, i.thumb != flip)
+
     def _is_noreturn_call(self, i: Insn) -> bool:
         tgt = i.target
         name = None
@@ -256,8 +282,100 @@ class FunctionAnalyzer:
             a = self.prev.get(a)
         return out
 
+    def _arm_jump_table(self, jmp: Insn) -> list[int]:
+        """ARM / Thumb switch dispatch, bounded by the `cmp rI, #n` before it:
+
+        - `addls pc, pc, rI, lsl #2`: a branch per case right after the dispatch;
+        - `tbb [pc, rI]` / `tbh [pc, rI, lsl #1]`: byte / halfword offsets (in halfwords);
+        - `ldr pc, [pc, rI, lsl #2]`: absolute addresses after the dispatch;
+        - `adr rB, T; ldr rT, [rB, rI, lsl #2]; add rB, rT; bx rB`: offsets from the table T.
+        """
+        ops = jmp.cs.operands
+        m = jmp.mnemonic.split(".")[0]
+        if jmp.cond:
+            m = m[:-2]
+        hist = self._back(jmp.addr, 8)
+        name = jmp.cs.reg_name
+
+        def pc_of(i: Insn) -> int:
+            return ((i.addr + 4) & ~3) if i.thumb else i.addr + 8
+
+        def bound(idx) -> int | None:
+            for i in hist:
+                o = i.cs.operands
+                if i.mnemonic.split(".")[0] == "cmp" and len(o) == 2 and o[0].type == 1 and o[0].reg == idx \
+                        and o[1].type == 2:
+                    return o[1].imm if 0 <= o[1].imm < 1024 else None
+            return None
+
+        def words(base, n, relative):
+            out = []
+            for k in range(n + 1):
+                v = self.bin.read_int(base + 4 * k, 4, signed=relative)
+                if v is None:
+                    return []
+                out.append(((base + v) if relative else v) & ~1 & 0xFFFFFFFF)
+            return out
+
+        if m == "add" and len(ops) == 3 and ops[2].type == 1:             # addls pc, pc, rI, lsl #2
+            n = bound(ops[2].reg)
+            return [jmp.addr + 8 + 4 * k for k in range(n + 1)] if n is not None else []
+        if m in ("tbb", "tbh") and ops and ops[0].type == 3:
+            n = bound(ops[0].mem.index)
+            if n is None:
+                return []
+            base, size = jmp.addr + 4, 1 if m == "tbb" else 2
+            out = []
+            for k in range(n + 1):
+                v = self.bin.read_int(base + size * k, size)
+                if v is None:
+                    return []
+                out.append(base + 2 * v)
+            return out
+        if m == "ldr" and len(ops) == 2 and ops[1].type == 3 and name(ops[1].mem.base) == "pc":
+            n = bound(ops[1].mem.index)
+            return words(pc_of(jmp), n, False) if n is not None else []
+        if m not in ("bx", "mov") or not ops or ops[-1].type != 1:
+            return []
+        target = ops[-1].reg
+        offset_reg = None
+        k = 0
+        if hist and hist[0].mnemonic.split(".")[0] == "add":                # add rB, rT
+            o = hist[0].cs.operands
+            regs = [x.reg for x in o if x.type == 1]
+            if regs and regs[0] == target and len(regs) >= 2:
+                offset_reg = regs[-1] if regs[-1] != target or len(regs) == 2 else regs[-2]
+                k = 1
+        load_dst = offset_reg if offset_reg is not None else target
+        for j in range(k, len(hist)):
+            i = hist[j]
+            o = i.cs.operands
+            if i.mnemonic.split(".")[0] == "ldr" and len(o) == 2 and o[0].type == 1 and o[0].reg == load_dst \
+                    and o[1].type == 3 and o[1].mem.index:
+                base_reg, idx = o[1].mem.base, o[1].mem.index
+                n = bound(idx)
+                if n is None:
+                    return []
+                for a in hist[j + 1:]:
+                    ao = a.cs.operands
+                    am = a.mnemonic.split(".")[0]
+                    if not ao or ao[0].type != 1 or ao[0].reg != base_reg:
+                        continue
+                    if am == "adr" and ao[1].type == 2:
+                        table = pc_of(a) + ao[1].imm
+                    elif am in ("add", "addw") and len(ao) == 3 and ao[1].type == 1 and \
+                            a.cs.reg_name(ao[1].reg) == "pc" and ao[2].type == 2:
+                        table = pc_of(a) + ao[2].imm
+                    else:
+                        return []
+                    return words(table, n, offset_reg is not None)
+                return []
+        return []
+
     def _jump_table(self, jmp: Insn) -> list[int]:
         """Resolve `jmp reg` / `jmp [table+reg*N]` switch dispatch on x86."""
+        if self.dis.arch == "arm":
+            return self._arm_jump_table(jmp)
         if self.dis.arch not in ("x86", "x64"):
             return []
         ptr = self.bin.bits // 8
@@ -379,6 +497,7 @@ class FunctionAnalyzer:
                 continue
             changed = True
             while changed:
+                checkpoint()
                 changed = False
                 covered = sorted((f.addr, f.end) for f in self.funcs.values() if sec.contains(f.addr))
                 gaps, cur = [], sec.addr

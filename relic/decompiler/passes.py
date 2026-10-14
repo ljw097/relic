@@ -19,6 +19,7 @@ from __future__ import annotations
 
 from collections import Counter
 
+from ..progress import checkpoint
 from .arch import ArchInfo
 from .interp import InterpError, apply_binop, apply_cast, apply_unop
 from .ir import (BARRIERS, Assign, BinOp, Call, CallStmt, Cast, Const, Effect, Expr, Extract, IRFunction,
@@ -106,6 +107,46 @@ def _fold_node(e: Expr) -> Expr:
     return e
 
 
+_NEG_CMP = {"==": "!=", "!=": "==", "<s": ">=s", ">=s": "<s", "<=s": ">s", ">s": "<=s",
+            "<u": ">=u", ">=u": "<u", "<=u": ">u", ">u": "<=u"}
+
+
+def _not(c: Expr) -> Expr:
+    """Logical negation, pushed through comparisons and (De Morgan) 1-bit `&` / `|`."""
+    if isinstance(c, UnOp) and c.op == "!":
+        return c.a
+    if isinstance(c, BinOp) and c.op in ("<s", "<=s", "<u", "<=u"):     # IR spelling: swap operands
+        return BinOp({"<s": "<=s", "<=s": "<s", "<u": "<=u", "<=u": "<u"}[c.op], c.b, c.a, 1)
+    if isinstance(c, BinOp) and c.op in _NEG_CMP:
+        return BinOp(_NEG_CMP[c.op], c.a, c.b, 1)
+    if isinstance(c, BinOp) and c.op in ("&", "|") and c.bits == 1:
+        return BinOp("|" if c.op == "&" else "&", _not(c.a), _not(c.b), 1)
+    return UnOp("!", c, 1)
+
+
+_FLIP = {">s": "<s", ">=s": "<=s", ">u": "<u", ">=u": "<=u"}
+
+
+def _canon_cmp(e: Expr) -> Expr:
+    """`b > a` as `a < b`: one spelling per comparison."""
+    if isinstance(e, BinOp) and e.op in _FLIP:
+        return BinOp(_FLIP[e.op], e.b, e.a, 1)
+    return e
+
+
+def _same_cond(x: Expr, y: Expr) -> bool:
+    x, y = _canon_cmp(x), _canon_cmp(y)
+    if x == y:
+        return True
+    return isinstance(x, BinOp) and isinstance(y, BinOp) and x.op == y.op and x.op in ("&", "|", "==", "!=") \
+        and _same_cond(x.a, y.b) and _same_cond(x.b, y.a)
+
+
+def _negation(x: Expr, y: Expr) -> bool:
+    """`x` is the logical negation of `y` (1-bit conditions; ARM `gt` / `le` flag tests included)."""
+    return _same_cond(x, _not(y)) or _same_cond(_not(x), y)
+
+
 def _simp_node(e: Expr) -> Expr:
     if isinstance(e, BinOp):
         a, b, op, w = e.a, e.b, e.op, e.bits
@@ -140,12 +181,29 @@ def _simp_node(e: Expr) -> Expr:
             if z(b): return a
         elif op in ("&&", "||"):
             if a == b and _droppable(a): return a
+        elif op in ("==", "!=") and z(b) and isinstance(a, BinOp) and a.op == "|" and \
+                isinstance(a.b, Const) and a.b.value and _droppable(a.a):
+            return Const(int(op == "!="), 1)          # `(x | 1) == 0` never holds
+        elif op in ("==", "!=") and z(b) and isinstance(a, Cast) and a.kind == "zext" and a.a.bits == 1:
+            return a.a if op == "!=" else _not(a.a)   # `(int)c == 0` -> `!c`
     elif isinstance(e, UnOp) and isinstance(e.a, UnOp) and e.op == e.a.op and e.op in ("-", "~"):
         return e.a.a
     elif isinstance(e, UnOp) and e.op == "!" and isinstance(e.a, UnOp) and e.a.op == "!" and e.a.a.bits == 1:
         return e.a.a
     elif isinstance(e, Ite) and e.a == e.b:
         return e.a
+    elif isinstance(e, Ite) and isinstance(e.a, Const) and isinstance(e.b, Const) and \
+            {e.a.value, e.b.value} == {0, 1} and e.cond.bits == 1:
+        # `c ? 1 : 0` is `c`, `c ? 0 : 1` is `!c`
+        c = e.cond if e.a.value == 1 else _not(e.cond)
+        return c if e.bits == 1 else Cast("zext", c, e.bits)
+    elif isinstance(e, Ite) and e.bits == 1 and not isinstance(e.b, Const) and _same_cond(e.b, e.cond):
+        return Ite(e.cond, e.a, Const(0, 1), 1)       # `c ? x : c` -> `c ? x : 0`
+    elif isinstance(e, Ite) and e.bits == 1 and not isinstance(e.a, Const) and _same_cond(e.a, e.cond):
+        return Ite(e.cond, Const(1, 1), e.b, 1)
+    elif isinstance(e, Ite) and isinstance(e.b, Ite) and (e.b.cond == e.cond or _negation(e.b.cond, e.cond)):
+        # predicated moves (`moveq r3, #1; movne r3, #0`): the inner test is decided by the outer one
+        return Ite(e.cond, e.a, e.b.b if e.b.cond == e.cond else e.b.a, e.bits)
     elif isinstance(e, Cast) and e.a.bits == e.bits:
         return e.a
     elif isinstance(e, Cast) and e.kind == "low" and isinstance(e.a, BinOp) and e.a.op in ("|", "^", "+"):
@@ -170,6 +228,9 @@ def _fold_pass(fn: IRFunction) -> bool:
 
 
 # ----------------------------------------------------- constant / copy propagation
+_FLAG_NAMES = frozenset(("zf", "cf", "sf", "of", "pf"))
+
+
 def _propagate(fn: IRFunction) -> bool:
     defs: dict[Var, Expr] = {}
     for s in fn.stmts():
@@ -183,6 +244,10 @@ def _propagate(fn: IRFunction) -> bool:
         if _trivial(src):
             sub[v] = src
         elif _movable(src) and uses.get(v, 0) == 1:
+            sub[v] = src
+        elif v.name in _FLAG_NAMES and not isinstance(src, Ite) and _droppable(src) and sum(1 for _ in walk(src)) <= 8:
+            # a flag read by several conditions (ARM predicated code): duplicate the compare so
+            # every condition can be recombined into a plain comparison
             sub[v] = src
     if not sub:
         return False
@@ -384,6 +449,7 @@ def _dce(fn: IRFunction) -> bool:
 def optimize(fn: IRFunction, arch: ArchInfo | None = None) -> IRFunction:
     """Run every pass to a fixpoint. Mutates and returns `fn` (expects SSA input)."""
     for _ in range(MAX_ITERS):
+        checkpoint()                 # a cancelled decompilation stops between rounds
         changed = False
         changed |= _fold_pass(fn)
         changed |= _propagate(fn)

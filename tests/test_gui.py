@@ -259,3 +259,111 @@ def test_recent_files_and_layout_are_remembered(app, win):
         assert w2.xrefs_dock.isHidden()
     finally:
         w2.close()
+
+
+def _slow_analyze(path, arch=None, base=0):
+    """An analysis that only ends when cancelled (checks in like the real one)."""
+    import time
+
+    from relic.progress import checkpoint, report
+    k = 0
+    while True:
+        report("functions", k)
+        checkpoint()
+        time.sleep(0.01)
+        k += 1
+
+
+def _spin(app, cond, ms=5000):
+    import time
+    end = time.monotonic() + ms / 1000
+    while not cond() and time.monotonic() < end:
+        app.processEvents()
+        time.sleep(0.01)
+    return cond()
+
+
+def test_vulns_scan_failure_is_not_shown_as_no_findings(app, vuln64, tmp_path, monkeypatch):
+    from relic.analysis import Analysis
+
+    def boom(self):
+        raise RuntimeError("scanner exploded")
+    monkeypatch.setattr(Analysis, "vulns", boom)
+    path = tmp_path / "vuln64"
+    shutil.copy(vuln64, path)
+    w = MainWindow()
+    w.open_file(str(path))
+    assert w.wait()
+    rows = _rows(w.vulns)
+    assert len(rows) == 1 and rows[0][0] == "error" and "scan failed: RuntimeError: scanner exploded" in rows[0][4]
+    w.close()
+
+
+def test_analysis_progress_and_cancel(app, vuln64, tmp_path, monkeypatch):
+    import relic.analysis
+    monkeypatch.setattr(relic.analysis, "analyze", _slow_analyze)
+    w = MainWindow()
+    w.open_file(str(vuln64))
+    assert _spin(app, lambda: "functions" in w.progress.format())    # progress reaches the status bar
+    assert w.progress.isVisibleTo(w) and w.cancel_button.isVisibleTo(w)
+    w.cancel_work()
+    assert w.wait(5000)
+    assert _spin(app, lambda: not w.progress.isVisibleTo(w))
+    assert w.an is None and w.windowTitle() == "Relic"
+    w.close()
+
+
+def test_close_does_not_wait_for_a_long_analysis(app, vuln64, monkeypatch):
+    import time
+
+    import relic.analysis
+    monkeypatch.setattr(relic.analysis, "analyze", _slow_analyze)
+    w = MainWindow()
+    w.show()
+    w.open_file(str(vuln64))
+    assert _spin(app, lambda: w.running_work() != [])
+    t = time.monotonic()
+    w.close()
+    assert time.monotonic() - t < 1.5                  # cancelled, not waited for
+    assert not w.running_work() and not w.isVisible()
+
+
+def test_decompilation_is_cancellable(vuln64):
+    from relic.analysis import analyze
+    from relic.decompiler.emit import decompile
+    from relic.progress import Cancelled, Progress
+    an = analyze(vuln64)
+    token = Progress()
+    token.cancel()
+    handle = token.activate()
+    try:
+        with pytest.raises(Cancelled):
+            decompile(an, an.function_by_name("main"))
+    finally:
+        Progress.deactivate(handle)
+    assert decompile(an, an.function_by_name("main")).text      # no token: unaffected
+
+
+def test_close_completes_after_slow_checkpoint(app, vuln64, monkeypatch):
+    """Work that takes a while to reach its next checkpoint: the window hides at once and the
+    close finishes when the thread has stopped (never destroying a running QThread)."""
+    import time
+
+    import relic.analysis
+    from relic.progress import checkpoint
+
+    def sluggish(path, arch=None, base=0):
+        while True:
+            time.sleep(0.4)
+            checkpoint()
+    monkeypatch.setattr(relic.analysis, "analyze", sluggish)
+    monkeypatch.setattr(MainWindow, "CLOSE_WAIT_MS", 50)
+    w = MainWindow()
+    w.show()
+    w.open_file(str(vuln64))
+    assert _spin(app, lambda: w.running_work() != [])
+    w.close()
+    assert not w.isVisible() and w._closing
+    assert _spin(app, lambda: not w.running_work())
+    app.processEvents()
+    assert not w.isVisible()

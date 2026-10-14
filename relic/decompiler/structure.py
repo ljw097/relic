@@ -15,6 +15,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 
+from ..progress import checkpoint
 from .ir import (BinOp, Branch, IndirectJump, IRFunction, Jump, Reg, Return, Stmt, UnOp, fmt, fmt_stmt, walk)
 
 EXIT = -1
@@ -162,6 +163,15 @@ def _switch_index(expr):
                 bias = -idx.b.signed if idx.op == "+" else idx.b.signed
                 idx = idx.a
             return idx, bias
+    # byte table (Thumb `tbb`): `table[idx]` with the scale folded away
+    from .ir import Load
+    for x in walk(expr):
+        if isinstance(x, Load) and x.bits == 8 and isinstance(x.addr, BinOp) and x.addr.op == "+":
+            a, b = x.addr.a, x.addr.b
+            if isinstance(a, Const) and not isinstance(b, Const):
+                return b, 0
+            if isinstance(b, Const) and not isinstance(a, Const):
+                return a, 0
     return None, 0
 
 
@@ -365,6 +375,7 @@ class Structurer:
         return Jump1("goto", n)
 
     def _region(self, n, stop, ctx):
+        checkpoint()
         seq = Seq()
         stops = stop if isinstance(stop, (set, frozenset)) else {stop}
         while n is not None and n not in stops and n != EXIT:

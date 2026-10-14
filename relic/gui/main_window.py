@@ -7,11 +7,12 @@ import traceback
 from PySide6.QtCore import QSettings, QSortFilterProxyModel, Qt, QThread, Signal
 from PySide6.QtGui import QAction, QColor, QKeySequence, QPalette, QStandardItem, QStandardItemModel
 from PySide6.QtWidgets import (QAbstractItemView, QApplication, QDockWidget, QFileDialog, QHeaderView,
-                               QInputDialog, QLabel, QLineEdit, QMainWindow, QMessageBox, QTableView,
-                               QTabWidget, QVBoxLayout, QWidget)
+                               QInputDialog, QLabel, QLineEdit, QMainWindow, QMessageBox, QProgressBar,
+                               QTableView, QTabWidget, QToolButton, QVBoxLayout, QWidget)
 
 from ..analysis import Analysis
 from ..analysis.strings import escape
+from ..progress import Cancelled, Progress
 from .views import THEME, DisasmView, GraphView, HexView, PseudocodeView, mono_font
 
 ADDR_ROLE = Qt.ItemDataRole.UserRole + 1
@@ -34,28 +35,65 @@ def apply_theme(app: QApplication):
     app.setPalette(p)
 
 
-class AnalysisThread(QThread):
+class WorkThread(QThread):
+    """Background work that reports progress and stops at its next checkpoint when cancelled.
+
+    Exactly one of `done`, `failed` or `cancelled` is emitted when the work ends.
+    """
+
+    failed = Signal(str)
+    cancelled = Signal()
+    progress = Signal(str, int, int)  # stage, done, total (0: unknown)
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.what = ""
+        self.token = Progress(self._report)
+
+    def _report(self, stage: str, done: int, total: int):
+        self.progress.emit(stage, done, total)
+
+    def cancel(self):
+        self.token.cancel()
+
+    def run(self):
+        handle = self.token.activate()
+        try:
+            self.work()
+        except Cancelled:
+            self.cancelled.emit()
+        except Exception as e:  # noqa: BLE001 - surfaced to the user
+            self.failed.emit(f"{type(e).__name__}: {e}\n\n{traceback.format_exc()}")
+        finally:
+            Progress.deactivate(handle)
+            self.token.callback = None      # refers back to this thread: no cycle once done
+
+    def work(self):
+        raise NotImplementedError
+
+
+class AnalysisThread(WorkThread):
     """Loads and analyses a binary off the GUI thread."""
 
     done = Signal(object, object)  # Analysis, extra results
-    failed = Signal(str)
 
     def __init__(self, path: str, arch: str | None, base: int, parent=None):
         super().__init__(parent)
         self.path, self.arch, self.base = path, arch, base
 
-    def run(self):
-        try:
-            from ..analysis import analyze
-            an = analyze(self.path, self.arch, self.base)
-            extra = {"checksec": an.checksec()}
-            self.done.emit(an, extra)
-        except Exception as e:  # noqa: BLE001 - surfaced to the user
-            self.failed.emit(f"{type(e).__name__}: {e}\n\n{traceback.format_exc()}")
+    def work(self):
+        from ..analysis import analyze
+        an = analyze(self.path, self.arch, self.base)
+        extra = {"checksec": an.checksec()}
+        self.done.emit(an, extra)
 
 
-class VulnsThread(QThread):
-    """Runs the pwnable heuristics after the window is up (they may decompile functions)."""
+class VulnsThread(WorkThread):
+    """Runs the pwnable heuristics after the window is up (they may decompile functions).
+
+    A failure is reported through `failed`, never as an empty result: "no findings" and
+    "the scan broke" must not look the same.
+    """
 
     done = Signal(object)
 
@@ -63,11 +101,8 @@ class VulnsThread(QThread):
         super().__init__(parent)
         self.an = an
 
-    def run(self):
-        try:
-            self.done.emit(self.an.vulns())
-        except Exception:  # noqa: BLE001 - an empty table beats a crashed GUI
-            self.done.emit([])
+    def work(self):
+        self.done.emit(self.an.vulns())
 
 
 class Table(QTableView):
@@ -201,6 +236,19 @@ class MainWindow(QMainWindow):
         self.status = QLabel()
         self.status.setFont(mono_font(9))
         self.statusBar().addPermanentWidget(self.status, 1)
+        # background work: what runs, how far it got, and a way to stop it
+        self.progress = QProgressBar()
+        self.progress.setMaximumWidth(220)
+        self.progress.setTextVisible(True)
+        self.cancel_button = QToolButton()
+        self.cancel_button.setText("Cancel")
+        self.cancel_button.setToolTip("Stop the running analysis / vulnerability scan (Ctrl+.)")
+        self.cancel_button.clicked.connect(self.cancel_work)
+        self.statusBar().addPermanentWidget(self.progress)
+        self.statusBar().addPermanentWidget(self.cancel_button)
+        self.progress.hide()
+        self.cancel_button.hide()
+        self._closing = False
         self._actions()
         self._update_actions()
         self._restore_layout()
@@ -231,6 +279,8 @@ class MainWindow(QMainWindow):
         self.recent_menu = m.addMenu("Open &Recent")
         self._fill_recent_menu()
         act(m, "&Save project", QKeySequence.StandardKey.Save, self.save_project)
+        m.addSeparator()
+        act(m, "&Cancel background work", "Ctrl+.", self.cancel_work, False)
         m.addSeparator()
         act(m, "&Quit", QKeySequence.StandardKey.Quit, self.close, False)
         m = mb.addMenu("&Navigate")
@@ -321,10 +371,69 @@ class MainWindow(QMainWindow):
         self.statusBar().showMessage(f"analysing {path} ...")
         self.setWindowTitle(f"Relic - {os.path.basename(path)} (analysing)")
         self.thread = AnalysisThread(path, arch, base, self)
-        self.thread.done.connect(lambda an, extra, p=path, a=arch, b=base: (self._remember(p, a, b),
-                                                                             self.set_analysis(an, extra)))
+        self.thread.done.connect(self._analysis_done)
         self.thread.failed.connect(self._failed)
+        self.thread.cancelled.connect(self._analysis_cancelled)
+        self._track(self.thread, "analysing")
         self.thread.start()
+
+    # ------------------------------------------------------- background work
+    # thread signals go to bound methods (per-thread data lives on the thread, found through
+    # `sender()`), not to lambdas capturing the window: no window <-> thread reference cycles
+    def _analysis_done(self, an: Analysis, extra: dict):
+        t = self.sender()
+        if isinstance(t, AnalysisThread):
+            self._remember(t.path, t.arch, t.base)
+        self.set_analysis(an, extra)
+
+    def _track(self, thread: WorkThread, what: str):
+        """Show `thread`'s progress in the status bar until it ends."""
+        thread.what = what
+        thread.progress.connect(self._thread_progress)
+        thread.finished.connect(self._work_finished)
+        self.progress.setRange(0, 0)
+        self.progress.setFormat(what)
+        self.progress.show()
+        self.cancel_button.setEnabled(True)
+        self.cancel_button.show()
+
+    def _thread_progress(self, stage: str, done: int, total: int):
+        t = self.sender()
+        self._on_progress(getattr(t, "what", "working"), stage, done, total)
+
+    def _on_progress(self, what: str, stage: str, done: int, total: int):
+        if total:
+            self.progress.setRange(0, total)
+            self.progress.setValue(min(done, total))
+            self.progress.setFormat(f"{what}: {stage} %v/%m")
+        else:
+            self.progress.setRange(0, 0)             # unknown amount: busy indicator
+            self.progress.setFormat(f"{what}: {stage} {done}" if done else f"{what}: {stage}")
+
+    def running_work(self) -> list[WorkThread]:
+        return [t for t in (self.thread, self.vulns_thread) if t is not None and t.isRunning()]
+
+    def _work_finished(self):
+        if self.running_work():
+            return
+        self.progress.hide()
+        self.cancel_button.hide()
+        if self._closing:
+            self.close()                             # a close deferred until the work stopped
+
+    def cancel_work(self):
+        """Ask the running analysis / scan to stop; it does so at its next checkpoint."""
+        running = self.running_work()
+        for t in running:
+            t.cancel()
+        if running:
+            self.cancel_button.setEnabled(False)
+            self.progress.setFormat("cancelling ...")
+            self.statusBar().showMessage("cancelling ...", 3000)
+
+    def _analysis_cancelled(self):
+        self.setWindowTitle(f"Relic - {os.path.basename(self.an.bin.path)}" if self.an else "Relic")
+        self.statusBar().showMessage("analysis cancelled", 5000)
 
     def wait(self, ms: int = 60000) -> bool:
         """Block until a background analysis (and the vulns scan after it) finishes."""
@@ -359,6 +468,9 @@ class MainWindow(QMainWindow):
             self._fill_vulns(None)
             self.vulns_thread = VulnsThread(an, self)
             self.vulns_thread.done.connect(self._fill_vulns)
+            self.vulns_thread.failed.connect(self._vulns_failed)
+            self.vulns_thread.cancelled.connect(self._vulns_cancelled)
+            self._track(self.vulns_thread, "vulns scan")
             self.vulns_thread.start()
         self.statusBar().showMessage(f"{len(an.functions)} functions, {len(an.strings)} strings", 5000)
         main = an.function_by_name("main")
@@ -389,6 +501,22 @@ class MainWindow(QMainWindow):
             self.vulns.add_row([v.severity, v.addr, v.func, v.kind, v.message], v.addr, sev_color.get(v.severity))
         self.vulns.setSortingEnabled(True)
         self.vulns.fit()
+
+    def _vulns_stopped(self, message: str, color: str | None = None):
+        """The scan ended without a result: say so in the table instead of showing no findings."""
+        self.vulns.setSortingEnabled(False)
+        self.vulns.clear_rows()
+        self.vulns.add_row(["error" if color else "-", "", "", "", message], None, color)
+        self.vulns.fit()
+
+    def _vulns_cancelled(self):
+        self._vulns_stopped("scan cancelled")
+
+    def _vulns_failed(self, msg: str):
+        head = msg.split("\n\n", 1)[0]
+        self._vulns_stopped(f"vulnerability scan failed: {head}", THEME["jump"])
+        self.vulns.setToolTip(msg)
+        self.statusBar().showMessage(f"vulnerability scan failed: {head}", 8000)
 
     def _fill_tables(self, checksec: dict):
         an, b = self.an, self.an.bin
@@ -654,14 +782,25 @@ class MainWindow(QMainWindow):
             return self.save_project()
         return r == QMessageBox.StandardButton.Discard
 
+    CLOSE_WAIT_MS = 2000
+
     def closeEvent(self, e):
-        if not self._confirm_discard():
+        if not self._closing and not self._confirm_discard():
             e.ignore()
             return
-        if self.thread is not None:
-            self.thread.wait()
-        if self.vulns_thread is not None:
-            self.vulns_thread.wait()
+        # running work is cancelled, not waited for: it stops at its next checkpoint, which is
+        # normally within milliseconds; if it takes longer the window goes away now and the
+        # close completes when the thread ends (a QThread must not be destroyed while running)
+        running = self.running_work()
+        for t in running:
+            t.cancel()
+        for t in running:
+            t.wait(self.CLOSE_WAIT_MS)
+        if self.running_work():
+            self._closing = True
+            self.hide()
+            e.ignore()
+            return
         self.decomp.shutdown()
         self._save_layout()
         super().closeEvent(e)

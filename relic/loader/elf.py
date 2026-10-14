@@ -39,6 +39,9 @@ def load_elf(path: str, data: bytes) -> Binary:
     b.arch, b.bits = arch, elf.elfclass
     b.endian = "little" if elf.little_endian else "big"
     b.entry = elf["e_entry"]
+    if arch == "arm" and b.entry & 1:         # Thumb entry point
+        b.entry &= ~1
+        b.thumb_code.add(b.entry)
     b.info["type"] = elf["e_type"]
     b.info["machine"] = elf["e_machine"]
     b.elf_type = elf["e_type"]
@@ -74,11 +77,16 @@ def load_elf(path: str, data: bytes) -> Binary:
             t = sym["st_info"]["type"]
             if not sym.name or sym["st_shndx"] == "SHN_UNDEF" or sym["st_value"] == 0:
                 continue
+            if arch == "arm" and sym.name[:2] in ("$a", "$t", "$d") and sym.name[2:3] in ("", "."):
+                b.arm_mapping[sym["st_value"]] = sym.name[1]
+                continue
             kind = {"STT_FUNC": "func", "STT_OBJECT": "object", "STT_GNU_IFUNC": "func"}.get(t)
             if kind is None:
                 continue
             addr = sym["st_value"]
             if arch == "arm" and kind == "func":
+                if addr & 1:
+                    b.thumb_code.add(addr & ~1)
                 addr &= ~1
             name = sym.name.split("@")[0]
             s = Symbol(name, addr, sym["st_size"], kind, source)
@@ -176,6 +184,36 @@ def _resolve_plt(b: Binary, got_names: dict[int, str]):
                     if slot in got_names and a.address not in found:
                         b.imports.append(Import(got_names[slot], a.address, slot))
                         found[a.address] = got_names[slot]
+    elif b.arch == "arm":
+        # `add ip, pc, #a, r; add ip, ip, #b; ldr pc, [ip, #c]!` -- emulate ip to find the slot
+        md = cs.Cs(cs.CS_ARCH_ARM, cs.CS_MODE_ARM)
+        md.detail = True
+        md.skipdata = True             # the Thumb entry halfwords are not valid A32
+        for sec in plt_secs:
+            code = b.data[sec.offset:sec.offset + sec.size]
+            ip, start = None, None
+            for insn in md.disasm(code, sec.addr):
+                if insn.id == 0:
+                    ip = None
+                    continue
+                ops = insn.operands
+                regs = [insn.reg_name(o.reg) for o in ops if o.type == cs.arm.ARM_OP_REG]
+                imms = [o.imm for o in ops if o.type == cs.arm.ARM_OP_IMM]
+                if insn.mnemonic == "add" and regs[:2] == ["ip", "pc"] and imms:
+                    ip, start = insn.address + 8 + (imms[0] & 0xFFFFFFFF), insn.address
+                elif insn.mnemonic == "add" and regs[:2] == ["ip", "ip"] and imms and ip is not None:
+                    ip += imms[0]
+                elif insn.mnemonic == "ldr" and regs[:1] == ["pc"] and ip is not None:
+                    slot = (ip + ops[1].mem.disp) & 0xFFFFFFFF
+                    if slot in got_names:
+                        # a Thumb caller enters 4 bytes earlier, at `bx pc; b.n .-2`
+                        thumb = start - 4 >= sec.addr and b.read(start - 4, 2) == b"\x78\x47"
+                        for stub in ((start - 4, start) if thumb else (start,)):
+                            b.imports.append(Import(got_names[slot], stub, slot))
+                            found[stub] = got_names[slot]
+                    ip = None
+                else:
+                    ip = None if insn.mnemonic != "add" else ip
     # fallback: order of .rela.plt entries -> sequential PLT stubs
     if not found and plt_secs and got_names:
         plt = plt_secs[0]

@@ -31,13 +31,23 @@ VARIANTS = {
     "vuln_a64_pie": ["-O1", "-fstack-protector-strong", "-pie", "-fPIE"],
     "flow_a64_O0": ["-O0"],
     "flow_a64_O2": ["-O2", "-fno-tree-vectorize"],
+    # ARM32 (cross compiler; skipped without it): A32 and Thumb-2 (gnueabihf defaults to Thumb)
+    "vuln_arm": ["-O0", "-marm"],
+    "vuln_thumb": ["-O1", "-mthumb", "-fstack-protector-strong", "-pie", "-fPIE"],
+    "flow_arm_O0": ["-O0", "-marm"],
+    "flow_arm_O2": ["-O2", "-marm", "-fno-tree-vectorize"],
+    "flow_thumb_O0": ["-O0", "-mthumb"],
+    "flow_thumb_O2": ["-O2", "-mthumb", "-fno-tree-vectorize"],
     # C++ (demangling)
     "shapes": ["-O0", "-no-pie", "-fno-inline"],
 }
 COMPILERS = {"vuln64_pe": "x86_64-w64-mingw32-gcc", "vuln32_pe": "i686-w64-mingw32-gcc", "shapes": "g++",
-             **{n: "aarch64-linux-gnu-gcc" for n in ("vuln_a64", "vuln_a64_pie", "flow_a64_O0", "flow_a64_O2")}}
+             **{n: "aarch64-linux-gnu-gcc" for n in ("vuln_a64", "vuln_a64_pie", "flow_a64_O0", "flow_a64_O2")},
+             **{n: "arm-linux-gnueabihf-gcc" for n in ("vuln_arm", "vuln_thumb", "flow_arm_O0", "flow_arm_O2",
+                                                       "flow_thumb_O0", "flow_thumb_O2")}}
 SOURCES = {"flow_O0": FLOW_SRC, "flow_O2": FLOW_SRC, "flow32_O0": FLOW_SRC, "flow32_O2": FLOW_SRC,
-           "shapes": os.path.join(HERE, "src", "shapes.cpp"), "flow_a64_O0": FLOW_SRC, "flow_a64_O2": FLOW_SRC}
+           "shapes": os.path.join(HERE, "src", "shapes.cpp"), "flow_a64_O0": FLOW_SRC, "flow_a64_O2": FLOW_SRC,
+           **{n: FLOW_SRC for n in ("flow_arm_O0", "flow_arm_O2", "flow_thumb_O0", "flow_thumb_O2")}}
 
 
 def _build(name: str) -> str:
@@ -110,3 +120,9 @@ vuln_a64 = _fixture("vuln_a64")
 vuln_a64_pie = _fixture("vuln_a64_pie")
 flow_a64_O0 = _fixture("flow_a64_O0")
 flow_a64_O2 = _fixture("flow_a64_O2")
+vuln_arm = _fixture("vuln_arm")
+vuln_thumb = _fixture("vuln_thumb")
+flow_arm_O0 = _fixture("flow_arm_O0")
+flow_arm_O2 = _fixture("flow_arm_O2")
+flow_thumb_O0 = _fixture("flow_thumb_O0")
+flow_thumb_O2 = _fixture("flow_thumb_O2")
