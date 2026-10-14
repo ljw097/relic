@@ -5,7 +5,7 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
 from ..disasm import CALL, Insn
-from ..progress import report
+from ..progress import Cancelled, report
 
 if TYPE_CHECKING:
     from . import Analysis
@@ -106,6 +106,8 @@ def _ir_args(an: "Analysis", f, cache: dict) -> dict[int, tuple] | None:
             from ..decompiler.cleanup import cached_ir
             from ..decompiler.ir import CallStmt
             res = {s.addr: s.call.args for s in cached_ir(an, f).stmts() if isinstance(s, CallStmt)}
+        except Cancelled:
+            raise
         except Exception:  # noqa: BLE001 - a decompiler failure must not hide the other findings
             res = None
     cache[f.addr] = res

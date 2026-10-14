@@ -21,6 +21,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
 
+from ..progress import Cancelled
 from .ir import (Assign, BinOp, Call, CallStmt, Const, Expr, IRFunction, Load, StackVar, Store, Var, stmt_exprs,
                  walk)
 from .sigs import lookup
@@ -412,6 +413,8 @@ def _scan_function(an: "Analysis", f) -> dict[tuple, _Use]:
         try:
             prep = prepare(an, f)
             cache[f.addr] = scan(prep.fn, f.addr, prep.arch.bits, an.name)
+        except Cancelled:
+            raise                 # not a function that fails: nothing is cached
         except Exception:  # noqa: BLE001 - a function that does not decompile adds nothing
             cache[f.addr] = {}
     return cache[f.addr]
@@ -444,8 +447,12 @@ def param_source(an: "Analysis", callee: int, reg: str) -> tuple | None:
         callers = [f for f in an.functions.values()
                    if (callee in f.calls or callee in f.tail_calls) and not f.is_import and f.addr != callee]
         found = []
-        for f in callers[:MAX_SCAN]:
-            found += [key for c, i, key in _scan_function(an, f).get(("passes",), ()) if c == callee and i == k]
+        try:
+            for f in callers[:MAX_SCAN]:
+                found += [key for c, i, key in _scan_function(an, f).get(("passes",), ()) if c == callee and i == k]
+        except Cancelled:
+            del cache[(callee, reg)]      # the guard is not an answer
+            raise
         # a global's struct first (every function agrees on it), then a caller's own struct
         found.sort(key=lambda key: root(key)[0] == "var")
         cache[(callee, reg)] = found[0] if found else None
@@ -473,6 +480,14 @@ def global_struct(an: "Analysis", key: tuple, ptr_bits: int) -> Struct | None:
     if key in reg:
         return reg[key]
     reg[key] = None                          # (being computed: no recursion through prepare)
+    try:
+        return _global_struct(an, key, ptr_bits, reg)
+    except Cancelled:
+        del reg[key]                         # the guard is not an answer
+        raise
+
+
+def _global_struct(an: "Analysis", key: tuple, ptr_bits: int, reg: dict) -> Struct | None:
     g = root(key)
     funcs = []
     for x in an.xrefs_to.get(g[1], ()):

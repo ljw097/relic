@@ -268,3 +268,25 @@ def test_hand_edited_fields_persist(vuln64, tmp_path):
     assert "    char tag[8];" in text and "char *f_0" not in text, text
     again.add_field("s_notes", 0, "char *")                  # back
     assert "->f_0" in _c(again, "show_note")
+
+
+def test_cancel_during_struct_recovery_caches_nothing(vuln64, monkeypatch):
+    """A decompilation cancelled while it scans other functions for a struct (the GUI moved on)
+    must not leave "no struct" behind: decompiled again, the struct is there."""
+    from relic.decompiler import pipeline
+    from relic.progress import Cancelled
+    an = analyze(vuln64)
+    real = pipeline.prepare
+    target = an.function_by_name("add_note")
+
+    def prepare(an_, f):
+        if f is not target:                    # the other functions the struct is looked up in
+            raise Cancelled()
+        return real(an_, f)
+    monkeypatch.setattr(pipeline, "prepare", prepare)
+    with pytest.raises(Cancelled):
+        decompile(an, target)
+    monkeypatch.setattr(pipeline, "prepare", real)
+    assert all(v is not None for v in an.__dict__.get("_structs", {}).values())
+    text = _c(an, "add_note")
+    assert "struct s_notes {" in text and "->f_8 = " in text, text

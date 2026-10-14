@@ -17,6 +17,7 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
+from ..progress import Cancelled
 from .ir import (Assign, BinOp, Branch, CallStmt, Const, Expr, IndirectJump, IRFunction, Jump, Load, Phi, Return,
                  StackAddr, StackVar, Store, Var, map_stmt, stmt_exprs, walk)
 from .stack import Frame, Slot
@@ -544,7 +545,17 @@ def self_width(an: "Analysis", func: "Function", ret_reg: str, bits: int = 32) -
         return c[func.addr]
     c[func.addr] = None          # recursion guard
     try:
+        return _self_width(an, func, ret_reg, bits, c)
+    except Cancelled:
+        del c[func.addr]         # the guard is not an answer
+        raise
+
+
+def _self_width(an: "Analysis", func: "Function", ret_reg: str, bits: int, c: dict) -> int | None:
+    try:
         fn = cached_ir(an, func)
+    except Cancelled:
+        raise
     except Exception:
         return None
     defs: dict = {}

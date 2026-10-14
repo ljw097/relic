@@ -174,6 +174,41 @@ def test_pseudocode_stale_result_is_not_shown(win):
     assert win.decomp.toPlainText().startswith("int classify(")
 
 
+def test_pseudocode_switch_cancels_slow_job(win, monkeypatch):
+    """Moving to another function stops a long decompilation instead of waiting for it, and the
+    cancelled one is not cached: shown again, it is decompiled again."""
+    import time
+
+    from relic.decompiler import emit
+    from relic.progress import checkpoint
+    real = emit.decompile
+    slow = win.an.function_by_name("add_note").addr
+
+    def decompile(an, f):
+        if f.addr == slow:
+            end = time.monotonic() + 30
+            while time.monotonic() < end:          # a long job that reaches checkpoints
+                checkpoint()
+                time.sleep(0.01)
+        return real(an, f)
+    monkeypatch.setattr(emit, "decompile", decompile)
+    win.tabs.setCurrentIndex(win.TAB_DECOMP)
+    win.decomp.wait_idle()
+    win.decomp.invalidate(reload=False)
+    win.goto_text("add_note")
+    assert win.decomp.busy()
+    t = time.monotonic()
+    win.goto_text("classify")
+    assert win.decomp.wait_idle(20000)
+    assert time.monotonic() - t < 10
+    assert win.decomp.toPlainText().startswith("int classify(")
+    assert slow not in win.decomp.cache
+    monkeypatch.setattr(emit, "decompile", real)
+    win.goto_text("add_note")
+    assert win.decomp.wait_idle()
+    assert "add_note(" in win.decomp.toPlainText()
+
+
 def _cursor_on(view, needle, offset=1):
     from PySide6.QtGui import QTextCursor
     doc = view.document()

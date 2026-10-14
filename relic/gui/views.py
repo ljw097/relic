@@ -687,13 +687,16 @@ class PseudocodeHighlighter(QSyntaxHighlighter):
                 self.setFormat(m.start(), m.end() - m.start(), f)
 
 
+CANCELLED_TEXT = "// decompilation cancelled"
+
+
 def _decompile_text(an: Analysis, f: Function):
     """Decompiled result for `f`, or an explanatory comment string on failure."""
     try:
         from ..decompiler.emit import decompile
         return decompile(an, f)
     except Cancelled:
-        return "// decompilation cancelled"
+        return CANCELLED_TEXT
     except NotImplementedError as e:
         return f"// {e}"
     except Exception as e:  # noqa: BLE001 - never take the GUI down with a decompiler bug
@@ -866,6 +869,10 @@ class PseudocodeView(QPlainTextEdit):
     def _request(self, f: Function):
         if self.job is not None and self.job.isRunning():
             self.queued = f        # only the latest request matters
+            if self.job.f is not f:
+                # the user moved on: stop the old one at its next checkpoint instead of making
+                # the new function wait for it (work it finished stays cached in the analysis)
+                self.job.cancel()
             return
         self.job = DecompileJob(self.gen, self.an, f, self)
         self.job.finished_result.connect(self._finished)
@@ -876,9 +883,10 @@ class PseudocodeView(QPlainTextEdit):
         if job is not None:
             job.wait()
             job.deleteLater()
-        if gen == self.gen:
+        cancelled = isinstance(res, str) and res == CANCELLED_TEXT
+        if gen == self.gen and not cancelled:
             self.cache[addr] = res
-        if self.func is not None and self.func.addr == addr and gen == self.gen:
+        if self.func is not None and self.func.addr == addr and gen == self.gen and not cancelled:
             self._display(res)
         nxt, self.queued = self.queued, None
         if self.func is not None and self.func.addr not in self.cache:
