@@ -891,3 +891,42 @@ def test_undo_redo_and_bookmarks(app, win):
     win.bookmarks.selectRow(0)
     win.remove_selected_bookmarks()
     assert not an.bookmarks and not _rows(win.bookmarks)
+
+
+def test_plugin_hooks(app, vuln64, tmp_path, monkeypatch):
+    """Line decorators (comment and colour), the analysis-done and cursor events; a hook that
+    raises is reported once and the listing still renders."""
+    plugins = tmp_path / "plugins"
+    plugins.mkdir()
+    (plugins / "hooks.py").write_text(
+        "events = []\n"
+        "def register(api):\n"
+        "    def deco(an, line):\n"
+        "        if line.mnemonic == 'call' and 'gets' in line.operands:\n"
+        "            return {'comment': 'unbounded read', 'color': '#5a1e1e'}\n"
+        "    api.add_line_decorator(deco)\n"
+        "    api.add_line_decorator(lambda an, line: 1 / 0)\n"
+        "    api.on_analysis(lambda ns: events.append(('analysis', len(ns['functions']()))))\n"
+        "    api.on_cursor(lambda ns, a: events.append(('cursor', a)))\n"
+        "    api.win.test_events = events\n")
+    monkeypatch.setenv("RELIC_PLUGINS", str(plugins))
+    path = tmp_path / "vuln64"
+    shutil.copy(vuln64, path)
+    w = MainWindow()
+    try:
+        w.open_file(str(path))
+        assert w.wait()
+        events = w.test_events
+        assert events and events[0][0] == "analysis" and events[0][1] >= 10
+        vuln = w.an.function_by_name("vuln")
+        w.goto(vuln.addr)
+        assert ("cursor", vuln.addr) in events
+        line = next(ln for ln in w.disasm.lines if ln.kind == "insn" and "gets" in ln.operands)
+        assert line.color == "#5a1e1e" and "unbounded read" in line.comment
+        assert "unbounded read" in w.disasm.toPlainText()
+        assert w.pyconsole.out.toPlainText().count("ZeroDivisionError") == 1      # reported once
+        w.patch_with("nop")                                                     # re-analysis
+        assert sum(e[0] == "analysis" for e in events) == 2
+    finally:
+        w.dirty = False
+        w.close()

@@ -359,6 +359,7 @@ class MainWindow(QMainWindow):
         self.progress.hide()
         self.cancel_button.hide()
         self._closing = False
+        self.plugin_hooks: dict[str, list] = {"analysis": [], "cursor": []}
         self._actions()
         self._update_actions()
         self._load_plugins()
@@ -677,6 +678,7 @@ class MainWindow(QMainWindow):
         main = an.function_by_name("main")
         start = main.addr if main else an.bin.entry
         self._update_actions()
+        self._run_hooks("analysis")
         self.goto(start, record=False)
 
     def _fill_functions(self):
@@ -788,6 +790,7 @@ class MainWindow(QMainWindow):
         self._update_actions()
         if self.xrefs_dock.isVisible():
             self._fill_xrefs(self._xref_subject(addr))
+        self._notify_cursor(addr)
 
     def go_back(self):
         if self.back:
@@ -1102,6 +1105,13 @@ class MainWindow(QMainWindow):
     def _cursor_moved(self, addr: int):
         self.cur = addr
         self._show_status(addr)
+        self._notify_cursor(addr)
+
+    def _notify_cursor(self, addr: int):
+        """Plugins' cursor hooks, once per address the cursor arrives at."""
+        if addr != getattr(self, "_hooked_addr", None):
+            self._hooked_addr = addr
+            self._run_hooks("cursor", addr)
 
     def _show_status(self, addr: int):
         an = self.an
@@ -1439,6 +1449,19 @@ class MainWindow(QMainWindow):
         self.plugins_menu.addAction(a)
         return a
 
+    def add_line_decorator(self, fn):
+        self.disasm.decorators.append(fn)
+        if self.an is not None:
+            self.disasm.reload()
+
+    def _run_hooks(self, kind: str, *args):
+        if not self.plugin_hooks[kind] or self.an is None:
+            return
+        from ..scripting import namespace
+        ns = namespace(self.an, self)
+        for fn in list(self.plugin_hooks[kind]):
+            fn(ns, *args)
+
     def report_plugin_error(self, plugin: str, error: str):
         self.pyconsole.append(f"[plugin {plugin}] {error}\n")
         self.statusBar().showMessage(f"plugin {plugin} failed (see the Python console)", 6000)
@@ -1564,6 +1587,7 @@ class MainWindow(QMainWindow):
         self.setWindowTitle(self.windowTitle().rstrip(" *") + " *")
         if keep is not None:
             self.goto(keep, record=False)
+        self._run_hooks("analysis")
 
     def save_project(self) -> bool:
         if self.an is None:

@@ -22,6 +22,7 @@ class Line:
     operands: str = ""
     comment: str = ""
     target: int | None = None  # navigable address for this line
+    color: str | None = None   # background a plugin gave the line (`#rrggbb`)
 
 
 def operands(an: Analysis, i: Insn) -> str:
@@ -59,7 +60,34 @@ def comment(an: Analysis, i: Insn) -> str:
     return "; ".join(parts)
 
 
-def function_lines(an: Analysis, f: Function) -> list[Line]:
+def decorate(an: Analysis, lines: list[Line], decorators=()) -> list[Line]:
+    """Let plugin decorators add to instruction / data lines: each is called as `d(an, line)` and
+    returns None, a comment to append, or a dict with `comment` and / or `color` (`#rrggbb`)."""
+    if not decorators:
+        return lines
+    for ln in lines:
+        if ln.kind not in ("insn", "data"):
+            continue
+        for d in decorators:
+            r = d(an, ln)
+            if not r:
+                continue
+            if isinstance(r, str):
+                r = {"comment": r}
+            text = r.get("comment")
+            if text:
+                ln.comment = f"{ln.comment}; {text}" if ln.comment else str(text)
+            if r.get("color"):
+                ln.color = str(r["color"])
+    return lines
+
+
+def function_lines(an: Analysis, f: Function, decorators=()) -> list[Line]:
+    """The listing of a function; `decorators` are plugin hooks (see `decorate`)."""
+    return decorate(an, _function_lines(an, f), decorators)
+
+
+def _function_lines(an: Analysis, f: Function) -> list[Line]:
     lines: list[Line] = []
     name = an.name(f.addr) or f.name
     callers = sorted({x.frm for x in an.xrefs_to.get(f.addr, []) if x.kind in ("call", "jmp")})

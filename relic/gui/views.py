@@ -192,6 +192,7 @@ class DisasmView(QPlainTextEdit):
         self.columns = {"bytes": 20, "mnem": 44}
         self.debug_pc: int | None = None          # while debugging: the stopped-at instruction
         self.debug_bps: set[int] = set()
+        self.decorators: list = []                # plugin line decorators (listing.decorate)
         self.show_bytes = True
         self.highlighter = ListingHighlighter(self.document(), self)
         self.cursorPositionChanged.connect(self._moved)
@@ -216,7 +217,7 @@ class DisasmView(QPlainTextEdit):
     def reload(self):
         if self.an is None or self.func is None:
             return
-        lines = function_lines(self.an, self.func)
+        lines = function_lines(self.an, self.func, self.decorators)
         text = render(lines, self.show_bytes)
         if text.startswith("\n"):  # render() puts a blank line before the function header
             text = text[1:]
@@ -260,7 +261,9 @@ class DisasmView(QPlainTextEdit):
         self._highlight_row(self.textCursor().blockNumber())
 
     def _debug_selections(self) -> list:
-        marks = [(self.row_of.get(a), "bp_line") for a in getattr(self, "debug_bps", ())]
+        # plugin colours first: the debugger's marks show over them
+        marks = [(k, ln.color) for k, ln in enumerate(self.lines) if ln.color]
+        marks += [(self.row_of.get(a), "bp_line") for a in getattr(self, "debug_bps", ())]
         if getattr(self, "debug_pc", None) is not None:
             marks.append((self.row_of.get(self.debug_pc), "pc_line"))
         return _line_marks(self, marks)
@@ -733,7 +736,7 @@ def _line_marks(view: QPlainTextEdit, marks) -> list:
         if row is None:
             continue
         sel = QTextEdit.ExtraSelection()
-        sel.format.setBackground(QColor(THEME[key]))
+        sel.format.setBackground(QColor(THEME.get(key, key)))     # a theme key, or a colour itself
         sel.format.setProperty(QTextCharFormat.Property.FullWidthSelection, True)
         sel.cursor = QTextCursor(view.document().findBlockByNumber(row))
         out.append(sel)

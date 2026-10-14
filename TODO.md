@@ -32,7 +32,6 @@
 
 - [ ] 부동소수점: ARM VFP 리프터(`vadd.f64`, `vcmp` + `vmrs`), x87(`fld`/`fstp`, 32비트 cdecl의 `double` 반환), `unsigned` ↔ `double` 변환 관용구(`cvtsi2sd` + 보정 분기)
 
-- [ ] 플러그인 훅: 리스팅 줄 꾸미기(주석·색), 분석 완료 이벤트
 - [ ] 열거형·공용체 타입
 - [ ] RISC-V / PPC 리프터(호출 인자 추출은 같은 경로로), PPC64 ELFv1 함수 디스크립터, RISC-V `auipc` 쌍
 - [ ] ARM 데이터 영역을 코드로 잘못 읽은 경우(coprocessor 명령 등) 감지

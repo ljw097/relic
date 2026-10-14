@@ -36,7 +36,7 @@
 | 타입 시스템 (10) | 구조체·열거형·로컬 타입, 타입 라이브러리, 타입 전파 | int/포인터/unsigned 추론, libc 시그니처 일부, 구조체 자동 복원(필드 오프셋·폭·포인터 타입, 중첩·자기 참조, 전역을 통해 함수 간 공유, 이름 변경), 배열 필드(`l->vals[i]`), 호출을 통한 구조체 공유(전역·지역), 변수·필드 타입 직접 지정(`Y`, 구조체를 다른 함수에 적용), 구조체 편집 창 | 40% |
 | 디컴파일러 (20) | Hex-Rays: 다수 아키텍처, 타입·구조체 대화형 수정, 부동소수점 | x86-64/x86-32/AArch64/ARM32/MIPS32, 재컴파일 검증, 구조화(switch·for·&&), 상수 나눗셈, -fipa-ra 레지스터 보존, 구조체 복원·대화형 재타입(`Y`), x86-64 SSE·AArch64 부동소수점(`float`/`double` 인자·반환값·리터럴·변환·비교·`fma`, 비트 단위 재컴파일 검증); ARM VFP·x87 부동소수점, SIMD 없음 | 50% |
 | 대화형 UI (12) | 리스팅·그래프·xref·이름/주석·검색·패치·undo·북마크·구조체 창 | 리스팅·그래프(층별 레이아웃)·의사 코드·헥스, 이름/주석/변수 이름, xref, 이동 기록, 테마·확대, 검색(바이트·텍스트·즉치값·명령어), 바이트 패치(NOP·분기 반전·어셈블, 프로젝트에 저장, 패치된 파일 내보내기), 모든 편집(이름·주석·타입·구조체·북마크·패치)의 undo/redo, 북마크, 함수 안 데이터(리터럴 풀·인라인 점프 테이블·패딩) 표시 | 62% |
-| 스크립팅·확장 (8) | IDAPython, IDC, SDK, 플러그인 | Python 라이브러리 API, 스크립팅 API(`here()`·`rename()`·`decompile()`·`patch()` …), GUI Python 콘솔, 플러그인(`register(api)` → Plugins 메뉴), `relic script` 배치 실행, CLI | 40% |
+| 스크립팅·확장 (8) | IDAPython, IDC, SDK, 플러그인 | Python 라이브러리 API, 스크립팅 API(`here()`·`rename()`·`decompile()`·`patch()` …), GUI Python 콘솔, 플러그인(`register(api)` → Plugins 메뉴, 리스팅 줄 꾸미기·분석 완료·커서 이동 훅), `relic script` 배치 실행, CLI | 40% |
 | 디버거 (7) | 로컬·원격(gdbserver 등) 디버깅 | 로컬 GUI 디버거(GDB/MI): 실행·단계 실행·중단점(조건·활성화·적중 횟수, 라이브러리 함수 이름)·하드웨어 watchpoint·리스팅/의사 코드 동기화, pwndbg식 레지스터·스택 telescope·vmmap·메모리 hexdump·백트레이스·콘솔, 레지스터·메모리 편집, PIE 슬라이드 보정; 원격·힙 뷰 없음 | 40% |
 | 프로젝트·협업 (5) | IDB, 스냅숏, Teams, Lumina | `<binary>.relic.json`(이름·주석·변수 이름·타입·구조체·패치·북마크) | 22% |
 
@@ -246,9 +246,18 @@ def register(api):
             if "gets(" in ns["decompile"](f):
                 ns["comment"](f.addr, "calls gets")
     api.add_action("Mark gets() callers", run, "Ctrl+Alt+G")     # Plugins 메뉴에 추가
+
+    # 리스팅 줄 꾸미기: 주석 덧붙이기, 배경색
+    def deco(an, line):
+        if line.mnemonic == "call" and "gets" in line.operands:
+            return {"comment": "unbounded read", "color": "#5a1e1e"}
+    api.add_line_decorator(deco)
+
+    api.on_analysis(lambda ns: print(len(ns["functions"]()), "functions"))   # 분석이 끝날 때마다 (패치 후 재분석 포함)
+    api.on_cursor(lambda ns, a: None)                                        # 커서가 다른 주소로 갈 때
 ```
 
-플러그인을 불러오다 난 오류는 GUI를 막지 않고 Python 콘솔에 표시됩니다.
+플러그인을 불러오다 난 오류나 훅 안의 예외는 GUI를 막지 않고 Python 콘솔에 (훅마다 한 번) 표시됩니다.
 
 ## 라이브러리로 사용
 
