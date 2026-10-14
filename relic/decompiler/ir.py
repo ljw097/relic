@@ -409,7 +409,7 @@ def fmt(e: Expr, prec: int = 0) -> str:
         s = f"{fmt(e.a, p)} {e.op} {fmt(e.b, p + 1)}"
         return f"({s})" if p < prec else s
     if isinstance(e, UnOp):
-        return f"{e.op}{fmt(e.a, 11)}"
+        return f"{e.op}({fmt(e.a)})" if e.op.isalpha() else f"{e.op}{fmt(e.a, 11)}"
     if isinstance(e, Cast):
         return f"{e.kind}{e.bits}({fmt(e.a)})"
     if isinstance(e, Extract):

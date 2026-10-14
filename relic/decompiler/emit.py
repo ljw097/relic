@@ -104,8 +104,10 @@ class CWriter:
         # and results (fpconst.float_types)
         from .fpabi import callee_ret, fp_params
         from .fpconst import float_types
-        fparams = dict(fp_params(an, prep.arch, prep.fn.addr)) if prep.arch.name.startswith("x64") else {}
-        self.ftypes = float_types(prep.fn, fparams, prep.ret_float, lambda st: callee_ret(an, st))
+        from .fpabi import fp_ret_reg
+        fparams = dict(fp_params(an, prep.arch, prep.fn.addr))
+        self.ftypes = float_types(prep.fn, fparams, prep.ret_float, lambda st: callee_ret(an, st),
+                                  fp_ret_reg(prep.arch))
         for name, w in list(self.ftypes.items()):
             cur = self.types.get(name)
             if cur is not None and cur.ptr and name not in fparams:
@@ -213,7 +215,7 @@ class CWriter:
         n = 0
         for s in self.p.fn.stmts():
             for d in ir.stmt_defs(s):
-                if isinstance(d, Var) and d.name.startswith("v") and d.name not in self.names:
+                if isinstance(d, Var) and d.name.startswith("_v") and d.name not in self.names:
                     n += 1
                     self.names[d.name] = f"v{n}"
 
@@ -420,7 +422,7 @@ class CWriter:
     _FCMP_C = {"f<": "<", "f<=": "<=", "f==": "==", "f!=": "!=", "f<u": "<", "f<=u": "<=", "f==u": "==",
                "f!=o": "!="}
     _FARITH_C = {"f+": ("+", 12), "f-": ("-", 12), "f*": ("*", 13), "f/": ("/", 13)}
-    _FCASTS = {"sitofp", "fptosi", "fpconv"}
+    _FCASTS = {"sitofp", "uitofp", "fptosi", "fptoui", "fpconv"}
 
     def _fbinop(self, e: BinOp) -> tuple[str, int]:
         if e.op in self._FARITH_C:
@@ -440,11 +442,14 @@ class CWriter:
 
     def _fintrinsic(self, e: Intrinsic) -> tuple[str, int]:
         x = e.args[0]
-        if e.name == "sitofp":
+        if e.name in ("sitofp", "uitofp"):
             t = "double" if e.bits == 64 else "float"
-            return f"({t}){self.expr(_bare(x), PREC_UNARY)}", PREC_UNARY
-        if e.name == "fptosi":
-            return f"({int_type(e.bits)}){self.fexpr(x, PREC_UNARY)}", PREC_UNARY
+            inner = self.expr(_bare(x), PREC_UNARY)
+            if e.name == "uitofp" and not self._unsigned(x):
+                inner = f"({int_type(x.bits, True)}){inner}"
+            return f"({t}){inner}", PREC_UNARY
+        if e.name in ("fptosi", "fptoui"):
+            return f"({int_type(e.bits, e.name == 'fptoui')}){self.fexpr(x, PREC_UNARY)}", PREC_UNARY
         if e.name == "fpconv":
             t = "double" if e.bits == 64 else "float"
             return f"({t}){self.fexpr(x, PREC_UNARY)}", PREC_UNARY
@@ -637,7 +642,8 @@ class CWriter:
         if isinstance(s, CallStmt):
             text = self.call(s.call)
             from .fpabi import callee_ret
-            reg = "xmm0" if self.p.arch.name.startswith("x64") and callee_ret(self.an, s) else self.p.arch.ret
+            from .fpabi import fp_ret_reg, is_fp_arch
+            reg = fp_ret_reg(self.p.arch) if is_fp_arch(self.p.arch) and callee_ret(self.an, s) else self.p.arch.ret
             ret = next((v for r, v in s.defs if r == reg), None)
             if ret is not None:
                 text = f"{self.expr(ret)} = {text}"
@@ -819,7 +825,7 @@ class CWriter:
             else:
                 t = self.types.get(gen) or CType(int_type(slot.width * 8))
                 self.emit(f"{t.decl(name)};  {where}", None, depth)
-        regs = sorted({v for v in self.names if v.startswith("v") and v not in self.p.params},
+        regs = sorted({v for v in self.names if v.startswith("_v") and v not in self.p.params},
                       key=lambda n: int(self.names[n][1:]))
         for v in regs:
             t = self.types.get(v)

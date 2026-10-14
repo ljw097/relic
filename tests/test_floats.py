@@ -23,7 +23,7 @@ def _c(an, name):
     return decompile(an, an.function_by_name(name)).text
 
 
-@pytest.fixture(scope="module", params=["floats_O0", "floats_O2"])
+@pytest.fixture(scope="module", params=["floats_O0", "floats_O2", "floats_a64_O0", "floats_a64_O2"])
 def an(request):
     return request.param, analyze(request.getfixturevalue(request.param))
 
@@ -47,7 +47,7 @@ def test_signatures(an):
 
 def test_expressions(an):
     name, a = an
-    assert "3.0 * " in _c(a, "poly") and "0.5" in _c(a, "poly")
+    assert ("3.0 * " in _c(a, "poly") or " * 3.0" in _c(a, "poly")) and "0.5" in _c(a, "poly")
     assert "1.5f" in _c(a, "scale")
     assert "sqrt(" in _c(a, "hyp")
     assert "(int64_t)" in _c(a, "to_long") and "(int)" in _c(a, "to_int")
@@ -66,7 +66,7 @@ def test_call_arguments_and_results(an):
     assert "scale(2.0f, 3.0f)" in text, text
     assert "mix(3, 10, 1.5, 0.25f)" in text, text
     assert "to_long(3.7)" in text, text
-    assert re.search(r"v\d+ = twice\(", text), text          # the result is kept (xmm0)
+    assert re.search(r"\w+ = twice\(", text), text           # the result is kept (xmm0 / d0)
 
 
 _HARNESS = r"""
@@ -76,11 +76,16 @@ _HARNESS = r"""
 #include <stdbool.h>
 #include <string.h>
 
+/* the reference compiled like the sample (an AArch64 build fuses a*b+c into one rounding:
+   the pseudocode says fma() for those), the pseudocode without contraction */
+#pragma GCC push_options
+#pragma GCC optimize ("%(opt)s", "fp-contract=fast", "no-tree-vectorize")
 %(defines)s
 #define main ref_main
 #include "%(src)s"
 #undef main
 %(undefs)s
+#pragma GCC pop_options
 
 %(code)s
 
@@ -134,23 +139,31 @@ int main(void)
 def test_recompiled_pseudocode_matches(an, tmp_path):
     """The pseudocode, compiled again and called through the original prototypes (the ABI is what
     the registers fix; the order C wrote mixed int / float parameters in is not), gives the same bits."""
-    cc = shutil.which("gcc")
+    name, a = an
+    run = []
+    if "a64" in name:
+        cc, qemu = shutil.which("aarch64-linux-gnu-gcc"), shutil.which("qemu-aarch64")
+        if cc is None or qemu is None:
+            pytest.skip("no aarch64-linux-gnu-gcc / qemu-aarch64 to run AArch64 pseudocode")
+        run, static = [qemu], ["-static"]
+    else:
+        cc, static = shutil.which("gcc"), []
     if cc is None:
         pytest.skip("no C compiler")
-    name, a = an
     code = "\n\n".join(_c(a, f) for f in FUNCS)
     # through a volatile pointer: gcc would otherwise turn the call into a direct one with the
     # pseudocode's own prototype
     ptrs = "\n".join(f"    __typeof__(ref_{f}) *volatile p_{f} = (__typeof__(ref_{f}) *)(void *){f};" for f in FUNCS)
     src = tmp_path / "re.c"
     src.write_text(_HARNESS % {"code": code, "src": os.path.join(HERE, "src", "floats.c"), "ptrs": ptrs,
+                               "opt": "O2" if name.endswith("O2") else "O0",
                                "defines": "\n".join(f"#define {f} ref_{f}" for f in FUNCS),
                                "undefs": "\n".join(f"#undef {f}" for f in FUNCS)})
     exe = tmp_path / "re"
-    r = subprocess.run([cc, "-O1", "-w", "-fwrapv", "-ffp-contract=off", "-fno-builtin", "-o", str(exe), str(src),
-                        "-lm"], capture_output=True, text=True)
+    r = subprocess.run([cc, "-O1", "-w", "-fwrapv", "-ffp-contract=off", "-fno-builtin", *static, "-o", str(exe),
+                        str(src), "-lm"], capture_output=True, text=True)
     assert r.returncode == 0, f"{name}: does not compile:\n{r.stderr[:3000]}\n{code}"
-    r = subprocess.run([str(exe)], capture_output=True, text=True, timeout=30)
+    r = subprocess.run([*run, str(exe)], capture_output=True, text=True, timeout=120)
     assert r.stdout.strip().endswith("ok"), f"{name}:\n{r.stdout[:2000]}\n{code}"
 
 
@@ -217,10 +230,12 @@ def test_optimisation_preserves_meaning(an, fname):
         for x in {x.name for s in fn.stmts() for t in stmt_exprs(s) for x in walk(t)
                   if isinstance(x, Var) and x.version == 0}:
             m.regs[x] = 0                         # entry registers the test does not set
-        m.regs.update({k: 0 for k in ("rax", "rdi", "rsi", "rbp")}, rsp=0x7FFF0000)
+        m.regs.update({k: 0 for k in ("rax", "rdi", "rsi", "rbp", "x0", "x29", "x30")}, rsp=0x7FFF0000,
+                      sp=0x7FFF0000)
         m.write(0x7FFF0000, 0xDEAD0000, 8)
         for k, v in enumerate(args):
-            m.regs[f"xmm{k}"] = from_float(v, 64) if fname not in ("scale",) else from_float(v, 32)
+            reg = f"v{k}" if a.bin.arch == "arm64" else f"xmm{k}"
+            m.regs[reg] = from_float(v, 64) if fname not in ("scale",) else from_float(v, 32)
         it = Interpreter(fn, m)
         it.run()
         return it.result

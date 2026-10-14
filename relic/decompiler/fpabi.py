@@ -17,8 +17,18 @@ from .ir import Assign, CallStmt, Cast, Expr, IRFunction, Reg, Return, Var, chil
 if TYPE_CHECKING:
     from ..analysis import Analysis, Function
 
-FP_ARGS = {"x64-sysv": tuple(f"xmm{k}" for k in range(8)), "x64-win": tuple(f"xmm{k}" for k in range(4))}
-FP_RET = "xmm0"
+FP_ARGS = {"x64-sysv": tuple(f"xmm{k}" for k in range(8)), "x64-win": tuple(f"xmm{k}" for k in range(4)),
+           "arm64-aapcs": tuple(f"v{k}" for k in range(8))}
+FP_RET = "xmm0"                  # x86-64; AArch64 returns floats in v0 (see fp_ret_reg)
+
+
+def fp_ret_reg(arch: ArchInfo) -> str:
+    return "v0" if arch.name.startswith("arm64") else FP_RET
+
+
+def is_fp_reg(name: str) -> bool:
+    """An SSE / SIMD-and-FP register (`xmm3`, AArch64 `v3`)."""
+    return name.startswith("xmm") or name[:1] == "v" and name[1:].isdigit()
 FLOAT_CONVS = "eEfFgGaA"
 # libc functions taking / returning floating point: argument codes `d` double, `f` float
 FP_SIGS = {
@@ -64,18 +74,18 @@ def _width(e: Expr) -> int | None:
     from .fp import is_fcmp
     from .ir import Ite
     if is_float_expr(e) or isinstance(e, Load) and e.bits in (32, 64) or \
-            isinstance(e, Ite) and is_fcmp(e.cond) and e.bits in (32, 64):
+            isinstance(e, Ite) and e.bits in (32, 64) and (is_fcmp(e.cond) or _xmm_source(e.a) or _xmm_source(e.b)):
         return e.bits
     return None
 
 
 def _xmm_source(e: Expr) -> str | None:
-    """The xmm register a copy reads: `xmm2`, `zext128(low64(xmm2))` (movsd between registers)."""
+    """The FP register a copy reads: `xmm2`, `zext128(low64(xmm2))` (movsd between registers)."""
     if isinstance(e, Cast) and e.kind == "zext":
         e = e.a
     if isinstance(e, Cast) and e.kind == "low":
         e = e.a
-    return e.name if isinstance(e, Reg) and e.name.startswith("xmm") else None
+    return e.name if isinstance(e, Reg) and is_fp_reg(e.name) else None
 
 
 def _cache(an: "Analysis", key: str) -> dict:
@@ -104,19 +114,21 @@ def set_fp_returns(an: "Analysis", func: "Function", fn: IRFunction) -> int | No
     construction would otherwise return rax); the float's width, or None."""
     w = fp_return(an, func)
     if w is not None:
+        from .arch import arch_for
+        reg = fp_ret_reg(arch_for(an.bin))
         for s in fn.stmts():
             if isinstance(s, Return) and s.value is None:
-                s.value = Cast("low", Reg(FP_RET, 128), w)
+                s.value = Cast("low", Reg(reg, 128), w)
     return w
 
 
 def _fp_return(an, func, arch) -> int | None:
     from .cleanup import _lifted, result_reads
-    xr = result_reads(an, func, FP_RET)
+    xr = result_reads(an, func, fp_ret_reg(arch))
     ir_ = result_reads(an, func, arch.ret)
     xmm_w = [r for r in xr if isinstance(r, int)]
     int_r = [r for r in ir_ if r != "none"]
-    if int_r:
+    if int_r and not xmm_w:
         return None                             # callers use the integer result
     try:
         fn = _lifted(an, func)
@@ -150,15 +162,17 @@ def _last_writes(an, fn: IRFunction, arch: ArchInfo) -> int | None:
     return 32 if widths == {32} else 64
 
 
-def _scan_back(an, fn, b, k, arch, seen, depth, reg: str = FP_RET) -> int | None:
+def _scan_back(an, fn, b, k, arch, seen, depth, reg: str | None = None) -> int | None:
     """Width of the float `reg` holds before statement `k` of block `b`, following copies between
     xmm registers back (`movapd xmm0, xmm2` after `minsd xmm2, ...`); 0 for a zeroed register or an
     untouched float parameter (either width); None when it is not a float (or rax is the result)."""
+    ret = fp_ret_reg(arch)
+    reg = reg or ret
     for s in reversed(b.stmts[:k]):
         if isinstance(s, CallStmt):
-            return callee_ret(an, s) if reg == FP_RET else None
+            return callee_ret(an, s) if reg == ret else None
         for d in stmt_defs(s):
-            if reg == FP_RET and isinstance(d, Reg) and d.name == arch.ret:
+            if reg == ret and isinstance(d, Reg) and d.name == arch.ret:
                 return None
             if isinstance(d, Reg) and d.name == reg and isinstance(s, Assign):
                 src = _xmm_source(s.src)

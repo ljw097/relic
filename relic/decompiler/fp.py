@@ -31,7 +31,7 @@ FARITH = ("f+", "f-", "f*", "f/")
 LT, EQ, GT, UN = 1, 2, 4, 8
 FCMP = {"f<": LT, "f<=": LT | EQ, "f==": EQ, "f!=": LT | GT | UN, "f<u": LT | UN, "f<=u": LT | EQ | UN,
         "f==u": EQ | UN, "f!=o": LT | GT, "funord": UN, "ford": LT | EQ | GT}
-FP_CASTS = ("sitofp", "fptosi", "fpconv")
+FP_CASTS = ("sitofp", "uitofp", "fptosi", "fptoui", "fpconv")
 _BY_SET = {v: k for k, v in FCMP.items()}
 
 
@@ -85,6 +85,13 @@ def apply_fbinop(op: str, a: int, b: int, bits: int) -> int:
 
 
 def apply_fcast(kind: str, a: int, src_bits: int, bits: int) -> int:
+    if kind == "uitofp":
+        return from_float(float(a & ((1 << src_bits) - 1)), bits)
+    if kind == "fptoui":
+        x = to_float(a, src_bits)
+        if math.isnan(x) or x <= -1 or math.isinf(x):
+            return 0 if (math.isnan(x) or x < 0) else (1 << bits) - 1
+        return min(int(x), (1 << bits) - 1)
     if kind == "sitofp":
         s = a & ((1 << src_bits) - 1)
         if s >> (src_bits - 1):
@@ -99,8 +106,43 @@ def apply_fcast(kind: str, a: int, src_bits: int, bits: int) -> int:
     return int(x) & ((1 << bits) - 1)
 
 
+def _fma(x: float, y: float, z: float) -> float:
+    """x * y + z rounded once (exact rational arithmetic; inf / nan the plain way)."""
+    if not all(map(math.isfinite, (x, y, z))):
+        return x * y + z
+    from fractions import Fraction
+    r = Fraction(x) * Fraction(y) + Fraction(z)
+    if r == 0:
+        return x * y + z               # the sign of an exact zero
+    try:
+        return float(r)
+    except OverflowError:
+        return math.copysign(math.inf, r)
+
+
 def apply_fintrinsic(name: str, args: list[int], bits: int) -> int:
     x = to_float(args[0], bits)
+    base = name[:-1] if bits == 32 and name.endswith("f") and name not in ("fabsf",) else name
+    if base in ("fma",):
+        return from_float(_fma(x, to_float(args[1], bits), to_float(args[2], bits)), bits)
+    if base in ("fmax", "fmin"):           # C fmax / fmin: a NaN operand gives the other one
+        y = to_float(args[1], bits)
+        if math.isnan(x):
+            return args[1]
+        if math.isnan(y):
+            return args[0]
+        if x == y == 0:                    # +0 is larger than -0
+            neg = math.copysign(1, x) < 0 and math.copysign(1, y) < 0 if base == "fmax" else \
+                math.copysign(1, x) < 0 or math.copysign(1, y) < 0
+            return from_float(-0.0 if neg else 0.0, bits)
+        return args[0] if (x > y) == (base == "fmax") else args[1]
+    if base == "round":                    # halfway cases away from zero
+        if not math.isfinite(x):
+            return args[0]
+        t = float(math.trunc(x))
+        if abs(x - t) >= 0.5:              # (x - trunc(x) is exact)
+            t += math.copysign(1.0, x)
+        return from_float(math.copysign(t, x), bits)
     if name in ("sqrt", "sqrtf"):
         r = math.sqrt(x) if x >= 0 else (x if math.isnan(x) else math.nan)
     elif name in ("fabs", "fabsf"):
@@ -119,7 +161,7 @@ def apply_fintrinsic(name: str, args: list[int], bits: int) -> int:
 
 
 FP_INTRINSICS = ("sqrt", "sqrtf", "fabs", "fabsf", "floor", "floorf", "ceil", "ceilf", "trunc", "truncf",
-                 "rint", "rintf")
+                 "rint", "rintf", "round", "roundf", "fma", "fmaf", "fmax", "fmaxf", "fmin", "fminf")
 
 
 def literal(v: int, bits: int) -> str:

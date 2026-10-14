@@ -483,7 +483,7 @@ def inline_single_use(fn: IRFunction) -> bool:
                     k += 1
                     continue
                 v, src = cand
-                if uses.get(v.name) != 1 or defs.get(v.name) != 1 or v.version != 0 or not v.name.startswith("v"):
+                if uses.get(v.name) != 1 or defs.get(v.name) != 1 or v.version != 0 or not v.name.startswith("_v"):
                     k += 1
                     continue
                 names, mem = _reads(src)

@@ -29,7 +29,7 @@ def is_float_expr(e: Expr) -> bool:
     if isinstance(e, UnOp):
         return e.op == "fneg"
     if isinstance(e, Intrinsic):
-        return e.name in FP_INTRINSICS or e.name in ("sitofp", "fpconv")
+        return e.name in FP_INTRINSICS or e.name in ("sitofp", "uitofp", "fpconv")
     return False
 
 
@@ -39,7 +39,7 @@ def float_operands(e: Expr) -> tuple[Expr, ...]:
         return (e.a, e.b)
     if isinstance(e, UnOp) and e.op == "fneg":
         return (e.a,)
-    if isinstance(e, Intrinsic) and (e.name in FP_INTRINSICS or e.name in ("fptosi", "fpconv")):
+    if isinstance(e, Intrinsic) and (e.name in FP_INTRINSICS or e.name in ("fptosi", "fptoui", "fpconv")):
         return e.args
     if isinstance(e, Ite) and (is_float_expr(e.a) or is_float_expr(e.b)):
         return (e.a, e.b)
@@ -73,7 +73,7 @@ def fold_float_constants(an: "Analysis", fn: IRFunction, extra=()) -> int:
 
 
 def float_types(fn: IRFunction, params_fp: dict[str, int], ret_float: bool,
-                callee_ret=lambda stmt: None) -> dict[str, int]:
+                callee_ret=lambda stmt: None, ret_reg: str = "xmm0") -> dict[str, int]:
     """Variables (register Vars and stack locals) that hold floats -> width (64 double, 32 float).
 
     A variable is a float when a floating-point operation reads or produces it, when it is a
@@ -110,7 +110,7 @@ def float_types(fn: IRFunction, params_fp: dict[str, int], ret_float: bool,
                     int_use(x.b)
                 elif isinstance(x, Load):
                     int_use(x.addr)
-                elif isinstance(x, Intrinsic) and x.name == "sitofp":
+                elif isinstance(x, Intrinsic) and x.name in ("sitofp", "uitofp"):
                     int_use(x.args[0])
         if isinstance(s, Store):
             int_use(s.dst)
@@ -127,7 +127,7 @@ def float_types(fn: IRFunction, params_fp: dict[str, int], ret_float: bool,
             w = callee_ret(s)
             if w is not None:
                 for r, d in s.defs:
-                    if r == "xmm0":
+                    if r == ret_reg:
                         mark(d, w)
         for top in stmt_exprs(s):
             for x in walk(top):

@@ -12,8 +12,8 @@ from __future__ import annotations
 from typing import TYPE_CHECKING
 
 from .arch import ArchInfo
-from .ir import Assign, Call, CallStmt, Cast, Const, Expr, IRFunction, Phi, Var, children, stmt_exprs, walk
-from .fpabi import arg_classes, assign_regs, fp_params, fp_sig, is_fp_arch
+from .ir import Assign, Call, CallStmt, Cast, Const, Expr, IRFunction, Phi, Return, Var, children, stmt_exprs, walk
+from .fpabi import arg_classes, assign_regs, fp_params, fp_sig, is_fp_arch, is_fp_reg
 from .sigs import arg_count, lookup
 
 if TYPE_CHECKING:
@@ -143,11 +143,21 @@ def _compute_livein(an: "Analysis", arch: ArchInfo, target: int, prefix: bool = 
     # Phis are followed only from such real uses (clobbered registers merge at joins).
     phis: dict[Var, Phi] = {}
     used: set[Var] = set()
+    # a function returning a float does not return the integer register: its `return` (which
+    # reads that register until the float result is known) is no use of an argument register
+    float_result = None
     for s in ssa.stmts():
         if isinstance(s, Assign) and isinstance(s.src, Phi):
             phis[s.dst] = s.src
             continue
         tops = stmt_exprs(s)
+        if isinstance(s, Return):
+            if float_result is None:
+                f = an.functions.get(target)
+                from .fpabi import fp_return
+                float_result = f is not None and fp_return(an, f) is not None
+            if float_result:
+                continue
         if isinstance(s, CallStmt):
             tops = [s.call]
             sig = lookup(s.name or (an.name(s.call.target.value) if isinstance(s.call.target, Const) else None))
@@ -341,7 +351,7 @@ def recover_calls(fn: IRFunction, an: "Analysis", arch: ArchInfo) -> IRFunction:
                 if r not in uses:
                     continue
                 v = uses[r]
-                if r.startswith("xmm"):           # the float in the register's low lanes
+                if is_fp_reg(r):                  # the float in the register's low lanes
                     w = widths.get(r) or (32 if _float_class(fsig, selected, r) else 64)
                     v = Cast("low", v, w)
                     fargs.append((len(args), w))
@@ -356,7 +366,7 @@ def _float_class(fsig, selected: list[str], reg: str) -> bool:
     if fsig is None:
         return False
     floats = [ch for ch in fsig[0] if ch in "df"]
-    xmms = [r for r in selected if r.startswith("xmm")]
+    xmms = [r for r in selected if is_fp_reg(r)]
     k = xmms.index(reg)
     return k < len(floats) and floats[k] == "f"
 

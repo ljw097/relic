@@ -22,6 +22,7 @@ from ...analysis.functions import NORETURN
 from ...disasm import Insn
 from ..ir import (Assign, BinOp, Branch, Call, CallStmt, Cast, Const, Effect, Expr, IndirectJump, Intrinsic, Ite,
                   Jump, Load, Reg, Return, Stmt, Store, UnOp, Unknown, mask)
+from ..fp import from_float
 from .x86 import LiftError, cast
 
 if TYPE_CHECKING:
@@ -243,10 +244,7 @@ class Arm64Lifter:
                 self._effect(i, m)
             elif i.cs.operands and i.cs.operands[0].type == OP_REG and \
                     _REGS.get(self.name(i.cs.operands[0]), ("x",))[0].startswith("v"):
-                # FP / SIMD: opaque function of the operands
-                ops = i.cs.operands
-                srcs = tuple(self.operand(o, self.width(o)) for o in ops[1:] if o.type in (OP_REG, OP_IMM))
-                self.write_reg(self.name(ops[0]), Intrinsic(m, srcs, self.width(ops[0])))
+                self._opaque(i, i.cs.operands)
             else:
                 self.out = [self.unknown(i)]
         except (LiftError, KeyError, StopIteration, AttributeError, IndexError):
@@ -553,18 +551,212 @@ class Arm64Lifter:
             v = BinOp("|", BinOp(">>u", b, Const(lsb, 8), w), BinOp("<<", a, Const(w - lsb, 8), w), w)
         self.write_reg(self.name(ops[0]), v)
 
+    def _opaque(self, i, ops):
+        """FP / SIMD the IR does not model: an opaque function of the operands."""
+        srcs = tuple(self.operand(o, self.width(o)) for o in ops[1:] if o.type in (OP_REG, OP_IMM))
+        self.write_reg(self.name(ops[0]), Intrinsic(i.mnemonic, srcs, self.width(ops[0])))
+
     def _i_fmov(self, i, ops):
-        """Bit-exact moves between general and FP registers; FP constants stay opaque."""
+        """Bit-exact moves between general and FP registers, FP immediates as their bits."""
         dst, src = ops[0], ops[1]
         dn = self.name(dst)
-        dv = _REGS.get(dn, ("x",))[0].startswith("v")
-        if src.type == OP_REG:
-            sv = _REGS.get(self.name(src), ("x",))[0].startswith("v")
-            if dv != sv or not dv:                 # GPR <-> FP: the same bits
-                self.write_reg(dn, self.resize(self.read_reg(self.name(src)), self.width(dst)))
-                return
-        self.write_reg(dn, Intrinsic("fmov", tuple(self.operand(o, self.width(dst)) for o in ops[1:]
-                                                   if o.type in (OP_REG, OP_IMM)), self.width(dst)))
+        if dst.vas or getattr(src, "vas", 0):
+            return self._opaque(i, ops)
+        w = self.width(dst)
+        if src.type == OP_REG:                     # GPR <-> FP, FP <-> FP: the same bits
+            self.write_reg(dn, self.resize(self.read_reg(self.name(src)), w))
+            return
+        if src.type == a64.ARM64_OP_FP and w in (32, 64):
+            self.write_reg(dn, Const(from_float(src.fp, w), w))
+            return
+        if src.type == OP_IMM:                     # `fmov d0, xzr` style zero, or raw bits
+            self.write_reg(dn, Const(src.imm, w))
+            return
+        self._opaque(i, ops)
+
+    def _i_movi(self, i, ops):
+        """`movi d0, #0` (the usual way to zero an FP register): a 64-bit immediate."""
+        if ops[0].vas or len(ops) != 2 or ops[1].type != OP_IMM or self.name(ops[0])[:1] != "d":
+            return self._opaque(i, ops)
+        self.write_reg(self.name(ops[0]), Const(ops[1].imm, 64))
+
+    # ------------------------------------------------------ scalar floating point
+    def _fw(self, op) -> int | None:
+        """Width of a scalar FP register operand (`s3` 32, `d3` 64), else None (vector, half)."""
+        if op.type != OP_REG or op.vas:
+            return None
+        n = self.name(op)
+        return {"s": 32, "d": 64}.get(n[:1]) if n[1:].isdigit() else None
+
+    def _fsrc(self, op, w: int) -> Expr:
+        if op.type == a64.ARM64_OP_FP:
+            return Const(from_float(op.fp, w), w)
+        if op.type == OP_IMM:
+            return Const(op.imm, w)
+        return self.resize(self.read_reg(self.name(op)), w)
+
+    def _farith(self, i, ops, op: str):
+        w = self._fw(ops[0])
+        if w is None or len(ops) != 3:
+            return self._opaque(i, ops)
+        self.write_reg(self.name(ops[0]), BinOp(op, self._fsrc(ops[1], w), self._fsrc(ops[2], w), w))
+
+    def _i_fadd(self, i, ops):
+        self._farith(i, ops, "f+")
+
+    def _i_fsub(self, i, ops):
+        self._farith(i, ops, "f-")
+
+    def _i_fmul(self, i, ops):
+        self._farith(i, ops, "f*")
+
+    def _i_fdiv(self, i, ops):
+        self._farith(i, ops, "f/")
+
+    def _i_fnmul(self, i, ops):
+        w = self._fw(ops[0])
+        if w is None:
+            return self._opaque(i, ops)
+        self.write_reg(self.name(ops[0]), UnOp("fneg", BinOp("f*", self._fsrc(ops[1], w), self._fsrc(ops[2], w), w), w))
+
+    def _funary(self, i, ops, name: str | None):
+        w = self._fw(ops[0])
+        if w is None or self._fw(ops[1]) != w:
+            return self._opaque(i, ops)
+        x = self._fsrc(ops[1], w)
+        self.write_reg(self.name(ops[0]), UnOp("fneg", x, w) if name is None else
+                       Intrinsic(name if w == 64 else name + "f", (x,), w))
+
+    def _i_fneg(self, i, ops):
+        self._funary(i, ops, None)
+
+    def _i_fabs(self, i, ops):
+        self._funary(i, ops, "fabs")
+
+    def _i_fsqrt(self, i, ops):
+        self._funary(i, ops, "sqrt")
+
+    def _i_frintm(self, i, ops):
+        self._funary(i, ops, "floor")
+
+    def _i_frintp(self, i, ops):
+        self._funary(i, ops, "ceil")
+
+    def _i_frintz(self, i, ops):
+        self._funary(i, ops, "trunc")
+
+    def _i_frintn(self, i, ops):
+        self._funary(i, ops, "rint")
+
+    _i_frintx = _i_frinti = _i_frintn
+
+    def _i_frinta(self, i, ops):
+        self._funary(i, ops, "round")
+
+    def _fminmax(self, i, ops, name: str):
+        w = self._fw(ops[0])
+        if w is None:
+            return self._opaque(i, ops)
+        self.write_reg(self.name(ops[0]), Intrinsic(name if w == 64 else name + "f",
+                                                    (self._fsrc(ops[1], w), self._fsrc(ops[2], w)), w))
+
+    def _i_fmaxnm(self, i, ops):
+        self._fminmax(i, ops, "fmax")
+
+    def _i_fminnm(self, i, ops):
+        self._fminmax(i, ops, "fmin")
+
+    _i_fmax, _i_fmin = _i_fmaxnm, _i_fminnm
+
+    def _fused(self, i, ops, neg_product: bool, neg_addend: bool):
+        """fmadd d = a + n*m, fmsub d = a - n*m, fnmadd d = -a - n*m, fnmsub d = n*m - a: one rounding,
+        so `fma(n, m, a)` (with the signs folded into its operands), never `n * m + a`."""
+        w = self._fw(ops[0])
+        if w is None or len(ops) != 4:
+            return self._opaque(i, ops)
+        n, m_, a = (self._fsrc(o, w) for o in ops[1:])
+        if neg_product:
+            n = UnOp("fneg", n, w)
+        if neg_addend:
+            a = UnOp("fneg", a, w)
+        self.write_reg(self.name(ops[0]), Intrinsic("fma" if w == 64 else "fmaf", (n, m_, a), w))
+
+    def _i_fmadd(self, i, ops):
+        self._fused(i, ops, False, False)
+
+    def _i_fmsub(self, i, ops):
+        self._fused(i, ops, True, False)
+
+    def _i_fnmadd(self, i, ops):
+        self._fused(i, ops, True, True)
+
+    def _i_fnmsub(self, i, ops):
+        self._fused(i, ops, False, True)
+
+    def _cvt_from_int(self, i, ops, kind: str):
+        w = self._fw(ops[0])
+        if w is None or len(ops) != 2 or ops[1].type != OP_REG:
+            return self._opaque(i, ops)                  # vector or fixed-point forms
+        self.write_reg(self.name(ops[0]), Intrinsic(kind, (self.read_reg(self.name(ops[1])),), w))
+
+    def _i_scvtf(self, i, ops):
+        self._cvt_from_int(i, ops, "sitofp")
+
+    def _i_ucvtf(self, i, ops):
+        self._cvt_from_int(i, ops, "uitofp")
+
+    def _cvt_to_int(self, i, ops, kind: str, rnd: str | None = None):
+        sw = self._fw(ops[1]) if len(ops) == 2 else None
+        if sw is None or ops[0].vas:
+            return self._opaque(i, ops)
+        x = self._fsrc(ops[1], sw)
+        if rnd is not None:
+            x = Intrinsic(rnd if sw == 64 else rnd + "f", (x,), sw)
+        self.write_reg(self.name(ops[0]), Intrinsic(kind, (x,), self.width(ops[0])))
+
+    def _i_fcvtzs(self, i, ops):
+        self._cvt_to_int(i, ops, "fptosi")
+
+    def _i_fcvtzu(self, i, ops):
+        self._cvt_to_int(i, ops, "fptoui")
+
+    def _i_fcvtms(self, i, ops):
+        self._cvt_to_int(i, ops, "fptosi", "floor")
+
+    def _i_fcvtps(self, i, ops):
+        self._cvt_to_int(i, ops, "fptosi", "ceil")
+
+    def _i_fcvtas(self, i, ops):
+        self._cvt_to_int(i, ops, "fptosi", "round")
+
+    def _i_fcvtns(self, i, ops):
+        self._cvt_to_int(i, ops, "fptosi", "rint")
+
+    def _i_fcvt(self, i, ops):
+        w, sw = self._fw(ops[0]), self._fw(ops[1])
+        if w is None or sw is None:
+            return self._opaque(i, ops)              # half precision, vectors
+        self.write_reg(self.name(ops[0]), Intrinsic("fpconv", (self._fsrc(ops[1], sw),), w))
+
+    def _i_fcmp(self, i, ops):
+        """NZCV of an FP compare: lt 1000, eq 0110, gt 0010, unordered 0011."""
+        w = self._fw(ops[0])
+        if w is None:
+            raise LiftError("fcmp")
+        a, b = self._fsrc(ops[0], w), self._fsrc(ops[1], w)
+        lt = BinOp("f<", a, b, 1)
+        self.assign(SF, lt)
+        self.assign(ZF, BinOp("f==", a, b, 1))
+        self.assign(CF, UnOp("!", lt, 1))
+        self.assign(OF, BinOp("funord", a, b, 1))
+
+    _i_fcmpe = _i_fcmp
+
+    def _i_fcsel(self, i, ops):
+        w = self._fw(ops[0])
+        if w is None:
+            return self._opaque(i, ops)
+        self.write_reg(self.name(ops[0]), Ite(self.cond(), self._fsrc(ops[1], w), self._fsrc(ops[2], w), w))
 
     def _i_mrs(self, i, ops):
         """System register read (`tpidr_el0` is the thread pointer)."""
