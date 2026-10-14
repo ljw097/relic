@@ -60,6 +60,12 @@ def _canon_arm():
     def canon(name: str) -> tuple[str, ...]:
         if name in ("cpsr", "apsr", "apsr_nzcv", "spsr"):
             return ("zf", "cf", "sf", "of")
+        if name[:1] == "s" and name[1:].isdigit():          # VFP singles are halves of d registers
+            return (f"d{int(name[1:]) // 2}",)
+        if name[:1] == "q" and name[1:].isdigit():
+            return (f"d{2 * int(name[1:])}", f"d{2 * int(name[1:]) + 1}")
+        if name == "fpscr":
+            return ("fpscr_n", "fpscr_z", "fpscr_c", "fpscr_v")
         return (ArmLifter.canon(name),)
     return canon
 

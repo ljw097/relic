@@ -44,6 +44,9 @@ def load_elf(path: str, data: bytes) -> Binary:
         b.thumb_code.add(b.entry)
     b.info["type"] = elf["e_type"]
     b.info["machine"] = elf["e_machine"]
+    if arch == "arm":
+        # EF_ARM_ABI_FLOAT_HARD: floating-point arguments and results in VFP registers (armhf)
+        b.arm_hard_float = bool(elf["e_flags"] & 0x400)
     b.elf_type = elf["e_type"]
 
     b.program_headers = []

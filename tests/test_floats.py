@@ -23,7 +23,8 @@ def _c(an, name):
     return decompile(an, an.function_by_name(name)).text
 
 
-@pytest.fixture(scope="module", params=["floats_O0", "floats_O2", "floats_a64_O0", "floats_a64_O2"])
+@pytest.fixture(scope="module", params=["floats_O0", "floats_O2", "floats_a64_O0", "floats_a64_O2",
+                                        "floats_arm_O0", "floats_arm_O2", "floats_thumb_O2"])
 def an(request):
     return request.param, analyze(request.getfixturevalue(request.param))
 
@@ -34,7 +35,8 @@ def test_signatures(an):
     assert sig["poly"] == "double poly(double a1)", sig
     assert sig["scale"] == "float scale(float a1, float a2)", sig
     assert sig["cmpd"] == "int cmpd(double a1, double a2)", sig
-    assert sig["to_long"] == "int64_t to_long(double a1)", sig
+    long_ = "int" if a.bin.bits == 32 else "int64_t"
+    assert sig["to_long"] == f"{long_} to_long(double a1)", sig
     assert sig["to_int"] == "int to_int(float a1)", sig
     assert sig["clampd"] == "double clampd(double a1, double a2, double a3)", sig
     assert sig["narrow"] == "float narrow(double a1)", sig
@@ -42,7 +44,7 @@ def test_signatures(an):
     assert sig["count_above"] == "int count_above(double *a1, int a2, double a3)", sig
     assert sig["sum_f"] == "double sum_f(float *a1, int a2)", sig
     # integer parameters first, then the float ones (the registers do not say how C interleaved them)
-    assert sig["mix"] == "double mix(int a1, int64_t a2, double a3, float a4)", sig
+    assert sig["mix"] == f"double mix(int a1, {long_} a2, double a3, float a4)", sig
 
 
 def test_expressions(an):
@@ -50,7 +52,7 @@ def test_expressions(an):
     assert ("3.0 * " in _c(a, "poly") or " * 3.0" in _c(a, "poly")) and "0.5" in _c(a, "poly")
     assert "1.5f" in _c(a, "scale")
     assert "sqrt(" in _c(a, "hyp")
-    assert "(int64_t)" in _c(a, "to_long") and "(int)" in _c(a, "to_int")
+    assert ("(int)" if a.bin.bits == 32 else "(int64_t)") in _c(a, "to_long") and "(int)" in _c(a, "to_int")
     assert "(float)" in _c(a, "narrow") and "0.5f" in _c(a, "narrow")
     assert "-" in _c(a, "absneg") and "__" not in _c(a, "absneg")
     assert "== " in _c(a, "is_equal")
@@ -178,11 +180,14 @@ def test_recompiled_pseudocode_matches(an, tmp_path):
     the registers fix; the order C wrote mixed int / float parameters in is not), gives the same bits."""
     name, a = an
     run = []
-    if "a64" in name:
-        cc, qemu = shutil.which("aarch64-linux-gnu-gcc"), shutil.which("qemu-aarch64")
+    cross = {"a64": ("aarch64-linux-gnu-gcc", "qemu-aarch64"), "arm": ("arm-linux-gnueabihf-gcc", "qemu-arm"),
+             "thumb": ("arm-linux-gnueabihf-gcc", "qemu-arm")}
+    kind = next((k for k in cross if f"_{k}_" in name), None)
+    if kind is not None:
+        cc, qemu = (shutil.which(t) for t in cross[kind])
         if cc is None or qemu is None:
-            pytest.skip("no aarch64-linux-gnu-gcc / qemu-aarch64 to run AArch64 pseudocode")
-        run, static = [qemu], ["-static"]
+            pytest.skip(f"no {cross[kind][0]} / {cross[kind][1]} to run the pseudocode")
+        run, static = [qemu], ["-static"] + (["-mthumb"] if kind == "thumb" else ["-marm"] if kind == "arm" else [])
     else:
         cc, static = shutil.which("gcc"), []
     if cc is None:
@@ -267,12 +272,20 @@ def test_optimisation_preserves_meaning(an, fname):
         for x in {x.name for s in fn.stmts() for t in stmt_exprs(s) for x in walk(t)
                   if isinstance(x, Var) and x.version == 0}:
             m.regs[x] = 0                         # entry registers the test does not set
-        m.regs.update({k: 0 for k in ("rax", "rdi", "rsi", "rbp", "x0", "x29", "x30")}, rsp=0x7FFF0000,
-                      sp=0x7FFF0000)
+        m.regs.update({k: 0 for k in ("rax", "rdi", "rsi", "rbp", "x0", "x29", "x30", "r0", "r11", "lr")},
+                      rsp=0x7FFF0000, sp=0x7FFF0000)
         m.write(0x7FFF0000, 0xDEAD0000, 8)
         for k, v in enumerate(args):
-            reg = f"v{k}" if a.bin.arch == "arm64" else f"xmm{k}"
-            m.regs[reg] = from_float(v, 64) if fname not in ("scale",) else from_float(v, 32)
+            w = 32 if fname == "scale" else 64
+            bits = from_float(v, w)
+            if a.bin.arch == "arm":                # d registers; floats in their halves (s0, s1 = d0)
+                if w == 32:
+                    d = f"d{k // 2}"
+                    m.regs[d] = m.regs.get(d, 0) | bits << (32 * (k & 1))
+                else:
+                    m.regs[f"d{k}"] = bits
+                continue
+            m.regs[f"v{k}" if a.bin.arch == "arm64" else f"xmm{k}"] = bits
         it = Interpreter(fn, m)
         it.run()
         return it.result

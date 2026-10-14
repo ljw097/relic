@@ -29,7 +29,7 @@
 
 ## P2
 
-- [ ] 부동소수점: ARM VFP 리프터(`vadd.f64`, `vcmp` + `vmrs`), x87(`fld`/`fstp`, 32비트 cdecl의 `double` 반환), `unsigned` ↔ `double` 변환 관용구(`cvtsi2sd` + 보정 분기)
+- [ ] 부동소수점: x87(`fld`/`fstp`, 32비트 cdecl의 `double` 반환), `unsigned` ↔ `double` 변환 관용구(`cvtsi2sd` + 보정 분기)
 
 - [ ] 열거형·공용체 타입
 - [ ] RISC-V / PPC 리프터(호출 인자 추출은 같은 경로로), PPC64 ELFv1 함수 디스크립터, RISC-V `auipc` 쌍

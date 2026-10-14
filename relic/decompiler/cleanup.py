@@ -167,6 +167,21 @@ def _read_form(e: Expr, reg: str):
     return forms[0] if all(f == forms[0] for f in forms) else "whole"
 
 
+def _callee_args(an: "Analysis", call: CallStmt) -> set[str]:
+    """Argument registers an internal callee reads (its parameters)."""
+    from .arch import arch_for
+    from .calls import livein_regs
+    from .fpabi import fp_params, fp_part
+    t = call.call.target
+    if not isinstance(t, Const) or t.value not in an.functions:
+        return set()
+    try:
+        arch = arch_for(an.bin)
+    except NotImplementedError:
+        return set()
+    return livein_regs(an, arch, t.value) | {fp_part(r)[0] for r, _ in fp_params(an, arch, t.value)}
+
+
 def result_reads(an: "Analysis", func: "Function", reg: str) -> list:
     """For every call to `func`, how the caller first reads the result register.
 
@@ -197,7 +212,15 @@ def result_reads(an: "Analysis", func: "Function", reg: str) -> list:
                 if isinstance(t, CallStmt):
                     reads = [_read_form(a, reg) for a in [t.call.target, *t.call.args]]
                     reads = [r for r in reads if r is not None]
-                    return reads[0] if reads else "none"   # a call clobbers the result register
+                    if reads:
+                        return reads[0]
+                    if t.clobbers is not None and reg not in t.clobbers and not t.tail:
+                        # a local callee that leaves the register alone (gcc -fipa-ra keeps the
+                        # result there across it), unless it takes it as an argument
+                        if reg in _callee_args(an, t):
+                            return "whole"
+                        continue
+                    return "none"                          # a call clobbers the result register
                 forms = [r for r in (_read_form(x, reg) for x in stmt_exprs(t)) if r is not None]
                 if forms:
                     return forms[0] if all(f == forms[0] for f in forms) else "whole"

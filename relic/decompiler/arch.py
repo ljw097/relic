@@ -68,6 +68,17 @@ ARM = ArchInfo(
 )
 
 
+# hard-float (armhf): floats in s0-s15 / d0-d7 as well; d0-d7 and d16-d31 are caller-saved
+ARM_VFP = ArchInfo(
+    "arm-aapcs-vfp", 32, "sp", "r0",
+    call_reads=(*_A32_ARGS, "sp", *(f"d{k}" for k in range(8))),
+    call_clobbers=(*_A32_ARGS, "r12", "lr", *FLAGS, "fpscr_n", "fpscr_z", "fpscr_c", "fpscr_v",
+                   *(f"d{k}" for k in range(8)), *(f"d{k}" for k in range(16, 32))),
+    syscall_reads=ARM.syscall_reads,
+    syscall_clobbers=ARM.syscall_clobbers,
+)
+
+
 _MIPS_ARGS = ("a0", "a1", "a2", "a3")
 MIPS_O32 = ArchInfo(
     "mips-o32", 32, "sp", "v0",
@@ -87,7 +98,7 @@ def arch_for(binary) -> ArchInfo:
     if binary.arch == "arm64":
         return ARM64
     if binary.arch == "arm":
-        return ARM
+        return ARM_VFP if getattr(binary, "arm_hard_float", False) else ARM
     if binary.arch == "mips" and binary.bits == 32:
         return MIPS_O32
     raise NotImplementedError(f"no calling convention for {binary.arch} yet")

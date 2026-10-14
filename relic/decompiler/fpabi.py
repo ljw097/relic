@@ -12,23 +12,43 @@ from __future__ import annotations
 from typing import TYPE_CHECKING
 
 from .arch import ArchInfo
-from .ir import Assign, CallStmt, Cast, Expr, IRFunction, Reg, Return, Var, children, stmt_defs, stmt_exprs
+from .ir import (Assign, BinOp, CallStmt, Cast, Const, Expr, Extract, IRFunction, Reg, Return, Var, children, stmt_defs,
+                 stmt_exprs)
 
 if TYPE_CHECKING:
     from ..analysis import Analysis, Function
 
 FP_ARGS = {"x64-sysv": tuple(f"xmm{k}" for k in range(8)), "x64-win": tuple(f"xmm{k}" for k in range(4)),
-           "arm64-aapcs": tuple(f"v{k}" for k in range(8))}
+           "arm64-aapcs": tuple(f"v{k}" for k in range(8)),
+           "arm-aapcs-vfp": tuple(f"d{k}" for k in range(8))}
 FP_RET = "xmm0"                  # x86-64; AArch64 returns floats in v0 (see fp_ret_reg)
 
 
 def fp_ret_reg(arch: ArchInfo) -> str:
-    return "v0" if arch.name.startswith("arm64") else FP_RET
+    if arch.name.startswith("arm64"):
+        return "v0"
+    if arch.name == "arm-aapcs-vfp":
+        return "d0"                      # a float result is s0, its low half
+    return FP_RET
+
+
+def fp_part(name: str) -> tuple[str, int, int | None]:
+    """(register holding it, low bit, width or None for the whole) of an FP argument location:
+    ARM `s5` is the high half of `d2`; `d2`, `xmm3`, `v3` are themselves."""
+    if name[:1] == "s" and name[1:].isdigit():
+        k = int(name[1:])
+        return f"d{k // 2}", 32 * (k & 1), 32
+    return name, 0, None
+
+
+def reg_bits(name: str) -> int:
+    """Width of a full FP register: ARM `d` 64, SSE / AArch64 128."""
+    return 64 if name[:1] == "d" else 128
 
 
 def is_fp_reg(name: str) -> bool:
-    """An SSE / SIMD-and-FP register (`xmm3`, AArch64 `v3`)."""
-    return name.startswith("xmm") or name[:1] == "v" and name[1:].isdigit()
+    """An SSE / SIMD-and-FP register (`xmm3`, AArch64 `v3`, ARM VFP `d3` / `s5`)."""
+    return name.startswith("xmm") or name[:1] in ("v", "d", "s") and name[1:].isdigit()
 FLOAT_CONVS = "eEfFgGaA"
 # libc functions taking / returning floating point: argument codes `d` double, `f` float
 FP_SIGS = {
@@ -69,6 +89,12 @@ def _width(e: Expr) -> int | None:
     from .ir import Const, Load
     if isinstance(e, Const):
         return 0 if e.value == 0 else None
+    if isinstance(e, BinOp) and e.op == "|" and e.bits == 64 and any(
+            isinstance(x, BinOp) and x.op == "<<" and isinstance(x.a, Cast) and x.a.kind == "zext"
+            and x.a.a.bits == 32 for x in (e.a, e.b)) and not any(
+            isinstance(x, BinOp) and x.op == "&" for x in (e.a, e.b)):
+        return 64                       # ARM `vmov d7, r2, r3`: a double put together from core registers
+    e = _unmerge(e)                                     # ARM `s0 = v` merged into d0
     if isinstance(e, Cast) and e.kind == "zext" and e.a.bits in (32, 64):
         e = e.a
     from .fp import is_fcmp
@@ -79,11 +105,22 @@ def _width(e: Expr) -> int | None:
     return None
 
 
+def _unmerge(e: Expr) -> Expr:
+    """The value written into part of a register: ARM `(d0 & ~0xffffffff) | zext(v)` -> zext(v)."""
+    if isinstance(e, BinOp) and e.op == "|":
+        for a, b in ((e.a, e.b), (e.b, e.a)):
+            if isinstance(a, BinOp) and a.op == "&" and isinstance(b, (Cast, BinOp)):
+                return b.a if isinstance(b, BinOp) and b.op == "<<" else b
+    return e
+
+
 def _xmm_source(e: Expr) -> str | None:
-    """The FP register a copy reads: `xmm2`, `zext128(low64(xmm2))` (movsd between registers)."""
+    """The FP register a copy reads: `xmm2`, `zext128(low64(xmm2))` (movsd between registers), ARM
+    `s15` (the high half of d7)."""
+    e = _unmerge(e)
     if isinstance(e, Cast) and e.kind == "zext":
         e = e.a
-    if isinstance(e, Cast) and e.kind == "low":
+    if isinstance(e, (Cast, Extract)) and (not isinstance(e, Cast) or e.kind == "low"):
         e = e.a
     return e.name if isinstance(e, Reg) and is_fp_reg(e.name) else None
 
@@ -104,9 +141,20 @@ def fp_return(an: "Analysis", func: "Function") -> int | None:
     c = _cache(an, "ret")
     if func.addr in c:
         return c[func.addr]
+    busy = _cache(an, "busy")
     c[func.addr] = None                         # recursion guard
-    c[func.addr] = r = _fp_return(an, func, arch)
+    busy[func.addr] = True
+    try:
+        c[func.addr] = r = _fp_return(an, func, arch)
+    finally:
+        busy.pop(func.addr, None)
     return r
+
+
+def fp_return_pending(an: "Analysis", addr: int) -> bool:
+    """`fp_return` of this function is being worked out further up the stack (its answer so far,
+    None, is only the recursion guard: nothing derived from it should be kept)."""
+    return addr in _cache(an, "busy")
 
 
 def set_fp_returns(an: "Analysis", func: "Function", fn: IRFunction) -> int | None:
@@ -118,7 +166,7 @@ def set_fp_returns(an: "Analysis", func: "Function", fn: IRFunction) -> int | No
         reg = fp_ret_reg(arch_for(an.bin))
         for s in fn.stmts():
             if isinstance(s, Return) and s.value is None:
-                s.value = Cast("low", Reg(reg, 128), w)
+                s.value = Cast("low", Reg(reg, reg_bits(reg)), w) if w < reg_bits(reg) else Reg(reg, w)
     return w
 
 
@@ -127,6 +175,8 @@ def _fp_return(an, func, arch) -> int | None:
     xr = result_reads(an, func, fp_ret_reg(arch))
     ir_ = result_reads(an, func, arch.ret)
     xmm_w = [r for r in xr if isinstance(r, int)]
+    if fp_ret_reg(arch)[:1] == "d":                     # ARM: d0 read whole is a double
+        xmm_w += [64 for r in xr if r == "whole"]
     int_r = [r for r in ir_ if r != "none"]
     if int_r and not xmm_w:
         return None                             # callers use the integer result
@@ -229,14 +279,25 @@ def fp_params(an: "Analysis", arch: ArchInfo, target: int) -> list[tuple[str, in
         regs = set(FP_ARGS[arch.name])
         widths: dict[str, int] = {}
 
+        halves: dict[str, set] = {}                      # ARM: d register -> {"lo", "hi", "whole"}
+
         def visit(e: Expr, under: int | None):
             if isinstance(e, Var) and e.version == 0 and e.name in regs:
                 w = under if under in (32, 64) else 64
                 widths[e.name] = max(widths.get(e.name, 0), w) if e.name in widths else w
+                halves.setdefault(e.name, set()).add("lo" if under == 32 else "whole")
+                return
+            if isinstance(e, Extract) and isinstance(e.a, Var) and e.a.version == 0 and e.a.name in regs \
+                    and e.lo == 32 and e.bits == 32:
+                halves.setdefault(e.a.name, set()).add("hi")
+                widths.setdefault(e.a.name, 32)
                 return
             if isinstance(e, Cast) and e.kind == "low":
                 visit(e.a, e.bits)
                 return
+            if isinstance(e, BinOp) and e.op == "&" and isinstance(e.a, Var) and isinstance(e.b, Const) and \
+                    e.b.value in (0xFFFFFFFF, 0xFFFFFFFF00000000):
+                return              # ARM: the half a write of the other half keeps -- not a read
             for k in children(e):
                 visit(k, None)
         for s in ssa.stmts():
@@ -253,10 +314,14 @@ def fp_params(an: "Analysis", arch: ArchInfo, target: int) -> list[tuple[str, in
                 continue
             for top in stmt_exprs(s):
                 visit(top, None)
-        for r in FP_ARGS[arch.name]:
+        for k, r in enumerate(FP_ARGS[arch.name]):
             if r not in widths:
                 break
-            out.append((r, widths[r]))
+            h = halves.get(r, set())
+            if arch.name == "arm-aapcs-vfp" and "whole" not in h:
+                out += [(f"s{2 * k}", 32)] + ([(f"s{2 * k + 1}", 32)] if "hi" in h else [])
+            else:
+                out.append((r, widths[r]))
     c[target] = out
     return out
 
@@ -282,12 +347,58 @@ def arg_classes(sig, fmt: str | None, fsig=None, scan: bool = False) -> list[str
     return out
 
 
-def place_args(arch: ArchInfo, classes: list[str], int_regs: tuple[str, ...]) -> list[str | None]:
+def place_args(arch: ArchInfo, classes: list[str], int_regs: tuple[str, ...],
+               variadic: bool = False) -> list[str | None]:
     """Where each argument goes, in argument order: its register, or None for the stack. SysV /
     AAPCS64 fill integer and float registers separately (a float after the seventh integer still
     gets an xmm register); Win64 gives argument k the k-th register of its kind."""
     fpr = FP_ARGS.get(arch.name, ())
     out: list[str | None] = []
+    if arch.name == "arm-aapcs-vfp" and variadic:
+        # a variadic call uses the base standard even on armhf: a double in an even-odd pair of
+        # core registers (`r2:r3`), else on the stack -- and once one is there, all that follow
+        ncrn = 0
+        for c in classes:
+            if c in "df":
+                ncrn += ncrn & 1
+                if ncrn + 1 < len(int_regs):
+                    out.append(f"{int_regs[ncrn]}:{int_regs[ncrn + 1]}")
+                    ncrn += 2
+                else:
+                    ncrn = len(int_regs)
+                    out.append(None)
+            else:
+                out.append(int_regs[ncrn] if ncrn < len(int_regs) else None)
+                ncrn += 1
+        return out
+    if arch.name == "arm-aapcs-vfp":
+        # AAPCS-VFP: a double takes the first free aligned pair of single slots (d0-d7), a float
+        # the first free slot (s0-s15) -- back-filling a hole a double left -- until one goes to
+        # the stack, after which every float argument does
+        free = [True] * 16
+        ni, stacked = 0, False
+        for c in classes:
+            if c not in "df":
+                out.append(int_regs[ni] if ni < len(int_regs) else None)
+                ni += 1
+                continue
+            slot = None
+            if not stacked:
+                if c == "d":
+                    slot = next((k for k in range(0, 16, 2) if free[k] and free[k + 1]), None)
+                else:
+                    slot = next((k for k in range(16) if free[k]), None)
+            if slot is None:
+                stacked = True
+                out.append(None)
+                continue
+            if c == "d":
+                free[slot] = free[slot + 1] = False
+                out.append(f"d{slot // 2}")
+            else:
+                free[slot] = False
+                out.append(f"s{slot}")
+        return out
     if arch.name == "x64-win":
         for k, c in enumerate(classes):
             regs = fpr if c in "df" else int_regs

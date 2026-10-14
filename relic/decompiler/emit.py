@@ -409,6 +409,10 @@ class CWriter:
         """`e` where a float of `bits` (default: its width) is expected: constants are literals,
         memory is read as `double` / `float`."""
         w = bits or e.bits
+        if self.p.arch.name == "arm-aapcs-vfp":
+            sp = self._vfp_param(e)
+            if sp is not None:
+                return self.vname(sp)
         e = self._unwrap_float(e, True)
         if isinstance(e, Const):
             from .fp import literal
@@ -463,7 +467,28 @@ class CWriter:
             return f"({t}){self.fexpr(x, PREC_UNARY)}", PREC_UNARY
         return f"{e.name}({', '.join(self.fexpr(a) for a in e.args)})", PREC_POSTFIX
 
+    def _vfp_param(self, e: Expr) -> str | None:
+        """ARM hard-float: `low32(d1)` / the high half of `d1` read on entry is the float
+        parameter passed in s2 / s3."""
+        if isinstance(e, Var) and e.bits == 32:                 # narrowed to the float it holds
+            v, odd = e, 0
+        elif isinstance(e, Cast) and e.kind == "low" and e.bits == 32:
+            v, odd = e.a, 0
+        elif isinstance(e, Extract) and e.lo == 32 and e.bits == 32:
+            v, odd = e.a, 1
+        else:
+            return None
+        if isinstance(v, Var) and v.name[:1] == "d" and v.name[1:].isdigit():
+            s = f"s{2 * int(v.name[1:]) + odd}"
+            if s in self.p.params:
+                return s
+        return None
+
     def _expr(self, e: Expr) -> tuple[str, int]:
+        if isinstance(e, (Cast, Extract, Var)) and self.p.arch.name == "arm-aapcs-vfp":
+            s = self._vfp_param(e)
+            if s is not None:
+                return self.vname(s), PREC_POSTFIX
         if isinstance(e, Cast) and e.kind in ("low", "zext") and self._unwrap_float(e) is not e:
             return self._expr(self._unwrap_float(e))
         if isinstance(e, Const):

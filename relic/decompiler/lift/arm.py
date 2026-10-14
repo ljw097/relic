@@ -25,8 +25,9 @@ import capstone.arm as A
 
 from ...analysis.functions import NORETURN
 from ...disasm import Insn
-from ..ir import (Assign, BinOp, Branch, Call, CallStmt, Const, Effect, Expr, IndirectJump, Intrinsic, Ite,
-                  Jump, Load, Reg, Return, Stmt, Store, UnOp, Unknown, mask)
+from ..ir import (Assign, BinOp, Branch, Call, CallStmt, Cast, Const, Effect, Expr, Extract, IndirectJump,
+                  Intrinsic, Ite, Jump, Load, Reg, Return, Stmt, Store, UnOp, Unknown, mask)
+from ..fp import from_float
 from .x86 import LiftError, cast
 
 if TYPE_CHECKING:
@@ -105,14 +106,29 @@ class ArmLifter:
             return Const(self.pc_value(), 32)
         if name in _GPR:
             return Reg(name, 32)
-        if name[:1] in ("s", "d", "q") and name[1:].isdigit():        # VFP / NEON
-            return Reg(name, {"s": 32, "d": 64, "q": 128}[name[0]])
+        if name[:1] == "s" and name[1:].isdigit():                    # s2k / s2k+1: halves of dk
+            k = int(name[1:])
+            d = Reg(f"d{k // 2}", 64)
+            return Extract(d, 32, 32) if k & 1 else Cast("low", d, 32)
+        if name[:1] in ("d", "q") and name[1:].isdigit():             # VFP / NEON
+            return Reg(name, {"d": 64, "q": 128}[name[0]])
         raise LiftError(f"register {name}")
 
     def write_reg(self, name: str, v: Expr):
         name = self.canon(name)
         if name == "pc":
             raise LiftError("write to pc")
+        if name[:1] == "s" and name[1:].isdigit():                    # merge into the d register
+            k = int(name[1:])
+            d = Reg(f"d{k // 2}", 64)
+            v = v if v.bits == 32 else cast("low", v, 32) if v.bits > 32 else cast("zext", v, 32)
+            new = cast("zext", v, 64)
+            if k & 1:
+                self.assign(d, BinOp("|", BinOp("&", d, Const(0xFFFFFFFF, 64), 64),
+                                     BinOp("<<", new, Const(32, 8), 64), 64))
+            else:
+                self.assign(d, BinOp("|", BinOp("&", d, Const(0xFFFFFFFF00000000, 64), 64), new, 64))
+            return
         r = self.read_reg(name)
         if v.bits != r.bits:
             v = cast("low", v, r.bits) if v.bits > r.bits else cast("zext", v, r.bits)
@@ -240,7 +256,8 @@ class ArmLifter:
 
     def _dispatch(self, i, base, ops):
         upd = getattr(i.cs, "update_flags", False)
-        name = base[:-1] if upd and base.endswith("s") and base not in ("mls", "smulls", "umulls") else base
+        name = base[:-1] if upd and base.endswith("s") and base not in ("mls", "smulls", "umulls") and \
+            not base.startswith("v") else base
         h = getattr(self, "_i_" + name, None)
         if h is not None:
             h(i, ops, upd)
@@ -320,6 +337,10 @@ class ArmLifter:
             self.emit(Effect(i.addr, name, ()))
 
     def _vfp(self, i, name, ops):
+        """VFP: scalar floating point (`.f32` / `.f64`) per fp.py; NEON and the rest stay opaque."""
+        h = getattr(self, "_v_" + name, None)
+        if h is not None and h(i, ops) is not False:
+            return
         dst = ops[0]
         if dst.type != OP_REG:
             raise LiftError("vfp store")
@@ -327,6 +348,271 @@ class ArmLifter:
                      for o in ops[1:])
         dn = self.reg_name(dst.reg)
         self.write_reg(dn, Intrinsic(name, srcs, self.read_reg(dn).bits))
+
+    def _vtypes(self) -> list[str]:
+        """The data types of a VFP mnemonic: `vcvt.f64.s32` -> ["f64", "s32"]."""
+        return self.insn.cs.mnemonic.split(".")[1:]
+
+    def _vw(self, op) -> int | None:
+        """Width of a scalar VFP register operand: s 32, d 64."""
+        if op.type != OP_REG:
+            return None
+        n = self.reg_name(op.reg)
+        return {"s": 32, "d": 64}.get(n[:1]) if n[1:].isdigit() else None
+
+    def _vsrc(self, op, w: int) -> Expr:
+        if op.type == 4:                                       # ARM_OP_FP: `#3.0`, `#0`
+            return Const(from_float(op.fp, w), w)
+        if op.type == OP_IMM:
+            return Const(from_float(float(op.imm), w), w)
+        return self.read_reg(self.reg_name(op.reg))
+
+    def _vscalar(self, ops) -> int | None:
+        """The width when every register operand is a scalar of one width (not NEON)."""
+        ws = {self._vw(o) for o in ops if o.type == OP_REG}
+        return ws.pop() if len(ws) == 1 and None not in ws else None
+
+    def _varith(self, i, ops, op):
+        w = self._vscalar(ops)
+        if w is None or len(ops) not in (2, 3):
+            return False
+        a, b = (ops[1], ops[2]) if len(ops) == 3 else (ops[0], ops[1])
+        self.write_reg(self.reg_name(ops[0].reg), BinOp(op, self._vsrc(a, w), self._vsrc(b, w), w))
+
+    def _v_vadd(self, i, ops):
+        return self._varith(i, ops, "f+")
+
+    def _v_vsub(self, i, ops):
+        return self._varith(i, ops, "f-")
+
+    def _v_vmul(self, i, ops):
+        return self._varith(i, ops, "f*")
+
+    def _v_vdiv(self, i, ops):
+        return self._varith(i, ops, "f/")
+
+    def _v_vnmul(self, i, ops):
+        w = self._vscalar(ops)
+        if w is None or len(ops) != 3:
+            return False
+        self.write_reg(self.reg_name(ops[0].reg),
+                       UnOp("fneg", BinOp("f*", self._vsrc(ops[1], w), self._vsrc(ops[2], w), w), w))
+
+    def _vacc(self, i, ops, neg_acc: bool, sub: bool):
+        """vmla d += n*m, vmls d -= n*m, vnmla d = -d - n*m, vnmls d = -d + n*m: the product is
+        rounded before the addition (unlike vfma)."""
+        w = self._vscalar(ops)
+        if w is None or len(ops) != 3:
+            return False
+        d = self.reg_name(ops[0].reg)
+        acc = self.read_reg(d)
+        if neg_acc:
+            acc = UnOp("fneg", acc, w)
+        prod = BinOp("f*", self._vsrc(ops[1], w), self._vsrc(ops[2], w), w)
+        self.write_reg(d, BinOp("f-" if sub else "f+", acc, prod, w))
+
+    def _v_vmla(self, i, ops):
+        return self._vacc(i, ops, False, False)
+
+    def _v_vmls(self, i, ops):
+        return self._vacc(i, ops, False, True)
+
+    def _v_vnmla(self, i, ops):
+        return self._vacc(i, ops, True, True)
+
+    def _v_vnmls(self, i, ops):
+        return self._vacc(i, ops, True, False)
+
+    def _vfused(self, i, ops, neg_product: bool, neg_acc: bool):
+        w = self._vscalar(ops)
+        if w is None or len(ops) != 3:
+            return False
+        d = self.reg_name(ops[0].reg)
+        n, m = self._vsrc(ops[1], w), self._vsrc(ops[2], w)
+        acc = self.read_reg(d)
+        if neg_product:
+            n = UnOp("fneg", n, w)
+        if neg_acc:
+            acc = UnOp("fneg", acc, w)
+        self.write_reg(d, Intrinsic("fma" if w == 64 else "fmaf", (n, m, acc), w))
+
+    def _v_vfma(self, i, ops):
+        return self._vfused(i, ops, False, False)
+
+    def _v_vfms(self, i, ops):
+        return self._vfused(i, ops, True, False)
+
+    def _v_vfnma(self, i, ops):
+        return self._vfused(i, ops, True, True)
+
+    def _v_vfnms(self, i, ops):
+        return self._vfused(i, ops, False, True)
+
+    def _vunary(self, i, ops, name):
+        w = self._vscalar(ops)
+        if w is None or len(ops) != 2:
+            return False
+        x = self._vsrc(ops[1], w)
+        self.write_reg(self.reg_name(ops[0].reg), UnOp("fneg", x, w) if name is None else
+                       Intrinsic(name if w == 64 else name + "f", (x,), w))
+
+    def _v_vneg(self, i, ops):
+        return self._vunary(i, ops, None)
+
+    def _v_vabs(self, i, ops):
+        return self._vunary(i, ops, "fabs")
+
+    def _v_vsqrt(self, i, ops):
+        return self._vunary(i, ops, "sqrt")
+
+    def _v_vmov(self, i, ops):
+        """Register moves (VFP <-> core: the same bits), FP immediates, pairs of core registers."""
+        if len(ops) == 2 and ops[0].type == OP_REG:
+            dn = self.reg_name(ops[0].reg)
+            dw = self._vw(ops[0])
+            src = ops[1]
+            if src.type == 4 and dw:                               # vmov.f64 d6, #3.0
+                self.write_reg(dn, Const(from_float(src.fp, dw), dw))
+                return
+            if src.type == OP_REG:
+                sn = self.reg_name(src.reg)
+                if dn in _GPR or sn in _GPR or dw is not None and dw == self._vw(src):
+                    self.write_reg(dn, self.read_reg(sn))
+                    return
+            return False
+        if len(ops) == 3 and all(o.type == OP_REG for o in ops):
+            a, b, c = (self.reg_name(o.reg) for o in ops)
+            if a.startswith("d") and b in _GPR and c in _GPR:      # vmov d0, r0, r1
+                self.write_reg(a, BinOp("|", cast("zext", self.read_reg(b), 64),
+                                        BinOp("<<", cast("zext", self.read_reg(c), 64), Const(32, 8), 64), 64))
+                return
+            if a in _GPR and b in _GPR and c.startswith("d"):      # vmov r0, r1, d0
+                d = self.tmp(self.read_reg(c))
+                self.write_reg(a, Cast("low", d, 32))
+                self.write_reg(b, Extract(d, 32, 32))
+                return
+        return False
+
+    def _v_vcvt(self, i, ops):
+        """vcvt.<to>.<from>: int <-> float (fixed point with a third operand), float <-> double."""
+        t = self._vtypes()
+        if len(t) != 2 or len(ops) not in (2, 3):
+            return False
+        to, frm = t
+        dn = self.reg_name(ops[0].reg)
+        fbits = ops[2].imm if len(ops) == 3 and ops[2].type == OP_IMM else 0
+        src = self.read_reg(self.reg_name(ops[1].reg))
+        if to[0] == "f" and frm[0] == "f":
+            self.write_reg(dn, Intrinsic("fpconv", (src,), int(to[1:])))
+        elif to[0] == "f":                                         # from an integer
+            w = int(to[1:])
+            ibits = int(frm[1:])
+            x = cast("low", src, ibits) if src.bits > ibits else src
+            v = Intrinsic("sitofp" if frm[0] == "s" else "uitofp", (x,), w)
+            if fbits:                                              # fixed point: / 2^fbits (exact)
+                v = BinOp("f/", v, Const(from_float(float(1 << fbits), w), w), w)
+            self.write_reg(dn, v)
+        else:                                                      # to an integer (truncating)
+            fw = int(frm[1:])
+            x = src
+            if fbits:
+                x = BinOp("f*", x, Const(from_float(float(1 << fbits), fw), fw), fw)
+            self.write_reg(dn, Intrinsic("fptosi" if to[0] == "s" else "fptoui", (x,), int(to[1:])))
+
+    def _v_vcvtr(self, i, ops):
+        t = self._vtypes()
+        if len(t) != 2 or t[0][0] == "f":
+            return False
+        fw = int(t[1][1:])
+        x = Intrinsic("rint" if fw == 64 else "rintf", (self.read_reg(self.reg_name(ops[1].reg)),), fw)
+        self.write_reg(self.reg_name(ops[0].reg), Intrinsic("fptosi" if t[0][0] == "s" else "fptoui", (x,), 32))
+
+    def _v_vcmp(self, i, ops):
+        """The FPSCR flags of a compare (lt 1000, eq 0110, gt 0010, unordered 0011); `vmrs
+        APSR_nzcv, fpscr` copies them to N Z C V."""
+        w = self._vw(ops[0])
+        if w is None or len(ops) != 2:
+            return False
+        a, b = self._vsrc(ops[0], w), self._vsrc(ops[1], w)
+        lt = BinOp("f<", a, b, 1)
+        self.assign(Reg("fpscr_n", 1), lt)
+        self.assign(Reg("fpscr_z", 1), BinOp("f==", a, b, 1))
+        self.assign(Reg("fpscr_c", 1), UnOp("!", lt, 1))
+        self.assign(Reg("fpscr_v", 1), BinOp("funord", a, b, 1))
+
+    _v_vcmpe = _v_vcmp
+
+    def _v_vmrs(self, i, ops):
+        if len(ops) == 2 and ops[0].type == OP_REG and self.insn.cs.reg_name(ops[0].reg).lower() == "apsr_nzcv":
+            for flag, src in ((SF, "fpscr_n"), (ZF, "fpscr_z"), (CF, "fpscr_c"), (OF, "fpscr_v")):
+                self.assign(flag, Reg(src, 1))
+            return
+        return False
+
+    def _vmem_width(self, op) -> int:
+        return 64 if self.reg_name(op.reg).startswith("d") else 32
+
+    def _v_vldr(self, i, ops):
+        dn = self.reg_name(ops[0].reg)
+        w = self._vmem_width(ops[0])
+        mem = ops[1]
+        if self.reg_name(mem.mem.base) == "pc" and not mem.mem.index:   # a constant in the literal pool
+            pc = self.pc_value() & ~3
+            disp = mem.mem.disp if not getattr(mem, "subtracted", False) else -mem.mem.disp
+            v = self.an.bin.read_int((pc + disp) & mask(32), w // 8)
+            if v is not None:
+                self.write_reg(dn, Const(v, w))
+                return
+        addr, wb = self._mem_access(ops)
+        self.write_reg(dn, Load(addr, w))
+        if wb is not None:
+            self.write_reg(*wb)
+
+    def _v_vstr(self, i, ops):
+        addr, wb = self._mem_access(ops)
+        self.emit(Store(i.addr, addr, self.read_reg(self.reg_name(ops[0].reg))))
+        if wb is not None:
+            self.write_reg(*wb)
+
+    def _vlist(self, regs: list[str], base: Expr, load: bool) -> Expr:
+        """Consecutive registers to / from memory from `base` up; the end address."""
+        off = 0
+        b = self.tmp(base)
+        for r in regs:
+            w = 64 if r.startswith("d") else 32
+            a = BinOp("+", b, Const(off, 32), 32) if off else b
+            if load:
+                self.write_reg(r, Load(a, w))
+            else:
+                self.emit(Store(self.insn.addr, a, self.read_reg(r)))
+            off += w // 8
+        return BinOp("+", b, Const(off, 32), 32)
+
+    def _v_vpush(self, i, ops):
+        regs = [self.reg_name(o.reg) for o in ops]
+        size = sum(8 if r.startswith("d") else 4 for r in regs)
+        sp = Reg("sp", 32)
+        self.assign(sp, BinOp("-", sp, Const(size, 32), 32))
+        self._vlist(regs, sp, False)
+
+    def _v_vpop(self, i, ops):
+        regs = [self.reg_name(o.reg) for o in ops]
+        sp = Reg("sp", 32)
+        end = self._vlist(regs, sp, True)
+        self.assign(sp, end)
+
+    def _vldm(self, i, ops, load: bool):
+        base = self.reg_name(ops[0].reg)
+        regs = [self.reg_name(o.reg) for o in ops[1:]]
+        end = self._vlist(regs, self.read_reg(base), load)
+        if getattr(self.insn.cs, "writeback", False):
+            self.write_reg(base, end)
+
+    def _v_vldmia(self, i, ops):
+        self._vldm(i, ops, True)
+
+    def _v_vstmia(self, i, ops):
+        self._vldm(i, ops, False)
 
     # ------------------------------------------------------- data processing
     def _i_mov(self, i, ops, upd):

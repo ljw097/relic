@@ -81,8 +81,9 @@ def prepare(an: "Analysis", func: "Function") -> Prepared:
             from .fpabi import stack_arg_base
             word = arch.bits // 8
             first = param_base(arch) + stack_arg_base(arch)
-            params += [frame.slots[o].name() if o in frame.slots else f"arg_{o:x}"
-                       for o in range(first, first + word * stack_param_count(an, arch, func.addr), word)]
+            from .calls import stack_param_slots
+            params += [frame.slots[first + rel].name() if first + rel in frame.slots else f"arg_{first + rel:x}"
+                       for rel, _, _ in stack_param_slots(an, arch, func.addr)]
     narrow_library_results(fn)
     from .calls import narrow_call_args
     narrow_call_args(an, arch, fn)
