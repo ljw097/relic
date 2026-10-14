@@ -346,6 +346,31 @@ class DebugController(QObject):
                     s.set_condition(live, bp.condition)
         self._submit(go, snapshot=False)
 
+    def set_register(self, name: str, value: str):
+        """Change a register to a number or gdb expression; the panels refresh."""
+        def go():
+            if self.session is None or not self.session.regs:
+                raise RuntimeError("no stopped program to change")
+            self.session.set_register(name, value)
+        self._submit(go)
+
+    def write_memory(self, where: str | int, data: str | bytes):
+        """Write bytes (`41 42`, `"AAAA\\n"`, `0x401136` as a word) at a live address or an
+        expression (`$rsp+8`, `notes`); the memory view moves there."""
+        def go():
+            from ..debugger import parse_bytes
+            s = self.session
+            if s is None or not s.regs:
+                raise RuntimeError("no stopped program to change")
+            a = s.address_of(where) if isinstance(where, str) else where
+            if a is None:
+                raise RuntimeError(f"cannot evaluate {where!r}")
+            raw = data if isinstance(data, bytes) else parse_bytes(data, s.word)
+            s.write_memory(a, raw)
+            self.mem_addr = a
+            self.log.emit(f"wrote {len(raw)} bytes at {a:#x}\n")
+        self._submit(go)
+
     def send_input(self, text: str):
         if self.session is not None:
             self.session.send_input(text)
@@ -456,9 +481,36 @@ def _hex(v: int, word: int) -> str:
 
 
 class RegistersPanel(QTableWidget):
+    """General-purpose registers; the context menu (or `E`) edits the selected one."""
+
+    edit_requested = Signal(str, int)      # register name, current value
+
     def __init__(self, parent=None):
         super().__init__(parent)
         _setup(self, ["Reg", "Value", ""])
+        self.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        self.customContextMenuRequested.connect(self._menu)
+
+    def selected_register(self) -> tuple[str, int] | None:
+        row = self.currentRow()
+        name, value = self.item(row, 0), item_value(self.item(row, 1))
+        return (name.text(), value) if name is not None and value is not None else None
+
+    def _menu(self, pos):
+        from PySide6.QtWidgets import QMenu
+        self.setCurrentCell(self.rowAt(pos.y()), 1)
+        reg = self.selected_register()
+        if reg is None:
+            return
+        menu = QMenu(self)
+        menu.addAction(f"Set {reg[0]}...", lambda: self.edit_requested.emit(*reg))
+        menu.exec(self.viewport().mapToGlobal(pos))
+
+    def keyPressEvent(self, e):
+        if e.key() == Qt.Key.Key_E and self.selected_register() is not None:
+            self.edit_requested.emit(*self.selected_register())
+            return
+        super().keyPressEvent(e)
 
     def show_snapshot(self, snap: Snapshot):
         self.setRowCount(len(snap.regs))

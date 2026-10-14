@@ -258,20 +258,10 @@ class DisasmView(QPlainTextEdit):
         self._highlight_row(self.textCursor().blockNumber())
 
     def _debug_selections(self) -> list:
-        out = []
-        marks = [(a, "bp_line") for a in getattr(self, "debug_bps", ())]
+        marks = [(self.row_of.get(a), "bp_line") for a in getattr(self, "debug_bps", ())]
         if getattr(self, "debug_pc", None) is not None:
-            marks.append((self.debug_pc, "pc_line"))
-        for addr, key in marks:
-            row = self.row_of.get(addr)
-            if row is None:
-                continue
-            sel = QTextEdit.ExtraSelection()
-            sel.format.setBackground(QColor(THEME[key]))
-            sel.format.setProperty(QTextCharFormat.Property.FullWidthSelection, True)
-            sel.cursor = QTextCursor(self.document().findBlockByNumber(row))
-            out.append(sel)
-        return out
+            marks.append((self.row_of.get(self.debug_pc), "pc_line"))
+        return _line_marks(self, marks)
 
     def _moved(self):
         row = self.textCursor().blockNumber()
@@ -590,6 +580,20 @@ class DecompileJob(QThread):
             Progress.deactivate(handle)
 
 
+def _line_marks(view: QPlainTextEdit, marks) -> list:
+    """Full-width background bands for (row, THEME key) pairs; rows that are None are skipped."""
+    out = []
+    for row, key in marks:
+        if row is None:
+            continue
+        sel = QTextEdit.ExtraSelection()
+        sel.format.setBackground(QColor(THEME[key]))
+        sel.format.setProperty(QTextCharFormat.Property.FullWidthSelection, True)
+        sel.cursor = QTextCursor(view.document().findBlockByNumber(row))
+        out.append(sel)
+    return out
+
+
 class PseudocodeView(QPlainTextEdit):
     """Decompiled C of one function, synchronised with the listing by instruction address.
 
@@ -618,6 +622,8 @@ class PseudocodeView(QPlainTextEdit):
         self.gen = 0                            # bumped by invalidate(): older results are stale
         self.job: DecompileJob | None = None
         self.queued: Function | None = None     # requested while a job was running
+        self.debug_pc: int | None = None        # while debugging: the stopped-at instruction (static)
+        self.debug_bps: set[int] = set()
         self._syncing = False
         self.cursorPositionChanged.connect(self._moved)
 
@@ -784,7 +790,34 @@ class PseudocodeView(QPlainTextEdit):
         return lines[row].addr if 0 <= row < len(lines) else None
 
     def _highlight_row(self, row: int):
-        self.setExtraSelections(_row_and_word_selections(self, row))
+        sel = _row_and_word_selections(self, row)
+        self.setExtraSelections(sel[:1] + self._debug_selections() + sel[1:])
+
+    def set_debug_marks(self, pc: int | None, breakpoints=()):
+        """Mark the statement being executed and the lines with breakpoints (static addresses)."""
+        self.debug_pc = pc
+        self.debug_bps = set(breakpoints)
+        self._highlight_row(self.textCursor().blockNumber())
+
+    def debug_rows(self) -> tuple[int | None, list[int]]:
+        """(row of the statement at pc, rows of breakpoints) in the shown function. pc maps to the
+        statement whose first instruction is the closest at or before it; a breakpoint needs
+        a statement starting at its address, or the function's entry."""
+        if self.result is None or self.an is None or self.func is None:
+            return None, []
+        pc_row = None
+        if self.debug_pc is not None and self.an.function_at(self.debug_pc) is self.func:
+            pc_row = self.line_for(self.debug_pc)
+        exact = {}
+        for k, ln in enumerate(self.result.lines):
+            if ln.addr is not None:
+                exact.setdefault(ln.addr, k)
+        bp_rows = sorted({exact.get(a, 0 if a == self.func.addr else None) for a in self.debug_bps} - {None})
+        return pc_row, bp_rows
+
+    def _debug_selections(self) -> list:
+        pc_row, bp_rows = self.debug_rows()
+        return _line_marks(self, [(r, "bp_line") for r in bp_rows] + [(pc_row, "pc_line")])
 
     def _moved(self):
         self._highlight_row(self.textCursor().blockNumber())

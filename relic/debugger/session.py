@@ -476,6 +476,29 @@ class Session:
             out.append((int(ins["address"], 16), ins.get("inst", "")))
         return out
 
+    def set_register(self, name: str, value: int | str):
+        """Change a register (`rax`, `$rip`) to a number or a gdb expression (`$rsp+8`); the
+        registers are read again, while what changed is still measured from the last stop."""
+        name = name.strip().lstrip("$")
+        if not re.fullmatch(r"\w+", name):
+            raise DebugError(f"not a register: {name!r}")
+        if isinstance(value, int):
+            value = f"{value & ((1 << (8 * self.word)) - 1):#x}"
+        try:
+            self.mi.command(f'-data-evaluate-expression "${name} = {_mi_quote(value.strip())}"')
+        except MIError as e:
+            raise DebugError(str(e)) from None
+        self.regs = self.read_registers()
+
+    def write_memory(self, addr: int, data: bytes):
+        """Write bytes into the process."""
+        if not data:
+            return
+        try:
+            self.mi.command(f"-data-write-memory-bytes {addr:#x} {data.hex()}")
+        except MIError as e:
+            raise DebugError(str(e)) from None
+
     def evaluate(self, expr: str) -> str:
         r = self.mi.command(f'-data-evaluate-expression "{expr}"')
         return r.results.get("value", "")
@@ -608,6 +631,32 @@ def watch_key(expr: str, access: str = "write", size: int | None = None) -> str:
     return f"{access}:{expr.strip()}" + (f"/{size}" if size else "")
 
 
+def parse_bytes(text: str, word: int = 8) -> bytes:
+    """Bytes to write, as typed: hex bytes (`41 42 ff`, `4142ff`), a quoted string with escapes
+    (`"AAAA\\n"`, `b'\\x00'`), or a number written as a little-endian word (`0x401136`, `-1`)."""
+    import ast
+    text = text.strip()
+    if not text:
+        return b""
+    if text[0] in "\"'" or text[:2] in ("b'", 'b"'):
+        try:
+            v = ast.literal_eval(text if text[0] == "b" else "b" + text)
+        except (ValueError, SyntaxError) as e:
+            raise DebugError(f"bad string: {e}") from None
+        return v
+    if text.lower().startswith(("0x", "-0x", "-")) and " " not in text:
+        try:
+            v = int(text, 0)
+        except ValueError:
+            raise DebugError(f"bad number: {text!r}") from None
+        return (v & ((1 << (8 * word)) - 1)).to_bytes(word, "little")
+    hexes = text.replace(" ", "").replace(",", "")
+    try:
+        return bytes.fromhex(hexes)
+    except ValueError:
+        raise DebugError(f"bad bytes: {text!r} (hex bytes, \"text\" or 0x number)") from None
+
+
 def describe_stop(stop: dict) -> str:
     """One line for why the program stopped: `breakpoint 2`, `watchpoint 3 *(int *)0x4040: 0 -> 5`,
     `signal SIGSEGV (Segmentation fault)`."""
@@ -636,4 +685,5 @@ def _quote(a: str) -> str:
     return a if re.fullmatch(r"[\w./:=+-]+", a) else '"' + a.replace("\\", "\\\\").replace('"', '\\"') + '"'
 
 
-__all__ = ["DebugError", "Frame", "Mapping", "Session", "TeleRow", "describe_stop", "watch_key"]
+__all__ = ["DebugError", "Frame", "Mapping", "Session", "TeleRow", "describe_stop", "parse_bytes",
+           "watch_key"]

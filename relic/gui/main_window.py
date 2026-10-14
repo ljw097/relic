@@ -326,6 +326,7 @@ class MainWindow(QMainWindow):
         self.dbg_mem.goto_expr.connect(self.dbg.view_memory)
         self.dbg_bps.changed.connect(self._debug_breakpoint_edited)
         self.dbg_bps.removed.connect(self._debug_breakpoint_removed)
+        self.dbg_regs.edit_requested.connect(self.debug_set_register_dialog)
         self.dbg_bps.cellDoubleClicked.connect(self._debug_breakpoint_clicked)
         for t in (self.dbg_regs, self.dbg_stack, self.dbg_vmmap):
             t.cellDoubleClicked.connect(lambda r, c, t=t: self._debug_follow(t, r, c))
@@ -408,6 +409,8 @@ class MainWindow(QMainWindow):
         act(m, "Toggle &breakpoint", "F2", self.debug_toggle_breakpoint)
         act(m, "Breakpoint at &function...", "Ctrl+Alt+B", self.debug_breakpoint_dialog)
         act(m, "Add &watchpoint...", "Ctrl+Alt+W", self.debug_watchpoint_dialog)
+        act(m, "Set re&gister...", None, lambda: self.debug_set_register_dialog())
+        act(m, "&Write memory...", None, self.debug_write_memory_dialog)
         act(m, "&Pause", "Ctrl+Alt+Pause", self.dbg.interrupt, False)
         act(m, "S&top", "Ctrl+F2", self.dbg.stop, False)
         m.addSeparator()
@@ -848,10 +851,15 @@ class MainWindow(QMainWindow):
         self.statusBar().showMessage(f"breakpoint {'set' if on else 'cleared'} at {self.an.location(self.cur)}", 3000)
 
     def _debug_breakpoints_changed(self):
-        self.disasm.set_debug_marks(self.dbg.last.pc_static,
-                                    [a for a, b in self.dbg.static_bps.items() if b.enabled])
+        self._debug_marks(self.dbg.last.pc_static)
         self.dbg_bps.an = self.an
         self.dbg_bps.show_breakpoints(self.dbg.breakpoint_list)
+
+    def _debug_marks(self, pc_static: int | None):
+        """pc and enabled breakpoints in the listing and the pseudocode."""
+        bps = [a for a, b in self.dbg.static_bps.items() if b.enabled]
+        self.disasm.set_debug_marks(pc_static, bps)
+        self.decomp.set_debug_marks(pc_static, bps)
 
     def _debug_breakpoint_edited(self, key, enabled, condition):
         self.dbg.set_breakpoint(key, enabled, condition)
@@ -903,6 +911,36 @@ class MainWindow(QMainWindow):
                 return self.an.label(refs[0])
         return f"{self.dbg_mem.addr:#x}" if self.dbg_mem.addr is not None else ""
 
+    def debug_set_register_dialog(self, name: str = "", value: int | None = None):
+        """Change a register: `rax = 0x41`, or `$rsp+8` (any gdb expression)."""
+        if not self.dbg.active:
+            return
+        if not name:
+            name, ok = QInputDialog.getItem(self, "Set register", "Register:",
+                                            [n for n, *_ in self.dbg.last.regs], 0, False)
+            if not ok:
+                return
+            value = next((v for n, v, *_ in self.dbg.last.regs if n == name), None)
+        text, ok = QInputDialog.getText(self, "Set register", f"New value of {name} (number or gdb expression):",
+                                        text=f"{value:#x}" if value is not None else "")
+        if ok and text.strip():
+            self.dbg.set_register(name, text)
+
+    def debug_write_memory_dialog(self):
+        """Write bytes at an address: hex (`41 42 ff`), a string (`"AAAA\\n"`) or a word (`0x401136`)."""
+        if not self.dbg.active:
+            return
+        where, ok = QInputDialog.getText(self, "Write memory", "Address or expression ($rsp+8, notes, 0x7ffd...):",
+                                         text=f"{self.dbg_mem.addr:#x}" if self.dbg_mem.addr is not None else "$rsp")
+        if not ok or not where.strip():
+            return
+        data, ok = QInputDialog.getText(self, "Write memory",
+                                        'Bytes: hex (41 42 ff), "string\\n", or a word (0x401136):')
+        if ok and data.strip():
+            self.dbg.write_memory(where, data)
+            self.dbg_docks[5].show()
+            self.dbg_docks[5].raise_()
+
     def debug_watch(self, expr: str, access: str = "write", size: int | None = None):
         bp = self.dbg.add_watchpoint(expr, access, size)
         self._debug_breakpoints_changed()
@@ -929,13 +967,13 @@ class MainWindow(QMainWindow):
         for panel in (self.dbg_regs, self.dbg_stack, self.dbg_bt, self.dbg_code, self.dbg_vmmap, self.dbg_bps):
             panel.show_snapshot(snap)
         if snap.exited:
-            self.disasm.set_debug_marks(None, [a for a, b in self.dbg.static_bps.items() if b.enabled])
+            self._debug_marks(None)
             self.dbg_console.append(f"[ {snap.exited} ]\n")
             self.statusBar().showMessage(f"program {snap.exited}", 5000)
             return
         if snap.pc_static is not None:
             self.goto(snap.pc_static, record=False)
-        self.disasm.set_debug_marks(snap.pc_static, [a for a, b in self.dbg.static_bps.items() if b.enabled])
+        self._debug_marks(snap.pc_static)
         where = self.an.location(snap.pc_static) if snap.pc_static is not None else f"{snap.pc:#x}"
         self.statusBar().showMessage(f"stopped at {where}" + (f" ({snap.stop})" if snap.stop else ""), 5000)
         if snap.reason.endswith(("watchpoint-trigger", "watchpoint-scope")):

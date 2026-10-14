@@ -526,3 +526,44 @@ def test_debugger_watchpoints_and_library_breakpoints(app, win):
     assert _debug_wait(app, win, lambda: "exited" in win.dbg_console.out.toPlainText())
     win.dbg.stop()
     assert _debug_wait(app, win, lambda: win.dbg.session is None)
+
+
+def test_debugger_pseudocode_marks_and_editing(app, win):
+    from test_debugger import _can_debug
+    if not _can_debug():
+        pytest.skip("gdb with ptrace permission is needed")
+    an = win.an
+    win.dbg_args = ["5"]
+    classify = an.function_by_name("classify").addr
+    win.goto(classify)
+    win.debug_toggle_breakpoint()
+    win.toggle_decompile()
+    assert win.decomp.wait_idle()
+    pc_row, bp_rows = win.decomp.debug_rows()
+    assert pc_row is None and bp_rows == [0]                 # the signature line stands for the entry
+    win.debug_start()
+    assert _debug_wait(app, win, lambda: win.dbg_regs.rowCount() > 0)
+    win.dbg.send_input("x\n")
+    win.debug_start_or_continue()
+    assert _debug_wait(app, win, lambda: win.decomp.debug_pc == classify)
+    assert win.decomp.wait_idle() and win.decomp.func.addr == classify
+    assert win.decomp.debug_rows() == (0, [0])
+    from PySide6.QtGui import QColor
+    from relic.gui.views import THEME
+    marks = [s.cursor.blockNumber() for s in win.decomp.extraSelections()
+             if s.format.background().color() == QColor(THEME["pc_line"])]
+    assert marks == [0]
+
+    def reg(name):
+        return next(int(win.dbg_regs.item(k, 1).text(), 16) for k in range(win.dbg_regs.rowCount())
+                    if win.dbg_regs.item(k, 0).text() == name)
+    assert reg("rdi") == 5
+    win.dbg.set_register("rdi", "0")                          # classify(0) returns 10
+    assert _debug_wait(app, win, lambda: reg("rdi") == 0)
+    win.dbg.write_memory("$rsp-0x40", '"relic"')
+    assert _debug_wait(app, win, lambda: "|relic" in win.dbg_mem.text.toPlainText())
+    assert "wrote 5 bytes" in win.dbg_console.out.toPlainText()
+    win.debug_start_or_continue()
+    assert _debug_wait(app, win, lambda: "exited with code 10" in win.dbg_console.out.toPlainText())
+    win.dbg.stop()
+    assert _debug_wait(app, win, lambda: win.dbg.session is None)

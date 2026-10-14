@@ -19,8 +19,9 @@
 - [x] vmmap 패널, 메모리(hexdump) 뷰(주소·gdb 식·Relic 이름), 레지스터·스택 값 더블클릭으로 리스팅/메모리 따라가기
 - [x] 중단점 목록 패널(조건·활성/비활성·적중 횟수, 재실행 시 유지)
 - [x] 하드웨어 watchpoint(쓰기/읽기/접근, 바이너리 전역·주소는 PIE 보정한 `*(T *)live`로, 크기 1/2/4/8, 그 밖은 gdb 식), 이름으로 중단점(바이너리 함수·`puts@plt`는 정적 주소, `puts` 같은 라이브러리 함수는 gdb pending 중단점으로 libc 안에서 멈춤), 중단점 패널에 종류 열·`Delete`로 삭제, 멈춘 이유(`watchpoint 3 …: 0 -> 0x4052a0`) 표시
-- [ ] **P2** glibc 힙 정보(bins/chunks), 의사 코드 뷰에서 현재 줄 표시
-- [ ] **P2** 레지스터·메모리 값 편집
+- [x] 의사 코드 뷰에서 현재 문장(pc)·중단점 줄 표시
+- [x] 레지스터·메모리 값 편집(Registers 패널 `E`/우클릭, Debug ▸ Set register / Write memory: hex·`"문자열\n"`·`0x…` 워드)
+- [ ] **P2** glibc 힙 정보(bins/chunks)
 
 ## 아키텍처별 분석 보강
 

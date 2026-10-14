@@ -166,3 +166,36 @@ def test_watchpoints_and_named_breakpoints(request, fixture):
         assert s.cont(timeout=20).get("reason", "").startswith("exited")
     finally:
         s.close()
+
+
+def test_parse_bytes():
+    from relic.debugger import DebugError, parse_bytes
+    assert parse_bytes("41 42 ff") == parse_bytes("4142ff") == b"AB\xff"
+    assert parse_bytes('"AA\\n"') == b"AA\n" and parse_bytes("b'\\x00a'") == b"\x00a"
+    assert parse_bytes("0x401136") == bytes.fromhex("3611400000000000")
+    assert parse_bytes("-1", 4) == b"\xff" * 4
+    with pytest.raises(DebugError):
+        parse_bytes("zz")
+
+
+@needs_gdb
+def test_set_register_and_write_memory(vuln64):
+    from relic.debugger import Session
+    an = analyze(vuln64)
+    s = Session(vuln64, args=["5"], analysis=an)
+    try:
+        s.start("entry")
+        s.add_breakpoint(s.to_live(an.function_by_name("classify").addr))
+        s.send_input("x\n")
+        s.cont(timeout=20)
+        assert s.regs["rdi"] == 5
+        s.write_memory(s.sp - 0x40, b"relic\0")
+        assert s.read_memory(s.sp - 0x40, 6) == b"relic\0" and s._string_at(s.sp - 0x40) == "relic"
+        s.set_register("rdi", "$rdi - 5")          # classify(0) returns 10, classify(5) 63
+        assert s.regs["rdi"] == 0
+        s.set_register("$rax", -1)
+        assert s.regs["rax"] == (1 << 64) - 1
+        st = s.cont(timeout=20)
+        assert st.get("reason") == "exited" and int(st["exit-code"], 8) == 10
+    finally:
+        s.close()
