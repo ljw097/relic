@@ -380,6 +380,7 @@ class MainWindow(QMainWindow):
         self.recent_menu = m.addMenu("Open &Recent")
         self._fill_recent_menu()
         act(m, "&Save project", QKeySequence.StandardKey.Save, self.save_project)
+        act(m, "Apply library &signatures...", None, self.signatures_dialog)
         m.addSeparator()
         act(m, "&Cancel background work", "Ctrl+.", self.cancel_work, False)
         m.addSeparator()
@@ -670,7 +671,8 @@ class MainWindow(QMainWindow):
         t.clear_rows()
         an = self.an
         for f in sorted(an.functions.values(), key=lambda f: f.addr):
-            color = THEME["addr"] if f.is_import else (THEME["jump"] if f.noreturn else None)
+            color = THEME["addr"] if f.is_import else (THEME["jump"] if f.noreturn else
+                                                       THEME["comment"] if f.library else None)
             t.add_row([an.name(f.addr) or f.name, f.addr, f.size], f.addr, color)
         t.setSortingEnabled(True)
         t.fit()
@@ -1238,6 +1240,49 @@ class MainWindow(QMainWindow):
     def comment(self, addr: int, text: str):
         self.an.comment(addr, text)
         self._after_edit()
+
+    def signatures_dialog(self):
+        """Pick signature files (or static libraries, built into ~/.relic/sigs) and name the
+        functions without a symbol that match."""
+        from ..analysis import libsigs
+        start = (libsigs.sig_dirs() or [os.path.expanduser("~")])[0]
+        paths, _ = QFileDialog.getOpenFileNames(self, "Library signatures", start,
+                                                "Signatures or static libraries (*.sig *.a *.o);;All files (*)")
+        if paths:
+            self.apply_signatures(paths)
+
+    def apply_signatures(self, paths: list[str]) -> int:
+        """Name functions by these signature files / static libraries; how many were named."""
+        from ..analysis import libsigs
+        dbs = []
+        QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
+        try:
+            for p in paths:
+                try:
+                    if p.endswith(".sig"):
+                        db = libsigs.SigDB.load(p)
+                    else:                        # a library: build its signatures once, keep them
+                        db = libsigs.build([p])
+                        out = os.path.join(os.path.expanduser("~"), ".relic", "sigs",
+                                           f"{os.path.splitext(os.path.basename(p))[0]}-{db.arch}.sig")
+                        db.save(out)
+                except (OSError, ValueError) as e:
+                    QMessageBox.warning(self, "Library signatures", f"{p}: {e}")
+                    continue
+                if db.arch == self.an.bin.arch:
+                    dbs.append(db)
+            named = libsigs.apply(self.an, dbs)
+        finally:
+            QApplication.restoreOverrideCursor()
+        self.an.lib_names.update(named)
+        if not dbs:
+            self.statusBar().showMessage(f"no signatures for {self.an.bin.arch}", 5000)
+        else:
+            self.statusBar().showMessage(f"{len(named)} functions named by library signatures", 5000)
+        if named:
+            self._after_edit()
+            self._fill_functions()
+        return len(named)
 
     def _after_edit(self):
         self.dirty = True

@@ -83,6 +83,7 @@ class Function:
     jump_tables: dict[int, list[int]] = field(default_factory=dict)  # jmp addr -> targets
     is_import: bool = False
     noreturn: bool = False
+    library: bool = False   # named by a library signature (libsigs), not by a symbol
 
     @property
     def end(self) -> int:
@@ -108,9 +109,10 @@ class Function:
 class FunctionAnalyzer:
     MAX_INSNS = 200_000
 
-    def __init__(self, binary: Binary, dis: Disassembler):
+    def __init__(self, binary: Binary, dis: Disassembler, noreturn: set[int] = frozenset()):
         self.bin = binary
         self.dis = dis
+        self.noreturn = noreturn      # functions known not to return (named by library signatures)
         self.funcs: dict[int, Function] = {}
         self.prev: dict[int, int] = {}  # insn addr -> previous insn addr on fallthrough
         self._queue: list[int] = []
@@ -329,6 +331,8 @@ class FunctionAnalyzer:
         tgt = i.target
         name = None
         if tgt is not None:
+            if tgt in self.noreturn:
+                return True
             fn = self.funcs.get(tgt)
             if fn is not None and fn.noreturn:
                 return True
@@ -714,6 +718,8 @@ class FunctionAnalyzer:
                 continue
             imp = b.imports_by_got.get(i.mem_target) if i.mem_target else None
             name = imp.name if imp else (b.name_of(i.target) if i.target else None)
+            if name is None and i.target in self.funcs:       # (named by a library signature)
+                name = self.funcs[i.target].name
             if name != "__libc_start_main":
                 continue
             for j in reversed(hist[:k]):

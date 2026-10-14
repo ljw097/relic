@@ -21,6 +21,16 @@ def app():
     return QApplication.instance() or QApplication([])
 
 
+@pytest.fixture(autouse=True)
+def _collect_windows():
+    """Collect windows of finished tests here, on the GUI thread between tests: left to the
+    cyclic GC, one is freed wherever it runs next -- a worker thread of a later test -- and
+    destroying Qt objects there crashes."""
+    yield
+    import gc
+    gc.collect()
+
+
 @pytest.fixture
 def win(app, vuln64, tmp_path):
     path = tmp_path / "vuln64"
@@ -829,3 +839,26 @@ def test_graph_bundles_fan_out_and_fan_in(app, flow_O2):
     small = an.function_by_name("gcd")
     g.show_function(an, small, small.addr)
     assert not g.bundled_out                                # two-way branches are not bundled
+
+
+def test_apply_library_signatures(app, vuln64_stripped, tmp_path):
+    """File > Apply library signatures names a stripped binary's functions in place."""
+    import subprocess
+    from relic.analysis import libsigs
+    obj = str(tmp_path / "vuln.o")
+    subprocess.run(["gcc", "-O0", "-fno-stack-protector", "-w", "-c", "-o", obj,
+                    os.path.join(os.path.dirname(__file__), "src", "vuln.c")], check=True)
+    sig = str(tmp_path / "vuln.sig")
+    libsigs.build([obj]).save(sig)
+    path = tmp_path / "stripped"
+    shutil.copy(vuln64_stripped, path)
+    w = MainWindow()
+    w.open_file(str(path))
+    assert w.wait()
+    assert w.an.function_by_name("checksum") is None
+    assert w.apply_signatures([sig]) >= 8
+    f = w.an.function_by_name("checksum")
+    assert f is not None and f.library
+    assert "checksum" in [r[0] for r in _rows(w.funcs.table)]
+    w.dirty = False
+    w.close()

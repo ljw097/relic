@@ -4,6 +4,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 
 import bisect
+import threading
 
 import capstone as cs
 
@@ -113,6 +114,9 @@ class Disassembler:
         self.md = capstone_for(binary.arch, binary.endian)
         self.delay_slots = binary.arch in ("mips", "mips64")
         self._cache: dict[int, Insn | None] = {}
+        # capstone handles are not thread-safe: the GUI decodes while a background job (the
+        # decompiler, the vulnerability scan) does
+        self._lock = threading.RLock()
         # ARM / Thumb interworking: the instruction set is a property of the address
         self.md_thumb = capstone_for("thumb", binary.endian) if binary.arch == "arm" else None
         self.modes: dict[int, bool] = {a: True for a in getattr(binary, "thumb_code", ())}  # addr -> thumb
@@ -146,17 +150,18 @@ class Disassembler:
             addr &= ~1
         if addr in self._cache:
             return self._cache[addr]
-        insn = None
-        if self.bin.is_exec(addr) or self.bin.format == "RAW":
-            thumb = self.is_thumb(addr)
-            md = self.md_thumb if thumb else self.md
-            code = self.bin.read(addr, 16)
-            for c in md.disasm(code, addr, 1):
-                insn = self._convert(c, thumb)
-            if thumb and insn is not None and insn.mnemonic.startswith("it"):
-                return self._it_block(insn)
-        self._cache[addr] = insn
-        return insn
+        with self._lock:
+            insn = None
+            if self.bin.is_exec(addr) or self.bin.format == "RAW":
+                thumb = self.is_thumb(addr)
+                md = self.md_thumb if thumb else self.md
+                code = self.bin.read(addr, 16)
+                for c in md.disasm(code, addr, 1):
+                    insn = self._convert(c, thumb)
+                if thumb and insn is not None and insn.mnemonic.startswith("it"):
+                    return self._it_block(insn)
+            self._cache[addr] = insn
+            return insn
 
     def _it_block(self, it: Insn) -> Insn:
         """Thumb `it`: capstone only applies its conditions within one decode run, so decode the
@@ -183,12 +188,13 @@ class Disassembler:
             return out
         out = []
         code = self.bin.read(addr, end - addr)
-        for c in self.md.disasm(code, addr):
-            i = self._cache.get(c.address)
-            if i is None:
-                i = self._convert(c)
-                self._cache[c.address] = i
-            out.append(i)
+        with self._lock:
+            for c in self.md.disasm(code, addr):
+                i = self._cache.get(c.address)
+                if i is None:
+                    i = self._convert(c)
+                    self._cache[c.address] = i
+                out.append(i)
         return out
 
     def linear(self, addr: int, count: int) -> list[Insn]:

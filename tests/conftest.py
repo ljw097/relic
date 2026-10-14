@@ -159,3 +159,10 @@ structs_O0 = _fixture("structs_O0")
 structs_O2 = _fixture("structs_O2")
 flow_mips_O0 = _fixture("flow_mips_O0")
 flow_mips_O2 = _fixture("flow_mips_O2")
+
+
+@pytest.fixture(autouse=True)
+def _no_user_signatures(monkeypatch):
+    """Analyses in tests use no library signature files of the user's (~/.relic/sigs)."""
+    from relic.analysis import libsigs
+    monkeypatch.setattr(libsigs, "sig_dirs", lambda: [])

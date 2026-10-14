@@ -269,6 +269,10 @@ class CWriter:
             imp = self.an.bin.imports_by_got.get(addr.value)
             if imp is not None and imp.name and bits == self.an.bin.bits:
                 return f"&{base_name(imp.name)}"
+            if self.string(addr.value) is not None and not self.an.string_at(addr.value):
+                # data read whole that happens to look like text (a stripped `stdout`'s
+                # pointer bytes): an address, not a string literal
+                return f"*({int_type(bits)} *){number(addr.value)}"
         if isinstance(addr, Load) and isinstance(addr.addr, Const):
             # through a GOT slot: `*(*(stdout@got))` is the imported object itself
             imp = self.an.bin.imports_by_got.get(addr.addr.value)

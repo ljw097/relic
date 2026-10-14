@@ -10,7 +10,7 @@ from dataclasses import dataclass
 from ..disasm import CALL, CJMP, JMP, Disassembler, Insn
 from ..loader.base import Binary
 from ..progress import report
-from .functions import Block, Function, FunctionAnalyzer
+from .functions import NORETURN, Block, Function, FunctionAnalyzer
 from .strings import String, find_strings
 
 
@@ -45,16 +45,30 @@ class Analysis:
         self.patch_redo: list[tuple[int, tuple | None]] = []
         self._fstarts: list[int] = []
         self._strings_by_addr: dict[int, String] = {}
+        # library signature files to name functions with (None: those in libsigs.sig_dirs())
+        self.sig_paths: list[str] | None = None
+        # functions named by a library signature: address -> name
+        self.lib_names: dict[int, str] = {}
 
     # ------------------------------------------------------------------ run
     def run(self, load_project: bool = True) -> "Analysis":
         if load_project:
             self._apply_saved_patches()
         report("functions", 0, force=True)
-        finder = FunctionAnalyzer(self.bin, self.dis)
-        self.functions = finder.run()
-        if "main" not in self.bin.name_to_addr:
-            main = self._main_from_start()
+        finder = self._find_functions()
+        stops = self._library_names()
+        if stops:
+            # library functions known not to return (exit, abort, __chk_fail) that the analysis
+            # did not know: calls to them end their blocks, which changes where functions end --
+            # find them again knowing that
+            report("functions", 0, force=True)
+            finder = self._find_functions(stops)
+            self._library_names()
+        if "main" not in self.bin.name_to_addr and not any(f.name == "main" for f in self.functions.values()):
+            # (after library names: a static binary's `__libc_start_main` has one only then)
+            main = finder._find_main() if self.lib_names else None
+            if main is None:
+                main = self._main_from_start()
             if main is not None:
                 finder.add_function(main, "main")
         self._fstarts = sorted(self.functions)
@@ -69,15 +83,37 @@ class Analysis:
             self.load_project()
         return self
 
+    def _find_functions(self, noreturn: set[int] = frozenset()) -> FunctionAnalyzer:
+        finder = FunctionAnalyzer(self.bin, self.dis, noreturn)
+        self.functions = finder.run()
+        return finder
+
+    def _library_names(self) -> set[int]:
+        """Name functions without a symbol by library signatures (libsigs); the ones named as
+        not returning that were not known to be so."""
+        from .libsigs import apply, available
+        dbs = available(self.bin.arch, self.sig_paths)
+        self.lib_names = apply(self, dbs) if dbs else {}
+        new = set()
+        for a in self.lib_names:
+            f = self.functions[a]
+            if f.name in NORETURN and not f.noreturn:
+                f.noreturn = True
+                new.add(a)
+        # only worth finding functions again if some call to one of them was taken to return
+        falls = any(b.last.kind == CALL and b.last.target in new and b.succs
+                    for g in self.functions.values() for b in g.blocks.values() if b.insns)
+        return new if falls else set()
+
     def reanalyze(self) -> "Analysis":
         """Analyse again (after a patch), keeping names, comments, variable names and patches."""
         keep = (self.renames, self.comments, self.var_names, self.patches, self.struct_names, self.var_types,
-                self.patch_undo, self.patch_redo)
+                self.patch_undo, self.patch_redo, self.sig_paths)
         b = self.bin
         self.__dict__.clear()                    # decompiler caches live on the instance too
         self.__init__(b)
         (self.renames, self.comments, self.var_names, self.patches, self.struct_names, self.var_types,
-         self.patch_undo, self.patch_redo) = keep
+         self.patch_undo, self.patch_redo, self.sig_paths) = keep
         return self.run(load_project=False)
 
     # ------------------------------------------------------------- patches
@@ -464,9 +500,13 @@ class Analysis:
         return True
 
 
-def analyze(path: str, arch: str | None = None, base: int = 0) -> Analysis:
+def analyze(path: str, arch: str | None = None, base: int = 0, sigs: list[str] | None = None) -> Analysis:
+    """Load and analyse a binary. `sigs`: library signature files to name functions with
+    (default: the .sig files in libsigs.sig_dirs())."""
     from ..loader import load
-    return Analysis(load(path, arch, base)).run()
+    an = Analysis(load(path, arch, base))
+    an.sig_paths = sigs
+    return an.run()
 
 
 __all__ = ["Analysis", "Block", "Function", "String", "Xref", "analyze"]

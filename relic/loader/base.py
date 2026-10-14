@@ -61,6 +61,7 @@ class Relocation:
     addr: int
     name: str
     kind: str = ""
+    addend: int = 0
 
 
 class Binary:

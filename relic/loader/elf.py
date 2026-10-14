@@ -125,7 +125,8 @@ def load_elf(path: str, data: bytes) -> Binary:
                 except Exception:
                     name = ""
             off = rel["r_offset"]
-            b.relocs.append(Relocation(off, name, describe_reloc_type(rel["r_info_type"], elf)))
+            b.relocs.append(Relocation(off, name, describe_reloc_type(rel["r_info_type"], elf),
+                                       rel["r_addend"] if rel.is_RELA() else 0))
             if name:
                 got_names[off] = name
     b.got_names = got_names
