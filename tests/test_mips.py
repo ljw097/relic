@@ -52,3 +52,53 @@ def test_calls_through_t9_and_strings_through_gp(request, variant):
         assert any(vuln.block_at(x.frm) for x in an.xrefs_to[s.addr]), text
     assert any(v.severity == "high" and "gets" in v.message and an.function_at(v.addr) is vuln
                for v in an.vulns())
+
+
+def _c(an, name):
+    from relic.decompiler.emit import decompile
+    return decompile(an, an.function_by_name(name)).text
+
+
+@pytest.mark.parametrize("variant", VARIANTS)
+def test_decompile_vuln_menu_main(request, variant):
+    an = analyze(request.getfixturevalue(variant))
+    pie = variant.endswith("pie")
+    code = _c(an, "vuln")
+    assert code.startswith("void vuln(void)") and "gets(buf_" in code and "char buf_" in code
+    assert "// stack canary at sp0-" in code and "__stack_chk" not in code.replace("// stack canary", "")
+    printf = '__printf_chk(2, "hello %s (%d)\\n", buf_' if pie else 'printf("hello %s (%d)\\n", buf_'
+    assert printf in code and ", checksum(buf_" in code, code
+    code = _c(an, "menu")
+    assert 'puts("1. add");' in code and '__isoc99_scanf("%d", &var_' in code and "exit(1);" in code
+    assert "__asm" not in code and "goto" not in code and "(*" not in code
+    code = _c(an, "main")
+    assert code.startswith("int main(int a1, ") and "while (1) {" in code and "setvbuf(stdout, 0, 2, 0)" in code
+    assert "sp - " not in code and "gp" not in code
+
+
+@pytest.mark.parametrize("variant", VARIANTS)
+def test_decompile_switch_and_loops(request, variant):
+    an = analyze(request.getfixturevalue(variant))
+    code = _c(an, "classify")
+    assert "switch (" in code and "case 5:" in code and "default:" in code and "goto" not in code
+    code = _c(an, "checksum")
+    assert code.startswith("int checksum(char *a1)") and "100000" in code.replace("0x186a1", "100000")
+    for f in an.functions.values():
+        if not f.is_import:
+            text = _c(an, f.name) if an.function_by_name(f.name) is f else ""
+            assert text.count("{") == text.count("}"), f.name
+
+
+def test_vulns(vuln_mips):
+    an = analyze(vuln_mips)
+    kinds = {(f.func, f.kind) for f in an.vulns()}
+    assert {("vuln", "dangerous-call"), ("show_note", "format-string"), ("win", "win-function")} <= kinds
+
+
+def test_stripped_finds_main_and_win(vuln_mips_stripped):
+    an = analyze(vuln_mips_stripped)
+    main = an.function_by_name("main")
+    assert main is not None
+    from relic.decompiler.emit import decompile
+    win = [f for f in an.functions.values() if not f.is_import and 'system("/bin/sh")' in decompile(an, f).text]
+    assert len(win) == 1 and an.name(win[0].addr).startswith("sub_")      # found by the prologue scan

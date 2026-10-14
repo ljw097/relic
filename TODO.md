@@ -37,7 +37,8 @@
   - [x] x64 SysV / Win64, x86 cdecl: 디컴파일러가 복원한 호출 인자 사용 (x64는 블록 안 역추적으로 결론이 안 날 때만; GUI는 창을 먼저 띄우고 백그라운드에서 스캔)
   - [x] AArch64 x0–x7 (AArch64 리프터)
   - [x] ARM r0–r3 (ARM32 리프터)
-  - [ ] MIPS a0–a3, RISC-V a0–a7, PPC r3–r10 (해당 리프터가 생기면 같은 경로로)
+  - [x] MIPS a0–a3 (MIPS32 리프터)
+  - [ ] RISC-V a0–a7, PPC r3–r10 (해당 리프터가 생기면 같은 경로로)
 - [x] **P1** 점프 테이블: ~~x86-32 PIC(GOT 기준 오프셋)~~ (완료), ~~AArch64(`adrp`+`add` 테이블, `ldrb/ldrh/ldr` 항목, `adr` 기준, `add ..., sxtb #2`, 다른 블록의 `cmp`와 `mov` 별칭으로 범위)~~ (완료), ~~ARM(`addls pc, pc, rN, lsl #2`, `ldr pc, [pc, rN, lsl #2]`, Thumb `tbb`/`tbh`, `adr`+`ldr`+`add`+`bx` 오프셋 테이블)~~ (완료)
   - 상대 테이블은 후보 기준 주소들을 검증해서 선택
 - [x] **P1** MIPS: GOT(`DT_PLTGOT`, `DT_MIPS_LOCAL_GOTNO`, `DT_MIPS_GOTSYM`, `DT_MIPS_SYMTABNO`) 기반 import(슬롯·`.MIPS.stubs` 스텁), 지연 슬롯을 분기 블록에 포함(`Insn.delay`, `Block.last`는 분기), `bal`은 호출(`bal .+8`은 pc 읽기), `jalr $t9`는 `lw $t9, off($gp)` 슬롯으로 이름·noreturn 판정
@@ -49,7 +50,7 @@
 ## 테스트 / 인프라
 
 - [x] **P0** GitHub Actions CI (pytest, gcc 설치, Python 3.10 / 3.12 / 3.13)
-- [ ] **P1** 멀티 아키텍처 샘플: `-m32`(완료: vuln32·flow32, CI에 gcc-multilib), `aarch64-linux-gnu-gcc`(완료: vuln_a64·flow_a64), `arm-linux-gnueabihf-gcc`(완료: vuln_arm·vuln_thumb·flow_arm·flow_thumb; CI는 교차 컴파일 job이 샘플을 만들고 본 job이 `-m32`로 재컴파일 검증), `mipsel-linux-gnu-gcc`(완료: vuln_mips·vuln_mips_pie, CI 교차 job; MIPS 리프터는 아직 없음)
+- [ ] **P1** 멀티 아키텍처 샘플: `-m32`(완료: vuln32·flow32, CI에 gcc-multilib), `aarch64-linux-gnu-gcc`(완료: vuln_a64·flow_a64), `arm-linux-gnueabihf-gcc`(완료: vuln_arm·vuln_thumb·flow_arm·flow_thumb; CI는 교차 컴파일 job이 샘플을 만들고 본 job이 `-m32`로 재컴파일 검증), `mipsel-linux-gnu-gcc`(완료: vuln_mips·vuln_mips_pie·flow_mips, CI 교차 job에서 qemu로 재컴파일 검증)
 - [x] case마다 함수를 호출하는 `switch` 샘플(`flow.c`의 `sw_calls`): x86-64/x86-32 × -O0/-O2 모두 점프 테이블 → `switch`, 재컴파일 검증
 - [x] PE 테스트: MinGW x64/x86 샘플로 로더·COFF 심볼·IAT 호출 이름·checksec·vulns·디컴파일 (CI에 mingw 설치, 없으면 skip)
 - [x] ruff 린트(`pyproject.toml`, E/F/W/B, CI `lint` job). 포맷터·import 정렬은 기존 줄바꿈 스타일과 맞지 않아 적용하지 않음
@@ -106,6 +107,8 @@
   - [x] AArch64 점프 테이블(`flow.c`의 12-case `sw_big`, 모든 아키텍처에서 재컴파일 검증)
   - [x] 호출 간 레지스터 보존(gcc `-fipa-ra`): 바이너리 안 함수 호출은 피호출 함수가 (전이적으로) 쓰는 레지스터만 덮어쓴다고 보고(`decompiler/clobbers.py`), import·간접 호출·미해결 점프·syscall은 ABI 전체. 이전에는 `gcd(y, 4) - sc_or(y, 9)`가 `sc_or(gcd(y, 4), 9)`와 미정의 변수로 나왔음
   - [x] 32비트 `int` 매개변수에 넘기는 음수 상수: 피호출 함수가 인자 레지스터를 하위 32비트로만 읽으면 `0xfffffffb` 대신 `-5`
+  - [x] MIPS32 리프터(`lift/mips.py`, o32): 지연 슬롯은 분기 조건·호출 대상을 먼저 계산한 뒤 슬롯 명령, 그다음 분기(`lift_delayed`), `$gp`는 상수 `_gp`(쓰기·cprestore 저장 무시), 로컬 GOT 항목은 링크 시 상수, `jalr $t9`는 GOT 슬롯의 import 이름, hi/lo(mult/div), movn/movz, ext/ins; 점프 테이블(절대·`$gp` 상대 `.gpword`, `sltiu` 범위). 재컴파일 검증은 mipsel-gcc `-static` + `qemu-mipsel`
+  - [x] 공통 개선(MIPS에서 발견): 스택 프레임의 반환 주소 슬롯은 x86 계열만(진입 sp+0은 호출자 영역: o32 인자 홈 슬롯 `arg_0`), 콜리 저장 레지스터 요약이 capstone `regs_access` 없는 아키텍처는 리프트 결과로, import GOT 슬롯을 통한 호출은 이름으로 출력, 가드 주소를 레지스터에 두는 카나리 인식, 분기형 부호 보정(`if (x < 0) x += 15`, 두 return)을 select로 바꿔 `/ 16`·`% 8` 복원, `sltiu x, 1` → `x == 0`
   - [x] x86-32: cdecl 스택 인자, 스택 매개변수(`a1`…), PC 썽크(`__x86.get_pc_thunk.*`, stripped는 본문으로 인식), `main`의 스택 재정렬, GOT 경유 전역(`stdout`)
 
 ## 완료

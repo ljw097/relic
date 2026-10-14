@@ -26,6 +26,8 @@ def _callee_saved(arch: ArchInfo) -> set[str]:
         return {f"x{k}" for k in range(19, 31)}      # x19-x28, frame pointer x29, link register x30
     if arch.name.startswith("arm"):
         return {f"r{k}" for k in range(4, 12)} | {"lr"}   # r4-r11 (r11 = frame pointer), link register
+    if arch.name.startswith("mips"):
+        return {f"s{k}" for k in range(8)} | {"fp", "ra"}
     if arch.bits == 64:
         return {"rbp", "rbx", "r12", "r13", "r14", "r15"}
     return {"ebp", "ebx", "esi", "edi"}
@@ -49,7 +51,7 @@ class Slot:
             return "canary"
         # above the return address: the caller's argument area (stack parameters, Win64 home
         # slots). A distinct prefix keeps +8 and -8 from sharing the name `var_8`
-        if self.offset > 0:
+        if self.offset > 0 or self.offset == 0 and self.kind != "retaddr":
             return f"arg_{self.offset:x}"
         tag = "buf" if self.kind == "buffer" else "var"
         return f"{tag}_{abs(self.offset):x}"
@@ -99,12 +101,18 @@ class Frame:
         return [s for s in self.locals() if s.kind == "buffer"]
 
 
-def _is_canary(e: Expr, guards=frozenset()) -> bool:
+def _is_canary(e: Expr, guards=frozenset(), defs=None, depth: int = 3) -> bool:
     """The stack-protector value: x86 reads it at fs/gs:[0x28 / 0x14] (fs_base starts as a Reg
     and becomes a Var in SSA), other targets from the global `__stack_chk_guard` (`guards` are
-    its address and GOT slots)."""
-    return any((isinstance(n, (Reg, Var)) and n.name in ("fs_base", "gs_base")) or
-               (isinstance(n, Const) and n.value in guards) for n in walk(e))
+    its address and GOT slots) -- also through a few SSA definitions (`defs`), for a guard
+    address kept in a callee-saved register across the function (MIPS PIC)."""
+    for n in walk(e):
+        if (isinstance(n, (Reg, Var)) and n.name in ("fs_base", "gs_base")) or \
+                (isinstance(n, Const) and n.value in guards):
+            return True
+        if defs and depth and isinstance(n, Var) and n in defs and _is_canary(defs[n], guards, defs, depth - 1):
+            return True
+    return False
 
 
 def _build_spoff(fn: IRFunction, arch: ArchInfo) -> dict[Var, int]:
@@ -162,11 +170,15 @@ def analyze_frame(fn: IRFunction, arch: ArchInfo, guards=frozenset()) -> Frame:
     frame.guards = frozenset(guards)
     realign_entry = frame.realigned
     saved = _callee_saved(arch)
+    defs = {s.dst: s.src for s in fn.stmts() if isinstance(s, Assign) and isinstance(s.dst, Var)}
 
     def slot(off: int) -> Slot:
         return frame.slots.setdefault(off, Slot(off))
 
-    frame.slots[0] = Slot(0, size=arch.bits // 8, width=arch.bits // 8, kind="retaddr")
+    if arch.name.startswith(("x64", "x86")):
+        # the return address `call` pushed; elsewhere it stays in a register (lr / ra) and the
+        # entry stack pointer is the caller's frame (MIPS o32: the argument home slots)
+        frame.slots[0] = Slot(0, size=arch.bits // 8, width=arch.bits // 8, kind="retaddr")
     # ARM `push {r3, r4, lr}`: an argument register pushed along with the link register only
     # keeps the stack 8-byte aligned
     lr_push = {s.addr for s in fn.stmts() if isinstance(s, Store) and isinstance(s.src, Var)
@@ -185,7 +197,7 @@ def analyze_frame(fn: IRFunction, arch: ArchInfo, guards=frozenset()) -> Frame:
             if off is not None:
                 sl = slot(off)
                 sl.width = max(sl.width, s.bits // 8)
-                if _is_canary(s.src, frame.guards):
+                if _is_canary(s.src, frame.guards, defs):
                     sl.kind, frame.canary = "canary", off
                 elif isinstance(s.src, Var) and s.src.version == 0 and sl.kind == "local" and (
                         s.src.name in saved or s.addr in lr_push):

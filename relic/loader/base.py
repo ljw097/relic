@@ -91,6 +91,7 @@ class Binary:
         self.thumb_code: set[int] = set()
         self.arm_mapping: dict[int, str] = {}
         self.mips_gp: int | None = None     # MIPS: value of $gp (GOT + 0x7ff0)
+        self.mips_local_got = (0, 0)         # MIPS: [start, end) of the GOT's local entries
 
     # ------------------------------------------------------------------ memory
     def _finalize(self):

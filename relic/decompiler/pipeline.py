@@ -76,7 +76,8 @@ def prepare(an: "Analysis", func: "Function") -> Prepared:
     narrow(fn)
     inline_single_use(fn)
     _fold_pass(fn)          # constants exposed by narrowing and inlining
-    recover_division(fn)    # magic-number multiplies -> x / c, x % c
+    if recover_division(fn):    # magic-number multiplies -> x / c, x % c
+        _fold_pass(fn)
     _dce(fn)
     fold_short_circuits(fn)
     st = Structurer(fn)

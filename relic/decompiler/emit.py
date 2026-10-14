@@ -338,8 +338,13 @@ class CWriter:
 
     def call(self, c: ir.Call) -> str:
         t = c.target
+        imp = None
+        if isinstance(t, Load) and isinstance(t.addr, Const):
+            imp = self.an.bin.imports_by_got.get(t.addr.value)
         if isinstance(t, Const):
             name = self.symbol(t.value) or f"sub_{t.value:x}"
+        elif imp is not None:                   # through the import's GOT slot (MIPS `jalr $t9`)
+            name = base_name(imp.name)
         else:
             name = f"(*{self.expr(t, PREC_UNARY)})"
         return f"{name}({', '.join(self.expr(_bare(a)) for a in c.args)})"

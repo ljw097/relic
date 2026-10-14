@@ -165,6 +165,7 @@ class FunctionAnalyzer:
                     if d is not None and nxt not in insns:
                         d.delay = True
                         insns[nxt] = d
+                        self.prev[nxt] = a
                         a, nxt = nxt, d.end
                 if i.kind == CALL:
                     tgt = i.target
@@ -197,7 +198,7 @@ class FunctionAnalyzer:
                     else:
                         table = self._jump_table(i)
                         if table:
-                            f.jump_tables[a] = table
+                            f.jump_tables[i.addr] = table
                             succ = list(dict.fromkeys(table))
                         if i.cond:                      # ARM `addls pc, pc, ...`: default falls through
                             succ.append(nxt)
@@ -503,12 +504,87 @@ class FunctionAnalyzer:
                 return []
         return []
 
+    def _mips_jump_table(self, jmp: Insn) -> list[int]:
+        """`jr $v0` after `lw $v0, 0(table + idx * 4)`: the table address built with `lui` + `addiu`
+        or read from the GOT (`lw $v0, %got(table)($gp)` + `addiu`), entries absolute or -- PIC
+        `.gpword` tables -- relative to `$gp` (`addu $v0, $v0, $gp`). The bound comes from the
+        `sltiu $t, idx, N` that guards it."""
+        b = self.bin
+        msk = self.dis._mask
+        hist = self._back(jmp.addr, 20)[::-1]                     # oldest first
+        regs: dict[str, tuple] = {}                               # register -> ("c", v) / ("idx",) / ...
+        gp = b.mips_gp
+        bound = None
+
+        def ops_of(i):
+            return [o.strip().lstrip("$") for o in i.op_str.split(",")]
+
+        def val(r):
+            if r == "zero":
+                return ("c", 0)
+            if r == "gp" and gp is not None:
+                return ("c", gp)
+            return regs.get(r)
+
+        for i in hist:
+            m, ops = i.mnemonic, ops_of(i)
+            if not ops or not ops[0]:
+                continue
+            d = ops[0]
+            new = None
+            if m == "lui" and len(ops) == 2:
+                new = ("c", (int(ops[1], 0) << 16) & msk)
+            elif m in ("addiu", "ori") and len(ops) == 3 and (v := val(ops[1])) and v[0] == "c":
+                k = int(ops[2], 0)
+                new = ("c", (v[1] | k if m == "ori" else v[1] + k) & msk)
+            elif m == "sll" and len(ops) == 3 and ops[2] == "2":
+                new = ("scaled",)
+            elif m == "sltiu" and len(ops) == 3:
+                bound = int(ops[2], 0)
+            elif m == "addu" and len(ops) == 3:
+                a, c = val(ops[1]), val(ops[2])
+                if a and c and {a[0], c[0]} == {"c", "scaled"}:
+                    new = ("elem", a[1] if a[0] == "c" else c[1])
+                elif a and c and a[0] == "entry" and c == ("c", gp):
+                    new = ("gprel", a[1])
+                elif a and c and c[0] == "entry" and a == ("c", gp):
+                    new = ("gprel", c[1])
+            elif m == "lw" and len(ops) == 2 and "(" in ops[1]:
+                off, base = ops[1].rstrip(")").split("(")
+                off = int(off or "0", 0)
+                v = val(base.lstrip("$"))
+                if v and v[0] == "elem" and off == 0:
+                    new = ("entry", v[1])
+                elif v and v[0] == "c":
+                    w = b.read_int((v[1] + off) & msk, 4)       # a GOT entry holding the table's page
+                    new = ("c", w) if w is not None else None
+            if new is not None:
+                regs[d] = new
+            elif d in regs and m not in ("sw", "sh", "sb", "beqz", "bnez", "beq", "bne", "sltiu"):
+                del regs[d]
+        target = val(ops_of(jmp)[0]) if jmp.op_str else None
+        if not target or target[0] not in ("entry", "gprel"):
+            return []
+        table, rel = target[1], target[0] == "gprel"
+        out = []
+        for k in range(bound if bound else 256):
+            w = b.read_int((table + 4 * k) & msk, 4)
+            if w is None:
+                break
+            t = (w + gp) & msk if rel else w
+            if not b.is_exec(t) or t & 3:
+                break
+            out.append(t)
+        return out if bound is None or len(out) == bound else []
+
     def _jump_table(self, jmp: Insn) -> list[int]:
         """Resolve `jmp reg` / `jmp [table+reg*N]` switch dispatch on x86."""
         if self.dis.arch == "arm":
             return self._arm_jump_table(jmp)
         if self.dis.arch == "arm64":
             return self._arm64_jump_table(jmp)
+        if self.dis.arch == "mips" and self.bin.bits == 32:
+            return self._mips_jump_table(jmp)
         if self.dis.arch not in ("x86", "x64"):
             return []
         ptr = self.bin.bits // 8
@@ -633,8 +709,8 @@ class FunctionAnalyzer:
         return cand
 
     def _scan_gaps(self):
-        """Pick up functions only reachable indirectly (prologue scan: x86, ARM, AArch64)."""
-        if self.dis.arch not in ("x86", "x64", "arm", "arm64"):
+        """Pick up functions only reachable indirectly (prologue scan: x86, ARM, AArch64, MIPS)."""
+        if self.dis.arch not in ("x86", "x64", "arm", "arm64", "mips"):
             return
         prologues = (b"\xf3\x0f\x1e\xfa", b"\xf3\x0f\x1e\xfb", b"\x55\x48\x89\xe5", b"\x55\x89\xe5")
         tried: set[int] = set()
@@ -659,6 +735,8 @@ class FunctionAnalyzer:
                 for s, e in gaps:
                     if self.dis.arch in ("arm", "arm64"):
                         start = self._arm_gap_function(s, e)
+                    elif self.dis.arch == "mips":
+                        start = self._mips_gap_function(s, e)
                     else:
                         start = self._gap_function(s, e, prologues)
                     if start is not None and start not in tried:
@@ -709,6 +787,28 @@ class FunctionAnalyzer:
                                      (w & 0x0F000000) == 0x0A000000 and w >> 28 == 0xE))
             at_start = False
             a += step
+        return None
+
+    def _mips_gap_function(self, s: int, e: int) -> int | None:
+        """First prologue in [s, e) past `nop` padding: `addiu $sp, $sp, -n` (a frame) or
+        `lui $gp, hi` (PIC: `$gp` from `$t9`, the frame right after)."""
+        a = s
+        while a < e and self.bin.read_int(a, 4) == 0:
+            a += 4
+        for _ in range(4):
+            if a >= e:
+                return None
+            i = self.dis.decode(a)
+            if i is None:
+                return None
+            ops = [o.strip() for o in i.op_str.split(",")]
+            if i.mnemonic == "addiu" and ops[:2] == ["$sp", "$sp"] and ops[2].startswith("-"):
+                return a
+            if i.mnemonic == "lui" and ops[0] == "$gp":
+                return a
+            if i.kind != "normal" or i.mnemonic != "nop":
+                return None
+            a = i.end
         return None
 
     def _gap_function(self, s: int, e: int, prologues: tuple[bytes, ...]) -> int | None:

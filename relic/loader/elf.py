@@ -153,6 +153,8 @@ def _resolve_mips_got(b: Binary, elf: ELFFile, got_names: dict[int, str]):
     if local is None or gotsym is None or not isinstance(dynsym, SymbolTableSection):
         return
     word = b.bits // 8
+    # the local part: page addresses and local symbols, only rebased by the dynamic linker
+    b.mips_local_got = (got, got + local * word)
     count = symtabno if symtabno is not None else dynsym.num_symbols()
     for k in range(gotsym, count):
         sym = dynsym.get_symbol(k)

@@ -21,6 +21,9 @@ def lifter_for(an: Analysis):
     if an.bin.arch == "arm":
         from .arm import ArmLifter
         return ArmLifter(an)
+    if an.bin.arch == "mips" and an.bin.bits == 32:
+        from .mips import MipsLifter
+        return MipsLifter(an)
     raise NotImplementedError(f"no lifter for {an.bin.arch} yet")
 
 
@@ -30,11 +33,20 @@ def lift_function(an: Analysis, f: Function) -> IRFunction:
     for a in sorted(f.blocks):
         blk = f.blocks[a]
         ib = IRBlock(a, succs=list(blk.succs), preds=list(blk.preds))
-        for i in blk.insns:
+        insns = blk.insns
+        k = 0
+        while k < len(insns):
+            i = insns[k]
+            if k + 1 < len(insns) and insns[k + 1].delay and hasattr(lifter, "lift_delayed"):
+                # MIPS: a branch and its delay slot, lifted together in execution order
+                ib.stmts += lifter.lift_delayed(i, insns[k + 1], f, i is blk.last)
+                k += 2
+                continue
             if i.kind == JMP and i is blk.last:
                 ib.stmts += lifter.lift_jmp(i, f)
             else:
                 ib.stmts += lifter.lift_insn(i, f)
+            k += 1
         last = ib.stmts[-1] if ib.stmts else None
         ends = isinstance(last, TERMINATORS) or isinstance(last, Unknown) and blk.last.is_terminator or \
             isinstance(last, CallStmt) and last.noreturn
