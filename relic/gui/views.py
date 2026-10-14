@@ -18,14 +18,14 @@ THEMES = {
         "call": "#f9e2af", "jump": "#f38ba8", "ret": "#cba6f7", "comment": "#7fb77e", "label": "#fab387",
         "func": "#a6e3a1", "current": "#2d2f36", "node": "#26272b", "node_border": "#45475a",
         "edge_true": "#7fb77e", "edge_false": "#f38ba8", "edge": "#89b4fa", "word": "#3e4452",
-        "window": "#25262b", "selection": "#3b4261",
+        "window": "#25262b", "selection": "#3b4261", "pc_line": "#24402c", "bp_line": "#4a252b",
     },
     "light": {
         "bg": "#fbfbfa", "fg": "#24292f", "addr": "#8c959f", "bytes": "#a0a7b0", "mnem": "#0550ae",
         "call": "#8a5a00", "jump": "#cf222e", "ret": "#8250df", "comment": "#1a7f37", "label": "#bc4c00",
         "func": "#116329", "current": "#eef2f7", "node": "#ffffff", "node_border": "#c4cbd4",
         "edge_true": "#1a7f37", "edge_false": "#cf222e", "edge": "#0969da", "word": "#dbe7f5",
-        "window": "#eff1f3", "selection": "#b6d4fe",
+        "window": "#eff1f3", "selection": "#b6d4fe", "pc_line": "#d3f2d0", "bp_line": "#f9d4d8",
     },
 }
 # the active colours: one dict changed in place, so every module sees the switch
@@ -188,6 +188,8 @@ class DisasmView(QPlainTextEdit):
         self.lines: list[Line] = []
         self.row_of: dict[int, int] = {}
         self.columns = {"bytes": 20, "mnem": 44}
+        self.debug_pc: int | None = None          # while debugging: the stopped-at instruction
+        self.debug_bps: set[int] = set()
         self.show_bytes = True
         self.highlighter = ListingHighlighter(self.document(), self)
         self.cursorPositionChanged.connect(self._moved)
@@ -245,7 +247,31 @@ class DisasmView(QPlainTextEdit):
         return ln.addr if ln else None
 
     def _highlight_row(self, row: int):
-        self.setExtraSelections(_row_and_word_selections(self, row))
+        sel = _row_and_word_selections(self, row)
+        # the cursor band first, then the debugger's marks over it, then the word highlights
+        self.setExtraSelections(sel[:1] + self._debug_selections() + sel[1:])
+
+    def set_debug_marks(self, pc: int | None, breakpoints=()):
+        """Mark the stopped-at instruction and the breakpoints (static addresses) while debugging."""
+        self.debug_pc = pc
+        self.debug_bps = set(breakpoints)
+        self._highlight_row(self.textCursor().blockNumber())
+
+    def _debug_selections(self) -> list:
+        out = []
+        marks = [(a, "bp_line") for a in getattr(self, "debug_bps", ())]
+        if getattr(self, "debug_pc", None) is not None:
+            marks.append((self.debug_pc, "pc_line"))
+        for addr, key in marks:
+            row = self.row_of.get(addr)
+            if row is None:
+                continue
+            sel = QTextEdit.ExtraSelection()
+            sel.format.setBackground(QColor(THEME[key]))
+            sel.format.setProperty(QTextCharFormat.Property.FullWidthSelection, True)
+            sel.cursor = QTextCursor(self.document().findBlockByNumber(row))
+            out.append(sel)
+        return out
 
     def _moved(self):
         row = self.textCursor().blockNumber()

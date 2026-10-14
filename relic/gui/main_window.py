@@ -6,13 +6,15 @@ import traceback
 
 from PySide6.QtCore import QSettings, QSortFilterProxyModel, Qt, QThread, Signal
 from PySide6.QtGui import QAction, QColor, QKeySequence, QPalette, QStandardItem, QStandardItemModel
-from PySide6.QtWidgets import (QAbstractItemView, QApplication, QDockWidget, QFileDialog, QHeaderView,
+from PySide6.QtWidgets import (QAbstractItemView, QApplication, QDockWidget, QFileDialog,
                                QInputDialog, QLabel, QLineEdit, QMainWindow, QMessageBox, QProgressBar,
                                QTableView, QTabWidget, QToolButton, QVBoxLayout, QWidget)
 
 from ..analysis import Analysis
 from ..analysis.strings import escape
 from ..progress import Cancelled, Progress
+from .debugger import (BacktracePanel, BreakpointsPanel, CodePanel, ConsolePanel, DebugController, MemoryPanel, RegistersPanel,
+                       StackPanel, VmmapPanel, item_value)
 from .views import (DEFAULT_FONT_SIZE, THEME, DisasmView, GraphView, HexView, PseudocodeView, current_theme,
                     font_size, mono_font, set_font_size, set_theme)
 
@@ -242,6 +244,7 @@ class MainWindow(QMainWindow):
         self.xrefs_dock.raise_()
         self.search_thread: SearchThread | None = None
 
+
         self.strings = FilteredTable(["Address", "Section", "Encoding", "Value"], "Filter strings")
         self.imports = FilteredTable(["Address", "GOT / IAT", "Name", "Library"], "Filter imports")
         self.vulns = Table(["Severity", "Address", "Function", "Kind", "Message"])
@@ -259,6 +262,45 @@ class MainWindow(QMainWindow):
             self.tabifyDockWidget(docks[0], d)
         docks[0].raise_()
         self.docks = docks
+
+        # local debugging (pwndbg-style context panels; shown once a session starts)
+        self.dbg = DebugController(self)
+        self.dbg_args: list[str] = []
+        self.dbg_regs = RegistersPanel()
+        self.dbg_stack = StackPanel()
+        self.dbg_bt = BacktracePanel()
+        self.dbg_code = CodePanel()
+        self.dbg_console = ConsolePanel()
+        self.dbg_mem = MemoryPanel()
+        self.dbg_vmmap = VmmapPanel()
+        self.dbg_bps = BreakpointsPanel()
+        right, bottom = Qt.DockWidgetArea.RightDockWidgetArea, Qt.DockWidgetArea.BottomDockWidgetArea
+        self.dbg_docks = [self._dock("Registers", self.dbg_regs, right), self._dock("Stack", self.dbg_stack, right),
+                          self._dock("Console", self.dbg_console, bottom), self._dock("Code", self.dbg_code, bottom),
+                          self._dock("Backtrace", self.dbg_bt, bottom), self._dock("Memory", self.dbg_mem, bottom),
+                          self._dock("Vmmap", self.dbg_vmmap, bottom),
+                          self._dock("Breakpoints", self.dbg_bps, bottom)]
+        # registers, then the stack, below the xrefs / search tabs; console, code and backtrace
+        # with the bottom tabs (strings, imports, ...)
+        self.splitDockWidget(self.xrefs_dock, self.dbg_docks[0], Qt.Orientation.Vertical)
+        self.splitDockWidget(self.dbg_docks[0], self.dbg_docks[1], Qt.Orientation.Vertical)
+        for d in self.dbg_docks[2:]:
+            self.tabifyDockWidget(self.docks[-1], d)
+        for d in self.dbg_docks:
+            d.hide()
+        self.dbg.state.connect(self._debug_state)
+        self.dbg.output.connect(self._debug_output)
+        self.dbg.log.connect(self.dbg_console.append)
+        self.dbg.busy.connect(self._debug_busy)
+        self.dbg_console.stdin_line.connect(self.dbg.send_input)
+        self.dbg_console.gdb_line.connect(self.dbg.gdb)
+        self.dbg_bt.cellDoubleClicked.connect(self._debug_frame_clicked)
+        self.dbg.memory.connect(self.dbg_mem.show_memory)
+        self.dbg_mem.goto_expr.connect(self.dbg.view_memory)
+        self.dbg_bps.changed.connect(self._debug_breakpoint_edited)
+        self.dbg_bps.cellDoubleClicked.connect(self._debug_breakpoint_clicked)
+        for t in (self.dbg_regs, self.dbg_stack, self.dbg_vmmap):
+            t.cellDoubleClicked.connect(lambda r, c, t=t: self._debug_follow(t, r, c))
 
         self.status = QLabel()
         self.status.setFont(mono_font(9))
@@ -328,6 +370,18 @@ class MainWindow(QMainWindow):
         act(m, "&Text...", "Alt+T", lambda: self.search_dialog("text"))
         act(m, "&Immediate value...", "Alt+I", lambda: self.search_dialog("imm"))
         act(m, "I&nstruction (regex)...", "Ctrl+Alt+I", lambda: self.search_dialog("insn"))
+        m = mb.addMenu("&Debug")
+        act(m, "&Start / Continue", "F9", self.debug_start_or_continue)
+        act(m, "Start at &main", "Shift+F9", lambda: self.debug_start("main"))
+        act(m, "Step &into", "F7", self.dbg.step_into)
+        act(m, "Step &over", "F8", self.dbg.step_over)
+        act(m, "Step o&ut", "Ctrl+F7", self.dbg.step_out)
+        act(m, "&Run to cursor", "F4", self.debug_run_to_cursor)
+        act(m, "Toggle &breakpoint", "F2", self.debug_toggle_breakpoint)
+        act(m, "&Pause", "Ctrl+Alt+Pause", self.dbg.interrupt, False)
+        act(m, "S&top", "Ctrl+F2", self.dbg.stop, False)
+        m.addSeparator()
+        act(m, "Program &arguments...", None, self.debug_arguments_dialog)
         m = mb.addMenu("&View")
         self.light_act = act(m, "&Light theme", "Ctrl+Shift+L",
                              lambda on: self.set_appearance(theme="light" if on else "dark"), False)
@@ -739,6 +793,107 @@ class MainWindow(QMainWindow):
         self.search_dock.raise_()
         self.statusBar().showMessage(f"{len(hits)} hit(s) for {what}", 5000)
 
+    # --------------------------------------------------------------- debugging
+    def debug_start(self, stop_at: str = "entry"):
+        """Run the analysed binary locally under gdb, stopped at its entry point (or `main`)."""
+        if self.an is None:
+            return
+        for d in self.dbg_docks:
+            d.show()
+        self.dbg_docks[2].raise_()        # console
+        self.dbg_console.append(f"$ {self.an.bin.path} {' '.join(self.dbg_args)}\n")
+        self.dbg.start(self.an.bin.path, self.an, self.dbg_args, stop_at)
+
+    def debug_start_or_continue(self):
+        if self.dbg.session is None or self.dbg.last.exited:
+            self.debug_start()
+        else:
+            self.dbg.cont()
+
+    def debug_toggle_breakpoint(self):
+        if self.cur is None:
+            return
+        on = self.dbg.toggle_breakpoint(self.cur)
+        self._debug_breakpoints_changed()
+        self.statusBar().showMessage(f"breakpoint {'set' if on else 'cleared'} at {self.an.location(self.cur)}", 3000)
+
+    def _debug_breakpoints_changed(self):
+        self.disasm.set_debug_marks(self.dbg.last.pc_static,
+                                    [a for a, b in self.dbg.static_bps.items() if b.enabled])
+        self.dbg_bps.an = self.an
+        self.dbg_bps.show_breakpoints(sorted(self.dbg.static_bps.values(), key=lambda b: b.addr))
+
+    def _debug_breakpoint_edited(self, addr: int, enabled, condition):
+        self.dbg.set_breakpoint(addr, enabled, condition)
+        self._debug_breakpoints_changed()
+
+    def _debug_breakpoint_clicked(self, row: int, col: int):
+        if col in (1, 2):
+            a = item_value(self.dbg_bps.item(row, 1))
+            if a is not None:
+                self.goto(a)
+
+    def debug_run_to_cursor(self):
+        if self.cur is not None:
+            self.dbg.run_to(self.cur)
+
+    def debug_arguments_dialog(self):
+        text, ok = QInputDialog.getText(self, "Program arguments", "Arguments (space-separated):",
+                                        text=" ".join(self.dbg_args))
+        if ok:
+            import shlex
+            try:
+                self.dbg_args = shlex.split(text)
+            except ValueError as e:
+                self.statusBar().showMessage(f"arguments: {e}", 4000)
+
+    def _debug_state(self, snap):
+        self.dbg_bps.an = self.an
+        for panel in (self.dbg_regs, self.dbg_stack, self.dbg_bt, self.dbg_code, self.dbg_vmmap, self.dbg_bps):
+            panel.show_snapshot(snap)
+        if snap.exited:
+            self.disasm.set_debug_marks(None, [a for a, b in self.dbg.static_bps.items() if b.enabled])
+            self.dbg_console.append(f"[ {snap.exited} ]\n")
+            self.statusBar().showMessage(f"program {snap.exited}", 5000)
+            return
+        if snap.pc_static is not None:
+            self.goto(snap.pc_static, record=False)
+        self.disasm.set_debug_marks(snap.pc_static, [a for a, b in self.dbg.static_bps.items() if b.enabled])
+        where = self.an.location(snap.pc_static) if snap.pc_static is not None else f"{snap.pc:#x}"
+        self.statusBar().showMessage(f"stopped at {where}" + (f" ({snap.reason})" if snap.reason else ""), 5000)
+
+    def _debug_output(self, data: bytes):
+        self.dbg_console.append(data.decode("utf-8", "replace"))
+
+    def _debug_busy(self, busy: bool):
+        if busy:
+            self.statusBar().showMessage("running ...")
+
+    def _debug_frame_clicked(self, row: int, _col: int):
+        live = item_value(self.dbg_bt.item(row, 1))
+        s = self.dbg.session
+        if live is not None and s is not None:
+            a = s.to_static(live)
+            if a is not None:
+                self.goto(a)
+
+    def _debug_follow(self, table, row: int, col: int):
+        """Double-click on a register, stack slot or mapping: code of the analysed binary opens
+        in the listing, anything else in the memory view."""
+        live = item_value(table.item(row, col))
+        if live is None:
+            live = item_value(table.item(row, 1))
+        s = self.dbg.session
+        if live is None or s is None:
+            return
+        a = s.to_static(live)
+        if table is not self.dbg_vmmap and a is not None and self.an.function_at(a) is not None:
+            self.goto(a)
+            return
+        self.dbg.view_memory(live)
+        self.dbg_docks[5].show()
+        self.dbg_docks[5].raise_()
+
     def goto_dialog(self):
         text, ok = QInputDialog.getText(self, "Go to", "Address or symbol (main, 0x401000, main+0x10):")
         if ok and text.strip():
@@ -937,6 +1092,7 @@ class MainWindow(QMainWindow):
             e.ignore()
             return
         self.decomp.shutdown()
+        self.dbg.shutdown()
         self._save_layout()
         super().closeEvent(e)
 

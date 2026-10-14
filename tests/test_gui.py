@@ -9,6 +9,7 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 os.environ["RELIC_SETTINGS"] = os.path.join(__import__("tempfile").mkdtemp(), "relic-test.ini")
 pytest.importorskip("PySide6.QtWidgets", exc_type=ImportError)  # also missing libEGL etc.
 
+from PySide6.QtCore import Qt  # noqa: E402
 from PySide6.QtWidgets import QApplication  # noqa: E402
 
 from relic.gui.main_window import MainWindow  # noqa: E402
@@ -414,3 +415,66 @@ def test_search_panel(app, win):
     assert not win.search("imm", "not-a-number")
     assert win.search("bytes", "e8 ?? ?? ?? ??") and win.wait()
     assert len(_rows(win.search_results)) > 5
+
+
+def _debug_wait(app, win, cond, ms=20000):
+    return _spin(app, lambda: win.dbg.idle and cond(), ms)
+
+
+def test_debugger_panels_breakpoints_and_console(app, win):
+    from test_debugger import _can_debug
+    if not _can_debug():
+        pytest.skip("gdb with ptrace permission is needed")
+    an = win.an
+    win.dbg_args = ["5"]
+    vuln = an.function_by_name("vuln").addr
+    win.goto(vuln)
+    win.debug_toggle_breakpoint()                       # before starting: applied at start
+    assert vuln in win.dbg.static_bps
+    win.debug_start()
+    assert _debug_wait(app, win, lambda: win.dbg_regs.rowCount() > 0)
+    assert all(d.isVisibleTo(win) for d in win.dbg_docks)
+    assert win.dbg_docks[1] not in win.tabifiedDockWidgets(win.dbg_docks[0])    # stack beside registers
+    win.debug_start_or_continue()                       # F9: continue to the breakpoint
+    assert _debug_wait(app, win, lambda: win.disasm.debug_pc == vuln)
+    assert win.cur == vuln
+    assert win.dbg_bps.rowCount() == 1 and win.dbg_bps.item(0, 2).text() == "vuln"
+    assert win.dbg_bps.item(0, 4).text() == "1"
+    assert win.dbg_regs.rowCount() >= 16 and win.dbg_regs.item(0, 0).text() == "rax"
+    assert win.dbg_stack.rowCount() == 16 and "main+" in win.dbg_stack.item(0, 2).text()
+    assert win.dbg_bt.item(0, 2).text() == "vuln"
+    assert "►" in win.dbg_code.toPlainText()
+    # memory view follows the stack pointer; vmmap lists the binary, stack and libc
+    rsp = next(int(win.dbg_regs.item(k, 1).text(), 16) for k in range(win.dbg_regs.rowCount())
+               if win.dbg_regs.item(k, 0).text() == "rsp")
+    assert _debug_wait(app, win, lambda: win.dbg_mem.addr == rsp)
+    assert win.dbg_mem.text.toPlainText().startswith(f"{rsp:#014x}")
+    paths = [win.dbg_vmmap.item(k, 5).text() for k in range(win.dbg_vmmap.rowCount())]
+    assert "[stack]" in paths and any(p.endswith("vuln64") for p in paths)
+    win.dbg_mem.where.setText("$rsp+0x10")
+    win.dbg_mem._go()
+    assert _debug_wait(app, win, lambda: win.dbg_mem.addr == rsp + 0x10)
+    row = next(k for k in range(win.dbg_regs.rowCount()) if win.dbg_regs.item(k, 0).text() == "rip")
+    win.goto(an.function_by_name("main").addr)
+    win._debug_follow(win.dbg_regs, row, 1)             # code of the binary: the listing
+    assert win.cur == vuln
+    win._debug_follow(win.dbg_vmmap, paths.index("[stack]"), 0)    # a mapping: the memory view
+    assert _debug_wait(app, win, lambda: win.dbg_mem.label.text().endswith("[stack]"))
+    win.dbg.step_over()
+    assert _debug_wait(app, win, lambda: win.disasm.debug_pc not in (None, vuln))
+    win.dbg_console.stdin.setText("relic")
+    win.dbg_console._send_stdin()
+    win.dbg_console.cmd.setText("info registers rip")
+    win.dbg_console._send_cmd()
+    win.debug_start_or_continue()
+    assert _debug_wait(app, win, lambda: "exited" in win.dbg_console.out.toPlainText())
+    text = win.dbg_console.out.toPlainText()
+    assert "hello relic" in text and "gdb> info registers rip" in text and "exited" in text
+    win.dbg.stop()
+    assert _debug_wait(app, win, lambda: win.dbg.session is None)
+    # breakpoints panel: disable and add a condition (kept for the next run)
+    win.dbg_bps.item(0, 0).setCheckState(Qt.CheckState.Unchecked)
+    win.dbg_bps.item(0, 3).setText("$rdi == 1")
+    bp = win.dbg.static_bps[vuln]
+    assert not bp.enabled and bp.condition == "$rdi == 1"
+    assert vuln not in win.disasm.debug_bps
