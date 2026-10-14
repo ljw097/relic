@@ -270,6 +270,10 @@ class CWriter:
         fa = self.structs.field(addr, bits)
         if fa is not None:
             return f"{self.expr(fa[0], PREC_POSTFIX)}->{self.fname(*fa[1:])}"
+        if self.an.bin.endian == "little":
+            pa = self.structs.part_of_field(addr, bits)
+            if pa is not None:                    # the low bytes of a wider field
+                return f"*({int_type(bits)} *)&{self.expr(pa[0], PREC_POSTFIX)}->{self.fname(*pa[1:])}"
         idx = self._indexed(addr, size)
         if idx is not None:
             base, i = idx
@@ -342,6 +346,11 @@ class CWriter:
             if e.a.bits == 1:                     # bool widened to an int: C does this already
                 return self._expr(e.a)
             t = int_type(e.bits, e.kind == "zext")
+            if e.kind == "zext" and e.a.bits in (8, 16, 32) and e.a.bits < e.bits and not self._unsigned(e.a) \
+                    and not isinstance(e.a, Const):
+                # C widens a signed value with its sign: zero-extend through the unsigned type
+                inner = e.a.a if isinstance(e.a, Cast) and e.a.kind == "low" else e.a
+                return f"({t})({int_type(e.a.bits, True)}){self.expr(inner, PREC_UNARY)}", PREC_UNARY
             return f"({t}){self.expr(e.a, PREC_UNARY)}", PREC_UNARY
         if isinstance(e, Extract):
             inner = self.expr(e.a, 11)

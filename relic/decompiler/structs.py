@@ -237,7 +237,7 @@ def scan(fn: IRFunction, fn_addr: int, ptr_bits: int, name_of=None) -> dict[tupl
             for k, a in enumerate(args):
                 if isinstance(a, (Var, StackVar, Load)) and a.bits == ptr_bits:
                     key = base_key(a, fn_addr, defs, ptr_bits, aliases)
-                    if key is not None and root(key)[0] in ("gptr", "gelem"):
+                    if key is not None:
                         passes.append((target.value, k, key))
         sig = lookup(name)
         for k, a in enumerate(args):
@@ -365,13 +365,13 @@ def param_source(an: "Analysis", callee: int, reg: str) -> tuple | None:
     if (callee, reg) not in cache:
         cache[(callee, reg)] = None
         callers = [f for f in an.functions.values()
-                   if (callee in f.calls or callee in f.tail_calls) and not f.is_import]
+                   if (callee in f.calls or callee in f.tail_calls) and not f.is_import and f.addr != callee]
+        found = []
         for f in callers[:MAX_SCAN]:
-            hit = next((key for c, i, key in _scan_function(an, f).get(("passes",), ()) if c == callee and i == k),
-                       None)
-            if hit is not None:
-                cache[(callee, reg)] = hit
-                break
+            found += [key for c, i, key in _scan_function(an, f).get(("passes",), ()) if c == callee and i == k]
+        # a global's struct first (every function agrees on it), then a caller's own struct
+        found.sort(key=lambda key: root(key)[0] == "var")
+        cache[(callee, reg)] = found[0] if found else None
     return cache[(callee, reg)]
 
 
@@ -438,6 +438,74 @@ def global_struct(an: "Analysis", key: tuple, ptr_bits: int) -> Struct | None:
     return st
 
 
+def function_structs(an: "Analysis", faddr: int, res: dict, ptr_bits: int) -> dict[tuple, Struct]:
+    """The structs rooted at one function's variables (`s_<func>_<n>`), from its scan `res`. A
+    struct this function hands to a callee also has the fields the callee reaches through that
+    parameter. Objects are kept per name across calls (the user may have grown one)."""
+    uses = {k: v for k, v in res.items() if k not in (("links",), ("passes",))}
+    regs = _param_regs(an)
+    merged: dict[tuple, _Use] = {}
+    for callee, k, passed in res.get(("passes",), ()):
+        cf = an.functions.get(callee)
+        if root(passed)[0] != "var" or cf is None or cf.is_import or k >= len(regs) or callee == faddr:
+            continue
+        croot = ("var", callee, regs[k])
+        for ckey, cu in _scan_function(an, cf).items():
+            if isinstance(cu, _Use) and root(ckey) == croot:
+                tgt = reroot(ckey, passed) if ckey != croot else passed
+                m = merged.setdefault(tgt, _Use())
+                for off, bs in cu.sizes.items():
+                    m.sizes.setdefault(off, set()).update(bs)
+                for off, t in cu.hints.items():
+                    m.hint(off, t)
+    for tgt, m in merged.items():
+        u = uses.get(tgt)
+        if u is None:
+            uses[tgt] = m
+            continue
+        u2 = _Use({o: set(b) for o, b in u.sizes.items()}, dict(u.hints))
+        for off, bs in m.sizes.items():
+            u2.sizes.setdefault(off, set()).update(bs)
+        for off, t in m.hints.items():
+            u2.hint(off, t)
+        uses[tgt] = u2
+    f = an.functions.get(faddr)
+    fname = "".join(c if c.isalnum() else "_" for c in (an.name(faddr) or (f.name if f else f"{faddr:x}")))
+    names = {key: f"s_{fname}_{n}" for n, key in enumerate(sorted((k for k in res if k[0] == "var"), key=str), 1)}
+    known = an.__dict__.setdefault("_local_structs", {})     # every local struct seen, by name
+    out: dict[tuple, Struct] = {}
+    for key, use in uses.items():
+        if root(key)[0] == "var" and root(key)[1] == faddr and \
+                _is_struct(use, field=key[0] == "field", ptr_bits=ptr_bits):
+            st = _build(_key_name(an, key, names), key, use, ptr_bits)
+            old = known.get(st.name)
+            if old is not None:
+                # built again: keep the one object other functions may have grown
+                for off, fl in st.fields.items():
+                    if off not in old.fields and not any(g.offset < off < g.end for g in old.fields.values()):
+                        old.fields[off] = fl
+                st = old
+            out[key] = known[st.name] = st
+    links = res.get(("links",), {})
+    for key, st in out.items():
+        for off, fl in st.fields.items():
+            if fl.bits == ptr_bits and fl.child is None:
+                target = links.get((key, off), ("field", key, off))
+                if target == key:
+                    fl.child = st
+                elif target in out:
+                    fl.child = out[target]
+    return out
+
+
+def caller_struct(an: "Analysis", key: tuple, ptr_bits: int) -> Struct | None:
+    """The struct of a key rooted at another function's variable (a caller's local struct)."""
+    f = an.functions.get(root(key)[1])
+    if f is None:
+        return None
+    return function_structs(an, f.addr, _scan_function(an, f), ptr_bits).get(key)
+
+
 class StructView:
     """The structs one function's pseudocode uses, and how to print accesses through them."""
 
@@ -458,28 +526,10 @@ class StructView:
                 for x in walk(top):
                     if isinstance(x, (Var, StackVar)) and x.bits == ptr_bits:
                         self._vars.setdefault(x.name, x)
-        n = 0
         res = scan(fn, fn.addr, ptr_bits, an.name)
-        links = res.pop(("links",), {})
-        res.pop(("passes",), None)
-        fname = "".join(c if c.isalnum() else "_" for c in (an.name(fn.addr) or f"{fn.addr:x}"))
-        names: dict[tuple, str] = {}
-        for key in sorted((k for k in res if k[0] == "var"), key=str):
-            n += 1
-            names[key] = f"s_{fname}_{n}"
-        self._res = res
-        known = an.__dict__.setdefault("_local_structs", {})     # every local struct seen, by name
-        for key, use in res.items():
-            if root(key)[0] == "var" and _is_struct(use, field=key[0] == "field", ptr_bits=ptr_bits):
-                st = _build(_key_name(an, key, names), key, use, ptr_bits)
-                old = known.get(st.name)
-                if old is not None:
-                    # decompiled again: keep the one object other functions may have grown
-                    for off, f in st.fields.items():
-                        if off not in old.fields and not any(g.offset < off < g.end for g in old.fields.values()):
-                            old.fields[off] = f
-                    st = old
-                self.local[key] = known[st.name] = st
+        links = res.get(("links",), {})
+        self.local = function_structs(an, fn.addr, res, ptr_bits)
+        self._res = {k: v for k, v in res.items() if k not in (("links",), ("passes",))}
         # variables the user typed `struct X *`
         self.forced: dict[str, Struct] = {}
         for gen, ctype in (user_types or {}).items():
@@ -533,8 +583,10 @@ class StructView:
         r = root(key)
         if r[0] == "var" and r[2] not in self.forced:
             src = param_source(self.an, self.fn.addr, r[2])
-            if src is not None:                       # a caller passes a global's struct here
-                st = global_struct(self.an, reroot(key, src), self.ptr_bits)
+            if src is not None:                       # a caller passes its struct here
+                k2 = reroot(key, src)
+                st = caller_struct(self.an, k2, self.ptr_bits) if root(src)[0] == "var" else \
+                    global_struct(self.an, k2, self.ptr_bits)
                 if st is not None:
                     return st
         if key[0] == "field":
@@ -589,6 +641,8 @@ class StructView:
         v = self._vars.get(name)
         if v is None:
             return None
+        if name not in self.defs and param_source(self.an, self.fn.addr, name) is not None:
+            return self.struct_of(v)                   # a parameter given a caller's struct
         if self.aliases.get(name) is None and name not in self.defs and \
                 not any(k[2] == name for k in self.local if k[0] == "var"):
             # copied into a variable that is one (`var_20 = a1`, var_20 walking a list)
@@ -620,6 +674,16 @@ class StructView:
             return None
         f = st.field_at(sp[1], bits)
         return (sp[0], st, f) if f is not None else None
+
+    def part_of_field(self, addr: Expr, bits: int) -> tuple[Expr, Struct, Field] | None:
+        """(base, struct, field) when `bits` at `addr` are the low part of a wider field (a 16-bit
+        read of a 64-bit field: `*(short *)&p->total`)."""
+        sp = split_addr(addr)
+        if sp is None:
+            return None
+        st = self.struct_of(sp[0])
+        f = st.fields.get(sp[1]) if st is not None else None
+        return (sp[0], st, f) if f is not None and f.bits > bits else None
 
     def field_addr(self, e: Expr) -> tuple[Expr, Struct, Field] | None:
         """(base, field) for `base + k` that is the address of a field (`&p->f_8`)."""

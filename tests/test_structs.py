@@ -10,7 +10,8 @@ from relic.analysis import analyze
 from relic.decompiler.emit import decompile
 
 HERE = os.path.dirname(__file__)
-FUNCS = ["item_score", "item_add", "name_len", "pool_total", "pool_first", "chain_sum"]      # callees first
+FUNCS = ["item_score", "item_add", "name_len", "pool_total", "pool_first", "item_weight", "make_item",
+         "chain_sum"]      # callees first
 
 
 def _c(an, name):
@@ -99,8 +100,12 @@ int main(void) {
         ref_pool[k] = &it[k];
         if (pool_total() != ref_pool_total()) { printf("pool_total %%d\n", k); bad++; }
         if (pool_first() != ref_pool_first()) { printf("pool_first %%d\n", k); bad++; }
+        if (item_weight((void *)&it[k]) != ref_item_weight(&it[k])) { printf("item_weight %%d\n", k); bad++; }
     }
     if (chain_sum((void *)&n1) != ref_chain_sum(&n1)) { printf("chain_sum\n"); bad++; }
+    int ns[] = {-5, 0, 3, 7, 1234, 70000};
+    for (int k = 0; k < 6; k++)
+        if (make_item(ns[k]) != ref_make_item(ns[k])) { printf("make_item %%d\n", ns[k]); bad++; }
     if (!bad) puts("ok");
     return bad != 0;
 }
@@ -210,3 +215,16 @@ def test_applied_types_still_recompile(structs_O2, tmp_path):
                         "-o", str(tmp_path / "re"), str(src)], capture_output=True, text=True)
     assert r.returncode == 0, r.stderr[:3000]
     assert subprocess.run([str(tmp_path / "re")], capture_output=True, text=True).stdout.strip().endswith("ok")
+
+
+@pytest.mark.parametrize("variant", ["structs_O0", "structs_O2"])
+def test_local_struct_passed_to_a_callee(request, variant):
+    """make_item mallocs an item and hands it to item_weight: one struct for both, with the
+    fields item_weight reads (kind, total) known on the caller's side too."""
+    an = analyze(request.getfixturevalue(variant))
+    callee = _c(an, "item_weight")
+    caller = _c(an, "make_item")
+    name = re.search(r"struct (s_make_item_\d+) \{", caller).group(1)
+    assert f"int item_weight(struct {name} *a1)" in callee, callee
+    decl = re.search(r"^struct %s \{.*?^\};" % name, caller, re.M | re.S).group(0)
+    assert "short f_c;" in decl and "int64_t f_10;" in decl and decl in callee
