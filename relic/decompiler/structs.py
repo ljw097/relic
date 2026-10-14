@@ -682,6 +682,9 @@ class StructView:
         links = res.get(("links",), {})
         self.local = function_structs(an, fn.addr, res, ptr_bits)
         self._res = {k: v for k, v in res.items() if k not in (("links",), ("passes",))}
+        # variables memory is accessed through at fixed offsets here: only for those is it worth
+        # asking the callers (preparing them) which struct they pass
+        self._bases = {root(k)[2] for k in self._res if root(k)[0] == "var"}
         # variables the user typed `struct X *`
         self.forced: dict[str, Struct] = {}
         for gen, ctype in (user_types or {}).items():
@@ -783,7 +786,8 @@ class StructView:
         v = self._vars.get(name)
         if v is None:
             return None
-        if name not in self.defs and param_source(self.an, self.fn.addr, name) is not None:
+        if name not in self.defs and name in self._bases and \
+                param_source(self.an, self.fn.addr, name) is not None:
             return self.struct_of(v)                   # a parameter given a caller's struct
         if self.aliases.get(name) is None and name not in self.defs and \
                 not any(k[2] == name for k in self.local if k[0] == "var"):
