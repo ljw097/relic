@@ -12,18 +12,61 @@ from ..analysis.functions import Function
 from ..listing import Line, function_lines, render
 from ..progress import Cancelled, Progress
 
-THEME = {
-    "bg": "#1e1f22", "fg": "#d4d4d4", "addr": "#6c7086", "bytes": "#585b70", "mnem": "#89b4fa",
-    "call": "#f9e2af", "jump": "#f38ba8", "ret": "#cba6f7", "comment": "#7fb77e", "label": "#fab387",
-    "func": "#a6e3a1", "current": "#2d2f36", "node": "#26272b", "node_border": "#45475a",
-    "edge_true": "#7fb77e", "edge_false": "#f38ba8", "edge": "#89b4fa", "word": "#3e4452",
+THEMES = {
+    "dark": {
+        "bg": "#1e1f22", "fg": "#d4d4d4", "addr": "#6c7086", "bytes": "#585b70", "mnem": "#89b4fa",
+        "call": "#f9e2af", "jump": "#f38ba8", "ret": "#cba6f7", "comment": "#7fb77e", "label": "#fab387",
+        "func": "#a6e3a1", "current": "#2d2f36", "node": "#26272b", "node_border": "#45475a",
+        "edge_true": "#7fb77e", "edge_false": "#f38ba8", "edge": "#89b4fa", "word": "#3e4452",
+        "window": "#25262b", "selection": "#3b4261",
+    },
+    "light": {
+        "bg": "#fbfbfa", "fg": "#24292f", "addr": "#8c959f", "bytes": "#a0a7b0", "mnem": "#0550ae",
+        "call": "#8a5a00", "jump": "#cf222e", "ret": "#8250df", "comment": "#1a7f37", "label": "#bc4c00",
+        "func": "#116329", "current": "#eef2f7", "node": "#ffffff", "node_border": "#c4cbd4",
+        "edge_true": "#1a7f37", "edge_false": "#cf222e", "edge": "#0969da", "word": "#dbe7f5",
+        "window": "#eff1f3", "selection": "#b6d4fe",
+    },
 }
+# the active colours: one dict changed in place, so every module sees the switch
+THEME: dict[str, str] = dict(THEMES["dark"])
+_STATE = {"theme": "dark", "font_size": 10}
+FONT_SIZES = (6, 28)
+DEFAULT_FONT_SIZE = 10
 
 
-def mono_font(size: int = 10) -> QFont:
+def set_theme(name: str) -> None:
+    """Switch the colour theme (views pick it up in `restyle`)."""
+    if name not in THEMES:
+        raise ValueError(f"unknown theme {name!r}")
+    THEME.clear()
+    THEME.update(THEMES[name])
+    _STATE["theme"] = name
+
+
+def current_theme() -> str:
+    return _STATE["theme"]
+
+
+def set_font_size(size: int) -> int:
+    """Point size of the code views (clamped); returns the size in effect."""
+    _STATE["font_size"] = max(FONT_SIZES[0], min(FONT_SIZES[1], int(size)))
+    return _STATE["font_size"]
+
+
+def font_size() -> int:
+    return _STATE["font_size"]
+
+
+def mono_font(size: int | None = None) -> QFont:
     f = QFontDatabase.systemFont(QFontDatabase.SystemFont.FixedFont)
-    f.setPointSize(size)
+    f.setPointSize(size if size is not None else _STATE["font_size"])
     return f
+
+
+def _code_style() -> str:
+    return (f"QPlainTextEdit {{ background: {THEME['bg']}; color: {THEME['fg']}; "
+            f"selection-background-color: {THEME['selection']}; }}")
 
 
 def _fmt(color: str, bold: bool = False) -> QTextCharFormat:
@@ -87,7 +130,13 @@ class ListingHighlighter(QSyntaxHighlighter):
     def __init__(self, doc, view: "DisasmView"):
         super().__init__(doc)
         self.view = view
+        self.refresh(rehighlight=False)
+
+    def refresh(self, rehighlight: bool = True):
+        """Rebuild the formats from the current theme."""
         self.f = {k: _fmt(v, k in ("func", "label")) for k, v in THEME.items()}
+        if rehighlight:
+            self.rehighlight()
 
     def highlightBlock(self, text: str):
         n = self.currentBlock().blockNumber()
@@ -133,7 +182,7 @@ class DisasmView(QPlainTextEdit):
         self.setReadOnly(True)
         self.setLineWrapMode(QPlainTextEdit.LineWrapMode.NoWrap)
         self.setFont(mono_font())
-        self.setStyleSheet(f"QPlainTextEdit {{ background: {THEME['bg']}; color: {THEME['fg']}; }}")
+        self.setStyleSheet(_code_style())
         self.an: Analysis | None = None
         self.func: Function | None = None
         self.lines: list[Line] = []
@@ -142,6 +191,13 @@ class DisasmView(QPlainTextEdit):
         self.show_bytes = True
         self.highlighter = ListingHighlighter(self.document(), self)
         self.cursorPositionChanged.connect(self._moved)
+
+    def restyle(self):
+        """Apply the current theme and font size."""
+        self.setFont(mono_font())
+        self.setStyleSheet(_code_style())
+        self.highlighter.refresh()
+        self._moved()
 
     def line_at(self, row: int) -> Line | None:
         return self.lines[row] if 0 <= row < len(self.lines) else None
@@ -256,11 +312,20 @@ class GraphView(QGraphicsView):
         self.setDragMode(QGraphicsView.DragMode.ScrollHandDrag)
         self.setBackgroundBrush(QColor(THEME["bg"]))
         self.setTransformationAnchor(QGraphicsView.ViewportAnchor.AnchorUnderMouse)
-        self.font = mono_font(9)
+        self.font = mono_font(max(font_size() - 1, FONT_SIZES[0]))
         self.nodes: dict[int, _Node] = {}
         self.an: Analysis | None = None
         self.func: Function | None = None
         self.graph_layout = None
+
+    def restyle(self):
+        """Apply the current theme and font size (the graph is drawn again)."""
+        self.font = mono_font(max(font_size() - 1, FONT_SIZES[0]))
+        self.setBackgroundBrush(QColor(THEME["bg"]))
+        selected = next((a for a, n in self.nodes.items() if n.selected), None)
+        self.reload()
+        if selected is not None:
+            self.goto(selected)
 
     def wheelEvent(self, e):
         if e.modifiers() & Qt.KeyboardModifier.ControlModifier:
@@ -400,8 +465,12 @@ class HexView(QPlainTextEdit):
         self.setReadOnly(True)
         self.setLineWrapMode(QPlainTextEdit.LineWrapMode.NoWrap)
         self.setFont(mono_font())
-        self.setStyleSheet(f"QPlainTextEdit {{ background: {THEME['bg']}; color: {THEME['fg']}; }}")
+        self.setStyleSheet(_code_style())
         self.base = 0
+
+    def restyle(self):
+        self.setFont(mono_font())
+        self.setStyleSheet(_code_style())
 
     def show_addr(self, an: Analysis, addr: int):
         b = an.bin
@@ -439,6 +508,9 @@ class PseudocodeHighlighter(QSyntaxHighlighter):
 
     def __init__(self, doc):
         super().__init__(doc)
+        self.refresh(rehighlight=False)
+
+    def refresh(self, rehighlight: bool = True):
         import re
         self.rules = [
             (re.compile(r"\b(" + "|".join(_C_TYPES) + r")\b"), _fmt(THEME["ret"])),
@@ -449,6 +521,8 @@ class PseudocodeHighlighter(QSyntaxHighlighter):
             (re.compile(r'"(?:[^"\\]|\\.)*"'), _fmt(THEME["label"])),
             (re.compile(r"//.*$"), _fmt(THEME["comment"])),
         ]
+        if rehighlight:
+            self.rehighlight()
 
     def highlightBlock(self, text: str):
         for rx, f in self.rules:
@@ -508,7 +582,7 @@ class PseudocodeView(QPlainTextEdit):
         self.setReadOnly(True)
         self.setLineWrapMode(QPlainTextEdit.LineWrapMode.NoWrap)
         self.setFont(mono_font())
-        self.setStyleSheet(f"QPlainTextEdit {{ background: {THEME['bg']}; color: {THEME['fg']}; }}")
+        self.setStyleSheet(_code_style())
         self.highlighter = PseudocodeHighlighter(self.document())
         self.an: Analysis | None = None
         self.func: Function | None = None
@@ -520,6 +594,13 @@ class PseudocodeView(QPlainTextEdit):
         self.queued: Function | None = None     # requested while a job was running
         self._syncing = False
         self.cursorPositionChanged.connect(self._moved)
+
+    def restyle(self):
+        """Apply the current theme and font size."""
+        self.setFont(mono_font())
+        self.setStyleSheet(_code_style())
+        self.highlighter.refresh()
+        self._moved()
 
     def show_function(self, an: Analysis, f: Function, addr: int | None = None):
         if an is not self.an:

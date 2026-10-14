@@ -10,7 +10,7 @@
 - [x] 취약점 스캔 실패를 "발견 없음"과 구분해 표시(`VulnsThread.failed`, 표에 오류 행)
 - [x] CFG 레이아웃: Sugiyama 방식(`relic/gui/layout.py`) — back edge 역전, 최장 경로 층, 긴 간선 더미 노드 경로, barycenter 교차 최소화(`/bin/ls` 큰 함수 교차 16656 → 1248), isotonic 좌표 배치, 층 하단까지 수직으로 내린 뒤 꺾는 간선
 - [ ] **P2** CFG: 노드 수천 개 함수에서 교차 계산(층 쌍마다 O(E²)) 가속, 간선 묶음(bundling), 접기
-- [ ] **P2** 테마 전환(라이트/다크), 폰트 크기 설정
+- [x] 테마 전환(라이트/다크, `Ctrl+Shift+L`)과 코드 글꼴 크기(`Ctrl+=`/`Ctrl+-`/`Ctrl+0`): 모든 뷰·표·앱 팔레트에 즉시 반영, `QSettings`에 저장
 
 ## 아키텍처별 분석 보강
 

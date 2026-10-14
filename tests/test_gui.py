@@ -367,3 +367,40 @@ def test_close_completes_after_slow_checkpoint(app, vuln64, monkeypatch):
     assert _spin(app, lambda: not w.running_work())
     app.processEvents()
     assert not w.isVisible()
+
+
+def test_theme_and_font_size_switch_and_persist(app, win):
+    from relic.gui import views
+    try:
+        win.set_appearance(theme="light")
+        assert views.current_theme() == "light" and views.THEME["bg"] == views.THEMES["light"]["bg"]
+        for v in (win.disasm, win.decomp, win.hex):
+            assert views.THEMES["light"]["bg"] in v.styleSheet()
+        assert win.light_act.isChecked()
+        assert app.palette().color(app.palette().ColorRole.Base).name() == views.THEMES["light"]["bg"]
+        size = views.font_size()
+        win.set_appearance(size=size + 3)
+        assert win.disasm.font().pointSize() == size + 3 and win.decomp.font().pointSize() == size + 3
+        win.set_appearance(size=1000)
+        assert views.font_size() == views.FONT_SIZES[1]
+        # a new window starts with the remembered appearance
+        w2 = MainWindow()
+        assert views.current_theme() == "light" and w2.disasm.font().pointSize() == views.FONT_SIZES[1]
+        w2.close()
+    finally:
+        win.set_appearance(theme="dark", size=views.DEFAULT_FONT_SIZE)
+    assert views.THEME["bg"] == views.THEMES["dark"]["bg"] and views.font_size() == views.DEFAULT_FONT_SIZE
+
+
+def test_graph_keeps_its_selection_across_a_restyle(win):
+    from relic.gui import views
+    win.goto(win.an.function_by_name("vuln").addr)
+    win.tabs.setCurrentIndex(win.TAB_GRAPH)
+    win.graph.show_function(win.an, win.an.function_by_name("vuln"))
+    sel = [a for a, n in win.graph.nodes.items() if n.selected]
+    try:
+        win.set_appearance(theme="light")
+        assert [a for a, n in win.graph.nodes.items() if n.selected] == sel
+        assert win.graph.backgroundBrush().color().name() == views.THEMES["light"]["bg"]
+    finally:
+        win.set_appearance(theme="dark")

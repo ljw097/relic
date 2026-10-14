@@ -13,22 +13,23 @@ from PySide6.QtWidgets import (QAbstractItemView, QApplication, QDockWidget, QFi
 from ..analysis import Analysis
 from ..analysis.strings import escape
 from ..progress import Cancelled, Progress
-from .views import THEME, DisasmView, GraphView, HexView, PseudocodeView, mono_font
+from .views import (DEFAULT_FONT_SIZE, THEME, DisasmView, GraphView, HexView, PseudocodeView, current_theme,
+                    font_size, mono_font, set_font_size, set_theme)
 
 ADDR_ROLE = Qt.ItemDataRole.UserRole + 1
 
 
 def apply_theme(app: QApplication):
-    """Dark Fusion palette matching the view colours."""
+    """Fusion palette matching the view colours of the current theme."""
     app.setStyle("Fusion")
     p = QPalette()
-    bg, base, fg = QColor("#25262b"), QColor(THEME["bg"]), QColor(THEME["fg"])
+    bg, base, fg = QColor(THEME["window"]), QColor(THEME["bg"]), QColor(THEME["fg"])
     for role, c in ((QPalette.ColorRole.Window, bg), (QPalette.ColorRole.WindowText, fg),
                     (QPalette.ColorRole.Base, base), (QPalette.ColorRole.AlternateBase, bg),
                     (QPalette.ColorRole.Text, fg), (QPalette.ColorRole.Button, bg),
                     (QPalette.ColorRole.ButtonText, fg), (QPalette.ColorRole.ToolTipBase, base),
-                    (QPalette.ColorRole.ToolTipText, fg), (QPalette.ColorRole.Highlight, QColor("#3b4261")),
-                    (QPalette.ColorRole.HighlightedText, QColor("#ffffff")),
+                    (QPalette.ColorRole.ToolTipText, fg), (QPalette.ColorRole.Highlight, QColor(THEME["selection"])),
+                    (QPalette.ColorRole.HighlightedText, QColor(THEME["fg"])),
                     (QPalette.ColorRole.PlaceholderText, QColor(THEME["addr"]))):
         p.setColor(role, c)
     p.setColor(QPalette.ColorGroup.Disabled, QPalette.ColorRole.Text, QColor(THEME["addr"]))
@@ -183,7 +184,10 @@ class MainWindow(QMainWindow):
 
     def __init__(self, parent=None):
         super().__init__(parent)
+        self._load_appearance()
         self.an: Analysis | None = None
+        self._last_vulns = None
+        self._last_checksec: dict | None = None
         self.thread: AnalysisThread | None = None
         self.vulns_thread: VulnsThread | None = None
         self.cur: int | None = None
@@ -297,10 +301,55 @@ class MainWindow(QMainWindow):
         act(m, "&Comment...", ";", self.comment_dialog)
         act(m, "&Xrefs to...", "X", self.show_xrefs_here)
         m = mb.addMenu("&View")
+        self.light_act = act(m, "&Light theme", "Ctrl+Shift+L",
+                             lambda on: self.set_appearance(theme="light" if on else "dark"), False)
+        self.light_act.setCheckable(True)
+        self.light_act.setChecked(current_theme() == "light")
+        act(m, "Zoom &in", ("Ctrl+=", "Ctrl++"), lambda: self.set_appearance(size=font_size() + 1), False)
+        act(m, "Zoom &out", "Ctrl+-", lambda: self.set_appearance(size=font_size() - 1), False)
+        act(m, "&Reset zoom", "Ctrl+0", lambda: self.set_appearance(size=DEFAULT_FONT_SIZE), False)
+        m.addSeparator()
         for d in [self.findChild(QDockWidget, "Functions"), self.xrefs_dock, *self.docks]:
             m.addAction(d.toggleViewAction())
         for a in self.actions():
             a.setShortcutContext(Qt.ShortcutContext.WindowShortcut)
+
+    # ------------------------------------------------------------ appearance
+    def _load_appearance(self):
+        st = self.settings()
+        theme = st.value("theme", "dark")
+        set_theme(theme if theme in ("dark", "light") else "dark")
+        try:
+            set_font_size(int(st.value("font_size", DEFAULT_FONT_SIZE)))
+        except (TypeError, ValueError):
+            set_font_size(DEFAULT_FONT_SIZE)
+        app = QApplication.instance()
+        if app is not None:
+            apply_theme(app)
+
+    def set_appearance(self, theme: str | None = None, size: int | None = None):
+        """Switch the colour theme and / or the code font size, and remember them."""
+        st = self.settings()
+        if theme is not None:
+            set_theme(theme)
+            st.setValue("theme", theme)
+            app = QApplication.instance()
+            if app is not None:
+                apply_theme(app)
+            self.light_act.setChecked(theme == "light")
+        if size is not None:
+            st.setValue("font_size", set_font_size(size))
+        st.sync()
+        for v in (self.disasm, self.graph, self.decomp, self.hex):
+            v.restyle()
+        if theme is not None and self.an is not None:
+            # table rows carry theme colours (imports, noreturn functions, severities)
+            self._fill_functions()
+            if self._last_checksec is not None:
+                self._fill_tables(self._last_checksec)
+            if self._last_vulns is not None:
+                self._fill_vulns(self._last_vulns)
+        self.statusBar().showMessage(f"{current_theme()} theme, {font_size()} pt", 3000)
 
     def _update_actions(self):
         for a in self._an_actions:
@@ -491,6 +540,7 @@ class MainWindow(QMainWindow):
 
     def _fill_vulns(self, vulns):
         """Fill the Vulns table; None shows that the scan is still running."""
+        self._last_vulns = vulns
         self.vulns.setSortingEnabled(False)
         self.vulns.clear_rows()
         if vulns is None:
@@ -519,6 +569,7 @@ class MainWindow(QMainWindow):
         self.statusBar().showMessage(f"vulnerability scan failed: {head}", 8000)
 
     def _fill_tables(self, checksec: dict):
+        self._last_checksec = checksec
         an, b = self.an, self.an.bin
         t = self.strings.table
         t.setSortingEnabled(False)
