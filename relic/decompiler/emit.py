@@ -253,6 +253,10 @@ class CWriter:
         if isinstance(addr, Const):
             sym = self.symbol(addr.value)
             if sym:
+                # the first element of an array object (`pool[0]`): the bare name is the array
+                s = self.an.bin.symbols.get(addr.value)
+                if s is not None and s.kind == "object" and s.size > size and s.size % size == 0:
+                    return f"{sym}[0]"
                 return sym
             # a GOT slot read on its own (kept in a register): the address of the import
             imp = self.an.bin.imports_by_got.get(addr.value)

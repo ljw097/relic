@@ -10,7 +10,7 @@ from relic.analysis import analyze
 from relic.decompiler.emit import decompile
 
 HERE = os.path.dirname(__file__)
-FUNCS = ["item_score", "item_add", "name_len", "pool_total", "chain_sum"]      # callees first
+FUNCS = ["item_score", "item_add", "name_len", "pool_total", "pool_first", "chain_sum"]      # callees first
 
 
 def _c(an, name):
@@ -57,7 +57,9 @@ def test_rename_struct_and_fields_persist(vuln64, tmp_path):
 def test_struct_parameters_and_nested_fields(request, variant):
     an = analyze(request.getfixturevalue(variant))
     text = _c(an, "item_score")
-    assert re.search(r"int item_score\(struct s_item_score_\d+ \*a1\)", text), text
+    # pool_first passes pool[0]: the parameter is the pool's struct, with item_score's fields in it
+    assert "int item_score(struct s_pool *a1)" in text, text
+    assert text.startswith("struct s_pool {  // recovered, 24 bytes"), text
     assert "->f_8" in text and "->f_c" in text and "->f_10" in text, text
     text = _c(an, "chain_sum")
     assert "->f_10" in text and "->f_8" in text, text            # next, it
@@ -96,6 +98,7 @@ int main(void) {
         if (memcmp(&a, &b, sizeof a)) { printf("item_add %%d\n", k); bad++; }
         ref_pool[k] = &it[k];
         if (pool_total() != ref_pool_total()) { printf("pool_total %%d\n", k); bad++; }
+        if (pool_first() != ref_pool_first()) { printf("pool_first %%d\n", k); bad++; }
     }
     if (chain_sum((void *)&n1) != ref_chain_sum(&n1)) { printf("chain_sum\n"); bad++; }
     if (!bad) puts("ok");

@@ -39,6 +39,10 @@ int pool_total(void) {
     return s;
 }
 
+int pool_first(void) {
+    return pool[0] ? item_score(pool[0]) : 0;
+}
+
 int chain_sum(struct node *n) {
     int s = 0;
     for (; n; n = n->next)
@@ -50,5 +54,5 @@ int main(int argc, char **argv) {
     struct item a = {argv[0], argc, 2, 1000};
     pool[0] = &a;
     item_add(&a, 3);
-    return item_score(&a) + pool_total() + name_len(&a);
+    return item_score(&a) + pool_total() + name_len(&a) + pool_first();
 }

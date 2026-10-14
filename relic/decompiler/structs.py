@@ -104,12 +104,13 @@ def _indexed(e: Expr) -> bool:
 
 
 def _global_of(e: Expr, ptr_bits: int) -> tuple | None:
-    """`Load(G)` -> ("gptr", G); `Load(G + i * ptr)` -> ("gelem", G)."""
+    """`Load(G)` and `Load(G + i * ptr)` -> ("gelem", G): a pointer stored at G -- `pool[0]` and
+    `pool[i]` (and a single global pointer) are the same kind of struct pointer."""
     if not isinstance(e, Load) or e.bits != ptr_bits:
         return None
     a = e.addr
     if isinstance(a, Const):
-        return ("gptr", a.value)
+        return ("gelem", a.value)
     if isinstance(a, BinOp) and a.op == "+":
         for g, i in ((a.a, a.b), (a.b, a.a)):
             if isinstance(g, Const) and isinstance(i, BinOp) and i.op in ("*", "<<") and isinstance(i.b, Const) \
@@ -229,8 +230,15 @@ def scan(fn: IRFunction, fn_addr: int, ptr_bits: int, name_of=None) -> dict[tupl
         return key, sp[1]
 
     loaded: dict[Expr, tuple] = {}         # Load expression -> (key, offset), for typing hints
+    passes: list[tuple] = []               # (callee, argument index, key of the struct passed)
 
-    def call_args(name, args):
+    def call_args(name, args, target=None):
+        if isinstance(target, Const):
+            for k, a in enumerate(args):
+                if isinstance(a, (Var, StackVar, Load)) and a.bits == ptr_bits:
+                    key = base_key(a, fn_addr, defs, ptr_bits, aliases)
+                    if key is not None and root(key)[0] in ("gptr", "gelem"):
+                        passes.append((target.value, k, key))
         sig = lookup(name)
         for k, a in enumerate(args):
             # the field itself, or a variable holding it (`v1 = it->name; strlen(v1)`)
@@ -263,14 +271,15 @@ def scan(fn: IRFunction, fn_addr: int, ptr_bits: int, name_of=None) -> dict[tupl
             if dst_key is not None:
                 links[loaded[s.src]] = dst_key
         if isinstance(s, CallStmt):
-            call_args(s.name, s.call.args)
+            call_args(s.name, s.call.args, s.call.target)
         elif name_of is not None:
             # calls folded into an expression (`return strlen(v1) + ...`)
             for top in stmt_exprs(s):
                 for x in walk(top):
                     if isinstance(x, Call) and isinstance(x.target, Const):
-                        call_args(name_of(x.target.value), x.args)
+                        call_args(name_of(x.target.value), x.args, x.target)
     uses[("links",)] = links                 # type: ignore[assignment]
+    uses[("passes",)] = passes               # type: ignore[assignment]
     return uses
 
 
@@ -291,7 +300,7 @@ def _call_ret_type(fn: IRFunction, v: Expr) -> str:
     return ""
 
 
-def _is_struct(use: _Use, global_elem: bool = False, field: bool = False) -> bool:
+def _is_struct(use: _Use, global_elem: bool = False, field: bool = False, ptr_bits: int = 0) -> bool:
     """Several offsets that do not look like an array: different widths, a pointer field next to
     a non-pointer one, or the elements of a global pointer array (`notes[i]->...`). A pointer
     read out of a struct field is one already at a single access past its start."""
@@ -301,7 +310,10 @@ def _is_struct(use: _Use, global_elem: bool = False, field: bool = False) -> boo
         return False
     widths = {b for bs in use.sizes.values() for b in bs}
     kinds = {use.hints.get(o, "").endswith("*") for o in use.sizes}
-    return len(widths) >= 2 or len(kinds) == 2 or global_elem
+    # pointer-sized slots told apart only by how some are used look just like an array of
+    # pointers (`argv[0]`, `argv[1]`): that alone is not a struct
+    mixed = len(kinds) == 2 and widths != {ptr_bits}
+    return len(widths) >= 2 or mixed or global_elem
 
 
 def _build(name: str, key: tuple, use: _Use, ptr_bits: int) -> Struct:
@@ -326,6 +338,41 @@ def _scan_function(an: "Analysis", f) -> dict[tuple, _Use]:
         except Exception:  # noqa: BLE001 - a function that does not decompile adds nothing
             cache[f.addr] = {}
     return cache[f.addr]
+
+
+def reroot(key: tuple, new_root: tuple) -> tuple:
+    """`key` with its root base replaced (a callee's `a1->f_8` seen from the caller's struct)."""
+    return ("field", reroot(key[1], new_root), key[2]) if key[0] == "field" else new_root
+
+
+def _param_regs(an: "Analysis") -> tuple[str, ...]:
+    from .arch import arch_for
+    from .calls import int_arg_regs
+    try:
+        return int_arg_regs(arch_for(an.bin))
+    except NotImplementedError:
+        return ()
+
+
+def param_source(an: "Analysis", callee: int, reg: str) -> tuple | None:
+    """The global struct a parameter receives: a caller passes `notes[i]` (a `gelem` / `gptr`
+    key) as this argument. The first caller that does decides."""
+    regs = _param_regs(an)
+    if reg not in regs:
+        return None
+    k = regs.index(reg)
+    cache = an.__dict__.setdefault("_param_sources", {})
+    if (callee, reg) not in cache:
+        cache[(callee, reg)] = None
+        callers = [f for f in an.functions.values()
+                   if (callee in f.calls or callee in f.tail_calls) and not f.is_import]
+        for f in callers[:MAX_SCAN]:
+            hit = next((key for c, i, key in _scan_function(an, f).get(("passes",), ()) if c == callee and i == k),
+                       None)
+            if hit is not None:
+                cache[(callee, reg)] = hit
+                break
+    return cache[(callee, reg)]
 
 
 def _global_name(an: "Analysis", g: int) -> str:
@@ -357,18 +404,30 @@ def global_struct(an: "Analysis", key: tuple, ptr_bits: int) -> Struct | None:
             funcs.append(f)
     use = _Use()
     links: dict[tuple, tuple] = {}
-    for f in funcs[:MAX_SCAN]:
-        res = _scan_function(an, f)
-        links.update(res.get(("links",), {}))
-        u = res.get(key)
-        if u is None:
-            continue
+
+    def merge(u):
         for off, bs in u.sizes.items():
             use.sizes.setdefault(off, set()).update(bs)
         for off, t in u.hints.items():
             use.hint(off, t)
+
+    regs = _param_regs(an)
+    for f in funcs[:MAX_SCAN]:
+        res = _scan_function(an, f)
+        links.update(res.get(("links",), {}))
+        u = res.get(key)
+        if u is not None:
+            merge(u)
+        # functions this one hands the struct to: their accesses through that parameter count
+        for callee, k, passed in res.get(("passes",), ()):
+            cf = an.functions.get(callee)
+            if passed != g or cf is None or cf.is_import or k >= len(regs):
+                continue
+            cu = _scan_function(an, cf).get(reroot(key, ("var", callee, regs[k])))
+            if cu is not None:
+                merge(cu)
     st = _build(_key_name(an, key), key, use, ptr_bits) \
-        if _is_struct(use, key[0] == "gelem", key[0] == "field") else None
+        if _is_struct(use, key[0] == "gelem", key[0] == "field", ptr_bits) else None
     reg[key] = st
     if st is not None:
         for off, f in st.fields.items():
@@ -402,6 +461,7 @@ class StructView:
         n = 0
         res = scan(fn, fn.addr, ptr_bits, an.name)
         links = res.pop(("links",), {})
+        res.pop(("passes",), None)
         fname = "".join(c if c.isalnum() else "_" for c in (an.name(fn.addr) or f"{fn.addr:x}"))
         names: dict[tuple, str] = {}
         for key in sorted((k for k in res if k[0] == "var"), key=str):
@@ -410,7 +470,7 @@ class StructView:
         self._res = res
         known = an.__dict__.setdefault("_local_structs", {})     # every local struct seen, by name
         for key, use in res.items():
-            if root(key)[0] == "var" and _is_struct(use, field=key[0] == "field"):
+            if root(key)[0] == "var" and _is_struct(use, field=key[0] == "field", ptr_bits=ptr_bits):
                 st = _build(_key_name(an, key, names), key, use, ptr_bits)
                 old = known.get(st.name)
                 if old is not None:
@@ -470,6 +530,13 @@ class StructView:
     def _struct_for_key(self, key: tuple) -> Struct | None:
         if key[0] == "var" and key[2] in self.forced:
             return self.forced[key[2]]
+        r = root(key)
+        if r[0] == "var" and r[2] not in self.forced:
+            src = param_source(self.an, self.fn.addr, r[2])
+            if src is not None:                       # a caller passes a global's struct here
+                st = global_struct(self.an, reroot(key, src), self.ptr_bits)
+                if st is not None:
+                    return st
         if key[0] == "field":
             # a field the user typed `struct X *`: its pointer reaches X
             parent = self._struct_for_key(key[1])
