@@ -8,8 +8,8 @@ signal. The program's own output arrives through `output`.
 
 Panels: `BreakpointsPanel`, `RegistersPanel`, `StackPanel`, `BacktracePanel`, `CodePanel` (gdb's
 disassembly at pc, for code outside the analysed binary too), `VmmapPanel`,
-`MemoryPanel` (a hexdump at an address or expression) and `ConsolePanel` (program output, a line to type the program's input, and a gdb
-command line).
+`MemoryPanel` (a hexdump at an address or expression) and `ConsolePanel` (program output, a
+line to type the program's input, and a gdb command line).
 """
 from __future__ import annotations
 
@@ -691,7 +691,8 @@ class BreakpointsPanel(QTableWidget):
             self.changed.emit(key, None, it.text())
 
     def keyPressEvent(self, e):
-        if e.key() in (Qt.Key.Key_Delete, Qt.Key.Key_Backspace) and self.state() != QAbstractItemView.State.EditingState:
+        editing = self.state() == QAbstractItemView.State.EditingState
+        if e.key() in (Qt.Key.Key_Delete, Qt.Key.Key_Backspace) and not editing:
             for row in sorted({ix.row() for ix in self.selectedIndexes()}, reverse=True):
                 if row < len(self.keys):
                     self.removed.emit(self.keys[row])
@@ -750,5 +751,5 @@ class ConsolePanel(QWidget):
             self.gdb_line.emit(line)
 
 
-__all__ = ["Breakpoint", "BreakpointsPanel", "BacktracePanel", "CodePanel", "ConsolePanel", "DebugController", "MemoryPanel", "RegistersPanel",
-           "Snapshot", "StackPanel", "VmmapPanel", "hexdump", "item_value"]
+__all__ = ["Breakpoint", "BreakpointsPanel", "BacktracePanel", "CodePanel", "ConsolePanel", "DebugController",
+           "MemoryPanel", "RegistersPanel", "Snapshot", "StackPanel", "VmmapPanel", "hexdump", "item_value"]

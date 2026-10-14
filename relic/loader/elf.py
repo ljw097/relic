@@ -31,11 +31,11 @@ def load_elf(path: str, data: bytes) -> Binary:
     b = Binary(path, data)
     b.format = "ELF"
     elf = ELFFile(io.BytesIO(data))
-    arch, bits = MACHINES.get(elf["e_machine"], ("unknown", elf.elfclass))
+    arch = MACHINES.get(elf["e_machine"], ("unknown", elf.elfclass))[0]
     if arch == "mips" and elf.elfclass == 64:
         arch = "mips64"
     if arch == "riscv64" and elf.elfclass == 32:
-        arch, bits = "riscv32", 32
+        arch = "riscv32"
     b.arch, b.bits = arch, elf.elfclass
     b.endian = "little" if elf.little_endian else "big"
     b.entry = elf["e_entry"]
@@ -173,11 +173,11 @@ def _resolve_plt(b: Binary, got_names: dict[int, str]):
             code = b.data[sec.offset:sec.offset + sec.size]
             insns = list(md.disasm(code, sec.addr))
             for i in range(len(insns) - 1):
-                a, l = insns[i], insns[i + 1]
-                if a.mnemonic == "adrp" and l.mnemonic == "ldr":
+                a, ld = insns[i], insns[i + 1]
+                if a.mnemonic == "adrp" and ld.mnemonic == "ldr":
                     try:
                         page = int(a.op_str.split("#")[-1], 16)
-                        off = int(l.op_str.split("#")[-1].rstrip("]!"), 16) if "#" in l.op_str else 0
+                        off = int(ld.op_str.split("#")[-1].rstrip("]!"), 16) if "#" in ld.op_str else 0
                     except ValueError:
                         continue
                     slot = page + off

@@ -9,7 +9,7 @@ def _sizes(*nodes, w=100.0, h=40.0):
 def _overlaps(lay, sizes, gap=0.0):
     for row in lay.order:
         xs = sorted((lay.pos[n][0], lay.pos[n][0] + sizes[n][0]) for n in row)
-        for (a0, a1), (b0, b1) in zip(xs, xs[1:]):
+        for (_a0, a1), (b0, _b1) in zip(xs, xs[1:]):
             if b0 < a1 + gap - 1e-6:
                 return True
     return False

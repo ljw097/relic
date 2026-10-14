@@ -3,7 +3,7 @@ import pytest
 
 from relic.analysis import analyze
 from relic.decompiler import decompile_ir
-from relic.decompiler.ir import Call, CallStmt, Const
+from relic.decompiler.ir import CallStmt, Const
 from relic.decompiler.sigs import arg_count, base_name, count_conversions, lookup
 
 

@@ -15,7 +15,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-from .ir import (Assign, BinOp, CallStmt, Cast, Const, Expr, IRFunction, Ite, Load, Return, StackAddr, StackVar,
+from .ir import (Assign, BinOp, CallStmt, Cast, Const, Expr, IRFunction, Ite, Load, Return, StackVar,
                  Store, UnOp, Var, map_stmt, stmt_exprs, transform, walk)
 
 _INT = {1: "bool", 8: "char", 16: "short", 32: "int", 64: "int64_t", 128: "__int128"}

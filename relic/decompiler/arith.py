@@ -131,7 +131,7 @@ def _recognise(full: Expr, x: Expr) -> Expr | None:
         c0 = round(probe / q)
         cands += [c for c in (c0, c0 - 1, c0 + 1) if 2 <= abs(c) < (1 << (w - 1))]
     for c in cands:
-        for signed, kind in ((True, "sext"), (False, "zext")):
+        for signed in (True, False):
             if c < 0 and not signed:
                 continue
             f = (lambda v, c=c: _sdiv(v, c, w)) if signed else (lambda v, c=c: (v & mask(w)) // c)

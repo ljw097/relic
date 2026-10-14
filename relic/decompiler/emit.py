@@ -19,7 +19,7 @@ from typing import TYPE_CHECKING
 from . import ir
 from .ir import (Assign, BinOp, CallStmt, Cast, Const, Effect, Expr, Extract, Intrinsic, Ite, Load, Reg, Return,
                  StackAddr, StackVar, Store, UnOp, Unknown, Var)
-from .sigs import base_name, lookup
+from .sigs import base_name
 from .structure import Block, If, Jump1, Loop, Ret, Seq, Switch, _negate, case_labels
 from .vartypes import CType, infer_types, int_type
 

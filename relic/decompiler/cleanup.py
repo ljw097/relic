@@ -430,7 +430,7 @@ def inline_single_use(fn: IRFunction) -> bool:
     expression reads (a store, a call, a write to one of its variables) may
     sit between the definition and the use.
     """
-    from .ir import Call, CallStmt as _CS, Effect, Unknown, children, stmt_defs, transform
+    from .ir import Call, CallStmt as _CS, Effect, Unknown, stmt_defs, transform
     changed_any = False
     while True:
         uses: dict[str, int] = {}
@@ -541,7 +541,7 @@ def self_width(an: "Analysis", func: "Function", ret_reg: str, bits: int = 32) -
         if isinstance(s, Assign) and isinstance(s.dst, Var):
             defs[s.dst] = s.src
         elif isinstance(s, CallStmt):
-            for r, v in s.defs:
+            for _r, v in s.defs:
                 if isinstance(v, Var):
                     defs[v] = s
     vals = [s.value for s in fn.stmts() if isinstance(s, Return) and s.value is not None]

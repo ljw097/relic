@@ -7,7 +7,6 @@ pseudocode compiled again, and every function must agree with the
 original source on a grid of inputs. This is what keeps goto reduction
 and other structuring changes honest.
 """
-import itertools
 import os
 import re
 import shutil

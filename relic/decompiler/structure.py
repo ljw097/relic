@@ -334,7 +334,7 @@ class Structurer:
         if self._dup_depth >= 2:
             return None
         stop_set = stops if isinstance(stops, (set, frozenset)) else {stops}
-        region, order, work, total = set(), [], [n], 0
+        region, work, total = set(), [n], 0
         while work:
             a = work.pop()
             if a in region:
@@ -498,7 +498,7 @@ class Structurer:
             follow = self._join(n, t, f, loop, sw, stops)
 
         # bounds check guarding a jump table -> switch with a default
-        for tgt, other, c in ((f, t, cond), (t, f, _negate(cond))):
+        for tgt, other, _c in ((f, t, cond), (t, f, _negate(cond))):
             sb = self.blocks.get(tgt)
             if sb is not None and tgt not in self.emitted and self.pred.get(tgt) == [n] and \
                     len(sb.stmts) == 1 and isinstance(sb.stmts[0], IndirectJump) and sb.stmts[0].targets:

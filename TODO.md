@@ -51,7 +51,7 @@
 - [ ] **P1** 멀티 아키텍처 샘플: `-m32`(완료: vuln32·flow32, CI에 gcc-multilib), `aarch64-linux-gnu-gcc`(완료: vuln_a64·flow_a64), `arm-linux-gnueabihf-gcc`(완료: vuln_arm·vuln_thumb·flow_arm·flow_thumb; CI는 교차 컴파일 job이 샘플을 만들고 본 job이 `-m32`로 재컴파일 검증), `mipsel-linux-gnu-gcc` (툴체인 없으면 skip)
 - [x] case마다 함수를 호출하는 `switch` 샘플(`flow.c`의 `sw_calls`): x86-64/x86-32 × -O0/-O2 모두 점프 테이블 → `switch`, 재컴파일 검증
 - [x] PE 테스트: MinGW x64/x86 샘플로 로더·COFF 심볼·IAT 호출 이름·checksec·vulns·디컴파일 (CI에 mingw 설치, 없으면 skip)
-- [ ] **P2** ruff 린트 / 포맷 설정
+- [x] ruff 린트(`pyproject.toml`, E/F/W/B, CI `lint` job). 포맷터·import 정렬은 기존 줄바꿈 스타일과 맞지 않아 적용하지 않음
 
 ## 분석 정확도
 
