@@ -57,6 +57,17 @@ ARM64 = ArchInfo(
 )
 
 
+_A32_ARGS = ("r0", "r1", "r2", "r3")
+ARM = ArchInfo(
+    "arm-aapcs", 32, "sp", "r0",
+    call_reads=(*_A32_ARGS, "sp"),
+    # r0-r3 and the intra-procedure scratch r12 are caller-saved; a call also overwrites lr
+    call_clobbers=(*_A32_ARGS, "r12", "lr", *FLAGS),
+    syscall_reads=("r7", "r0", "r1", "r2", "r3", "r4", "r5", "r6"),
+    syscall_clobbers=("r0",),
+)
+
+
 def arch_for(binary) -> ArchInfo:
     if binary.arch == "x64":
         return X64_WIN if binary.format == "PE" else X64_SYSV
@@ -64,4 +75,6 @@ def arch_for(binary) -> ArchInfo:
         return X86_CDECL
     if binary.arch == "arm64":
         return ARM64
+    if binary.arch == "arm":
+        return ARM
     raise NotImplementedError(f"no calling convention for {binary.arch} yet")

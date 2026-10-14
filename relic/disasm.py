@@ -3,6 +3,8 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 
+import bisect
+
 import capstone as cs
 
 from .loader.base import Binary
@@ -30,6 +32,8 @@ class Insn:
     regs_write: tuple[str, ...] = ()
     regs_read: tuple[str, ...] = ()
     cs: object = field(default=None, repr=False, compare=False)  # underlying capstone insn (detail available)
+    cond: bool = False  # ARM: executes only when its condition holds
+    thumb: bool = False  # ARM: decoded as Thumb
 
     @property
     def end(self) -> int:
@@ -86,21 +90,74 @@ class Disassembler:
         self.md = capstone_for(binary.arch, binary.endian)
         self.delay_slots = binary.arch in ("mips", "mips64")
         self._cache: dict[int, Insn | None] = {}
+        # ARM / Thumb interworking: the instruction set is a property of the address
+        self.md_thumb = capstone_for("thumb", binary.endian) if binary.arch == "arm" else None
+        self.modes: dict[int, bool] = {a: True for a in getattr(binary, "thumb_code", ())}  # addr -> thumb
+        mapping = getattr(binary, "arm_mapping", {})
+        self._map_addrs = sorted(mapping)
+        self._map_kinds = [mapping[a] for a in self._map_addrs]
+
+    # ------------------------------------------------------------------ modes
+    def is_thumb(self, addr: int) -> bool:
+        """Instruction set at `addr`: control-flow hints first, then the `$a`/`$t` mapping symbols."""
+        if self.md_thumb is None:
+            return False
+        if addr in self.modes:
+            return self.modes[addr]
+        k = bisect.bisect_right(self._map_addrs, addr) - 1
+        return k >= 0 and self._map_kinds[k] == "t"
+
+    def hint(self, addr: int, thumb: bool):
+        """Record the instruction set control flow reaches `addr` in (an odd address is Thumb)."""
+        if self.md_thumb is None:
+            return
+        if addr & 1:
+            addr, thumb = addr & ~1, True
+        if addr not in self.modes and addr not in self._cache:
+            self.modes[addr] = thumb
 
     # ------------------------------------------------------------------ decode
     def decode(self, addr: int) -> Insn | None:
+        if self.md_thumb is not None and addr & 1:
+            self.hint(addr, True)
+            addr &= ~1
         if addr in self._cache:
             return self._cache[addr]
         insn = None
         if self.bin.is_exec(addr) or self.bin.format == "RAW":
+            thumb = self.is_thumb(addr)
+            md = self.md_thumb if thumb else self.md
             code = self.bin.read(addr, 16)
-            for c in self.md.disasm(code, addr, 1):
-                insn = self._convert(c)
+            for c in md.disasm(code, addr, 1):
+                insn = self._convert(c, thumb)
+            if thumb and insn is not None and insn.mnemonic.startswith("it"):
+                return self._it_block(insn)
         self._cache[addr] = insn
         return insn
 
+    def _it_block(self, it: Insn) -> Insn:
+        """Thumb `it`: capstone only applies its conditions within one decode run, so decode the
+        block in one go and cache the conditional instructions with their condition."""
+        n = len(it.mnemonic.split()[0]) - 1          # `it` 1, `itt`/`ite` 2, ...
+        code = self.bin.read(it.addr, 2 + 4 * n)
+        for k, c in enumerate(self.md_thumb.disasm(code, it.addr, n + 1)):
+            i = it if k == 0 else self._convert(c, True)
+            self._cache[c.address] = i
+            self.modes.setdefault(c.address, True)
+        return it
+
     def decode_block(self, addr: int, end: int) -> list[Insn]:
         """Linear sweep from addr to end (stops at undecodable bytes)."""
+        if self.md_thumb is not None:
+            out = []
+            while addr < end:
+                i = self.decode(addr)
+                if i is None:
+                    break
+                out.append(i)
+                self.hint(i.end, i.thumb)
+                addr = i.end
+            return out
         out = []
         code = self.bin.read(addr, end - addr)
         for c in self.md.disasm(code, addr):
@@ -119,11 +176,13 @@ class Disassembler:
                 break
             out.append(i)
             addr = i.end
+            if self.md_thumb is not None and addr not in self._map_addrs:
+                self.hint(addr, i.thumb)       # a linear sweep stays in the same instruction set
         return out
 
     # ------------------------------------------------------------- classify
-    def _convert(self, c) -> Insn:
-        i = Insn(c.address, c.size, c.mnemonic, c.op_str, bytes(c.bytes), cs=c)
+    def _convert(self, c, thumb: bool = False) -> Insn:
+        i = Insn(c.address, c.size, c.mnemonic, c.op_str, bytes(c.bytes), cs=c, thumb=thumb)
         try:
             r, w = c.regs_access()
             i.regs_read = tuple(c.reg_name(x) for x in r)
@@ -176,6 +235,22 @@ class Disassembler:
         m = c.mnemonic
         groups = set(c.groups)
         arch = self.arch
+        if arch in ("arm", "thumb"):
+            cc = getattr(c, "cc", cs.arm.ARM_CC_AL)
+            i.cond = cc not in (cs.arm.ARM_CC_AL, 0)
+            base = m.split(".")[0]
+            if i.cond and len(base) > 2:
+                base = base[:-2]                  # `bxeq` -> `bx`, `popne` -> `pop`
+            ops = c.op_str.replace(" ", "")
+            if (base == "bx" and ops == "lr") or (base in ("pop", "ldm", "ldmia", "ldmfd") and "pc" in ops) or \
+                    (base == "mov" and ops == "pc,lr") or (base == "ldr" and ops.startswith("pc,[sp]")):
+                # a conditional return falls through when its condition fails
+                i.kind = CJMP if i.cond else RET
+                return
+            if (base == "add" and ops.startswith("pc,pc,")) or base in ("tbb", "tbh") or \
+                    (base == "ldr" and ops.startswith("pc,[pc,")) or (base == "mov" and ops.startswith("pc,")):
+                i.kind = JMP                      # switch dispatch / computed jump
+                return
         if cs.CS_GRP_RET in groups or m in ("ret", "c.ret") or \
                 (arch.startswith("ppc") and m == "blr") or \
                 (arch.startswith("mips") and m == "jr" and c.op_str.strip() == "$ra") or \

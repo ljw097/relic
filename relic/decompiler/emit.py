@@ -172,6 +172,10 @@ class CWriter:
             sym = self.symbol(addr.value)
             if sym:
                 return sym
+            # a GOT slot read on its own (kept in a register): the address of the import
+            imp = self.an.bin.imports_by_got.get(addr.value)
+            if imp is not None and imp.name and bits == self.an.bin.bits:
+                return f"&{base_name(imp.name)}"
         if isinstance(addr, Load) and isinstance(addr.addr, Const):
             # through a GOT slot: `*(*(stdout@got))` is the imported object itself
             imp = self.an.bin.imports_by_got.get(addr.addr.value)

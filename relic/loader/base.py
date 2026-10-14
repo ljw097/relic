@@ -86,6 +86,10 @@ class Binary:
         self.interp = ""
         self.info: dict[str, str] = {}
         self._seg_starts: list[int] = []
+        # ARM: where Thumb code starts (odd entry / symbol values) and the `$a`/`$t`/`$d`
+        # mapping symbols (address -> "a" | "t" | "d")
+        self.thumb_code: set[int] = set()
+        self.arm_mapping: dict[int, str] = {}
 
     # ------------------------------------------------------------------ memory
     def _finalize(self):
