@@ -931,3 +931,27 @@ def test_plugin_hooks(app, vuln64, tmp_path, monkeypatch):
     finally:
         w.dirty = False
         w.close()
+
+
+def test_plugin_hooks_analysis_and_listing(app, vuln64, tmp_path, monkeypatch):
+    plugins = tmp_path / "plugins"
+    plugins.mkdir()
+    log = tmp_path / "seen.txt"
+    (plugins / "hooks.py").write_text(
+        "def register(api):\n"
+        f"    api.on_analysis(lambda ns: open({str(log)!r}, 'a').write(ns['an'].bin.path + '\\n'))\n"
+        "    api.add_listing_comment(lambda an, a: 'entry!' if a == an.function_by_name('main').addr else None)\n"
+        "    api.add_listing_comment(lambda an, a: 1 / 0)\n")
+    monkeypatch.setenv("RELIC_PLUGINS", str(plugins))
+    path = tmp_path / "vuln64"
+    shutil.copy(vuln64, path)
+    w = MainWindow()
+    try:
+        w.open_file(str(path))
+        assert w.wait()
+        assert log.read_text().split() == [str(path)]
+        assert "entry!" in w.disasm.toPlainText()          # a failing hook does not stop the others
+        assert "ZeroDivisionError" in w.pyconsole.out.toPlainText()
+    finally:
+        w.dirty = False
+        w.close()

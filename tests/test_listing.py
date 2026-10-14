@@ -17,7 +17,7 @@ def test_arm_literal_pool_resolves_pic_offsets(vuln_arm):
     notes = " | ".join(ln.comment for ln in pool)
     assert '= "name?"' in notes and '= "hello %s (%d)\\n"' in notes
     assert "[__stack_chk_guard@got]" in notes            # a GOT offset, added to the GOT base
-    assert all("<- vuln+" in ln.comment for ln in pool)   # each slot names the load that uses it
+    assert all("literal <- vuln+" in ln.comment for ln in pool)   # each slot names the load that uses it
     s = next(s for s in a.strings if s.value == "name?")
     assert any(ln.target == s.addr for ln in pool)        # double-click follows to the string
     # the pool follows the last instruction and is not decoded as code

@@ -23,11 +23,12 @@ like PATH) and in `~/.relic/plugins`. A plugin defines `register(api)`; the
 all", callback, "Ctrl+Alt+R")`) whose callbacks get the scripting
 namespace. Hooks: `api.add_line_decorator(fn)` -- `fn(an, line)` returns a
 comment and / or a background colour for a listing line (`{"comment": "...",
-"color": "#402020"}`); `api.on_analysis(fn)` -- `fn(ns)` after a binary is
-analysed (and again after a patch re-analyses it); `api.on_cursor(fn)` --
-`fn(ns, addr)` when the cursor moves. Loading errors are collected, not
-raised, and an exception in a hook is reported once in the Python console:
-a broken plugin must not keep the GUI from starting.
+"color": "#402020"}`); `api.add_listing_comment(fn)` -- the simple form,
+`fn(an, addr)` returns text for an instruction's comment; `api.on_analysis(fn)`
+-- `fn(ns)` after a binary is analysed (and again after a patch re-analyses
+it); `api.on_cursor(fn)` -- `fn(ns, addr)` when the cursor moves. Loading
+errors are collected, not raised, and an exception in a hook is reported once
+in the Python console: a broken plugin must not keep the GUI from starting.
 """
 from __future__ import annotations
 
@@ -310,6 +311,11 @@ class PluginAPI:
     def on_cursor(self, fn: Callable[[dict, int], object]):
         """`fn(ns, addr)` whenever the cursor moves to another address."""
         self.win.plugin_hooks["cursor"].append(self._guarded(fn))
+
+    def add_listing_comment(self, fn: Callable[["Analysis", int], str | None]):
+        """`fn(an, addr)` for every listed instruction; text it returns is added to the line's
+        comment (`lambda an, a: "hot" if a in hot else None`) -- add_line_decorator's simple form."""
+        self.add_line_decorator(lambda an, line: fn(an, line.addr) if line.kind == "insn" else None)
 
 
 def load_plugins(win) -> tuple[list[str], list[tuple[str, str]]]:

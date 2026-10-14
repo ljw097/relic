@@ -88,3 +88,21 @@ def test_stripped_binary_finds_main_and_win(request, name):
     kinds = {f.kind for f in a.vulns()}
     assert "win-function" in kinds and "dangerous-call" in kinds
     assert len([f for f in a.functions.values() if not f.is_import]) >= 14
+
+
+def test_listing_shows_literal_pools_and_inline_tables(vuln_arm, flow_thumb_O2):
+    """Data kept among code is listed as data, not left out (or decoded as instructions)."""
+    from relic.listing import function_lines
+    an = analyze(vuln_arm)
+    f = an.function_by_name("main")
+    lines = function_lines(an, f)
+    pool = [ln for ln in lines if ln.mnemonic == ".word"]
+    assert pool and all(ln.addr >= f.addr and "literal" in ln.comment for ln in pool)
+    assert all(not any(b.addr <= ln.addr < b.end for b in f.blocks.values()) for ln in pool)
+    an = analyze(flow_thumb_O2)
+    f = next(g for g in an.functions.values() if any(an.dis.decode(j).mnemonic == "tbb" for j in g.jump_tables))
+    cases = [ln for ln in function_lines(an, f) if ln.mnemonic == ".byte" and ln.target is not None]
+    targets = [t for j, ts in f.jump_tables.items() if an.dis.decode(j).mnemonic == "tbb" for t in ts]
+    assert [ln.target for ln in cases] == targets
+    addrs = [ln.addr for ln in function_lines(an, f) if ln.kind == "insn"]
+    assert addrs == sorted(addrs)

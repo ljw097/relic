@@ -374,7 +374,7 @@ def _word_lines(an: Analysis, f: Function, s: int, e: int, pools: dict) -> list[
                 imp = an.bin.imports_by_got.get((got + v) & 0xFFFFFFFF)
                 if imp is not None:
                     notes.append(f"GOT + {v:#x} = [{imp.name}@got]")
-            notes.append(f"<- {an.location(pools[s][1].addr)}")
+            notes.append(f"literal <- {an.location(pools[s][1].addr)}")
         out.append(Line("data", s, raw=raw, mnemonic=name, operands=operand, comment="; ".join(notes),
                         target=target))
         s += size
