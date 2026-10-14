@@ -23,7 +23,7 @@ from ..progress import checkpoint
 from .arch import ArchInfo
 from .interp import InterpError, apply_binop, apply_cast, apply_unop
 from .ir import (BARRIERS, Assign, BinOp, Branch, Call, CallStmt, Cast, Const, Effect, Expr, Extract, IRFunction,
-                 Ite, Jump, Load, Phi, Return, UnOp, Unknown, Var, mask, stmt_exprs, transform, walk)
+                 Ite, Jump, Load, Phi, Return, UnOp, Unknown, Var, children, mask, stmt_exprs, transform, walk)
 
 MAX_ITERS = 64
 
@@ -52,13 +52,23 @@ def _dead_removable(e: Expr) -> bool:
     return not _has(e, Call)
 
 
+def _add_uses(c: Counter, s, k: int = 1) -> None:
+    """Add `k` to the count of every variable statement `s` reads (an explicit stack: this
+    runs over every statement of every pass round, generator recursion costs too much)."""
+    stack = list(stmt_exprs(s))
+    pop, push = stack.pop, stack.extend
+    while stack:
+        x = pop()
+        if isinstance(x, Var):
+            c[x] += k
+        else:
+            push(children(x))
+
+
 def _count_uses(fn: IRFunction) -> Counter:
     c: Counter = Counter()
     for s in fn.stmts():
-        for top in stmt_exprs(s):
-            for x in walk(top):
-                if isinstance(x, Var):
-                    c[x] += 1
+        _add_uses(c, s)
     return c
 
 
@@ -427,14 +437,17 @@ def _conditions(fn: IRFunction) -> bool:
 # -------------------------------------------------------------- dead-code elimination
 def _dce(fn: IRFunction) -> bool:
     changed = False
+    # counted once: a removed statement takes its reads off the count, which can make the
+    # definitions it read dead in the next round
+    uses = _count_uses(fn)
     while True:
-        uses = _count_uses(fn)
         removed = False
         for b in fn.blocks.values():
             kept = []
             for s in b.stmts:
                 if isinstance(s, Assign) and isinstance(s.dst, Var) \
                         and uses.get(s.dst, 0) == 0 and _dead_removable(s.src):
+                    _add_uses(uses, s, -1)
                     removed = True
                     continue
                 if isinstance(s, (CallStmt, Effect, Unknown)):

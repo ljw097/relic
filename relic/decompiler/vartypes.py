@@ -16,7 +16,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 from .ir import (Assign, BinOp, CallStmt, Cast, Const, Expr, IRFunction, Ite, Load, Return, StackVar,
-                 Store, UnOp, Var, map_stmt, stmt_exprs, transform, walk)
+                 Store, UnOp, Var, children, map_stmt, stmt_exprs, transform, walk)
 
 _INT = {1: "bool", 8: "char", 16: "short", 32: "int", 64: "int64_t", 128: "__int128"}
 _UINT = {1: "bool", 8: "unsigned char", 16: "unsigned short", 32: "unsigned int", 64: "uint64_t",
@@ -56,46 +56,41 @@ def simplify_low(e: Expr) -> Expr:
     return transform(e, node)
 
 
-def _narrow_width(fn: IRFunction, v: Var) -> int | None:
-    """The width every use of `v` agrees on, if all uses only read its low bits."""
-    width = None
-    passthrough = False
+def _narrow_widths(fn: IRFunction, cands: dict[str, Var]) -> dict[str, int]:
+    """For every candidate variable, the width all its uses agree on, when every use only reads
+    its low bits (`low_n(v)`) or hands it on whole (a call argument, `return`). One walk."""
+    width: dict[str, int] = {}
+    bad: set[str] = set()
 
-    def visit(e: Expr, top: bool) -> bool:
-        nonlocal width, passthrough
-        if isinstance(e, Cast) and e.kind == "low" and e.a == v:
-            if width is not None and width != e.bits:
-                return False
-            width = e.bits
-            return True
-        if e == v:
-            if top:
-                passthrough = True      # handed on whole: call argument / return value / copy
-                return True
-            return False
-        return all(visit(k, False) for k in _kids(e))
+    def visit(e: Expr, top: bool):
+        if isinstance(e, Cast) and e.kind == "low" and isinstance(e.a, Var):
+            v = cands.get(e.a.name)
+            if v is not None and e.a == v:
+                if width.setdefault(v.name, e.bits) != e.bits:
+                    bad.add(v.name)
+                return
+        elif isinstance(e, Var):
+            if not top and cands.get(e.name) == e:
+                bad.add(e.name)
+            return
+        for k in children(e):
+            visit(k, False)
 
     for s in fn.stmts():
         if isinstance(s, CallStmt):
-            tops = [(a, True) for a in s.call.args] + [(s.call.target, False)]
+            for a in s.call.args:
+                visit(a, True)
+            visit(s.call.target, False)
         elif isinstance(s, Return):
-            tops = [(s.value, True)] if s.value is not None else []
+            if s.value is not None:
+                visit(s.value, True)
         else:
-            tops = [(x, False) for x in stmt_exprs(s)]
-        for e, top in tops:
-            if not visit(e, top):
-                return None
-    return width
+            for x in stmt_exprs(s):
+                visit(x, False)
+    return {n: w for n, w in width.items() if n not in bad}
 
 
-def _kids(e):
-    from .ir import children
-    return children(e)
-
-
-def narrow(fn: IRFunction, keep: set[str] = frozenset()) -> dict[str, int]:
-    """Narrow wide variables that are only read as their low bits (in place); name -> new width."""
-    done: dict[str, int] = {}
+def _collect_vars(fn: IRFunction) -> dict[str, Var]:
     seen: dict[str, Var] = {}
     for s in fn.stmts():
         for top in stmt_exprs(s):
@@ -105,35 +100,51 @@ def narrow(fn: IRFunction, keep: set[str] = frozenset()) -> dict[str, int]:
         for d in _defs(s):
             if isinstance(d, Var):
                 seen.setdefault(d.name, d)
-    for name, v in seen.items():
-        if name in keep or v.bits <= 8:
-            continue
-        w = _narrow_width(fn, v)
-        if w is None or w >= v.bits:
-            continue
-        nv = Var(v.name, v.version, w)
+    return seen
 
-        def sub(e: Expr, v=v, nv=nv, w=w) -> Expr:
-            def node(x: Expr) -> Expr:
-                if isinstance(x, Cast) and x.kind == "low" and x.a == nv:
-                    return nv if x.bits == w else Cast("low", nv, x.bits)
-                if x == v:
-                    return Cast("zext", nv, v.bits)
-                return x
+
+def narrow(fn: IRFunction, keep: set[str] = frozenset()) -> dict[str, int]:
+    """Narrow wide variables that are only read as their low bits (in place); name -> new width.
+
+    Narrowing one variable can expose another (`v1 = v2 + 1` becomes `v1 = low32(v2) + 1`), so
+    rounds repeat until nothing more narrows."""
+    done: dict[str, int] = {}
+    while True:
+        cands = {n: v for n, v in _collect_vars(fn).items() if n not in keep and n not in done and v.bits > 8}
+        found = {n: w for n, w in _narrow_widths(fn, cands).items() if w < cands[n].bits}
+        if not found:
+            break
+        olds = {cands[n]: Var(n, cands[n].version, w) for n, w in found.items()}
+        news = {nv: v for v, nv in olds.items()}
+
+        def low_first(x: Expr) -> Expr:
+            if isinstance(x, Cast) and x.kind == "low" and x.a in olds:
+                nv = olds[x.a]
+                if x.bits == nv.bits:
+                    return nv
+            return x
+
+        def node(x: Expr) -> Expr:
+            if isinstance(x, Cast) and x.kind == "low" and x.a in news:
+                return x.a if x.bits == x.a.bits else Cast("low", x.a, x.bits)
+            if isinstance(x, Var) and x in olds:
+                return Cast("zext", olds[x], x.bits)
+            return x
+
+        def sub(e: Expr) -> Expr:
             # replace `low_w(v)` first so the zext placeholder does not swallow it
-            e = transform(e, lambda x: nv if isinstance(x, Cast) and x.kind == "low" and x.a == v
-                          and x.bits == w else x)
-            return transform(e, node)
+            return transform(transform(e, low_first), node)
 
         for b in fn.blocks.values():
             for s in b.stmts:
                 map_stmt(s, sub)
-                if isinstance(s, Assign) and s.dst == v:
+                if isinstance(s, Assign) and isinstance(s.dst, Var) and s.dst in olds:
+                    nv = olds[s.dst]
                     s.dst = nv
-                    s.src = simplify_low(Cast("low", s.src, w))
+                    s.src = simplify_low(Cast("low", s.src, nv.bits))
                 elif hasattr(s, "defs") and not isinstance(s, Assign):
-                    s.defs = [(r, nv if d == v else d) for r, d in s.defs]
-        done[name] = w
+                    s.defs = [(r, olds.get(d, d) if isinstance(d, Var) else d) for r, d in s.defs]
+        done.update(found)
     if done:
         for b in fn.blocks.values():
             for s in b.stmts:

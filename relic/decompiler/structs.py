@@ -569,7 +569,12 @@ def caller_struct(an: "Analysis", key: tuple, ptr_bits: int) -> Struct | None:
     f = an.functions.get(root(key)[1])
     if f is None:
         return None
-    return function_structs(an, f.addr, _scan_function(an, f), ptr_bits).get(key)
+    # one build per function (and per name of it: generated struct names include it)
+    cache = an.__dict__.setdefault("_caller_structs", {})
+    ck = (f.addr, an.name(f.addr), ptr_bits)
+    if ck not in cache:
+        cache[ck] = function_structs(an, f.addr, _scan_function(an, f), ptr_bits)
+    return cache[ck].get(key)
 
 
 _CTYPE_BITS = {"char": 8, "signed char": 8, "unsigned char": 8, "bool": 8, "short": 16, "unsigned short": 16,
