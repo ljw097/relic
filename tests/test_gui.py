@@ -747,3 +747,50 @@ def test_debugger_runs_the_patched_image_and_undo(app, win):
     assert win.undo_patch() and not an.patches and an.dis.decode(cj.addr).mnemonic == cj.mnemonic
     assert win.redo_patch() and cj.addr in an.patches
     assert win.undo_patch() and not win.undo_patch()
+
+
+def test_graph_collapse_block_and_loop(app, win):
+    from PySide6.QtCore import QEvent
+    from PySide6.QtGui import QKeyEvent
+    an = win.an
+    f = an.function_by_name("checksum")                    # a loop with an if inside
+    win.goto(f.addr)
+    g = win.graph
+    g.show_function(an, f, f.addr)
+    full = len(g.nodes)
+    body = g.loop_of(next(a for a, b in f.blocks.items() if b.last.kind == "cjmp" and a != f.addr))
+    assert body and len(body) >= 2 and full == len(f.blocks)
+    # one block
+    g.goto(f.addr)
+    assert g.collapse()
+    assert len(g.nodes) == full and "collapsed" in "".join(g.nodes[f.addr].lines)
+    assert g.expand(f.addr) and "collapsed" not in "".join(g.nodes[f.addr].lines)
+    # the loop around a block, with a key
+    inner = next(iter(body - {g._loop_head(body)}))
+    g.goto(inner)
+    g.keyPressEvent(QKeyEvent(QEvent.Type.KeyPress, Qt.Key.Key_L, Qt.KeyboardModifier.NoModifier))
+    head = g._loop_head(body)
+    assert len(g.nodes) == full - len(body) + 1 and g.selected_block() == head
+    assert f"{len(body)} blocks (loop)" in "".join(g.nodes[head].lines)
+    assert not (set(g.graph_layout.pos) & (body - {head}))     # folded blocks have no node of their own
+    assert g.goto(inner) and g.selected_block() == head      # a folded block's address finds its group
+    g.node_activated(g.nodes[head], 0)                          # double-click opens it again
+    assert len(g.nodes) == full
+    g.collapse(inner, loop=True)
+    g.expand_all()
+    assert len(g.nodes) == full
+
+
+def test_graph_bundles_fan_out_and_fan_in(app, flow_O2):
+    from relic.analysis import analyze
+    from relic.gui.views import GraphView
+    an = analyze(flow_O2)
+    g = GraphView()
+    f = an.function_by_name("sw_big")
+    g.show_function(an, f, f.addr)
+    switch = next(a for a, b in f.blocks.items() if len(b.succs) >= 10)
+    join = max(f.blocks, key=lambda a: len(f.blocks[a].preds))
+    assert switch in g.bundled_out and join in g.bundled_in
+    small = an.function_by_name("gcd")
+    g.show_function(an, small, small.addr)
+    assert not g.bundled_out                                # two-way branches are not bundled
