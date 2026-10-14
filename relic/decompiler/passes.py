@@ -90,6 +90,24 @@ def _rewrite(fn: IRFunction, f) -> bool:
     return changed
 
 
+def _fixed(f, memo: dict | None):
+    """`f` (a pure rewrite of one expression) skipping expressions it already left unchanged:
+    `memo` maps id -> expression for those (the expression is kept alive, so its id is not
+    reused). An unchanged result returns the original object, so it stays known next round."""
+    if memo is None:
+        return f
+
+    def g(e: Expr) -> Expr:
+        if memo.get(id(e)) is e:
+            return e
+        r = f(e)
+        if r == e:
+            memo[id(e)] = e
+            return e
+        return r
+    return g
+
+
 def _subst(e: Expr, sub: dict[Var, Expr]) -> Expr:
     if not sub:
         return e
@@ -237,8 +255,8 @@ def _simp_node(e: Expr) -> Expr:
     return e
 
 
-def _fold_pass(fn: IRFunction) -> bool:
-    return _rewrite(fn, lambda e: transform(e, lambda x: _simp_node(_fold_node(x))))
+def _fold_pass(fn: IRFunction, memo: dict | None = None) -> bool:
+    return _rewrite(fn, _fixed(lambda e: transform(e, lambda x: _simp_node(_fold_node(x))), memo))
 
 
 # ----------------------------------------------------- constant / copy propagation
@@ -426,12 +444,12 @@ def bool_ite(e: Expr) -> Expr:
     return e
 
 
-def _conditions(fn: IRFunction) -> bool:
+def _conditions(fn: IRFunction, memo: dict | None = None) -> bool:
     def one(e):
         e = transform(e, _hoist_ite)
         e = transform(e, lambda x: _simp_node(_fold_node(x)))
         return transform(transform(e, _combine_node), _tidy_node)
-    return _rewrite(fn, one)
+    return _rewrite(fn, _fixed(one, memo))
 
 
 # -------------------------------------------------------------- dead-code elimination
@@ -515,13 +533,15 @@ def _sign_fixups(fn: IRFunction) -> bool:
 # ---------------------------------------------------------------------- driver
 def optimize(fn: IRFunction, arch: ArchInfo | None = None) -> IRFunction:
     """Run every pass to a fixpoint. Mutates and returns `fn` (expects SSA input)."""
+    folded: dict = {}
+    conds: dict = {}
     for _ in range(MAX_ITERS):
         checkpoint()                 # a cancelled decompilation stops between rounds
         changed = False
-        changed |= _fold_pass(fn)
+        changed |= _fold_pass(fn, folded)
         changed |= _propagate(fn)
         changed |= _forward_loads(fn)
-        changed |= _conditions(fn)
+        changed |= _conditions(fn, conds)
         changed |= _sign_fixups(fn)
         changed |= _dce(fn)
         if not changed:
