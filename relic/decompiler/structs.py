@@ -511,16 +511,24 @@ def global_struct(an: "Analysis", key: tuple, ptr_bits: int) -> Struct | None:
     return st
 
 
-def function_structs(an: "Analysis", faddr: int, res: dict, ptr_bits: int) -> dict[tuple, Struct]:
+def function_structs(an: "Analysis", faddr: int, res: dict, ptr_bits: int,
+                     only: tuple[tuple, int] | None = None) -> dict[tuple, Struct]:
     """The structs rooted at one function's variables (`s_<func>_<n>`), from its scan `res`. A
     struct this function hands to a callee also has the fields the callee reaches through that
-    parameter. Objects are kept per name across calls (the user may have grown one)."""
+    parameter. Objects are kept per name across calls (the user may have grown one).
+
+    With `only` = (root key, callee), only that callee's accesses through the struct are merged:
+    every callee looked into is prepared, and a callee asking its caller for the struct it is
+    handed needs its own accesses, not all of its siblings' (the shared struct object grows
+    with theirs when they or the caller are decompiled)."""
     uses = {k: v for k, v in res.items() if k not in (("links",), ("passes",))}
     regs = _param_regs(an)
     merged: dict[tuple, _Use] = {}
     for callee, k, passed in res.get(("passes",), ()):
         cf = an.functions.get(callee)
         if root(passed)[0] != "var" or cf is None or cf.is_import or k >= len(regs) or callee == faddr:
+            continue
+        if only is not None and (root(passed) != only[0] or callee != only[1]):
             continue
         croot = ("var", callee, regs[k])
         for ckey, cu in _scan_function(an, cf).items():
@@ -564,16 +572,18 @@ def function_structs(an: "Analysis", faddr: int, res: dict, ptr_bits: int) -> di
     return out
 
 
-def caller_struct(an: "Analysis", key: tuple, ptr_bits: int) -> Struct | None:
-    """The struct of a key rooted at another function's variable (a caller's local struct)."""
+def caller_struct(an: "Analysis", key: tuple, ptr_bits: int, via: int | None = None) -> Struct | None:
+    """The struct of a key rooted at another function's variable (a caller's local struct), as
+    seen by `via`, the callee it is handed to (see function_structs)."""
     f = an.functions.get(root(key)[1])
     if f is None:
         return None
     # one build per function (and per name of it: generated struct names include it)
     cache = an.__dict__.setdefault("_caller_structs", {})
-    ck = (f.addr, an.name(f.addr), ptr_bits)
+    only = (root(key), via) if via is not None else None
+    ck = (f.addr, an.name(f.addr), ptr_bits, only)
     if ck not in cache:
-        cache[ck] = function_structs(an, f.addr, _scan_function(an, f), ptr_bits)
+        cache[ck] = function_structs(an, f.addr, _scan_function(an, f), ptr_bits, only)
     return cache[ck].get(key)
 
 
@@ -733,7 +743,7 @@ class StructView:
             src = param_source(self.an, self.fn.addr, r[2])
             if src is not None:                       # a caller passes its struct here
                 k2 = reroot(key, src)
-                st = caller_struct(self.an, k2, self.ptr_bits) if root(src)[0] == "var" else \
+                st = caller_struct(self.an, k2, self.ptr_bits, self.fn.addr) if root(src)[0] == "var" else \
                     global_struct(self.an, k2, self.ptr_bits)
                 if st is not None:
                     return st
