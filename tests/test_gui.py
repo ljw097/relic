@@ -9,6 +9,7 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 os.environ["RELIC_SETTINGS"] = os.path.join(__import__("tempfile").mkdtemp(), "relic-test.ini")
 pytest.importorskip("PySide6.QtWidgets", exc_type=ImportError)  # also missing libEGL etc.
 
+from PySide6.QtCore import Qt  # noqa: E402
 from PySide6.QtWidgets import QApplication  # noqa: E402
 
 from relic.gui.main_window import MainWindow  # noqa: E402
@@ -437,6 +438,8 @@ def test_debugger_panels_breakpoints_and_console(app, win):
     win.debug_start_or_continue()                       # F9: continue to the breakpoint
     assert _debug_wait(app, win, lambda: win.disasm.debug_pc == vuln)
     assert win.cur == vuln
+    assert win.dbg_bps.rowCount() == 1 and win.dbg_bps.item(0, 2).text() == "vuln"
+    assert win.dbg_bps.item(0, 4).text() == "1"
     assert win.dbg_regs.rowCount() >= 16 and win.dbg_regs.item(0, 0).text() == "rax"
     assert win.dbg_stack.rowCount() == 16 and "main+" in win.dbg_stack.item(0, 2).text()
     assert win.dbg_bt.item(0, 2).text() == "vuln"
@@ -469,3 +472,9 @@ def test_debugger_panels_breakpoints_and_console(app, win):
     assert "hello relic" in text and "gdb> info registers rip" in text and "exited" in text
     win.dbg.stop()
     assert _debug_wait(app, win, lambda: win.dbg.session is None)
+    # breakpoints panel: disable and add a condition (kept for the next run)
+    win.dbg_bps.item(0, 0).setCheckState(Qt.CheckState.Unchecked)
+    win.dbg_bps.item(0, 3).setText("$rdi == 1")
+    bp = win.dbg.static_bps[vuln]
+    assert not bp.enabled and bp.condition == "$rdi == 1"
+    assert vuln not in win.disasm.debug_bps

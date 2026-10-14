@@ -13,7 +13,7 @@ from PySide6.QtWidgets import (QAbstractItemView, QApplication, QDockWidget, QFi
 from ..analysis import Analysis
 from ..analysis.strings import escape
 from ..progress import Cancelled, Progress
-from .debugger import (BacktracePanel, CodePanel, ConsolePanel, DebugController, MemoryPanel, RegistersPanel,
+from .debugger import (BacktracePanel, BreakpointsPanel, CodePanel, ConsolePanel, DebugController, MemoryPanel, RegistersPanel,
                        StackPanel, VmmapPanel, item_value)
 from .views import (DEFAULT_FONT_SIZE, THEME, DisasmView, GraphView, HexView, PseudocodeView, current_theme,
                     font_size, mono_font, set_font_size, set_theme)
@@ -273,11 +273,13 @@ class MainWindow(QMainWindow):
         self.dbg_console = ConsolePanel()
         self.dbg_mem = MemoryPanel()
         self.dbg_vmmap = VmmapPanel()
+        self.dbg_bps = BreakpointsPanel()
         right, bottom = Qt.DockWidgetArea.RightDockWidgetArea, Qt.DockWidgetArea.BottomDockWidgetArea
         self.dbg_docks = [self._dock("Registers", self.dbg_regs, right), self._dock("Stack", self.dbg_stack, right),
                           self._dock("Console", self.dbg_console, bottom), self._dock("Code", self.dbg_code, bottom),
                           self._dock("Backtrace", self.dbg_bt, bottom), self._dock("Memory", self.dbg_mem, bottom),
-                          self._dock("Vmmap", self.dbg_vmmap, bottom)]
+                          self._dock("Vmmap", self.dbg_vmmap, bottom),
+                          self._dock("Breakpoints", self.dbg_bps, bottom)]
         # registers, then the stack, below the xrefs / search tabs; console, code and backtrace
         # with the bottom tabs (strings, imports, ...)
         self.splitDockWidget(self.xrefs_dock, self.dbg_docks[0], Qt.Orientation.Vertical)
@@ -295,6 +297,8 @@ class MainWindow(QMainWindow):
         self.dbg_bt.cellDoubleClicked.connect(self._debug_frame_clicked)
         self.dbg.memory.connect(self.dbg_mem.show_memory)
         self.dbg_mem.goto_expr.connect(self.dbg.view_memory)
+        self.dbg_bps.changed.connect(self._debug_breakpoint_edited)
+        self.dbg_bps.cellDoubleClicked.connect(self._debug_breakpoint_clicked)
         for t in (self.dbg_regs, self.dbg_stack, self.dbg_vmmap):
             t.cellDoubleClicked.connect(lambda r, c, t=t: self._debug_follow(t, r, c))
 
@@ -810,8 +814,24 @@ class MainWindow(QMainWindow):
         if self.cur is None:
             return
         on = self.dbg.toggle_breakpoint(self.cur)
-        self.disasm.set_debug_marks(self.dbg.last.pc_static, self.dbg.static_bps)
+        self._debug_breakpoints_changed()
         self.statusBar().showMessage(f"breakpoint {'set' if on else 'cleared'} at {self.an.location(self.cur)}", 3000)
+
+    def _debug_breakpoints_changed(self):
+        self.disasm.set_debug_marks(self.dbg.last.pc_static,
+                                    [a for a, b in self.dbg.static_bps.items() if b.enabled])
+        self.dbg_bps.an = self.an
+        self.dbg_bps.show_breakpoints(sorted(self.dbg.static_bps.values(), key=lambda b: b.addr))
+
+    def _debug_breakpoint_edited(self, addr: int, enabled, condition):
+        self.dbg.set_breakpoint(addr, enabled, condition)
+        self._debug_breakpoints_changed()
+
+    def _debug_breakpoint_clicked(self, row: int, col: int):
+        if col in (1, 2):
+            a = item_value(self.dbg_bps.item(row, 1))
+            if a is not None:
+                self.goto(a)
 
     def debug_run_to_cursor(self):
         if self.cur is not None:
@@ -828,16 +848,17 @@ class MainWindow(QMainWindow):
                 self.statusBar().showMessage(f"arguments: {e}", 4000)
 
     def _debug_state(self, snap):
-        for panel in (self.dbg_regs, self.dbg_stack, self.dbg_bt, self.dbg_code, self.dbg_vmmap):
+        self.dbg_bps.an = self.an
+        for panel in (self.dbg_regs, self.dbg_stack, self.dbg_bt, self.dbg_code, self.dbg_vmmap, self.dbg_bps):
             panel.show_snapshot(snap)
         if snap.exited:
-            self.disasm.set_debug_marks(None, self.dbg.static_bps)
+            self.disasm.set_debug_marks(None, [a for a, b in self.dbg.static_bps.items() if b.enabled])
             self.dbg_console.append(f"[ {snap.exited} ]\n")
             self.statusBar().showMessage(f"program {snap.exited}", 5000)
             return
         if snap.pc_static is not None:
             self.goto(snap.pc_static, record=False)
-        self.disasm.set_debug_marks(snap.pc_static, self.dbg.static_bps)
+        self.disasm.set_debug_marks(snap.pc_static, [a for a, b in self.dbg.static_bps.items() if b.enabled])
         where = self.an.location(snap.pc_static) if snap.pc_static is not None else f"{snap.pc:#x}"
         self.statusBar().showMessage(f"stopped at {where}" + (f" ({snap.reason})" if snap.reason else ""), 5000)
 

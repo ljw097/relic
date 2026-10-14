@@ -31,6 +31,10 @@ _PC = {"i386:x86-64": "rip", "i386": "eip", "aarch64": "pc", "arm": "pc"}
 _SP = {"i386:x86-64": "rsp", "i386": "esp", "aarch64": "sp", "arm": "sp"}
 
 
+def _mi_quote(text: str) -> str:
+    return text.replace("\\", "\\\\").replace('"', '\\"')
+
+
 @dataclass
 class Mapping:
     start: int
@@ -225,11 +229,40 @@ class Session:
                     pass
 
     # ----------------------------------------------------------- breakpoints
-    def add_breakpoint(self, live_addr: int) -> int:
-        r = self.mi.command(f"-break-insert *{live_addr:#x}")
+    def add_breakpoint(self, live_addr: int, condition: str = "", enabled: bool = True) -> int:
+        cond = f'-c "{_mi_quote(condition)}" ' if condition else ""
+        off = "-d " if not enabled else ""
+        r = self.mi.command(f"-break-insert {off}{cond}*{live_addr:#x}")
         n = int(r.results["bkpt"]["number"])
         self.breakpoints[live_addr] = n
         return n
+
+    def set_breakpoint_enabled(self, live_addr: int, enabled: bool):
+        n = self.breakpoints.get(live_addr)
+        if n is not None:
+            self.mi.command(f"-break-{'enable' if enabled else 'disable'} {n}")
+
+    def set_breakpoint_condition(self, live_addr: int, condition: str):
+        """Stop only when the gdb expression is true (`$rdi == 5`); empty: always."""
+        n = self.breakpoints.get(live_addr)
+        if n is not None:
+            self.mi.command(f"-break-condition {n} {condition}".rstrip())
+
+    def breakpoint_hits(self) -> dict[int, int]:
+        """live address -> how many times the breakpoint was hit."""
+        try:
+            r = self.mi.command("-break-list")
+        except MIError:
+            return {}
+        table = r.results.get("BreakpointTable", {})
+        by_number = {}
+        for row in table.get("body", []):
+            b = row.get("bkpt", row) if isinstance(row, dict) else {}
+            try:
+                by_number[int(b["number"])] = int(b.get("times", "0"))
+            except (KeyError, ValueError):
+                continue
+        return {a: by_number.get(n, 0) for a, n in self.breakpoints.items()}
 
     def remove_breakpoint(self, live_addr: int):
         n = self.breakpoints.pop(live_addr, None)

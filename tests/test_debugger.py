@@ -96,6 +96,28 @@ def test_breakpoint_toggle_and_raw_command(vuln64):
     assert not os.path.exists(f"/proc/{s.mi.proc.pid}/status") or s.mi.proc.poll() is not None
 
 
+
+@needs_gdb
+def test_breakpoint_condition_enable_hits(vuln64):
+    from relic.debugger import Session
+    an = analyze(vuln64)
+    s = Session(vuln64, args=["5"], analysis=an)
+    try:
+        s.start("entry")
+        vuln = s.to_live(an.function_by_name("vuln").addr)
+        classify = s.to_live(an.function_by_name("classify").addr)
+        s.add_breakpoint(vuln, enabled=False)
+        s.add_breakpoint(classify, condition="$rdi == 4")
+        s.set_breakpoint_condition(classify, "$rdi == 5")         # classify(atoi("5"))
+        s.send_input("x\n")
+        st = s.cont(timeout=20)
+        assert st.get("reason") == "breakpoint-hit" and s.pc == classify
+        assert s.breakpoint_hits() == {vuln: 0, classify: 1}
+        s.set_breakpoint_enabled(vuln, True)
+        assert s.cont(timeout=20).get("reason", "").startswith("exited")
+    finally:
+        s.close()
+
 def test_hexdump():
     from relic.gui.debugger import hexdump
     out = hexdump(0x1000, b"hello, world!\x00\x01\xff" + b"A" * 4)

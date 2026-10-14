@@ -6,7 +6,7 @@ pwndbg's `context` prints: registers (changed ones marked), the code at pc,
 the stack as a telescope, the backtrace -- and hands it to the GUI through a
 signal. The program's own output arrives through `output`.
 
-Panels: `RegistersPanel`, `StackPanel`, `BacktracePanel`, `CodePanel` (gdb's
+Panels: `BreakpointsPanel`, `RegistersPanel`, `StackPanel`, `BacktracePanel`, `CodePanel` (gdb's
 disassembly at pc, for code outside the analysed binary too), `VmmapPanel`,
 `MemoryPanel` (a hexdump at an address or expression) and `ConsolePanel` (program output, a line to type the program's input, and a gdb
 command line).
@@ -30,6 +30,15 @@ _KIND_COLOR = {"stack": "call", "heap": "mnem", "code": "jump", "data": "ret", "
 
 
 @dataclass
+class Breakpoint:
+    """A breakpoint at an address of the analysed binary (kept across runs)."""
+    addr: int                      # static
+    enabled: bool = True
+    condition: str = ""
+    hits: int = 0
+
+
+@dataclass
 class Snapshot:
     running: bool = False
     exited: str = ""                     # "exited normally" / "exited with code N" / "killed"
@@ -40,7 +49,7 @@ class Snapshot:
     stack: list = field(default_factory=list)       # TeleRow
     frames: list = field(default_factory=list)      # (level, addr, symbol)
     code: list = field(default_factory=list)        # (addr, text, symbol)
-    breakpoints: list = field(default_factory=list)  # static addresses
+    breakpoints: list = field(default_factory=list)  # Breakpoint
     maps: list = field(default_factory=list)        # Mapping
     word: int = 8
 
@@ -60,7 +69,7 @@ class DebugController(QObject):
         self.an = None
         self.path = ""
         self.args: list[str] = []
-        self.static_bps: set[int] = set()
+        self.static_bps: dict[int, Breakpoint] = {}
         self.mem_addr: int | None = None   # the memory view's address (None: follow the stack pointer)
         self.last = Snapshot()
         self._jobs: queue.Queue = queue.Queue()
@@ -121,8 +130,9 @@ class DebugController(QObject):
             self.session = Session(path, self.args, analysis, on_output=self.output.emit)
             self.mem_addr = None
             self.session.start(stop_at)
-            for a in sorted(self.static_bps):
-                self.session.add_breakpoint(self.session.to_live(a))
+            for bp in sorted(self.static_bps.values(), key=lambda b: b.addr):
+                bp.hits = 0
+                self.session.add_breakpoint(self.session.to_live(bp.addr), bp.condition, bp.enabled)
         self._submit(go)
 
     def _close(self):
@@ -173,7 +183,10 @@ class DebugController(QObject):
     def toggle_breakpoint(self, static_addr: int) -> bool:
         """Set or clear a breakpoint at an address of the analysed binary (before or while running)."""
         on = static_addr not in self.static_bps
-        (self.static_bps.add if on else self.static_bps.discard)(static_addr)
+        if on:
+            self.static_bps[static_addr] = Breakpoint(static_addr)
+        else:
+            del self.static_bps[static_addr]
 
         def go():
             if self.session is not None and self.session.regs:
@@ -184,6 +197,26 @@ class DebugController(QObject):
                     self.session.remove_breakpoint(live)
         self._submit(go, snapshot=False)
         return on
+
+    def set_breakpoint(self, static_addr: int, enabled: bool | None = None, condition: str | None = None):
+        """Enable / disable a breakpoint or change its condition (`$rdi == 5`)."""
+        bp = self.static_bps.get(static_addr)
+        if bp is None:
+            return
+        if enabled is not None:
+            bp.enabled = enabled
+        if condition is not None:
+            bp.condition = condition.strip()
+
+        def go():
+            s = self.session
+            if s is not None and s.regs:
+                live = s.to_live(static_addr)
+                if enabled is not None:
+                    s.set_breakpoint_enabled(live, enabled)
+                if condition is not None:
+                    s.set_breakpoint_condition(live, bp.condition)
+        self._submit(go, snapshot=False)
 
     def send_input(self, text: str):
         if self.session is not None:
@@ -226,7 +259,12 @@ class DebugController(QObject):
     # -------------------------------------------------------- snapshot
     def _snapshot(self) -> Snapshot:
         s = self.session
-        snap = Snapshot(breakpoints=sorted(self.static_bps))
+        if s is not None and s.regs:
+            hits = s.breakpoint_hits()
+            for bp in self.static_bps.values():
+                bp.hits = hits.get(s.to_live(bp.addr), bp.hits)
+        snap = Snapshot(breakpoints=[Breakpoint(b.addr, b.enabled, b.condition, b.hits)
+                                     for b in sorted(self.static_bps.values(), key=lambda b: b.addr)])
         if s is None:
             snap.exited = "not running"
             return snap
@@ -422,6 +460,54 @@ class MemoryPanel(QWidget):
         self.text.setPlainText(hexdump(addr, data))
 
 
+class BreakpointsPanel(QTableWidget):
+    """Breakpoints: a check box to enable each, its location, a condition to edit, the hit count."""
+
+    changed = Signal(int, object, object)    # static address, enabled or None, condition or None
+
+    def __init__(self, analysis=None, parent=None):
+        super().__init__(parent)
+        _setup(self, ["On", "Address", "Location", "Condition", "Hits"])
+        self.setEditTriggers(QAbstractItemView.EditTrigger.DoubleClicked | QAbstractItemView.EditTrigger.EditKeyPressed)
+        self.an = analysis
+        self._filling = False
+        self.itemChanged.connect(self._edited)
+
+    def show_breakpoints(self, bps: list):
+        self._filling = True
+        try:
+            self.setRowCount(len(bps))
+            for k, b in enumerate(bps):
+                on = QTableWidgetItem()
+                on.setFlags(Qt.ItemFlag.ItemIsUserCheckable | Qt.ItemFlag.ItemIsEnabled)
+                on.setCheckState(Qt.CheckState.Checked if b.enabled else Qt.CheckState.Unchecked)
+                on.setData(Qt.ItemDataRole.UserRole, str(b.addr))
+                self.setItem(k, 0, on)
+                self.setItem(k, 1, _item(f"{b.addr:#x}", THEME["addr"], b.addr))
+                self.setItem(k, 2, _item(self.an.location(b.addr) if self.an is not None else "", THEME["func"],
+                                         b.addr))
+                cond = _item(b.condition, None, b.addr)
+                cond.setFlags(cond.flags() | Qt.ItemFlag.ItemIsEditable)
+                self.setItem(k, 3, cond)
+                self.setItem(k, 4, _item(str(b.hits), None, b.addr))
+        finally:
+            self._filling = False
+
+    def show_snapshot(self, snap: Snapshot):
+        self.show_breakpoints(snap.breakpoints)
+
+    def _edited(self, it: QTableWidgetItem):
+        if self._filling:
+            return
+        a = item_value(it)
+        if a is None:
+            return
+        if it.column() == 0:
+            self.changed.emit(a, it.checkState() == Qt.CheckState.Checked, None)
+        elif it.column() == 3:
+            self.changed.emit(a, None, it.text())
+
+
 class ConsolePanel(QWidget):
     """Program output, the program's stdin, and a gdb command line."""
 
@@ -473,5 +559,5 @@ class ConsolePanel(QWidget):
             self.gdb_line.emit(line)
 
 
-__all__ = ["BacktracePanel", "CodePanel", "ConsolePanel", "DebugController", "MemoryPanel", "RegistersPanel",
+__all__ = ["Breakpoint", "BreakpointsPanel", "BacktracePanel", "CodePanel", "ConsolePanel", "DebugController", "MemoryPanel", "RegistersPanel",
            "Snapshot", "StackPanel", "VmmapPanel", "hexdump", "item_value"]
