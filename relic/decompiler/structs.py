@@ -572,6 +572,92 @@ def caller_struct(an: "Analysis", key: tuple, ptr_bits: int) -> Struct | None:
     return function_structs(an, f.addr, _scan_function(an, f), ptr_bits).get(key)
 
 
+_CTYPE_BITS = {"char": 8, "signed char": 8, "unsigned char": 8, "bool": 8, "short": 16, "unsigned short": 16,
+               "int": 32, "unsigned int": 32, "unsigned": 32, "float": 32, "int8_t": 8, "uint8_t": 8,
+               "int16_t": 16, "uint16_t": 16, "int32_t": 32, "uint32_t": 32, "int64_t": 64, "uint64_t": 64,
+               "long long": 64, "unsigned long long": 64, "double": 64, "__int128": 128,
+               "unsigned __int128": 128}
+
+
+def field_layout(ctype: str, ptr_bits: int) -> tuple[str, int, int | None]:
+    """`int`, `char *`, `char[16]` -> (element C type, element bits, array length or None)."""
+    from .vartypes import parse_ctype
+    t = ctype.strip()
+    count = None
+    if t.endswith("]") and "[" in t:
+        t, n = t[:-1].split("[", 1)
+        t = t.strip()
+        try:
+            count = int(n, 0)
+        except ValueError:
+            raise ValueError(f"bad array length in {ctype!r}") from None
+        if count <= 0:
+            raise ValueError("array length must be positive")
+    ct = parse_ctype(t)
+    if ct.ptr:
+        return str(ct), ptr_bits, count
+    bits = _CTYPE_BITS.get(ct.base, 64 if ct.base in ("long", "unsigned long", "size_t", "ssize_t") else 0)
+    if not bits:
+        raise ValueError(f"{t!r} has no known size (a pointer to it has)")
+    return str(ct), bits, count
+
+
+def apply_edits(an: "Analysis", st: Struct, ptr_bits: int) -> Struct:
+    """The user's added / removed fields (struct editor) on `st`, in place."""
+    d = an.struct_names.get(st.name, {})
+    for off in d.get("removed", ()):
+        st.fields.pop(int(off, 16), None)
+    for off, (ctype, _name) in d.get("added", {}).items():
+        o = int(off, 16)
+        try:
+            t, bits, count = field_layout(ctype, ptr_bits)
+        except ValueError:
+            continue
+        cur = st.fields.get(o)
+        if cur is not None and cur.bits == bits and cur.array == (count is not None) and cur.count == count:
+            continue
+        for k in [k for k, f in st.fields.items() if k != o and o <= k < o + bits // 8 * (count or 1)]:
+            del st.fields[k]
+        st.fields[o] = Field(o, bits, "" if t == int_type(bits) else t, f"f_{o:x}",
+                             array=count is not None, count=count)
+    return st
+
+
+def find_struct(an: "Analysis", name: str, extra=()) -> Struct | None:
+    """A struct by the name shown (a user's rename) or its generated name; one the user named
+    but that this session has not recovered yet comes from the layout saved in the project."""
+    gen = next((g for g, d in an.struct_names.items() if d.get("name") == name), name)
+    for st in list(extra) + list(an.__dict__.get("_structs", {}).values()) + \
+            list(an.__dict__.get("_local_structs", {}).values()):
+        if st is not None and st.name == gen:
+            return st
+    layout = an.struct_names.get(gen, {}).get("layout")
+    if not layout:
+        return None
+    st = Struct(gen, ("saved", gen))
+    for off, entry in layout.items():
+        o = int(off, 16)
+        st.fields[o] = Field(o, entry[0], entry[1], f"f_{o:x}")
+        if len(entry) > 2:                         # an array: its length (-1: flexible)
+            st.fields[o].array, st.fields[o].count = True, (entry[2] if entry[2] >= 0 else None)
+    an.__dict__.setdefault("_local_structs", {})[gen] = st
+    return st
+
+
+def known_structs(an: "Analysis", ptr_bits: int) -> list[Struct]:
+    """Every struct recovered so far in this session, and those the project remembers."""
+    out: dict[str, Struct] = {}
+    for st in list(an.__dict__.get("_structs", {}).values()) + list(an.__dict__.get("_local_structs", {}).values()):
+        if st is not None:
+            out.setdefault(st.name, st)
+    for gen, d in an.struct_names.items():
+        if gen not in out and d.get("layout"):
+            st = find_struct(an, gen)
+            if st is not None:
+                out[gen] = st
+    return [apply_edits(an, st, ptr_bits) for _, st in sorted(out.items())]
+
+
 class StructView:
     """The structs one function's pseudocode uses, and how to print accesses through them."""
 
@@ -610,24 +696,9 @@ class StructView:
                     f.child = st if target == key else self._struct_for_key(target)
 
     def find(self, name: str) -> Struct | None:
-        """A struct by the name shown (a user's rename) or its generated name; one the user named
-        but that this session has not recovered yet comes from the layout saved in the project."""
-        gen = next((g for g, d in self.an.struct_names.items() if d.get("name") == name), name)
-        for st in list(self.local.values()) + list(self.an.__dict__.get("_structs", {}).values()) + \
-                list(self.an.__dict__.get("_local_structs", {}).values()):
-            if st is not None and st.name == gen:
-                return st
-        layout = self.an.struct_names.get(gen, {}).get("layout")
-        if not layout:
-            return None
-        st = Struct(gen, ("saved", gen))
-        for off, entry in layout.items():
-            o = int(off, 16)
-            st.fields[o] = Field(o, entry[0], entry[1], f"f_{o:x}")
-            if len(entry) > 2:                         # an array: its length (-1: flexible)
-                st.fields[o].array, st.fields[o].count = True, (entry[2] if entry[2] >= 0 else None)
-        self.an.__dict__.setdefault("_local_structs", {})[gen] = st
-        return st
+        """A struct by the name shown (a user's rename) or its generated name (see find_struct)."""
+        st = find_struct(self.an, name, self.local.values())
+        return apply_edits(self.an, st, self.ptr_bits) if st is not None else None
 
     def _extended(self, st: Struct, key: tuple) -> Struct:
         """`st` grown with the fields this function reaches through `key` (in place: every
@@ -699,6 +770,7 @@ class StructView:
             return None
         st = self._struct_for_key(key)
         if st is not None:
+            apply_edits(self.an, st, self.ptr_bits)
             self._use(st)
         return st
 

@@ -429,6 +429,7 @@ class MainWindow(QMainWindow):
         self.plugins_menu = mb.addMenu("&Plugins")
         m = mb.addMenu("&View")
         act(m, "&Python console", "Ctrl+Shift+P", self.show_python_console, False)
+        act(m, "&Structures...", "Ctrl+Shift+S", self.show_structs)
         self.light_act = act(m, "&Light theme", "Ctrl+Shift+L",
                              lambda on: self.set_appearance(theme="light" if on else "dark"), False)
         self.light_act.setCheckable(True)
@@ -1248,6 +1249,17 @@ class MainWindow(QMainWindow):
             self.graph.goto(keep)
 
     # ------------------------------------------------------------- scripting
+    def show_structs(self):
+        """The structures window (one per main window, refreshed when shown)."""
+        from .structs import StructsDialog
+        if getattr(self, "structs_dialog", None) is None:
+            self.structs_dialog = StructsDialog(self)
+        else:
+            self.structs_dialog.refresh()
+        self.structs_dialog.show()
+        self.structs_dialog.raise_()
+        return self.structs_dialog
+
     def show_python_console(self):
         d = self.findChild(QDockWidget, "Python")
         d.show()

@@ -362,9 +362,28 @@ class Analysis:
             types.pop(generated, None)
         self._tidy_struct_names(struct)
 
+    def add_field(self, struct: str, offset: int, ctype: str, name: str = ""):
+        """Add (or replace) a field of a recovered struct by hand: `int`, `char *`, `char[16]`."""
+        from ..decompiler.structs import field_layout
+        field_layout(ctype, self.bin.bits)                       # ValueError for what is not a type
+        d = self.struct_names.setdefault(struct, {})
+        d.setdefault("added", {})[f"{offset:#x}"] = [ctype.strip(), name.strip()]
+        d["removed"] = [o for o in d.get("removed", []) if o != f"{offset:#x}"]
+        if name.strip():
+            self.rename_field(struct, f"f_{offset:x}", name)
+        self._tidy_struct_names(struct)
+
+    def remove_field(self, struct: str, offset: int):
+        """Drop a field of a recovered struct (it is shown as a plain memory access again)."""
+        d = self.struct_names.setdefault(struct, {})
+        d.get("added", {}).pop(f"{offset:#x}", None)
+        if f"{offset:#x}" not in d.setdefault("removed", []):
+            d["removed"].append(f"{offset:#x}")
+        self._tidy_struct_names(struct)
+
     def _tidy_struct_names(self, struct: str):
         d = self.struct_names.get(struct, {})
-        for k in ("fields", "types"):
+        for k in ("fields", "types", "added", "removed"):
             if not d.get(k):
                 d.pop(k, None)
         if set(d) <= {"layout"}:                 # nothing the user set: no entry

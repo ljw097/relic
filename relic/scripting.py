@@ -109,6 +109,18 @@ class Api:
         if self.win is not None:
             self.win._after_edit()
 
+    def add_field(self, struct: str, offset: int, ctype: str, name: str = ""):
+        """Add a field by hand to a recovered struct (`char[16]`, `int`, `char *`)."""
+        self.an.add_field(struct, offset, ctype, name)
+        if self.win is not None:
+            self.win._after_edit()
+
+    def remove_field(self, struct: str, offset: int):
+        """Drop a field of a recovered struct."""
+        self.an.remove_field(struct, offset)
+        if self.win is not None:
+            self.win._after_edit()
+
     def comment(self, where, text: str):
         a = self.addr(where)
         if self.win is not None:
@@ -197,7 +209,7 @@ def namespace(an: "Analysis", win=None) -> dict:
     api = Api(an, win)
     ns = {"an": an, "bin": an.bin, "api": api, "win": win}
     for n in ("addr", "here", "goto", "name", "rename", "rename_struct", "rename_field", "set_type",
-              "set_field_type", "comment", "func",
+              "set_field_type", "add_field", "remove_field", "comment", "func",
               "functions", "xrefs_to", "xrefs_from",
               "disasm", "decompile", "strings", "search", "patch", "nop", "invert", "assemble", "revert", "save"):
         ns[n] = getattr(api, n)

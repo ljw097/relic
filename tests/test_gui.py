@@ -688,3 +688,35 @@ def test_pseudocode_set_type(app, win, monkeypatch):
     win.set_type_dialog()
     assert win.decomp.wait_idle() and "    void *f_0;" in win.decomp.toPlainText()
     assert not win.set_var_type("a1", "not a type!")
+
+
+def test_structures_window(app, win, monkeypatch):
+    from PySide6.QtWidgets import QInputDialog
+    win.goto(win.an.function_by_name("add_note").addr)
+    win.toggle_decompile()
+    assert win.decomp.wait_idle()
+    dlg = win.show_structs()
+    assert [dlg.list.item(k).text() for k in range(dlg.list.count())] == ["s_notes  (12 bytes)"]
+    assert [dlg.table.item(r, 0).text() for r in range(dlg.table.rowCount())] == ["0x0", "0x8"]
+    assert dlg.table.item(0, 2).text() == "char *" and "struct s_notes {" in dlg.decl.text()
+    dlg.table.item(1, 1).setText("size")                      # rename a field in place
+    assert win.decomp.wait_idle() and "->size = " in win.decomp.toPlainText()
+    dlg.table.item(1, 2).setText("unsigned int")              # retype it
+    assert win.decomp.wait_idle() and "    unsigned int size;" in win.decomp.toPlainText()
+    monkeypatch.setattr(QInputDialog, "getText", lambda *a, **k: ("0x10 char[8] tag", True))
+    dlg.add_field()
+    assert dlg.table.rowCount() == 3 and dlg.table.item(2, 1).text() == "tag"
+    assert dlg.table.item(2, 2).text() == "char[8]"
+    assert win.decomp.wait_idle() and "    char tag[8];" in win.decomp.toPlainText()
+    dlg.table.selectRow(0)
+    dlg.remove_field()
+    assert win.decomp.wait_idle() and "*(int64_t *)notes[" in win.decomp.toPlainText()
+    monkeypatch.setattr(QInputDialog, "getText", lambda *a, **k: ("note", True))
+    dlg.rename_struct()
+    assert dlg.list.item(0).text().startswith("note ") and win.decomp.wait_idle()
+    assert "struct note {" in win.decomp.toPlainText()
+    win.save_project()
+    import json
+    saved = json.load(open(win.an.project_path))["structs"]["s_notes"]
+    assert saved["removed"] == ["0x0"] and saved["added"] == {"0x10": ["char[8]", "tag"]}
+    dlg.close()

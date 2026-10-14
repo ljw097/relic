@@ -248,3 +248,23 @@ def test_array_fields(request, variant):
     assert "    char f_28[];" in text and re.search(r"->f_28\[\w+ & 15\]", text), text
     if variant.endswith("O0"):                  # (-O2 walks a pointer through vals instead)
         assert re.search(r"->f_8\[var_\w+\]", _c(an, "list_sum"))
+
+
+def test_hand_edited_fields_persist(vuln64, tmp_path):
+    path = tmp_path / "v"
+    shutil.copy(vuln64, path)
+    an = analyze(str(path))
+    _c(an, "add_note")
+    an.add_field("s_notes", 0x10, "char[8]", "tag")
+    an.add_field("s_notes", 0xc, "unsigned int")
+    an.remove_field("s_notes", 0)
+    with pytest.raises(ValueError):
+        an.add_field("s_notes", 0x20, "struct nope")          # no size known
+    text = _c(an, "add_note")
+    assert "    unsigned int f_c;\n    char tag[8];" in text and "*(int64_t *)notes[" in text, text
+    an.save_project()
+    again = analyze(str(path))
+    text = _c(again, "show_note")
+    assert "    char tag[8];" in text and "char *f_0" not in text, text
+    again.add_field("s_notes", 0, "char *")                  # back
+    assert "->f_0" in _c(again, "show_note")
