@@ -6,6 +6,10 @@
 
 - [x] 커서 아래 단어 하이라이트 (리스팅·의사 코드, 레지스터는 rax/eax/ax/al 별칭까지)
 - [x] 최근 파일 목록(File ▸ Open Recent), 창 크기·dock 배치 저장 (`QSettings`, `RELIC_SETTINGS`로 ini 경로 지정 가능)
+- [x] 백그라운드 작업 취소·진행 표시: 상태 표시줄 진행 막대 + Cancel(`Ctrl+.`), 스레드별 취소 토큰(`relic/progress.py`)을 함수 탐색·xref·취약점 스캔·디컴파일 패스 사이에서 확인; 종료 시 기다리지 않고 취소(최대 2초, 넘으면 창을 숨기고 스레드 종료 후 닫음)
+- [x] 취약점 스캔 실패를 "발견 없음"과 구분해 표시(`VulnsThread.failed`, 표에 오류 행)
+- [x] CFG 레이아웃: Sugiyama 방식(`relic/gui/layout.py`) — back edge 역전, 최장 경로 층, 긴 간선 더미 노드 경로, barycenter 교차 최소화(`/bin/ls` 큰 함수 교차 16656 → 1248), isotonic 좌표 배치, 층 하단까지 수직으로 내린 뒤 꺾는 간선
+- [ ] **P2** CFG: 노드 수천 개 함수에서 교차 계산(층 쌍마다 O(E²)) 가속, 간선 묶음(bundling), 접기
 - [ ] **P2** 테마 전환(라이트/다크), 폰트 크기 설정
 
 ## 아키텍처별 분석 보강

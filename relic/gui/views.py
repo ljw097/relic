@@ -260,6 +260,7 @@ class GraphView(QGraphicsView):
         self.nodes: dict[int, _Node] = {}
         self.an: Analysis | None = None
         self.func: Function | None = None
+        self.graph_layout = None
 
     def wheelEvent(self, e):
         if e.modifiers() & Qt.KeyboardModifier.ControlModifier:
@@ -294,73 +295,62 @@ class GraphView(QGraphicsView):
         self._layout(f)
 
     def _layout(self, f: Function):
-        # longest-path layering over a DFS spanning tree (back edges ignored)
-        order, seen, back = [], set(), set()
-        stack = [(f.addr, iter(f.blocks[f.addr].succs))]
-        seen.add(f.addr)
-        on_stack = {f.addr}
-        while stack:
-            a, it = stack[-1]
-            nxt = next(it, None)
-            if nxt is None:
-                stack.pop()
-                on_stack.discard(a)
-                order.append(a)
-                continue
-            if nxt in on_stack:
-                back.add((a, nxt))
-            elif nxt not in seen and nxt in f.blocks:
-                seen.add(nxt)
-                on_stack.add(nxt)
-                stack.append((nxt, iter(f.blocks[nxt].succs)))
-        order.reverse()
-        order += [a for a in sorted(f.blocks) if a not in seen]
-        layer = {a: 0 for a in order}
-        for a in order:
-            for s in f.blocks[a].succs:
-                if (a, s) not in back and s in layer:
-                    layer[s] = max(layer[s], layer[a] + 1)
-        rows: dict[int, list[int]] = {}
-        for a in order:
-            rows.setdefault(layer[a], []).append(a)
-        y = 0.0
-        gap_x, gap_y = 40.0, 50.0
-        for lv in sorted(rows):
-            members = rows[lv]
-            width = sum(self.nodes[a].w for a in members) + gap_x * (len(members) - 1)
-            x = -width / 2
-            h = 0.0
-            for a in members:
-                n = self.nodes[a]
-                n.setPos(x, y)
-                x += n.w + gap_x
-                h = max(h, n.h)
-            y += h + gap_y
+        """Sugiyama-style layered layout (see `layout.py`): loops point back up, long edges are
+        routed between the blocks they pass, crossings are reduced."""
+        from .layout import layered_layout
+        sizes = {a: (n.w, n.h) for a, n in self.nodes.items()}
+        edges = [(a, s) for a, blk in f.blocks.items() for s in blk.succs if s in self.nodes]
+        lay = layered_layout(sizes, edges, f.addr)
+        self.graph_layout = lay
+        for a, (x, y) in lay.pos.items():
+            self.nodes[a].setPos(x, y)
         for a, blk in f.blocks.items():
             src = self.nodes[a]
-            for s in blk.succs:
-                if s not in self.nodes:
-                    continue
+            succs = [s for s in dict.fromkeys(blk.succs) if s in self.nodes]
+            # out-ports spread along the block's bottom, in the order of where the edges go
+            def heads(s, a=a):
+                r = lay.routes.get((a, s))
+                return r[0][0] if r else self.nodes[s].pos().x() + self.nodes[s].w / 2
+            ports = sorted(succs, key=heads)
+            for k, s in enumerate(ports):
                 color = THEME["edge"]
                 if blk.last.kind == "cjmp":
                     color = THEME["edge_true"] if s == blk.last.target else THEME["edge_false"]
-                self._edge(src, self.nodes[s], color, (a, s) in back)
+                frac = (k + 1) / (len(ports) + 1)
+                route = lay.routes.get((a, s), [])
+                if (a, s) not in lay.back:
+                    # drop straight to the bottom of the layer before bending, so the edge never
+                    # cuts through a taller block next to its source
+                    bottom = lay.row_bottom.get(lay.layer[a])
+                    if bottom is not None and bottom > src.pos().y() + src.h + 1:
+                        route = [(src.pos().x() + src.w * frac, bottom), *route]
+                self._edge(src, self.nodes[s], color, (a, s) in lay.back, route, frac)
         self.setSceneRect(self.scene().itemsBoundingRect().adjusted(-60, -60, 60, 60))
 
-    def _edge(self, a: _Node, b: _Node, color: str, back: bool):
-        p1 = a.pos() + QPointF(a.w / 2, a.h)
+    def _edge(self, a: _Node, b: _Node, color: str, back: bool, route=(), frac: float = 0.5):
+        p1 = a.pos() + QPointF(a.w * frac, a.h)
         p2 = b.pos() + QPointF(b.w / 2, 0)
         path = QPainterPath(p1)
+        pts = [QPointF(x, y) for x, y in route]
         if back:
-            side = max(a.pos().x() + a.w, b.pos().x() + b.w) + 25
+            # leave below the block, climb along the route (or beside both blocks), enter from above
+            side = pts[0].x() if pts else max(a.pos().x() + a.w, b.pos().x() + b.w) + 25
+            top = pts[-1].x() if pts else side
             path.lineTo(p1.x(), p1.y() + 12)
             path.lineTo(side, p1.y() + 12)
-            path.lineTo(side, p2.y() - 12)
+            for p in pts:
+                path.lineTo(p)
+            path.lineTo(top, p2.y() - 12)
             path.lineTo(p2.x(), p2.y() - 12)
             path.lineTo(p2)
         else:
-            mid = (p1.y() + p2.y()) / 2
-            path.cubicTo(QPointF(p1.x(), mid), QPointF(p2.x(), mid), p2)
+            chain = [p1, *pts, p2]
+            for q0, q1 in zip(chain, chain[1:]):
+                if q0.x() == q1.x():
+                    path.lineTo(q1)
+                else:
+                    mid = (q0.y() + q1.y()) / 2
+                    path.cubicTo(QPointF(q0.x(), mid), QPointF(q1.x(), mid), q1)
         item = QGraphicsPathItem(path)
         item.setPen(QPen(QColor(color), 1.4))
         item.setZValue(-1)
