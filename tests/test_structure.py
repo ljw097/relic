@@ -361,3 +361,55 @@ def test_random_cfgs_run_like_the_cfg():
         tree = Structurer(fn).run()
         for oracle in _oracles(15):
             assert _run_tree(tree, oracle, tables=_tables(fn)) == _run_cfg(fn, oracle), (seed, edges)
+
+
+_SPARSE = r"""
+#include <stdio.h>
+__attribute__((noinline)) int sparse(int x, int y)
+{
+    int r = 0;
+    switch (x) {
+    case 1: r = y + 1; break;
+    case 7: r = y * 3; break;
+    case 20: r = y - 5; break;
+    case 100: r = y ^ 0x55; break;
+    case 250: r = y << 2; break;
+    case 1000: r = -y; break;
+    case 5000: r = y / 7; break;
+    default: r = 42;
+    }
+    return r + 1;
+}
+int main(int c, char **v) { return sparse(c, c); }
+"""
+
+
+def test_unoptimised_compare_tree_is_a_switch(tmp_path):
+    """gcc -O0 compiles a sparse switch to a binary search whose `x > K` arms each jump to the
+    default: an else-if chain with the default repeated in its range arms -> one switch."""
+    import shutil
+    import subprocess
+    from relic.decompiler.emit import decompile
+    cc = shutil.which("gcc")
+    if cc is None:
+        pytest.skip("no C compiler")
+    src = tmp_path / "s.c"
+    src.write_text(_SPARSE)
+    exe = tmp_path / "s"
+    subprocess.run([cc, "-O0", "-no-pie", "-fno-stack-protector", "-o", str(exe), str(src)], check=True)
+    an = analyze(str(exe))
+    text = decompile(an, an.function_by_name("sparse")).text
+    assert "switch (" in text and text.count("case ") == 7 and "default:" in text, text
+    assert " > " not in text and "goto" not in text, text
+    # recompiled, the pseudocode computes what the source does
+    body = text.replace("int sparse(", "int dec_sparse(")
+    harness = tmp_path / "h.c"
+    harness.write_text(_SPARSE.replace("int main(int c, char **v) { return sparse(c, c); }", "") +
+                       "#include <stdint.h>\n" + body +
+                       "\nint main(void) { int bad = 0;\n"
+                       "  for (int x = -3; x < 5005; x++) bad |= sparse(x, x * 3) != dec_sparse(x, x * 3);\n"
+                       "  puts(bad ? \"FAIL\" : \"ok\"); return bad; }\n")
+    out = tmp_path / "h"
+    r = subprocess.run([cc, "-w", "-o", str(out), str(harness)], capture_output=True, text=True)
+    assert r.returncode == 0, r.stderr + text
+    assert subprocess.run([str(out)], capture_output=True, text=True).stdout.strip() == "ok"

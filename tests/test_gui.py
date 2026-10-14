@@ -514,9 +514,10 @@ def test_debugger_panels_breakpoints_and_console(app, win):
     win.dbg_console.cmd.setText("info registers rip")
     win.dbg_console._send_cmd()
     win.debug_start_or_continue()
-    assert _debug_wait(app, win, lambda: "exited" in win.dbg_console.out.toPlainText())
-    text = win.dbg_console.out.toPlainText()
-    assert "hello relic" in text and "gdb> info registers rip" in text and "exited" in text
+    # (the program's own output comes through its pty and can land after gdb's exit notice)
+    want = ("hello relic", "gdb> info registers rip", "exited")
+    assert _debug_wait(app, win, lambda: all(w in win.dbg_console.out.toPlainText() for w in want)), \
+        win.dbg_console.out.toPlainText()
     win.dbg.stop()
     assert _debug_wait(app, win, lambda: win.dbg.session is None)
     # breakpoints panel: disable and add a condition (kept for the next run)
