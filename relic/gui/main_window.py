@@ -6,9 +6,9 @@ import traceback
 
 from PySide6.QtCore import QSettings, QSortFilterProxyModel, Qt, QThread, Signal
 from PySide6.QtGui import QAction, QColor, QKeySequence, QPalette, QStandardItem, QStandardItemModel
-from PySide6.QtWidgets import (QAbstractItemView, QApplication, QDockWidget, QFileDialog,
-                               QInputDialog, QLabel, QLineEdit, QMainWindow, QMessageBox, QProgressBar,
-                               QTableView, QTabWidget, QToolButton, QVBoxLayout, QWidget)
+from PySide6.QtWidgets import (QAbstractItemView, QApplication, QComboBox, QDialog, QDialogButtonBox, QDockWidget,
+                               QFileDialog, QFormLayout, QInputDialog, QLabel, QLineEdit, QMainWindow, QMessageBox,
+                               QProgressBar, QTableView, QTabWidget, QToolButton, QVBoxLayout, QWidget)
 
 from ..analysis import Analysis
 from ..analysis.strings import escape
@@ -198,6 +198,33 @@ _C_RESERVED = {"if", "else", "while", "do", "for", "switch", "case", "default", 
                "enum", "typedef", "const", "static", "extern", "volatile", "float", "double"}
 
 
+class WatchDialog(QDialog):
+    """Expression to watch, write / read / access, and how many bytes."""
+
+    SIZES = [("word", None), ("1 byte", 1), ("2 bytes", 2), ("4 bytes", 4), ("8 bytes", 8)]
+
+    def __init__(self, parent=None, expr: str = ""):
+        super().__init__(parent)
+        self.setWindowTitle("Add watchpoint")
+        self.expr = QLineEdit(expr)
+        self.expr.setPlaceholderText("notes, notes+8, 0x404040, *(int *)($rbp-4)")
+        self.access = QComboBox()
+        self.access.addItems(["write", "read", "access"])
+        self.size = QComboBox()
+        self.size.addItems([t for t, _ in self.SIZES])
+        form = QFormLayout(self)
+        form.addRow("Expression", self.expr)
+        form.addRow("Stop on", self.access)
+        form.addRow("Size", self.size)
+        buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        form.addRow(buttons)
+
+    def values(self) -> tuple[str, str, int | None]:
+        return self.expr.text().strip(), self.access.currentText(), self.SIZES[self.size.currentIndex()][1]
+
+
 class MainWindow(QMainWindow):
     TAB_DISASM, TAB_GRAPH, TAB_DECOMP, TAB_HEX = range(4)
 
@@ -298,6 +325,7 @@ class MainWindow(QMainWindow):
         self.dbg.memory.connect(self.dbg_mem.show_memory)
         self.dbg_mem.goto_expr.connect(self.dbg.view_memory)
         self.dbg_bps.changed.connect(self._debug_breakpoint_edited)
+        self.dbg_bps.removed.connect(self._debug_breakpoint_removed)
         self.dbg_bps.cellDoubleClicked.connect(self._debug_breakpoint_clicked)
         for t in (self.dbg_regs, self.dbg_stack, self.dbg_vmmap):
             t.cellDoubleClicked.connect(lambda r, c, t=t: self._debug_follow(t, r, c))
@@ -378,6 +406,8 @@ class MainWindow(QMainWindow):
         act(m, "Step o&ut", "Ctrl+F7", self.dbg.step_out)
         act(m, "&Run to cursor", "F4", self.debug_run_to_cursor)
         act(m, "Toggle &breakpoint", "F2", self.debug_toggle_breakpoint)
+        act(m, "Breakpoint at &function...", "Ctrl+Alt+B", self.debug_breakpoint_dialog)
+        act(m, "Add &watchpoint...", "Ctrl+Alt+W", self.debug_watchpoint_dialog)
         act(m, "&Pause", "Ctrl+Alt+Pause", self.dbg.interrupt, False)
         act(m, "S&top", "Ctrl+F2", self.dbg.stop, False)
         m.addSeparator()
@@ -821,17 +851,64 @@ class MainWindow(QMainWindow):
         self.disasm.set_debug_marks(self.dbg.last.pc_static,
                                     [a for a, b in self.dbg.static_bps.items() if b.enabled])
         self.dbg_bps.an = self.an
-        self.dbg_bps.show_breakpoints(sorted(self.dbg.static_bps.values(), key=lambda b: b.addr))
+        self.dbg_bps.show_breakpoints(self.dbg.breakpoint_list)
 
-    def _debug_breakpoint_edited(self, addr: int, enabled, condition):
-        self.dbg.set_breakpoint(addr, enabled, condition)
+    def _debug_breakpoint_edited(self, key, enabled, condition):
+        self.dbg.set_breakpoint(key, enabled, condition)
+        self._debug_breakpoints_changed()
+
+    def _debug_breakpoint_removed(self, key):
+        self.dbg.remove_breakpoint(key)
         self._debug_breakpoints_changed()
 
     def _debug_breakpoint_clicked(self, row: int, col: int):
-        if col in (1, 2):
-            a = item_value(self.dbg_bps.item(row, 1))
+        if col in (2, 3):
+            a = item_value(self.dbg_bps.item(row, 2))
             if a is not None:
                 self.goto(a)
+
+    def debug_breakpoint_dialog(self):
+        """Break on a function by name: one of the binary (`vuln`), `puts@plt`, or a library
+        function (`puts` stops inside libc)."""
+        if self.an is None:
+            return
+        cur = self.an.name(self.cur) if self.cur is not None else ""
+        text, ok = QInputDialog.getText(self, "Breakpoint at function",
+                                        "Function (vuln, puts, puts@plt, libc.so.6:system, 0x401136):",
+                                        text=cur or "")
+        if ok and text.strip():
+            self.debug_break_at(text)
+
+    def debug_break_at(self, text: str):
+        bp = self.dbg.breakpoint_at(text, self.an)
+        self._debug_breakpoints_changed()
+        if bp is not None:
+            self.dbg_docks[7].show()
+            self.statusBar().showMessage(f"breakpoint on {bp.describe(self.an)}", 3000)
+
+    def debug_watchpoint_dialog(self):
+        """Watch memory: a global of the binary (`notes`), an address, or a gdb expression."""
+        if self.an is None:
+            return
+        dlg = WatchDialog(self, self._debug_watch_default())
+        if dlg.exec():
+            self.debug_watch(*dlg.values())
+
+    def _debug_watch_default(self) -> str:
+        """The data the cursor's instruction refers to, else the memory view's address."""
+        if self.cur is not None:
+            refs = [x.to for x in self.an.xrefs_from.get(self.cur, ()) if x.kind == "data"]
+            refs = [a for a in refs if self.an.string_at(a) is None] or refs
+            if refs:
+                return self.an.label(refs[0])
+        return f"{self.dbg_mem.addr:#x}" if self.dbg_mem.addr is not None else ""
+
+    def debug_watch(self, expr: str, access: str = "write", size: int | None = None):
+        bp = self.dbg.add_watchpoint(expr, access, size)
+        self._debug_breakpoints_changed()
+        if bp is not None:
+            self.dbg_docks[7].show()
+            self.statusBar().showMessage(f"watching {bp.describe()}", 3000)
 
     def debug_run_to_cursor(self):
         if self.cur is not None:
@@ -860,7 +937,9 @@ class MainWindow(QMainWindow):
             self.goto(snap.pc_static, record=False)
         self.disasm.set_debug_marks(snap.pc_static, [a for a, b in self.dbg.static_bps.items() if b.enabled])
         where = self.an.location(snap.pc_static) if snap.pc_static is not None else f"{snap.pc:#x}"
-        self.statusBar().showMessage(f"stopped at {where}" + (f" ({snap.reason})" if snap.reason else ""), 5000)
+        self.statusBar().showMessage(f"stopped at {where}" + (f" ({snap.stop})" if snap.stop else ""), 5000)
+        if snap.reason.endswith(("watchpoint-trigger", "watchpoint-scope")):
+            self.dbg_console.append(f"[ {snap.stop} at {where} ]\n")
 
     def _debug_output(self, data: bytes):
         self.dbg_console.append(data.decode("utf-8", "replace"))

@@ -9,7 +9,8 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 os.environ["RELIC_SETTINGS"] = os.path.join(__import__("tempfile").mkdtemp(), "relic-test.ini")
 pytest.importorskip("PySide6.QtWidgets", exc_type=ImportError)  # also missing libEGL etc.
 
-from PySide6.QtCore import Qt  # noqa: E402
+from PySide6.QtCore import QEvent, Qt  # noqa: E402
+from PySide6.QtGui import QKeyEvent  # noqa: E402
 from PySide6.QtWidgets import QApplication  # noqa: E402
 
 from relic.gui.main_window import MainWindow  # noqa: E402
@@ -438,8 +439,8 @@ def test_debugger_panels_breakpoints_and_console(app, win):
     win.debug_start_or_continue()                       # F9: continue to the breakpoint
     assert _debug_wait(app, win, lambda: win.disasm.debug_pc == vuln)
     assert win.cur == vuln
-    assert win.dbg_bps.rowCount() == 1 and win.dbg_bps.item(0, 2).text() == "vuln"
-    assert win.dbg_bps.item(0, 4).text() == "1"
+    assert win.dbg_bps.rowCount() == 1 and win.dbg_bps.item(0, 3).text() == "vuln"
+    assert win.dbg_bps.item(0, 5).text() == "1"
     assert win.dbg_regs.rowCount() >= 16 and win.dbg_regs.item(0, 0).text() == "rax"
     assert win.dbg_stack.rowCount() == 16 and "main+" in win.dbg_stack.item(0, 2).text()
     assert win.dbg_bt.item(0, 2).text() == "vuln"
@@ -474,7 +475,54 @@ def test_debugger_panels_breakpoints_and_console(app, win):
     assert _debug_wait(app, win, lambda: win.dbg.session is None)
     # breakpoints panel: disable and add a condition (kept for the next run)
     win.dbg_bps.item(0, 0).setCheckState(Qt.CheckState.Unchecked)
-    win.dbg_bps.item(0, 3).setText("$rdi == 1")
+    win.dbg_bps.item(0, 4).setText("$rdi == 1")
     bp = win.dbg.static_bps[vuln]
     assert not bp.enabled and bp.condition == "$rdi == 1"
     assert vuln not in win.disasm.debug_bps
+
+
+def test_debugger_watchpoints_and_library_breakpoints(app, win):
+    from test_debugger import _can_debug
+    if not _can_debug():
+        pytest.skip("gdb with ptrace permission is needed")
+    from relic.gui.main_window import WatchDialog
+    an = win.an
+    notes = an.resolve("notes")
+    # the watch dialog offers the global the cursor's instruction refers to
+    add_note = an.function_by_name("add_note")
+    win.goto(next(x.frm for x in an.xrefs_to[notes] if an.function_at(x.frm) is add_note))
+    assert win._debug_watch_default() == "notes"
+    dlg = WatchDialog(win, "notes")
+    dlg.access.setCurrentText("read")
+    dlg.size.setCurrentIndex(3)
+    assert dlg.values() == ("notes", "read", 4)
+    # set before the program runs: applied at start, a library function stops inside libc
+    win.debug_break_at("puts")
+    win.debug_break_at("add_note")
+    win.debug_watch("notes", "write")
+    assert [win.dbg_bps.item(k, 1).text() for k in range(3)] == ["break", "break", "write watch"]
+    assert win.dbg_bps.item(0, 3).text() == "add_note" and win.dbg_bps.item(1, 3).text() == "puts"
+    assert add_note.addr in win.dbg.static_bps
+    win.debug_start()
+    assert _debug_wait(app, win, lambda: win.dbg_regs.rowCount() > 0)
+    win.debug_start_or_continue()
+    assert _debug_wait(app, win, lambda: "puts" in win.dbg_bt.item(0, 2).text())
+    assert win.dbg.last.pc_static is None                   # in libc, not at the PLT stub
+    win.dbg_bps.selectRow(1)                       # Delete on the puts row
+    win.dbg_bps.keyPressEvent(QKeyEvent(QEvent.Type.KeyPress, Qt.Key.Key_Delete, Qt.KeyboardModifier.NoModifier))
+    assert win.dbg_bps.rowCount() == 2 and "puts" not in win.dbg.other_bps
+    win.dbg.send_input("1\n8\nAAAA\n4\n")
+    win.debug_start_or_continue()
+    assert _debug_wait(app, win, lambda: win.disasm.debug_pc == add_note.addr)
+    win.debug_start_or_continue()
+    assert _debug_wait(app, win, lambda: "[ watchpoint " in win.dbg_console.out.toPlainText())
+    assert an.function_at(win.cur) is add_note
+    assert win.dbg.last.stop.startswith("watchpoint ") and ": 0 -> " in win.dbg.last.stop
+    assert win.dbg.last.reason == "watchpoint-trigger"
+    assert win.dbg_bps.item(1, 5).text() == "1"
+    win.dbg_bps.item(1, 0).setCheckState(Qt.CheckState.Unchecked)
+    assert not win.dbg.other_bps["write:notes"].enabled
+    win.debug_start_or_continue()
+    assert _debug_wait(app, win, lambda: "exited" in win.dbg_console.out.toPlainText())
+    win.dbg.stop()
+    assert _debug_wait(app, win, lambda: win.dbg.session is None)
