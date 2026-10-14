@@ -65,7 +65,7 @@ def test_classify(ans, variant):
 @pytest.mark.parametrize("variant", VARIANTS)
 def test_main(ans, variant):
     code = _c(ans[variant], "main")
-    assert code.startswith("int main(int a1, ")
+    assert code.startswith("int main(int argc, ")
     assert "while (1) {" in code and "break;" in code
     assert "show_note(menu());" in code and "del_note(menu());" in code
     assert "setvbuf(stdout, 0, 2, 0);" in code

@@ -128,10 +128,15 @@ def narrow_call_args(an: "Analysis", arch: ArchInfo, fn) -> int:
     return n
 
 
-def _compute_livein(an: "Analysis", arch: ArchInfo, target: int) -> list[str]:
+def livein_regs(an: "Analysis", arch: ArchInfo, target: int) -> set[str]:
+    """Every argument register the callee really reads on entry (no prefix rule)."""
+    return _compute_livein(an, arch, target, prefix=False)
+
+
+def _compute_livein(an: "Analysis", arch: ArchInfo, target: int, prefix: bool = True):
     ssa = _entry_ssa(an, arch, target)
     if ssa is None:
-        return []
+        return [] if prefix else set()
     # a call's implicit `uses` list every argument register the convention allows, which
     # would make every register look like a parameter; only count what the callee really
     # reads, plus the registers a known libc callee consumes (wrappers passing args along).
@@ -158,6 +163,8 @@ def _compute_livein(an: "Analysis", arch: ArchInfo, target: int) -> list[str]:
                 if x in phis:
                     work.append(x)
     livein = {v.name for v in used if v.version == 0}
+    if not prefix:
+        return livein & set(int_arg_regs(arch))
     # take the contiguous prefix of argument registers: a gap means the later
     # ones are scratch (e.g. a partial write like `mov dl, al` reads rdx), not parameters
     params: list[str] = []

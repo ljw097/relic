@@ -66,6 +66,12 @@ def prepare(an: "Analysis", func: "Function") -> Prepared:
         n = stack_param_count(an, arch, func.addr)
         params = [frame.slots[o].name() if o in frame.slots else f"arg_{o:x}"
                   for o in range(word, word * (n + 1), word)]
+    elif (an.name(func.addr) or "") == "main":
+        # main(argc, argv, envp): an unused argc before a used argv is still the first parameter
+        from .calls import int_arg_regs, livein_regs
+        regs = int_arg_regs(arch)[:3]
+        live = livein_regs(an, arch, func.addr)
+        params = list(regs[:max((k + 1 for k, r in enumerate(regs) if r in live), default=0)])
     else:
         params = _livein_arg_regs(an, arch, func.addr) + [r for r, _ in fp_params(an, arch, func.addr)]
     narrow_library_results(fn)

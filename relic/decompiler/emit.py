@@ -126,6 +126,8 @@ class CWriter:
         self.commented: set[int] = set()
         self.out: list[Line] = []
         self._name_vars()
+        if self._is_main():
+            self._spread_types([r for r in self.p.params[1:3]])
         # user types (Analysis.var_types, keyed by generated name) -> by the IR's variable names
         wanted = an.var_types.get(prep.fn.addr, {})
         user_types: dict[str, str] = {}
@@ -182,9 +184,32 @@ class CWriter:
         return shown
 
     # ------------------------------------------------------------- naming
+    MAIN_PARAMS = (("argc", "int"), ("argv", "char **"), ("envp", "char **"))
+
+    def _is_main(self) -> bool:
+        return base_name(self.an.name(self.p.fn.addr) or self.p.fn.name) == "main"
+
+    def _spread_types(self, names: list[str]):
+        """Copies of these variables (`var_28 = argv`) get their type."""
+        todo = list(names)
+        while todo:
+            n = todo.pop()
+            t = self.types.get(n)
+            for st in self.p.fn.stmts():
+                if isinstance(st, Assign) and isinstance(st.src, (Var, StackVar)) and st.src.name == n and \
+                        isinstance(st.dst, (Var, StackVar)) and st.dst.bits == st.src.bits and \
+                        str(self.types.get(st.dst.name)) != str(t):
+                    cur = self.types.get(st.dst.name)
+                    if cur is None or cur.base in (int_type(self.ptr_bits), "char", "int") and cur.ptr <= 1:
+                        self.types[st.dst.name] = t
+                        todo.append(st.dst.name)
+
     def _name_vars(self):
+        main = self._is_main() and len(self.p.params) <= 3
         for k, r in enumerate(self.p.params):
-            self.names[r] = f"a{k + 1}"
+            self.names[r] = self.MAIN_PARAMS[k][0] if main else f"a{k + 1}"
+            if main:
+                self.types[r] = parse_ctype(self.MAIN_PARAMS[k][1])
         n = 0
         for s in self.p.fn.stmts():
             for d in ir.stmt_defs(s):
@@ -315,7 +340,8 @@ class CWriter:
         base = addr if isinstance(addr, (Var, StackVar)) else None
         if base is not None:
             t = self.types.get(base.name)
-            if t is not None and t.ptr == 1 and (t.base == int_type(bits) or self._float_of(t.base, bits)):
+            if t is not None and t.ptr == 1 and (t.base == int_type(bits) or self._float_of(t.base, bits)) \
+                    or t is not None and t.ptr >= 2 and bits == self.ptr_bits:
                 return f"*{self.expr(base, PREC_UNARY)}"
         return f"*({int_type(bits)} *){self.expr(addr, PREC_UNARY)}"
 
@@ -345,7 +371,8 @@ class CWriter:
                     return sym, _bare(i)
             if isinstance(base, (Var, StackVar)):
                 t = self.types.get(base.name)
-                if t is not None and t.ptr == 1 and (t.base == int_type(size * 8) or self._float_of(t.base, size * 8)):
+                if t is not None and t.ptr == 1 and (t.base == int_type(size * 8) or self._float_of(t.base, size * 8)) \
+                        or t is not None and t.ptr >= 2 and size * 8 == self.ptr_bits:
                     return self.vname(base.name), _bare(i)
             if isinstance(base, StackAddr):
                 return self.vname(base.name), _bare(i)
@@ -547,6 +574,8 @@ class CWriter:
             t = self.types.get(e.name)
             if t is not None and t.ptr == 1:
                 return self._SIZES.get(t.base, 0)
+            if t is not None and t.ptr >= 2:           # a pointer to pointers
+                return self.ptr_bits // 8
         return 0
 
     def _scaled(self, ptr: Expr, off: Expr) -> Expr | None:
