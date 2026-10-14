@@ -636,7 +636,6 @@ def test_python_console_and_plugins(app, vuln64, tmp_path, monkeypatch):
 
 
 def test_pseudocode_struct_field_rename(app, win):
-    from PySide6.QtGui import QTextCursor
     win.goto(win.an.function_by_name("add_note").addr)
     win.toggle_decompile()
     assert win.decomp.wait_idle()
