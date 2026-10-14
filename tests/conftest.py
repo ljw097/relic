@@ -49,6 +49,9 @@ VARIANTS = {
     # library argument / result types
     "libtypes_O0": ["-O0", "-fno-stack-protector", "-no-pie"],
     "libtypes_O2": ["-O2", "-fno-stack-protector", "-no-pie"],
+    # floating point (SSE scalar)
+    "floats_O0": ["-O0", "-no-pie", "-fno-stack-protector"],
+    "floats_O2": ["-O2", "-no-pie", "-fno-stack-protector", "-fno-tree-vectorize"],
     # C++ (demangling)
     "shapes": ["-O0", "-no-pie", "-fno-inline"],
 }
@@ -59,10 +62,14 @@ COMPILERS = {"vuln64_pe": "x86_64-w64-mingw32-gcc", "vuln32_pe": "i686-w64-mingw
                                                        "flow_thumb_O0", "flow_thumb_O2")}}
 SOURCES = {"structs_O0": os.path.join(HERE, "src", "structs.c"), "structs_O2": os.path.join(HERE, "src", "structs.c"),
            **{n: os.path.join(HERE, "src", "libtypes.c") for n in ("libtypes_O0", "libtypes_O2")},
+           "floats_O0": os.path.join(HERE, "src", "floats.c"), "floats_O2": os.path.join(HERE, "src", "floats.c"),
            "flow_O0": FLOW_SRC, "flow_O2": FLOW_SRC, "flow32_O0": FLOW_SRC, "flow32_O2": FLOW_SRC,
            "shapes": os.path.join(HERE, "src", "shapes.cpp"), "flow_a64_O0": FLOW_SRC, "flow_a64_O2": FLOW_SRC,
            **{n: FLOW_SRC for n in ("flow_arm_O0", "flow_arm_O2", "flow_thumb_O0", "flow_thumb_O2",
                                     "flow_mips_O0", "flow_mips_O2")}}
+
+
+LIBS = {"floats_O0": ["-lm"], "floats_O2": ["-lm"]}     # after the source: linkers drop unused libraries
 
 
 def _build(name: str) -> str:
@@ -91,7 +98,8 @@ def _build(name: str) -> str:
         pytest.skip(f"no C compiler for {name}")
     os.makedirs(BINS, exist_ok=True)
     try:
-        subprocess.run([cc, *VARIANTS[name], "-w", "-o", out, src_path], check=True, capture_output=True)
+        subprocess.run([cc, *VARIANTS[name], "-w", "-o", out, src_path, *LIBS.get(name, ())], check=True,
+                       capture_output=True)
     except subprocess.CalledProcessError as e:
         pytest.skip(f"cannot build {name}: {e.stderr.decode(errors='replace')[:200]}")
     return out
@@ -156,6 +164,8 @@ vuln_mips = _fixture("vuln_mips")
 vuln_mips_pie = _fixture("vuln_mips_pie")
 vuln_mips_stripped = _fixture("vuln_mips_stripped")
 structs_O0 = _fixture("structs_O0")
+floats_O0 = _fixture("floats_O0")
+floats_O2 = _fixture("floats_O2")
 structs_O2 = _fixture("structs_O2")
 flow_mips_O0 = _fixture("flow_mips_O0")
 flow_mips_O2 = _fixture("flow_mips_O2")

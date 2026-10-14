@@ -13,6 +13,7 @@ from typing import TYPE_CHECKING
 
 from .arch import ArchInfo
 from .ir import Assign, Call, CallStmt, Cast, Const, Expr, IRFunction, Phi, Var, children, stmt_exprs, walk
+from .fpabi import arg_classes, assign_regs, fp_params, fp_sig, is_fp_arch
 from .sigs import arg_count, lookup
 
 if TYPE_CHECKING:
@@ -123,7 +124,7 @@ def narrow_call_args(an: "Analysis", arch: ArchInfo, fn) -> int:
                 changed = True
         if changed:
             n += 1
-            s.call = Call(call.target, tuple(args), call.bits)
+            s.call = Call(call.target, tuple(args), call.bits, call.fargs)
     return n
 
 
@@ -299,25 +300,58 @@ def recover_calls(fn: IRFunction, an: "Analysis", arch: ArchInfo) -> IRFunction:
         for s in b.stmts:
             if not isinstance(s, CallStmt) or s.call.args:
                 continue
+            fps: list = []
+            widths: dict = {}
             uses = dict(s.uses)
             tgt = s.call.target.value if isinstance(s.call.target, Const) else None
             name = s.name or (an.name(tgt) if tgt is not None else None)
             sig = lookup(name)
             f = an.functions.get(tgt) if tgt is not None else None
-            if sig is not None:
+            fsig = fp_sig(name) if is_fp_arch(arch) else None
+            if fsig is not None:
+                selected = assign_regs(arch, arg_classes(None, None, fsig), argregs)
+            elif sig is not None:
                 fmt = _read_format(an, uses.get(argregs[sig.fmt])) if sig.fmt is not None and \
                     sig.fmt < len(argregs) else None
-                selected = list(argregs[:arg_count(sig, fmt)])
+                if is_fp_arch(arch) and fmt is not None:
+                    scan = "scanf" in (name or "")
+                    selected = assign_regs(arch, arg_classes(sig, fmt, scan=scan), argregs)
+                else:
+                    selected = list(argregs[:arg_count(sig, fmt)])
             elif f is not None and not f.is_import:
                 selected = _livein_arg_regs(an, arch, tgt)
+                fps = fp_params(an, arch, tgt)
+                if fps:
+                    selected = selected + [r for r, _ in fps]
+                    widths = dict(fps)
             else:
                 if own is None:
                     own = _livein_arg_regs(an, arch, fn.addr)
                 selected = _set_before_call(fn, argregs, uses, own)
-            args = [uses[r] for r in selected if r in uses]
-            s.call = Call(s.call.target, tuple(args), s.call.bits)
+            args = []
+            fargs = []
+            for r in selected:
+                if r not in uses:
+                    continue
+                v = uses[r]
+                if r.startswith("xmm"):           # the float in the register's low lanes
+                    w = widths.get(r) or (32 if _float_class(fsig, selected, r) else 64)
+                    v = Cast("low", v, w)
+                    fargs.append((len(args), w))
+                args.append(v)
+            s.call = Call(s.call.target, tuple(args), s.call.bits, tuple(fargs))
             s.uses = [(r, uses[r]) for r in selected if r in uses]
     return fn
+
+
+def _float_class(fsig, selected: list[str], reg: str) -> bool:
+    """A libc argument declared `float` (`f`), by its place among the float arguments."""
+    if fsig is None:
+        return False
+    floats = [ch for ch in fsig[0] if ch in "df"]
+    xmms = [r for r in selected if r.startswith("xmm")]
+    k = xmms.index(reg)
+    return k < len(floats) and floats[k] == "f"
 
 
 __all__ = ["recover_calls", "int_arg_regs"]

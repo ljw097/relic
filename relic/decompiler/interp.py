@@ -10,10 +10,14 @@ from typing import Callable
 
 from .ir import (Assign, BinOp, Branch, CallStmt, Cast, Const, Effect, Expr, Extract, IndirectJump,
                  Intrinsic, IRFunction, Ite, Jump, Load, Phi, Reg, Return, Store, UnOp, Unknown, Var, mask)
+from .fp import FARITH, FCMP, FP_CASTS, FP_INTRINSICS, apply_fbinop, apply_fcast, apply_fintrinsic
 
 
 class InterpError(Exception):
     pass
+
+
+_FP_OPS = frozenset(FARITH) | frozenset(FCMP)
 
 
 def _s(v: int, bits: int) -> int:
@@ -28,6 +32,8 @@ def apply_binop(op: str, a: int, b: int, aw: int, bw: int) -> int:
     Shared by the interpreter and the constant-folding pass so both agree exactly.
     """
     w = aw
+    if op[0] == "f" and op in _FP_OPS:
+        return apply_fbinop(op, a, b, aw)
     if op == "+":
         return a + b
     if op == "-":
@@ -95,6 +101,8 @@ def apply_unop(op: str, a: int, bits: int) -> int:
         return ~a & mask(bits)
     if op == "!":
         return int(a == 0)
+    if op == "fneg":
+        return a ^ (1 << (bits - 1))
     raise InterpError(f"unary operator {op}")
 
 
@@ -180,6 +188,10 @@ class Interpreter:
 
     def _intrinsic(self, e: Intrinsic) -> int:
         args = [self.eval(a) for a in e.args]
+        if e.name in FP_INTRINSICS:
+            return apply_fintrinsic(e.name, args, e.bits)
+        if e.name in FP_CASTS:
+            return apply_fcast(e.name, args[0], e.args[0].bits, e.bits)
         if e.name == "parity":
             return int(bin(args[0] & 0xFF).count("1") % 2 == 0)
         if e.name == "smul_overflow":

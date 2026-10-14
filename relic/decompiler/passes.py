@@ -21,6 +21,7 @@ from collections import Counter
 
 from ..progress import checkpoint
 from .arch import ArchInfo
+from .fp import fold_fcmp, is_fcmp, negate_fcmp
 from .interp import InterpError, apply_binop, apply_cast, apply_unop
 from .ir import (BARRIERS, Assign, BinOp, Branch, Call, CallStmt, Cast, Const, Effect, Expr, Extract, IRFunction,
                  Ite, Jump, Load, Phi, Return, UnOp, Unknown, Var, children, mask, stmt_exprs, transform, walk)
@@ -143,6 +144,8 @@ def _not(c: Expr) -> Expr:
     """Logical negation, pushed through comparisons and (De Morgan) 1-bit `&` / `|`."""
     if isinstance(c, UnOp) and c.op == "!":
         return c.a
+    if is_fcmp(c):
+        return negate_fcmp(c)
     if isinstance(c, BinOp) and c.op in ("<s", "<=s", "<u", "<=u"):     # IR spelling: swap operands
         return BinOp({"<s": "<=s", "<=s": "<s", "<u": "<=u", "<=u": "<u"}[c.op], c.b, c.a, 1)
     if isinstance(c, BinOp) and c.op in _NEG_CMP:
@@ -175,7 +178,23 @@ def _negation(x: Expr, y: Expr) -> bool:
     return _same_cond(x, _not(y)) or _same_cond(_not(x), y)
 
 
+def _has_fcmp(e: Expr) -> bool:
+    return any(is_fcmp(x) for x in walk(e))
+
+
 def _simp_node(e: Expr) -> Expr:
+    if e.bits == 1 and isinstance(e, (BinOp, UnOp, Ite)) and (not isinstance(e, BinOp) or e.op[0] != "f"):
+        f = fold_fcmp(e)
+        if f is not e:
+            return f
+    if isinstance(e, Ite) and e.bits > 1:
+        # `c ? 0 : zext(x)` (x 1-bit) -> `zext(c ? 0 : x)`: a condition that can fold further
+        k, x = (e.a, e.b) if isinstance(e.a, Const) else (e.b, e.a)
+        if isinstance(k, Const) and k.value in (0, 1) and isinstance(x, Cast) and x.kind == "zext" and \
+                x.a.bits == 1 and (_has_fcmp(e.cond) or _has_fcmp(x.a)):
+            kb = Const(k.value, 1)
+            inner = Ite(e.cond, kb, x.a, 1) if k is e.a else Ite(e.cond, x.a, kb, 1)
+            return Cast("zext", _simp_node(inner), e.bits)
     if isinstance(e, BinOp):
         a, b, op, w = e.a, e.b, e.op, e.bits
         z = lambda x: isinstance(x, Const) and x.value == 0

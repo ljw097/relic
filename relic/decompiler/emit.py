@@ -19,6 +19,8 @@ from typing import TYPE_CHECKING
 from . import ir
 from .ir import (Assign, BinOp, CallStmt, Cast, Const, Effect, Expr, Extract, Intrinsic, Ite, Load, Reg, Return,
                  StackAddr, StackVar, Store, UnOp, Unknown, Var)
+from .fp import FARITH, FCMP, FP_INTRINSICS
+from .fpconst import float_operands, is_float_expr
 from .sigs import base_name
 from .structure import Block, If, Jump1, Loop, Ret, Seq, Switch, _negate, case_labels
 from .vartypes import CType, infer_types, int_type, library_types, parse_ctype
@@ -98,6 +100,23 @@ class CWriter:
             cur = self.types.get(name)
             if cur is not None and cur.ptr == 0:
                 self.types[name] = t
+        # floats and doubles: what floating-point operations read and produce, float parameters
+        # and results (fpconst.float_types)
+        from .fpabi import callee_ret, fp_params
+        from .fpconst import float_types
+        fparams = dict(fp_params(an, prep.arch, prep.fn.addr)) if prep.arch.name.startswith("x64") else {}
+        self.ftypes = float_types(prep.fn, fparams, prep.ret_float, lambda st: callee_ret(an, st))
+        for name, w in list(self.ftypes.items()):
+            cur = self.types.get(name)
+            if cur is not None and cur.ptr and name not in fparams:
+                del self.ftypes[name]                # dereferenced: a pointer, whatever is copied to it
+                continue
+            self.types[name] = CType("double" if w == 64 else "float")
+        from .fpconst import float_pointees
+        for name, w in float_pointees(prep.fn, self.ftypes, self.is_addr).items():
+            cur = self.types.get(name)
+            if cur is not None and cur.ptr == 1 and cur.base in (int_type(w), int_type(w, True)):
+                self.types[name] = CType("double" if w == 64 else "float", 1)
         self.shown_structs: dict[str, str] = {}
         self.shown_fields: dict[str, list] = {}
         self.names: dict[str, str] = {}
@@ -296,9 +315,13 @@ class CWriter:
         base = addr if isinstance(addr, (Var, StackVar)) else None
         if base is not None:
             t = self.types.get(base.name)
-            if t is not None and t.ptr == 1 and t.base == int_type(bits):
+            if t is not None and t.ptr == 1 and (t.base == int_type(bits) or self._float_of(t.base, bits)):
                 return f"*{self.expr(base, PREC_UNARY)}"
         return f"*({int_type(bits)} *){self.expr(addr, PREC_UNARY)}"
+
+    @staticmethod
+    def _float_of(base: str, bits: int) -> bool:
+        return base == "double" and bits == 64 or base == "float" and bits == 32
 
     def _indexed(self, addr: Expr, size: int):
         """(base text, index) for `base + i*size` where base is a symbol or a matching pointer."""
@@ -322,7 +345,7 @@ class CWriter:
                     return sym, _bare(i)
             if isinstance(base, (Var, StackVar)):
                 t = self.types.get(base.name)
-                if t is not None and t.ptr == 1 and t.base == int_type(size * 8):
+                if t is not None and t.ptr == 1 and (t.base == int_type(size * 8) or self._float_of(t.base, size * 8)):
                     return self.vname(base.name), _bare(i)
             if isinstance(base, StackAddr):
                 return self.vname(base.name), _bare(i)
@@ -332,7 +355,77 @@ class CWriter:
         text, p = self._expr(e)
         return f"({text})" if p < prec else text
 
+    # ------------------------------------------------------------ floating point
+    def _float_var(self, e: Expr) -> bool:
+        return isinstance(e, (Var, StackVar)) and e.name in self.ftypes
+
+    def _unwrap_float(self, e: Expr, loose: bool = False) -> Expr:
+        """`low64(x)` / `zext128(x)` around a float: C sees just the float. `loose`: where a float
+        is expected anyway, also around constants and memory."""
+        while isinstance(e, Cast) and e.kind in ("low", "zext") and (
+                self._float_var(e.a) or is_float_expr(e.a) or
+                loose and isinstance(e.a, (Cast, Const, Load))):
+            e = e.a
+        return e
+
+    def fexpr(self, e: Expr, prec: int = 0, bits: int | None = None) -> str:
+        """`e` where a float of `bits` (default: its width) is expected: constants are literals,
+        memory is read as `double` / `float`."""
+        w = bits or e.bits
+        e = self._unwrap_float(e, True)
+        if isinstance(e, Const):
+            from .fp import literal
+            v = literal(e.value & ((1 << min(w, 64)) - 1), 32 if w == 32 else 64)
+            return f"({v})" if v.startswith("-") and prec > PREC_UNARY else v
+        if isinstance(e, Load) and e.bits in (32, 64):
+            from .fpconst import _ro_value
+            c = _ro_value(self.an, e)
+            if c is not None and self.symbol(e.addr.value) is None:      # a constant in .rodata
+                return self.fexpr(c, prec, e.bits)
+            text = self.mem(e.addr, e.bits)
+            ft = "double" if e.bits == 64 else "float"
+            raw = f"*({int_type(e.bits)} *)"
+            if text.startswith(raw):
+                text = f"*({ft} *)" + text[len(raw):]
+            return f"({text})" if prec > PREC_UNARY and text.startswith("*") else text
+        return self.expr(e, prec)
+
+    _FCMP_C = {"f<": "<", "f<=": "<=", "f==": "==", "f!=": "!=", "f<u": "<", "f<=u": "<=", "f==u": "==",
+               "f!=o": "!="}
+    _FARITH_C = {"f+": ("+", 12), "f-": ("-", 12), "f*": ("*", 13), "f/": ("/", 13)}
+    _FCASTS = {"sitofp", "fptosi", "fpconv"}
+
+    def _fbinop(self, e: BinOp) -> tuple[str, int]:
+        if e.op in self._FARITH_C:
+            op, p = self._FARITH_C[e.op]
+            return f"{self.fexpr(e.a, p)} {op} {self.fexpr(e.b, p + 1)}", p
+        if e.op in ("funord", "ford"):
+            text = f"isunordered({self.fexpr(e.a)}, {self.fexpr(e.b)})"
+            return (text, PREC_POSTFIX) if e.op == "funord" else (f"!{text}", PREC_UNARY)
+        a, b, op = e.a, e.b, self._FCMP_C[e.op]
+        if isinstance(self._unwrap_float(a), Const) and not isinstance(self._unwrap_float(b), Const):
+            a, b, op = b, a, FLIP.get(op, op)
+        elif op in ("<", "<="):                   # `b < a` reads better as `a > b` when a is a name
+            if not isinstance(self._unwrap_float(a), (Var, StackVar)) and \
+                    isinstance(self._unwrap_float(b), (Var, StackVar)):
+                a, b, op = b, a, FLIP[op]
+        return f"{self.fexpr(a, 10)} {op} {self.fexpr(b, 11)}", 10
+
+    def _fintrinsic(self, e: Intrinsic) -> tuple[str, int]:
+        x = e.args[0]
+        if e.name == "sitofp":
+            t = "double" if e.bits == 64 else "float"
+            return f"({t}){self.expr(_bare(x), PREC_UNARY)}", PREC_UNARY
+        if e.name == "fptosi":
+            return f"({int_type(e.bits)}){self.fexpr(x, PREC_UNARY)}", PREC_UNARY
+        if e.name == "fpconv":
+            t = "double" if e.bits == 64 else "float"
+            return f"({t}){self.fexpr(x, PREC_UNARY)}", PREC_UNARY
+        return f"{e.name}({', '.join(self.fexpr(a) for a in e.args)})", PREC_POSTFIX
+
     def _expr(self, e: Expr) -> tuple[str, int]:
+        if isinstance(e, Cast) and e.kind in ("low", "zext") and self._unwrap_float(e) is not e:
+            return self._expr(self._unwrap_float(e))
         if isinstance(e, Const):
             return self.const(e), PREC_POSTFIX
         if isinstance(e, Var):
@@ -356,6 +449,8 @@ class CWriter:
                 neg = _negate(e.a)
                 if not (isinstance(neg, UnOp) and neg.op == "!"):
                     return self._expr(neg)
+            if e.op == "fneg":
+                return f"-{self.fexpr(e.a, PREC_UNARY)}", PREC_UNARY
             return f"{e.op}{self.expr(e.a, PREC_UNARY)}", PREC_UNARY
         if isinstance(e, Cast):
             if e.a.bits == 1:                     # bool widened to an int: C does this already
@@ -374,8 +469,12 @@ class CWriter:
             from .passes import bool_ite
             return self._expr(bool_ite(e))            # `c ? x : 0` reads `c && x`
         if isinstance(e, Ite):
-            return (f"{self.expr(e.cond, PREC_TERNARY + 1)} ? {self.expr(e.a, PREC_TERNARY + 1)} : "
-                    f"{self.expr(e.b, PREC_TERNARY)}"), PREC_TERNARY
+            fl = float_operands(e)
+            sub = self.fexpr if fl else self.expr
+            return (f"{self.expr(e.cond, PREC_TERNARY + 1)} ? {sub(e.a, PREC_TERNARY + 1)} : "
+                    f"{sub(e.b, PREC_TERNARY)}"), PREC_TERNARY
+        if isinstance(e, Intrinsic) and (e.name in self._FCASTS or e.name in FP_INTRINSICS):
+            return self._fintrinsic(e)
         if isinstance(e, Intrinsic):
             return f"__{e.name}({', '.join(self.expr(a) for a in e.args)})", PREC_POSTFIX
         if isinstance(e, ir.Call):
@@ -387,6 +486,8 @@ class CWriter:
             fa = self.structs.field_addr(e)
             if fa is not None:                    # the address of a field: `&p->f_8`
                 return f"&{self.expr(fa[0], PREC_POSTFIX)}->{self.fname(*fa[1:])}", PREC_UNARY
+        if e.op[0] == "f" and (e.op in FARITH or e.op in FCMP):
+            return self._fbinop(e)
         if e.op not in BIN:                       # carry / sborrow ... : flag helpers
             return f"__{e.op}({self.expr(e.a)}, {self.expr(e.b)})", PREC_POSTFIX
         if e.op in _NUMERIC_OPS:
@@ -424,12 +525,14 @@ class CWriter:
                 return f"(char *){self.expr(a, PREC_UNARY)} {op} {self.expr(b, p + 1)}", p
         if e.op == "+" and isinstance(b, Const) and b.signed < 0 and b.bits >= 8:
             return f"{self.expr(a, p)} - {number(-b.signed)}", p
+        if e.op == "-" and isinstance(b, Const) and b.signed < 0 and b.bits >= 8 and -b.signed < 0x10000:
+            return f"{self.expr(a, p)} + {number(-b.signed)}", p
         if e.op == "+" and isinstance(a, Const) and not isinstance(b, Const):
             a, b = b, a
         return f"{self.expr(a, p)} {op} {self.expr(b, p + 1)}", p
 
     _SIZES = {"char": 1, "unsigned char": 1, "short": 2, "unsigned short": 2, "int": 4, "unsigned int": 4,
-              "int64_t": 8, "uint64_t": 8}
+              "int64_t": 8, "uint64_t": 8, "float": 4, "double": 8}
 
     def _struct_ptr(self, e: Expr) -> bool:
         if isinstance(e, (Var, StackVar)):
@@ -477,7 +580,9 @@ class CWriter:
 
     def call(self, c: ir.Call) -> str:
         name = self._callee_name(c) or f"(*{self.expr(c.target, PREC_UNARY)})"
-        return f"{name}({', '.join(self.expr(_bare(a)) for a in c.args)})"
+        fl = dict(c.fargs)
+        args = [self.fexpr(a, 0, fl[k]) if k in fl else self.expr(_bare(a)) for k, a in enumerate(c.args)]
+        return f"{name}({', '.join(args)})"
 
     # --------------------------------------------------------- statements
     def stmt(self, s) -> str | None:
@@ -495,12 +600,16 @@ class CWriter:
                 if src.op in ("+", "-") and isinstance(b, Const) and b.value == 1:
                     return f"{lhs}{src.op}{src.op};"
                 return f"{lhs} {BIN[src.op][0]}= {self.expr(b)};"
+            if self._float_var(s.dst):
+                return f"{lhs} = {self.fexpr(src, 0, s.dst.bits if s.dst.bits in (32, 64) else None)};"
             return f"{lhs} = {self.expr(_bare(src) if self._implicit(s.dst, src) else src)};"
         if isinstance(s, Store):
             return f"{self.mem(s.dst, s.bits)} = {self.expr(s.src)};"
         if isinstance(s, CallStmt):
             text = self.call(s.call)
-            ret = next((v for r, v in s.defs if r == self.p.arch.ret), None)
+            from .fpabi import callee_ret
+            reg = "xmm0" if self.p.arch.name.startswith("x64") and callee_ret(self.an, s) else self.p.arch.ret
+            ret = next((v for r, v in s.defs if r == reg), None)
             if ret is not None:
                 text = f"{self.expr(ret)} = {text}"
             return text + ";"
@@ -550,7 +659,11 @@ class CWriter:
                     self.emit(text, s.addr, depth)
         elif isinstance(n, Ret):
             v = n.stmt.value
-            self.emit("return;" if v is None else f"return {self.expr(_bare(v))};", n.stmt.addr, depth)
+            if v is not None and self.p.ret_float:
+                text = f"return {self.fexpr(v, 0, self.p.ret_bits)};"
+            else:
+                text = "return;" if v is None else f"return {self.expr(_bare(v))};"
+            self.emit(text, n.stmt.addr, depth)
         elif isinstance(n, Jump1):
             self.emit(f"goto loc_{n.addr:x};" if n.kind == "goto" else f"{n.kind};", None, depth)
         elif isinstance(n, If):
@@ -627,7 +740,9 @@ class CWriter:
         ret = "void"
         if self.p.returns:
             vals = [s.value for s in fn.stmts() if isinstance(s, Return) and s.value is not None]
-            if self.p.ret_bits is not None:
+            if self.p.ret_float:
+                ret = "double" if self.p.ret_bits == 64 else "float"
+            elif self.p.ret_bits is not None:
                 ret = int_type(self.p.ret_bits)
             else:
                 ret = self._ret_type(vals[0]) if vals else "int"
