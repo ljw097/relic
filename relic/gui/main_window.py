@@ -396,6 +396,7 @@ class MainWindow(QMainWindow):
         m = mb.addMenu("&Edit")
         act(m, "&Rename...", "N", self.rename_dialog)
         act(m, "&Comment...", ";", self.comment_dialog)
+        act(m, "Set t&ype...", "Y", self.set_type_dialog)
         act(m, "&Xrefs to...", "X", self.show_xrefs_here)
         m.addSeparator()
         act(m, "&Patch bytes...", "Ctrl+Alt+P", self.patch_bytes_dialog)
@@ -1153,6 +1154,50 @@ class MainWindow(QMainWindow):
             self.statusBar().showMessage(f"'{name}' is not a free C identifier here", 3000)
             return False
         self.an.rename_var(func.addr, generated, name)
+        self._after_edit()
+        return True
+
+    def set_type_dialog(self):
+        """Pseudocode: a C type for the variable / parameter or struct field under the cursor
+        (`char *`, `unsigned int`, `struct note *`); empty resets to the recovered one."""
+        if self.tabs.currentIndex() != self.TAB_DECOMP or self.decomp.result is None:
+            self.statusBar().showMessage("set type: put the cursor on a variable or field in the pseudocode", 4000)
+            return
+        var = self.decomp.variable_under_cursor()
+        if var is not None:
+            shown, gen = var
+            cur = self.decomp.result.types.get(gen, "")
+            text, ok = QInputDialog.getText(self, "Set type", f"Type of {shown} (empty: as recovered):", text=cur)
+            if ok:
+                self.set_var_type(gen, text)
+            return
+        st = self.decomp.struct_under_cursor()
+        if st is not None and st[2] is not None:
+            shown, struct, fld = st
+            cur = self.an.struct_names.get(struct, {}).get("types", {}).get(fld, "")
+            text, ok = QInputDialog.getText(self, "Set type", f"Type of field {shown} (empty: as recovered):",
+                                            text=cur)
+            if ok:
+                self.set_field_type(struct, fld, text)
+
+    def set_var_type(self, generated: str, ctype: str) -> bool:
+        func = self.decomp.func
+        if func is None or self.an is None:
+            return False
+        try:
+            self.an.set_var_type(func.addr, generated, ctype)
+        except ValueError as e:
+            self.statusBar().showMessage(f"set type: {e}", 5000)
+            return False
+        self._after_edit()
+        return True
+
+    def set_field_type(self, struct: str, field: str, ctype: str) -> bool:
+        try:
+            self.an.set_field_type(struct, field, ctype)
+        except ValueError as e:
+            self.statusBar().showMessage(f"set type: {e}", 5000)
+            return False
         self._after_edit()
         return True
 

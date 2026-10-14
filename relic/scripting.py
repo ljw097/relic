@@ -94,6 +94,21 @@ class Api:
         else:
             self.an.rename_field(struct, field, name)
 
+    def set_type(self, func, var: str, ctype: str):
+        """Give a variable / parameter (`a1`, `v3`, `var_10`) of a function a C type."""
+        f = self.func(func)
+        if f is None:
+            raise ValueError(f"no function at {func!r}")
+        self.an.set_var_type(f.addr, var, ctype)
+        if self.win is not None:
+            self.win._after_edit()
+
+    def set_field_type(self, struct: str, field: str, ctype: str):
+        """Give a field (`f_8`) of a recovered struct (`s_notes`) a C type."""
+        self.an.set_field_type(struct, field, ctype)
+        if self.win is not None:
+            self.win._after_edit()
+
     def comment(self, where, text: str):
         a = self.addr(where)
         if self.win is not None:
@@ -181,7 +196,8 @@ def namespace(an: "Analysis", win=None) -> dict:
     """Globals for console / plugin / script code."""
     api = Api(an, win)
     ns = {"an": an, "bin": an.bin, "api": api, "win": win}
-    for n in ("addr", "here", "goto", "name", "rename", "rename_struct", "rename_field", "comment", "func",
+    for n in ("addr", "here", "goto", "name", "rename", "rename_struct", "rename_field", "set_type",
+              "set_field_type", "comment", "func",
               "functions", "xrefs_to", "xrefs_from",
               "disasm", "decompile", "strings", "search", "patch", "nop", "invert", "assemble", "revert", "save"):
         ns[n] = getattr(api, n)

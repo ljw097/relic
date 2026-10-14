@@ -141,3 +141,69 @@ def test_nested_and_self_referential_structs(request, variant):
     assert text.index(f"struct {item} {{") < text.index(f"struct {node} {{")        # declared first
     assert f"int chain_sum(struct {node} *a1)" in text
     assert re.search(r"->f_8->f_8|v\d+->f_8;", text), text                          # n->it->count
+
+
+def test_user_types_for_variables_and_fields(structs_O2, tmp_path):
+    path = tmp_path / "s"
+    shutil.copy(structs_O2, path)
+    an = analyze(str(path))
+    score = decompile(an, an.function_by_name("item_score"))
+    item = next(iter(score.structs.values()))
+    an.rename_struct(item, "item")
+    an.rename_field(item, "f_8", "count")
+    # the struct recovered in item_score, applied to the parameter of other functions
+    for fn in ("name_len", "item_add"):
+        an.set_var_type(an.function_by_name(fn).addr, "a1", "struct item *")
+        text = _c(an, fn)
+        assert f"{fn}(struct item *a1" in text and "struct item {" in text, text
+    assert "char *f_0;" in _c(an, "name_len") and "->count" in _c(an, "item_add")
+    # scalar types, a bad type, an unknown struct
+    an.set_var_type(an.function_by_name("item_add").addr, "a2", "unsigned int")
+    assert "struct item *a1, unsigned int a2)" in _c(an, "item_add")
+    with pytest.raises(ValueError):
+        an.set_var_type(an.function_by_name("item_add").addr, "a2", "int[")
+    an.set_var_type(an.function_by_name("chain_sum").addr, "a1", "struct node *")
+    text = _c(an, "chain_sum")
+    assert "// a1: no struct node to apply" in text and "struct node *a1" not in text
+    # a field typed as a pointer to a named struct: the nested access goes through it
+    node = next(g for s, g in decompile(an, an.function_by_name("chain_sum")).structs.items()
+                if not s.endswith("_8"))
+    an.rename_struct(node, "node")
+    an.set_field_type(node, "f_8", "struct item *")
+    text = _c(an, "chain_sum")
+    assert "    struct item *f_8;" in text and "->count" in text, text
+    an.save_project()
+    again = analyze(str(path))
+    assert "->count" in _c(again, "chain_sum") and "unsigned int a2)" in _c(again, "item_add")
+    again.set_var_type(again.function_by_name("item_add").addr, "a2", "")
+    assert "unsigned int a2" not in _c(again, "item_add")
+
+
+def test_applied_types_still_recompile(structs_O2, tmp_path):
+    """Structs applied by the user change only how the code reads, not what it computes."""
+    an = analyze(structs_O2)
+    item = next(iter(decompile(an, an.function_by_name("item_score")).structs.values()))
+    an.rename_struct(item, "item_r")          # (the reference source has its own `struct item`)
+    for fn in ("name_len", "item_add"):
+        an.set_var_type(an.function_by_name(fn).addr, "a1", "struct item_r *")
+    cc = shutil.which("gcc")
+    if cc is None:
+        pytest.skip("no C compiler")
+    for fn in FUNCS:                         # a struct applied to several functions grows with each
+        _c(an, fn)
+    seen, parts = set(), []
+    for fn in FUNCS:
+        text = _c(an, fn)
+        for block in re.findall(r"^struct \w+ \{.*?^\};\n", text, re.M | re.S):
+            name = block.split()[1]
+            text = text.replace(block, "" if name in seen else block)
+            seen.add(name)
+        parts.append(text)
+    src = tmp_path / "re.c"
+    src.write_text(_HARNESS % {"code": "\n\n".join(parts), "src": os.path.join(HERE, "src", "structs.c"),
+                               "defines": "\n".join(f"#define {f} ref_{f}" for f in FUNCS),
+                               "undefs": "\n".join(f"#undef {f}" for f in FUNCS)})
+    r = subprocess.run([cc, "-w", "-fwrapv", "-Wno-error=incompatible-pointer-types", "-Wno-error=int-conversion",
+                        "-o", str(tmp_path / "re"), str(src)], capture_output=True, text=True)
+    assert r.returncode == 0, r.stderr[:3000]
+    assert subprocess.run([str(tmp_path / "re")], capture_output=True, text=True).stdout.strip().endswith("ok")

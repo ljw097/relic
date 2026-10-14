@@ -33,7 +33,10 @@ class Analysis:
         self.renames: dict[int, str] = {}
         # decompiler variable names: function address -> {generated name: user name}
         self.var_names: dict[int, dict[str, str]] = {}
-        # recovered structs: generated struct name -> {"name": user name, "fields": {f_8: user name}}
+        # user types of decompiler variables: function address -> {generated name: C type}
+        self.var_types: dict[int, dict[str, str]] = {}
+        # recovered structs: generated struct name -> {"name": user name, "fields": {f_8: user name},
+        # "types": {f_8: C type}}
         self.struct_names: dict[str, dict] = {}
         # byte patches: address -> (original bytes, new bytes), applied to `bin.data`
         self.patches: dict[int, tuple[bytes, bytes]] = {}
@@ -65,11 +68,11 @@ class Analysis:
 
     def reanalyze(self) -> "Analysis":
         """Analyse again (after a patch), keeping names, comments, variable names and patches."""
-        keep = (self.renames, self.comments, self.var_names, self.patches, self.struct_names)
+        keep = (self.renames, self.comments, self.var_names, self.patches, self.struct_names, self.var_types)
         b = self.bin
         self.__dict__.clear()                    # decompiler caches live on the instance too
         self.__init__(b)
-        self.renames, self.comments, self.var_names, self.patches, self.struct_names = keep
+        self.renames, self.comments, self.var_names, self.patches, self.struct_names, self.var_types = keep
         return self.run(load_project=False)
 
     # ------------------------------------------------------------- patches
@@ -331,11 +334,40 @@ class Analysis:
             fields.pop(generated, None)
         self._tidy_struct_names(struct)
 
+    def set_var_type(self, func: int, generated: str, ctype: str):
+        """Give a decompiler variable / parameter of the function at `func` a C type (`char *`,
+        `struct note *`); empty resets to the inferred one. ValueError for what is not a type."""
+        from ..decompiler.vartypes import parse_ctype
+        types = self.var_types.setdefault(func, {})
+        if ctype.strip():
+            t = parse_ctype(ctype)
+            types[generated] = str(t)
+            if t.base.startswith("struct "):
+                # keep an entry (and so the struct's layout) for a struct applied by its own name
+                name = t.base[7:]
+                if not any(d.get("name") == name for d in self.struct_names.values()):
+                    self.struct_names.setdefault(name, {})["applied"] = True
+        else:
+            types.pop(generated, None)
+        if not types:
+            self.var_types.pop(func, None)
+
+    def set_field_type(self, struct: str, generated: str, ctype: str):
+        """Give a field of a recovered struct a C type; empty resets it."""
+        from ..decompiler.vartypes import parse_ctype
+        types = self.struct_names.setdefault(struct, {}).setdefault("types", {})
+        if ctype.strip():
+            types[generated] = str(parse_ctype(ctype))
+        else:
+            types.pop(generated, None)
+        self._tidy_struct_names(struct)
+
     def _tidy_struct_names(self, struct: str):
         d = self.struct_names.get(struct, {})
-        if not d.get("fields"):
-            d.pop("fields", None)
-        if not d:
+        for k in ("fields", "types"):
+            if not d.get(k):
+                d.pop(k, None)
+        if set(d) <= {"layout"}:                 # nothing the user set: no entry
             self.struct_names.pop(struct, None)
 
     def comment(self, addr: int, text: str):
@@ -353,6 +385,7 @@ class Analysis:
             "variables": {f"{a:#x}": dict(sorted(v.items())) for a, v in sorted(self.var_names.items())},
             "patches": {f"{a:#x}": {"old": o.hex(), "new": n.hex()} for a, (o, n) in sorted(self.patches.items())},
             "structs": dict(sorted(self.struct_names.items())),
+            "types": {f"{a:#x}": dict(sorted(v.items())) for a, v in sorted(self.var_types.items())},
         }
         with open(path or self.project_path, "w") as fp:
             json.dump(data, fp, indent=2)
@@ -367,6 +400,7 @@ class Analysis:
         self.comments = {int(a, 16): c for a, c in data.get("comments", {}).items()}
         self.var_names = {int(a, 16): dict(v) for a, v in data.get("variables", {}).items()}
         self.struct_names = {k: dict(v) for k, v in data.get("structs", {}).items()}
+        self.var_types = {int(a, 16): dict(v) for a, v in data.get("types", {}).items()}
         return True
 
 

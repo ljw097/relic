@@ -161,6 +161,27 @@ class CType:
         return self.base + (" " + "*" * self.ptr if self.ptr else "")
 
 
+_BASES = {"void", "char", "short", "int", "long", "bool", "float", "double", "size_t", "ssize_t", "FILE",
+          "int8_t", "int16_t", "int32_t", "int64_t", "uint8_t", "uint16_t", "uint32_t", "uint64_t",
+          "unsigned char", "unsigned short", "unsigned int", "unsigned long", "unsigned", "signed char",
+          "long long", "unsigned long long", "__int128", "unsigned __int128"}
+
+
+def parse_ctype(text: str) -> CType:
+    """`int`, `unsigned int`, `char *`, `struct note *`, `void **` -> CType; ValueError otherwise."""
+    import re
+    t = " ".join(text.replace("*", " * ").split())
+    m = re.fullmatch(r"(?:const )?((?:struct )?[A-Za-z_][A-Za-z0-9_]*(?: [A-Za-z_][A-Za-z0-9_]*)*)((?: \*)*)", t)
+    if m is None:
+        raise ValueError(f"not a C type: {text!r}")
+    base, ptr = m.group(1), m.group(2).count("*")
+    if not base.startswith("struct ") and base not in _BASES:
+        raise ValueError(f"unknown type {base!r} (an integer type, void, char, or struct NAME)")
+    if base == "void" and not ptr:
+        raise ValueError("void is only a pointer target")
+    return CType(base, ptr)
+
+
 def _addr_base(a: Expr, is_addr=lambda v: False):
     """The variable a memory address is based on (`v`, `v + 8`, `v + i*4`).
 
@@ -241,4 +262,4 @@ def infer_types(fn: IRFunction, ptr_bits: int, is_addr=lambda v: False,
     return out
 
 
-__all__ = ["narrow", "simplify_low", "infer_types", "int_type", "CType"]
+__all__ = ["narrow", "simplify_low", "infer_types", "int_type", "parse_ctype", "CType"]

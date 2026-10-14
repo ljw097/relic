@@ -21,7 +21,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
 
-from .ir import (Assign, BinOp, CallStmt, Const, Expr, IRFunction, Load, StackVar, Store, Var, stmt_exprs,
+from .ir import (Assign, BinOp, Call, CallStmt, Const, Expr, IRFunction, Load, StackVar, Store, Var, stmt_exprs,
                  walk)
 from .sigs import lookup
 from .vartypes import int_type
@@ -59,10 +59,12 @@ class Struct:
         f = self.fields.get(offset)
         return f if f is not None and f.bits == bits else None
 
-    def declaration(self, sname=None, fname=None) -> list[str]:
-        """C lines; `sname(struct)` / `fname(field)` give the names to show (user renames)."""
+    def declaration(self, sname=None, fname=None, ftype=None) -> list[str]:
+        """C lines; `sname(struct)` / `fname(field)` give the names to show (user renames),
+        `ftype(field)` a field's type when it is not the recovered one."""
         fname = fname or (lambda f: f.name)
         sname = sname or (lambda st: st.name)
+        ftype = ftype or (lambda f: None)
         out = [f"struct {sname(self)} {{  // recovered, {self.size} bytes"]
         pos = 0
         for off in sorted(self.fields):
@@ -71,7 +73,7 @@ class Struct:
                 out.append(f"    char _pad_{pos:x}[{off - pos}];")
             elif off < pos:
                 continue                     # overlaps the previous field: shown through casts
-            t = f"struct {sname(f.child)} *" if f.child is not None else (f.ctype or int_type(f.bits))
+            t = ftype(f) or (f"struct {sname(f.child)} *" if f.child is not None else (f.ctype or int_type(f.bits)))
             sep = "" if t.endswith("*") else " "
             out.append(f"    {t}{sep}{fname(f)};")
             pos = f.end
@@ -207,7 +209,7 @@ class _Use:
             self.hints[off] = t
 
 
-def scan(fn: IRFunction, fn_addr: int, ptr_bits: int) -> dict[tuple, _Use]:
+def scan(fn: IRFunction, fn_addr: int, ptr_bits: int, name_of=None) -> dict[tuple, _Use]:
     """Fixed-offset accesses per base key in one (non-SSA, prepared) function. The entry
     ("links",) maps (key, offset) to the key of a variable assigned that field's pointer
     (`n = n->next`: the field points to the same struct)."""
@@ -227,6 +229,16 @@ def scan(fn: IRFunction, fn_addr: int, ptr_bits: int) -> dict[tuple, _Use]:
         return key, sp[1]
 
     loaded: dict[Expr, tuple] = {}         # Load expression -> (key, offset), for typing hints
+
+    def call_args(name, args):
+        sig = lookup(name)
+        for k, a in enumerate(args):
+            # the field itself, or a variable holding it (`v1 = it->name; strlen(v1)`)
+            src = defs.get(a.name) if isinstance(a, (Var, StackVar)) else a
+            if src in loaded and sig is not None and (sig.fmt == k or name and _string_arg(name, k)):
+                key, o = loaded[src]
+                uses[key].hint(o, "char *")
+
     for s in fn.stmts():
         for top in stmt_exprs(s):
             for x in walk(top):
@@ -251,11 +263,13 @@ def scan(fn: IRFunction, fn_addr: int, ptr_bits: int) -> dict[tuple, _Use]:
             if dst_key is not None:
                 links[loaded[s.src]] = dst_key
         if isinstance(s, CallStmt):
-            sig = lookup(s.name)
-            for k, a in enumerate(s.call.args):
-                if a in loaded and sig is not None and (sig.fmt == k or s.name and _string_arg(s.name, k)):
-                    key, o = loaded[a]
-                    uses[key].hint(o, "char *")
+            call_args(s.name, s.call.args)
+        elif name_of is not None:
+            # calls folded into an expression (`return strlen(v1) + ...`)
+            for top in stmt_exprs(s):
+                for x in walk(top):
+                    if isinstance(x, Call) and isinstance(x.target, Const):
+                        call_args(name_of(x.target.value), x.args)
     uses[("links",)] = links                 # type: ignore[assignment]
     return uses
 
@@ -308,7 +322,7 @@ def _scan_function(an: "Analysis", f) -> dict[tuple, _Use]:
         from .pipeline import prepare
         try:
             prep = prepare(an, f)
-            cache[f.addr] = scan(prep.fn, f.addr, prep.arch.bits)
+            cache[f.addr] = scan(prep.fn, f.addr, prep.arch.bits, an.name)
         except Exception:  # noqa: BLE001 - a function that does not decompile adds nothing
             cache[f.addr] = {}
     return cache[f.addr]
@@ -368,7 +382,7 @@ def global_struct(an: "Analysis", key: tuple, ptr_bits: int) -> Struct | None:
 class StructView:
     """The structs one function's pseudocode uses, and how to print accesses through them."""
 
-    def __init__(self, an: "Analysis", fn: IRFunction, ptr_bits: int):
+    def __init__(self, an: "Analysis", fn: IRFunction, ptr_bits: int, user_types: dict[str, str] | None = None):
         self.an = an
         self.fn = fn
         self.ptr_bits = ptr_bits
@@ -386,32 +400,107 @@ class StructView:
                     if isinstance(x, (Var, StackVar)) and x.bits == ptr_bits:
                         self._vars.setdefault(x.name, x)
         n = 0
-        res = scan(fn, fn.addr, ptr_bits)
+        res = scan(fn, fn.addr, ptr_bits, an.name)
         links = res.pop(("links",), {})
         fname = "".join(c if c.isalnum() else "_" for c in (an.name(fn.addr) or f"{fn.addr:x}"))
         names: dict[tuple, str] = {}
         for key in sorted((k for k in res if k[0] == "var"), key=str):
             n += 1
             names[key] = f"s_{fname}_{n}"
+        self._res = res
+        known = an.__dict__.setdefault("_local_structs", {})     # every local struct seen, by name
         for key, use in res.items():
             if root(key)[0] == "var" and _is_struct(use, field=key[0] == "field"):
-                self.local[key] = _build(_key_name(an, key, names), key, use, ptr_bits)
+                st = _build(_key_name(an, key, names), key, use, ptr_bits)
+                old = known.get(st.name)
+                if old is not None:
+                    # decompiled again: keep the one object other functions may have grown
+                    for off, f in st.fields.items():
+                        if off not in old.fields and not any(g.offset < off < g.end for g in old.fields.values()):
+                            old.fields[off] = f
+                    st = old
+                self.local[key] = known[st.name] = st
+        # variables the user typed `struct X *`
+        self.forced: dict[str, Struct] = {}
+        for gen, ctype in (user_types or {}).items():
+            if ctype.startswith("struct ") and ctype.endswith("*") and ctype.count("*") == 1:
+                st = self.find(ctype[7:].rstrip(" *"))
+                if st is not None:
+                    self.forced[gen] = self._extended(st, ("var", fn.addr, gen))
         for key, st in self.local.items():
             for off, f in st.fields.items():
                 if f.bits == ptr_bits:
                     target = links.get((key, off), ("field", key, off))
                     f.child = st if target == key else self._struct_for_key(target)
 
+    def find(self, name: str) -> Struct | None:
+        """A struct by the name shown (a user's rename) or its generated name; one the user named
+        but that this session has not recovered yet comes from the layout saved in the project."""
+        gen = next((g for g, d in self.an.struct_names.items() if d.get("name") == name), name)
+        for st in list(self.local.values()) + list(self.an.__dict__.get("_structs", {}).values()) + \
+                list(self.an.__dict__.get("_local_structs", {}).values()):
+            if st is not None and st.name == gen:
+                return st
+        layout = self.an.struct_names.get(gen, {}).get("layout")
+        if not layout:
+            return None
+        st = Struct(gen, ("saved", gen))
+        for off, (bits, ctype) in layout.items():
+            st.fields[int(off, 16)] = Field(int(off, 16), bits, ctype, f"f_{int(off, 16):x}")
+        self.an.__dict__.setdefault("_local_structs", {})[gen] = st
+        return st
+
+    def _extended(self, st: Struct, key: tuple) -> Struct:
+        """`st` grown with the fields this function reaches through `key` (in place: every
+        function the user applied the struct to adds what it uses, one definition for all)."""
+        use = self._res.get(key)
+        if use is None:
+            return st
+        new = st
+        for off, bs in use.sizes.items():
+            if off not in new.fields and not any(f.offset < off < f.end for f in new.fields.values()):
+                new.fields[off] = Field(off, max(bs), use.hints.get(off, "") if max(bs) == self.ptr_bits else "",
+                                        f"f_{off:x}")
+        return new
+
+    def field_type(self, st: Struct, f: Field) -> str | None:
+        """The user's type of a field, if any."""
+        return self.an.struct_names.get(st.name, {}).get("types", {}).get(f.name)
+
     def _struct_for_key(self, key: tuple) -> Struct | None:
+        if key[0] == "var" and key[2] in self.forced:
+            return self.forced[key[2]]
+        if key[0] == "field":
+            # a field the user typed `struct X *`: its pointer reaches X
+            parent = self._struct_for_key(key[1])
+            f = parent.fields.get(key[2]) if parent is not None else None
+            t = self.field_type(parent, f) if f is not None else None
+            if t and t.startswith("struct ") and t.count("*") == 1:
+                st = self.find(t[7:].rstrip(" *"))
+                if st is not None:
+                    return st
         return self.local.get(key) if root(key)[0] == "var" else global_struct(self.an, key, self.ptr_bits)
 
+    def child(self, st: Struct, f: Field) -> Struct | None:
+        """The struct a pointer field points to: the user's `struct X *` type, else recovered."""
+        t = self.field_type(st, f)
+        if t is not None:
+            return self.find(t[7:].rstrip(" *")) if t.startswith("struct ") and t.count("*") == 1 else None
+        return f.child
+
     def _use(self, st: Struct):
-        """Record a struct shown, and those its fields point to (declared before it)."""
+        """Record a struct shown, and those its fields point to (declared before it). A struct the
+        user named keeps its layout in the project, so types that name it work in a new session."""
         if st in self.used:
             return
+        d = self.an.struct_names.get(st.name)
+        if d is not None:
+            d["layout"] = {f"{o:#x}": [f.bits, f.ctype] for o, f in sorted(st.fields.items())}
         for f in st.fields.values():
-            if f.child is not None and f.child is not st and f.child not in self.used:
-                self._use(f.child)
+            c = self.child(st, f)
+            if c is not None and c is not st and c not in self.used and \
+                    all(c.name != u.name for u in self.used):
+                self._use(c)
         if st not in self.used:
             self.used.append(st)
 
@@ -427,6 +516,9 @@ class StructView:
     def var_struct(self, name: str) -> Struct | None:
         """The struct a pointer variable points to (for its declaration): its own, or that of the
         variable / global it is a copy of (`var_10 = a1` at -O0)."""
+        if name in self.forced:
+            self._use(self.forced[name])
+            return self.forced[name]
         v = self._vars.get(name)
         if v is None:
             return None
@@ -438,6 +530,18 @@ class StructView:
                     return self.struct_of(self._vars[dst])
             return None
         return self.struct_of(v)
+
+    def var_field_type(self, name: str) -> str | None:
+        """The pointer type of the field a variable is a copy of (`v1 = a1->name`: `char *`)."""
+        d = self.defs.get(name)
+        if not isinstance(d, Load):
+            return None
+        fa = self.field(d.addr, d.bits)
+        if fa is None:
+            return None
+        _, st, f = fa
+        t = self.field_type(st, f) or f.ctype
+        return t if t.endswith("*") and not t.startswith("struct ") else None
 
     def field(self, addr: Expr, bits: int) -> tuple[Expr, Struct, Field] | None:
         """(base, struct, field) when `bits` of memory at `addr` are a recovered field."""

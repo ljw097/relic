@@ -21,7 +21,7 @@ from .ir import (Assign, BinOp, CallStmt, Cast, Const, Effect, Expr, Extract, In
                  StackAddr, StackVar, Store, UnOp, Unknown, Var)
 from .sigs import base_name
 from .structure import Block, If, Jump1, Loop, Ret, Seq, Switch, _negate, case_labels
-from .vartypes import CType, infer_types, int_type
+from .vartypes import CType, infer_types, int_type, parse_ctype
 
 if TYPE_CHECKING:
     from ..analysis import Analysis, Function
@@ -43,6 +43,7 @@ class Decompiled:
     variables: dict[str, str] = field(default_factory=dict)   # shown name -> generated name
     structs: dict[str, str] = field(default_factory=dict)     # shown struct name -> generated name
     fields: dict[str, list] = field(default_factory=dict)     # shown field -> [(struct, field), ...]
+    types: dict[str, str] = field(default_factory=dict)       # generated variable name -> C type shown
 
     @property
     def text(self) -> str:
@@ -92,12 +93,6 @@ class CWriter:
         self.types: dict[str, CType] = infer_types(prep.fn, self.ptr_bits, self.is_addr)
         self.shown_structs: dict[str, str] = {}
         self.shown_fields: dict[str, list] = {}
-        from .structs import StructView
-        self.structs = StructView(an, prep.fn, self.ptr_bits)
-        for name in list(self.types):
-            st = self.structs.var_struct(name)
-            if st is not None and self.types[name].ptr <= 1:
-                self.types[name] = CType(f"struct {self.sname(st)}", 1)
         self.names: dict[str, str] = {}
         # user names for variables (Analysis.var_names), keyed by the generated name
         self.user: dict[str, str] = dict(an.var_names.get(prep.fn.addr, {}))
@@ -105,12 +100,53 @@ class CWriter:
         self.commented: set[int] = set()
         self.out: list[Line] = []
         self._name_vars()
+        # user types (Analysis.var_types, keyed by generated name) -> by the IR's variable names
+        wanted = an.var_types.get(prep.fn.addr, {})
+        user_types: dict[str, str] = {}
+        for name in set(self.types) | set(self.p.params):
+            gen = self.names.get(name, name)
+            if gen in wanted:
+                user_types[name] = wanted[gen]
+        from .structs import StructView
+        self.structs = StructView(an, prep.fn, self.ptr_bits, user_types)
+        for name in list(self.types):
+            st = self.structs.var_struct(name)
+            if st is not None and self.types[name].ptr <= 1:
+                self.types[name] = CType(f"struct {self.sname(st)}", 1)
+            else:
+                ft = self.structs.var_field_type(name)
+                if ft is not None and self.types[name].ptr <= 1:
+                    self.types[name] = parse_ctype(ft)
+        self.notes: list[str] = []
+        for name, t in user_types.items():
+            try:
+                ct = parse_ctype(t)
+            except ValueError:
+                continue
+            st = self.structs.forced.get(name)
+            if st is not None:
+                self.types[name] = CType(f"struct {self.sname(st)}", 1)
+            elif ct.base.startswith("struct "):
+                # no struct by that name (yet): keep what was recovered rather than declare one
+                self.notes.append(f"// {self.names.get(name, name)}: no struct {ct.base[7:]} to apply "
+                                  "(rename a recovered struct to it first)")
+            else:
+                self.types[name] = ct
 
     # ------------------------------------------------------------- structs
     def sname(self, st) -> str:
         shown = self.an.struct_names.get(st.name, {}).get("name") or st.name
         self.shown_structs[shown] = st.name
         return shown
+
+    def ftype(self, st, f) -> str | None:
+        """The user's type of a field; a struct it names is shown by its current name."""
+        t = self.structs.field_type(st, f)
+        if t and t.startswith("struct "):
+            target = self.structs.find(t[7:].rstrip(" *"))
+            if target is not None:
+                return f"struct {self.sname(target)} " + "*" * t.count("*")
+        return t
 
     def fname(self, st, f) -> str:
         shown = self.an.struct_names.get(st.name, {}).get("fields", {}).get(f.name) or f.name
@@ -569,6 +605,8 @@ class CWriter:
         return "ret" if self.p.arch.name.startswith(("x64", "x86")) else "sp0"
 
     def declarations(self, depth: int):
+        for note in self.notes:
+            self.emit(note, None, depth)
         frame = self.p.frame
         used = {x.name for s in self.p.fn.stmts() for top in ir.stmt_exprs(s) for x in ir.walk(top)
                 if isinstance(x, (StackVar, StackAddr))}
@@ -614,7 +652,8 @@ class CWriter:
         self.emit("}", None, 0)
         if self.structs.used:                     # the structs the body refers to, above it
             head = [Line(t, None, 0) for st in self.structs.used
-                    for t in st.declaration(self.sname, lambda f, st=st: self.fname(st, f)) + [""]]
+                    for t in st.declaration(self.sname, lambda f, st=st: self.fname(st, f),
+                                            lambda f, st=st: self.ftype(st, f)) + [""]]
             self.out[:0] = head
         return self.out
 
@@ -746,8 +785,9 @@ def decompile(an: "Analysis", func: "Function") -> Decompiled:
     prep = prepare(an, func)
     w = CWriter(an, prep)
     lines = w.render()
+    types = {w.names.get(n, n): str(t) for n, t in w.types.items()}
     return Decompiled(an.name(func.addr) or func.name, func.addr, lines, dict(w.shown), dict(w.shown_structs),
-                      {k: list(v) for k, v in w.shown_fields.items()})
+                      {k: list(v) for k, v in w.shown_fields.items()}, types)
 
 
 __all__ = ["Decompiled", "Line", "decompile", "number"]

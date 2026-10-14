@@ -658,4 +658,33 @@ def test_pseudocode_struct_field_rename(app, win):
     assert win.decomp.struct_under_cursor() == ("note", "s_notes", None)
     win.save_project()
     import json
-    assert json.load(open(win.an.project_path))["structs"] == {"s_notes": {"name": "note", "fields": {"f_8": "size"}}}
+    saved = json.load(open(win.an.project_path))["structs"]["s_notes"]
+    assert saved["name"] == "note" and saved["fields"] == {"f_8": "size"}
+    assert saved["layout"] == {"0x0": [64, "char *"], "0x8": [32, ""]}       # for types that name it
+
+
+def test_pseudocode_set_type(app, win, monkeypatch):
+    from PySide6.QtWidgets import QInputDialog
+    win.goto(win.an.function_by_name("show_note").addr)
+    win.toggle_decompile()
+    assert win.decomp.wait_idle()
+    text = win.decomp.toPlainText()
+    cur = win.decomp.textCursor()
+    cur.setPosition(text.index("int a1") + 4)
+    win.decomp.setTextCursor(cur)
+    seen = {}
+
+    def answer(parent, title, label, text=""):
+        seen["prefill"] = text
+        return "unsigned int", True
+    monkeypatch.setattr(QInputDialog, "getText", answer)
+    win.set_type_dialog()
+    assert seen["prefill"] == "int"
+    assert win.decomp.wait_idle() and "show_note(unsigned int a1)" in win.decomp.toPlainText()
+    text = win.decomp.toPlainText()
+    cur.setPosition(text.index("->f_0") + 3)
+    win.decomp.setTextCursor(cur)
+    monkeypatch.setattr(QInputDialog, "getText", lambda *a, **k: ("void *", True))
+    win.set_type_dialog()
+    assert win.decomp.wait_idle() and "    void *f_0;" in win.decomp.toPlainText()
+    assert not win.set_var_type("a1", "not a type!")
