@@ -152,14 +152,16 @@ class ListingHighlighter(QSyntaxHighlighter):
         if ln.kind == "xref":
             self.setFormat(0, len(text), self.f["comment"])
             return
-        if ln.kind != "insn":
+        if ln.kind not in ("insn", "data"):
             return
         c = self.view.columns
         self.setFormat(0, c["bytes"], self.f["addr"])
         self.setFormat(c["bytes"], c["mnem"] - c["bytes"], self.f["bytes"])
         m = ln.mnemonic
         key = "mnem"
-        if m.startswith("call") or m in ("bl", "blx", "jal", "jalr"):
+        if ln.kind == "data":
+            key = "label"
+        elif m.startswith("call") or m in ("bl", "blx", "jal", "jalr"):
             key = "call"
         elif m.startswith("j") or m.startswith("b") and m not in ("bswap", "bt", "bts", "btr", "btc", "bsf", "bsr"):
             key = "jump"
@@ -221,7 +223,7 @@ class DisasmView(QPlainTextEdit):
         self.lines = lines
         self.row_of = {}
         for k, ln in enumerate(lines):
-            if ln.kind == "insn" or (ln.kind == "func" and ln.addr not in self.row_of):
+            if ln.kind in ("insn", "data") or (ln.kind == "func" and ln.addr not in self.row_of):
                 self.row_of.setdefault(ln.addr, k)
         addr_w = 16 if any(ln.addr >> 32 for ln in lines) else 8
         self.columns = {"bytes": 2 + addr_w + 2, "mnem": 2 + addr_w + 2 + (24 if self.show_bytes else 0)}
