@@ -160,6 +160,7 @@ relic sc.bin --arch x64 --base 0x1000
 | `Ctrl+Alt+Pause` / `Ctrl+F2` | 일시 정지 / 종료 |
 | `Ctrl+Alt+P` / `Ctrl+Alt+A` | 바이트 패치 / 어셈블해서 패치 (`pip install .[asm]`: keystone) |
 | `Ctrl+Alt+N` / `Ctrl+Alt+J` | 명령어를 NOP으로 / 조건 분기 반전 (Edit ▸ Revert patch, Export patched file) |
+| `Ctrl+Z` / `Ctrl+Shift+Z` | 패치 되돌리기 / 다시 하기 |
 | `Ctrl+Shift+S` | 구조체 창: 복원된 구조체의 필드 이름·타입 수정, 필드 추가(`0x10 char[8] tag`)·삭제 |
 | `Ctrl+Shift+P` | Python 콘솔 (`an`, `here()`, `goto()`, `rename()`, `decompile()`, `patch()` …, ↑/↓ 기록) |
 | `Ctrl+.` | 실행 중인 분석 / 취약점 스캔 / 검색 취소 |
@@ -181,6 +182,7 @@ Debug 메뉴(`F9`)가 열린 바이너리를 로컬 `gdb`(GDB/MI)로 실행합�
   - 이름으로 중단점: 바이너리 함수나 `puts@plt`는 그 주소에, `puts`처럼 import한 라이브러리 함수는 libc 안의 함수 본체에서 멈춤(라이브러리가 아직 로드되지 않았으면 로드될 때 설정)
   - watchpoint: 쓰기/읽기/접근, 대상은 바이너리 전역·주소(`notes`, `notes+8`, `0x404040`; PIE 슬라이드 보정, 크기 1/2/4/8바이트)나 gdb 식(`*(int *)($rbp-4)`). 커서 줄이 참조하는 전역이 기본값. 멈추면 이전 값 → 새 값을 Console과 상태 표시줄에 표시
 - **Vmmap** / **Memory**: 프로세스 메모리 맵(종류별 색), 주소·식(`$rsp+8`, `main`, `0x7ffd...`)의 hexdump. 레지스터·스택 값이나 매핑을 더블클릭하면 분석한 바이너리의 코드는 리스팅으로, 그 밖은 Memory 뷰로 따라갑니다
+- 패치가 있으면 디버거는 패치된 이미지(임시 사본)를 실행합니다 — 리스팅에 보이는 코드가 실제로 돕니다
 - 리스팅과 의사 코드에서 현재 pc 줄(의사 코드는 그 명령이 속한 문장)은 초록, 중단점은 빨강으로 표시하며 멈출 때마다 정적 주소로 따라갑니다(PIE 슬라이드는 자동 보정)
 - 값 바꾸기: Registers 패널에서 `E`(또는 우클릭 ▸ Set)로 레지스터를 숫자나 gdb 식(`$rsp+8`)으로, Debug ▸ Write memory로 메모리에 hex 바이트(`41 42 ff`)·문자열(`"AAAA\n"`)·워드(`0x401136`)를 씁니다
 

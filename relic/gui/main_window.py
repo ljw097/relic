@@ -404,6 +404,8 @@ class MainWindow(QMainWindow):
         act(m, "&NOP instruction", "Ctrl+Alt+N", lambda: self.patch_with("nop"))
         act(m, "In&vert branch", "Ctrl+Alt+J", lambda: self.patch_with("invert"))
         act(m, "Re&vert patch", None, self.revert_patch_here)
+        act(m, "&Undo patch", "Ctrl+Z", self.undo_patch)
+        act(m, "Redo patc&h", ("Ctrl+Shift+Z", "Ctrl+Y"), self.redo_patch)
         act(m, "&Export patched file...", None, self.export_patched_dialog)
         m = mb.addMenu("&Search")
         act(m, "Sequence of &bytes...", "Alt+B", lambda: self.search_dialog("bytes"))
@@ -1359,6 +1361,29 @@ class MainWindow(QMainWindow):
         self.an.revert(start)
         self._after_patch(a)
         self.statusBar().showMessage(f"reverted the patch at {start:#x}", 4000)
+        return True
+
+    def undo_patch(self) -> bool:
+        """Undo the last patch or revert (Ctrl+Z); the cursor goes to it."""
+        if self.an is None:
+            return False
+        addr = self.an.undo_patch()
+        if addr is None:
+            self.statusBar().showMessage("nothing to undo", 3000)
+            return False
+        self._after_patch(addr)
+        self.statusBar().showMessage(f"undid the patch edit at {addr:#x}", 4000)
+        return True
+
+    def redo_patch(self) -> bool:
+        if self.an is None:
+            return False
+        addr = self.an.redo_patch()
+        if addr is None:
+            self.statusBar().showMessage("nothing to redo", 3000)
+            return False
+        self._after_patch(addr)
+        self.statusBar().showMessage(f"redid the patch edit at {addr:#x}", 4000)
         return True
 
     def export_patched_dialog(self):

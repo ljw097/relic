@@ -153,7 +153,18 @@ class DebugController(QObject):
             from ..debugger import Session
             self._close()
             self.path, self.an, self.args = path, analysis, list(args or [])
-            self.session = Session(path, self.args, analysis, on_output=self.output.emit)
+            run = path
+            if analysis is not None and analysis.patches:
+                # run what the listing shows: the patched image, written next to nothing else
+                import os
+                import tempfile
+
+                from ..patch import export
+                self._tmpdir = tempfile.mkdtemp(prefix="relic-dbg-")
+                run = export(analysis.bin, os.path.join(self._tmpdir, os.path.basename(path)))
+                n = len(analysis.patches)
+                self.log.emit(f"[ debugging the patched image ({n} patch{'es' if n != 1 else ''}): {run} ]\n")
+            self.session = Session(run, self.args, analysis, on_output=self.output.emit)
             self.mem_addr = None
             self.session.start(stop_at)
             for bp in sorted(self.static_bps.values(), key=lambda b: b.addr):
@@ -173,6 +184,11 @@ class DebugController(QObject):
                 self.session.close()
             finally:
                 self.session = None
+        tmp = getattr(self, "_tmpdir", None)
+        if tmp:
+            import shutil
+            shutil.rmtree(tmp, ignore_errors=True)
+            self._tmpdir = None
 
     def _run(self, name: str, *args):
         def go():

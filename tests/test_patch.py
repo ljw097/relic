@@ -110,3 +110,23 @@ def test_cli(vuln64, tmp_path):
     assert b"name?" in p.stdout
     r = relic("patch", str(path), "notes", "--bytes", "41")
     assert r.returncode != 0 and "not all in the file" in r.stderr
+
+
+def test_patch_undo_redo(vuln64, tmp_path):
+    path = tmp_path / "v"
+    shutil.copy(vuln64, path)
+    an = analyze(str(path))
+    win = an.function_by_name("win").addr
+    orig = an.bin.read(win, 2)
+    an.patch(win, b"\xc3")
+    an.patch(win, b"\x90\xc3")                                 # replaces the first patch
+    an.revert(win)
+    assert an.patches == {} and an.bin.read(win, 2) == orig
+    assert an.undo_patch() == win and an.patches[win][1] == b"\x90\xc3"    # the revert undone
+    assert an.undo_patch() == win and an.patches[win][1] == b"\xc3"
+    assert an.undo_patch() == win and an.patches == {} and an.bin.read(win, 2) == orig
+    assert an.undo_patch() is None
+    assert an.redo_patch() == win and an.dis.decode(win).mnemonic == "ret"
+    assert an.redo_patch() == win and an.patches[win][1] == b"\x90\xc3"
+    an.patch(an.function_by_name("vuln").addr, b"\xc3")          # a new edit drops the redo history
+    assert an.redo_patch() is None and len(an.patch_undo) == 3

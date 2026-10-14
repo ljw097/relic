@@ -40,6 +40,9 @@ class Analysis:
         self.struct_names: dict[str, dict] = {}
         # byte patches: address -> (original bytes, new bytes), applied to `bin.data`
         self.patches: dict[int, tuple[bytes, bytes]] = {}
+        # undo / redo of patch edits: (address, the patch there before the edit, or None)
+        self.patch_undo: list[tuple[int, tuple | None]] = []
+        self.patch_redo: list[tuple[int, tuple | None]] = []
         self._fstarts: list[int] = []
         self._strings_by_addr: dict[int, String] = {}
 
@@ -68,15 +71,17 @@ class Analysis:
 
     def reanalyze(self) -> "Analysis":
         """Analyse again (after a patch), keeping names, comments, variable names and patches."""
-        keep = (self.renames, self.comments, self.var_names, self.patches, self.struct_names, self.var_types)
+        keep = (self.renames, self.comments, self.var_names, self.patches, self.struct_names, self.var_types,
+                self.patch_undo, self.patch_redo)
         b = self.bin
         self.__dict__.clear()                    # decompiler caches live on the instance too
         self.__init__(b)
-        self.renames, self.comments, self.var_names, self.patches, self.struct_names, self.var_types = keep
+        (self.renames, self.comments, self.var_names, self.patches, self.struct_names, self.var_types,
+         self.patch_undo, self.patch_redo) = keep
         return self.run(load_project=False)
 
     # ------------------------------------------------------------- patches
-    def patch(self, addr: int, data: bytes, reanalyze: bool = True) -> bytes:
+    def patch(self, addr: int, data: bytes, reanalyze: bool = True, _record: bool = True) -> bytes:
         """Write `data` at `addr` (see `relic.patch`); returns the bytes it replaced. Patching
         the same address again replaces the earlier patch; overlapping another one is refused."""
         from ..patch import PatchError, write
@@ -84,24 +89,60 @@ class Analysis:
         for a, (_old, new) in self.patches.items():
             if a != addr and a < end and addr < a + len(new):
                 raise PatchError(f"overlaps the patch at {a:#x} (revert it first)")
-        if addr in self.patches:
-            self.revert(addr, reanalyze=False)
+        before = self.patches.get(addr)
+        if before is not None:
+            self.revert(addr, reanalyze=False, _record=False)
         old = write(self.bin, addr, data)
         self.patches[addr] = (old, bytes(data))
+        if _record:
+            self.patch_undo.append((addr, before))
+            self.patch_redo.clear()
         if reanalyze:
             self.reanalyze()
         return old
 
-    def revert(self, addr: int, reanalyze: bool = True) -> bool:
+    def revert(self, addr: int, reanalyze: bool = True, _record: bool = True) -> bool:
         """Put back the original bytes of the patch at `addr`."""
         from ..patch import write
         p = self.patches.pop(addr, None)
         if p is None:
             return False
         write(self.bin, addr, p[0])
+        if _record:
+            self.patch_undo.append((addr, p))
+            self.patch_redo.clear()
         if reanalyze:
             self.reanalyze()
         return True
+
+    def _set_patch(self, addr: int, state: tuple | None):
+        """Make the patch at `addr` be `state` ((original, new) or None: none)."""
+        if addr in self.patches:
+            self.revert(addr, reanalyze=False, _record=False)
+        if state is not None:
+            self.patch(addr, state[1], reanalyze=False, _record=False)
+
+    def undo_patch(self, reanalyze: bool = True) -> int | None:
+        """Undo the last patch edit (a patch or a revert); its address, or None if nothing to undo."""
+        if not self.patch_undo:
+            return None
+        addr, before = self.patch_undo.pop()
+        self.patch_redo.append((addr, self.patches.get(addr)))
+        self._set_patch(addr, before)
+        if reanalyze:
+            self.reanalyze()
+        return addr
+
+    def redo_patch(self, reanalyze: bool = True) -> int | None:
+        """Redo the last undone patch edit."""
+        if not self.patch_redo:
+            return None
+        addr, after = self.patch_redo.pop()
+        self.patch_undo.append((addr, self.patches.get(addr)))
+        self._set_patch(addr, after)
+        if reanalyze:
+            self.reanalyze()
+        return addr
 
     def patched_at(self, addr: int) -> bool:
         return any(a <= addr < a + len(new) for a, (_, new) in self.patches.items())

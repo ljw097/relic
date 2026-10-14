@@ -720,3 +720,30 @@ def test_structures_window(app, win, monkeypatch):
     saved = json.load(open(win.an.project_path))["structs"]["s_notes"]
     assert saved["removed"] == ["0x0"] and saved["added"] == {"0x10": ["char[8]", "tag"]}
     dlg.close()
+
+
+def test_debugger_runs_the_patched_image_and_undo(app, win):
+    from test_debugger import _can_debug
+    if not _can_debug():
+        pytest.skip("gdb with ptrace permission is needed")
+    an = win.an
+    main = an.function_by_name("main")
+    cj = next(i for b in sorted(main.blocks.values(), key=lambda b: b.addr) for i in b.insns if i.kind == "cjmp")
+    win.goto(cj.addr)
+    assert win.patch_with("invert")                  # `argc > 1` turned around: no argument runs vuln()
+    win.dbg_args = []
+    win.debug_start()
+    assert _debug_wait(app, win, lambda: win.dbg_regs.rowCount() > 0)
+    assert "debugging the patched image (1 patch)" in win.dbg_console.out.toPlainText()
+    win.dbg.send_input("relic\n")
+    win.debug_start_or_continue()
+    # vuln() ran; main then hands argv[1] (NULL: no argument) to atoi and stops on a signal
+    assert _debug_wait(app, win, lambda: "hello relic" in win.dbg_console.out.toPlainText())
+    assert "name?" in win.dbg_console.out.toPlainText()
+    tmp = win.dbg._tmpdir
+    win.dbg.stop()
+    assert _debug_wait(app, win, lambda: win.dbg.session is None)
+    assert tmp and not os.path.exists(tmp)                      # the patched copy is gone
+    assert win.undo_patch() and not an.patches and an.dis.decode(cj.addr).mnemonic == cj.mnemonic
+    assert win.redo_patch() and cj.addr in an.patches
+    assert win.undo_patch() and not win.undo_patch()
