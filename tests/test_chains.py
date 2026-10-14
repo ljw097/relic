@@ -1,7 +1,7 @@
 """Compare chains on one value -> switch (decompiler/chains.py), on hand-built trees."""
 from relic.decompiler.chains import switchify
 from relic.decompiler.ir import BinOp, Const, Return, Var
-from relic.decompiler.structure import Block, Case, If, Jump1, Loop, Ret, Seq, Switch
+from relic.decompiler.structure import Block, If, Jump1, Loop, Ret, Seq, Switch
 
 X = Var("x", 1, 32)
 
