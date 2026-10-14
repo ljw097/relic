@@ -154,6 +154,8 @@ class Disassembler:
             insn = None
             if self.bin.is_exec(addr) or self.bin.format == "RAW":
                 thumb = self.is_thumb(addr)
+                if not thumb and self.md_thumb is None:
+                    return self._decode_run(addr)
                 md = self.md_thumb if thumb else self.md
                 code = self.bin.read(addr, 16)
                 for c in md.disasm(code, addr, 1):
@@ -162,6 +164,27 @@ class Disassembler:
                     return self._it_block(insn)
             self._cache[addr] = insn
             return insn
+
+    RUN = 8      # instructions decoded per capstone call on a miss
+
+    def _decode_run(self, addr: int) -> Insn | None:
+        """Decode the instruction at `addr` and the few after it in one capstone call (an
+        instruction decodes the same however it is reached, so they are cached for later)."""
+        first = None
+        for c in self.md.disasm(self.bin.read(addr, 16 * self.RUN), addr, self.RUN):
+            if first is not None and not (self.bin.is_exec(c.address) or self.bin.format == "RAW"):
+                break                              # (decode() answers None outside code)
+            i = self._cache.get(c.address)
+            if i is None and c.address not in self._cache:
+                i = self._convert(c)
+                self._cache[c.address] = i
+            if first is None:
+                first = i
+            if i is not None and i.kind in (JMP, RET):
+                break                              # what follows may be data or padding
+        if first is None:
+            self._cache[addr] = None
+        return first
 
     def _it_block(self, it: Insn) -> Insn:
         """Thumb `it`: capstone only applies its conditions within one decode run, so decode the
