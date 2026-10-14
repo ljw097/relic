@@ -92,11 +92,17 @@ def test_pie_classify_switch_has_default(vuln64_pie):
 # ------------------------------------------------- structured tree vs. CFG, by execution
 def _cfg(edges: dict, entry: int):
     """An IRFunction from {block: [successors]}: two successors branch on a variable `c<addr>`,
-    one jumps, none returns."""
-    from relic.decompiler.ir import Assign, Branch, Const, IRBlock, IRFunction, Jump, Return, Var
+    one jumps, none returns; a tuple of successors is a jump table indexed by `s<addr>`."""
+    from relic.decompiler.ir import (Assign, BinOp, Branch, Const, IndirectJump, IRBlock, IRFunction, Jump, Load,
+                                     Return, Var)
     fn = IRFunction(entry, "f")
     for a, outs in edges.items():
-        if len(outs) == 2:
+        if isinstance(outs, tuple):
+            idx = BinOp("*", Var(f"s{a:x}", 0, 64), Const(8, 64), 64)
+            last = IndirectJump(a, Load(BinOp("+", Const(0x9000, 64), idx, 64), 64),
+                                list(dict.fromkeys(outs)), list(outs))
+            outs = list(dict.fromkeys(outs))
+        elif len(outs) == 2:
             last = Branch(a, Var(f"c{a:x}", 0, 1), outs[0], outs[1])
         elif outs:
             last = Jump(a, outs[0])
@@ -105,20 +111,34 @@ def _cfg(edges: dict, entry: int):
         # a statement in every block: none may be dropped as empty
         fn.blocks[a] = IRBlock(a, [Assign(a, Var(f"m{a:x}", 0, 32), Const(1, 32)), last], list(outs))
     for a, outs in edges.items():
-        for s in outs:
+        for s in dict.fromkeys(outs):
             fn.blocks[s].preds.append(a)
     return fn
 
 
+def _choice(a, v, tables):
+    """What block `a` does with the oracle's value `v`: a branch's side, a table's index."""
+    return int(v * len(tables[a])) if a in tables else v < 0.5
+
+
+def _tables(fn):
+    from relic.decompiler.ir import IndirectJump
+    return {a: b.stmts[-1].table for a, b in fn.blocks.items() if isinstance(b.stmts[-1], IndirectJump)}
+
+
 def _run_cfg(fn, oracle, limit=60):
     trace, seen, a = [], {}, fn.addr
+    tables = _tables(fn)
     while len(trace) < limit:
         trace.append(a)
         seen[a] = seen.get(a, 0) + 1
         outs = fn.blocks[a].succs
         if not outs:
             break
-        a = outs[0] if len(outs) == 1 or oracle(a, seen[a]) else outs[1]
+        if a in tables:
+            a = tables[a][_choice(a, oracle(a, seen[a]), tables)]
+        else:
+            a = outs[0] if len(outs) == 1 or _choice(a, oracle(a, seen[a]), tables) else outs[1]
     return trace
 
 
@@ -126,7 +146,7 @@ def _compile_tree(tree):
     """A structured tree as jump code: ("visit", block), ("test", cond, else_index),
     ("jmp", index or ("label", block)), ("ret",). Labels: every non-copy block and loop header
     (where a `goto` lands, as the renderer prints them)."""
-    from relic.decompiler.structure import If, Jump1, Loop, Ret
+    from relic.decompiler.structure import If, Jump1, Loop, Ret, Switch
     code, labels = [], {}
 
     def emit(node, brk, cont):
@@ -189,21 +209,37 @@ def _compile_tree(tree):
                 code.append(("jmp", cont))
         elif isinstance(node, Ret):
             code.append(("ret", node.stmt.addr))
+        elif isinstance(node, Switch):
+            k = len(code)
+            code.append(None)
+            exits, starts, default = [], {}, None
+            for case in node.cases:                     # case bodies in order: fall-through
+                for v in case.values:
+                    starts[v] = len(code)
+                if case.default:
+                    default = len(code)
+                emit(case.body, exits, cont)
+            end = len(code)
+            for j in exits:
+                code[j] = ("jmp", end)
+            code[k] = ("switch", node.expr, starts, end if default is None else default)
         else:
             raise AssertionError(f"node {node}")
     emit(tree, None, None)
     return code, labels
 
 
-def _run_tree(tree, oracle, limit=60):
+def _run_tree(tree, oracle, limit=60, tables=None):
     """Execute a structured tree: the blocks it passes through, in order."""
     from relic.decompiler.ir import BinOp, Const, UnOp, Var
     code, labels = _compile_tree(tree)
     trace, seen, val = [], {}, {}
+    tables = tables or {}
 
     def ev(c):
         if isinstance(c, Var):
-            return val[int(c.name[1:], 16)]
+            a = int(c.name[1:], 16)
+            return _choice(a, val[a], tables)
         if isinstance(c, Const):
             return bool(c.value)
         if isinstance(c, UnOp) and c.op == "!":
@@ -226,6 +262,8 @@ def _run_tree(tree, oracle, limit=60):
         elif op[0] == "test":
             if not ev(op[1]):
                 pc = op[2]
+        elif op[0] == "switch":
+            pc = op[2].get(ev(op[1]), op[3])
         elif op[0] == "jmp":
             pc = labels[op[1][1]] if isinstance(op[1], tuple) else op[1]
         elif op[0] == "ret":
@@ -240,7 +278,7 @@ def _oracles(seed_count=200):
     for seed in range(seed_count):
         rnd = random.Random(seed)
         table = {}
-        yield lambda a, k, table=table, rnd=rnd: table.setdefault((a, k), rnd.random() < 0.5)
+        yield lambda a, k, table=table, rnd=rnd: table.setdefault((a, k), rnd.random())
 
 
 def test_loop_with_join_bypassed_by_one_side_runs_like_the_cfg():
@@ -260,7 +298,7 @@ def test_loop_with_join_bypassed_by_one_side_runs_like_the_cfg():
     tree = st.run()
     assert not st.gotos
     for oracle in _oracles():
-        assert _run_tree(tree, oracle) == _run_cfg(fn, oracle)
+        assert _run_tree(tree, oracle, tables=_tables(fn)) == _run_cfg(fn, oracle)
 
 
 _FOUND = [   # CFGs that once structured into code doing something else (one bug each)
@@ -284,10 +322,10 @@ def test_found_cfgs_run_like_the_cfg(edges):
     fn = _cfg(edges, min(edges))
     tree = Structurer(fn).run()
     for oracle in _oracles(60):
-        assert _run_tree(tree, oracle) == _run_cfg(fn, oracle)
+        assert _run_tree(tree, oracle, tables=_tables(fn)) == _run_cfg(fn, oracle)
 
 
-def _random_cfg(rnd, n):
+def _random_cfg(rnd, n, switches=False):
     addrs = [0x100 + 0x10 * i for i in range(n)]
     edges = {}
     for i, a in enumerate(addrs[:-1]):
@@ -296,6 +334,8 @@ def _random_cfg(rnd, n):
             edges[a] = []
         elif r < 0.45:
             edges[a] = [rnd.choice(later)]
+        elif r < 0.55 and switches and len(later) >= 3:
+            edges[a] = tuple(rnd.choice(later) for _ in range(rnd.randint(3, 6)))
         else:
             t = rnd.choice(later if rnd.random() < 0.8 or not i else addrs[:i + 1])
             f = rnd.choice(later)
@@ -303,7 +343,7 @@ def _random_cfg(rnd, n):
     edges[addrs[-1]] = []
     seen, work = {addrs[0]}, [addrs[0]]
     while work:
-        for s in edges[work.pop()]:
+        for s in set(edges[work.pop()]):
             if s not in seen:
                 seen.add(s)
                 work.append(s)
@@ -316,8 +356,8 @@ def test_random_cfgs_run_like_the_cfg():
     import random
     for seed in range(300):
         rnd = random.Random(seed)
-        edges = _random_cfg(rnd, rnd.randint(3, 14))
+        edges = _random_cfg(rnd, rnd.randint(3, 14), switches=seed % 2 == 1)
         fn = _cfg(edges, min(edges))
         tree = Structurer(fn).run()
         for oracle in _oracles(15):
-            assert _run_tree(tree, oracle) == _run_cfg(fn, oracle), (seed, edges)
+            assert _run_tree(tree, oracle, tables=_tables(fn)) == _run_cfg(fn, oracle), (seed, edges)

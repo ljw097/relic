@@ -28,6 +28,7 @@ DUP_STMTS = 12   # ... and statements is copied rather than reached by goto
 @dataclass
 class Seq:
     items: list = field(default_factory=list)
+    end: int | None = field(default=None, compare=False)   # the stop flow reached at its end, if any
 
 
 @dataclass
@@ -317,7 +318,7 @@ class Structurer:
                 if edge is not None:
                     return Seq([Block(n, body, copy=True), edge])
                 if nxt in (stops if isinstance(stops, (set, frozenset)) else {stops}):
-                    return Seq([Block(n, body, copy=True)])
+                    return Seq([Block(n, body, copy=True)], end=nxt)
                 if _small_return(self.blocks[nxt]):
                     return Seq([Block(n, body, copy=True), Ret(self.blocks[nxt].stmts[0])])
         region = self._dup_region(n, stops, ctx)
@@ -410,7 +411,9 @@ class Structurer:
                 if edge is not None:
                     seq.items.append(edge)
                 else:
-                    seq.items.extend(self._revisit(n, stops, ctx).items)
+                    again = self._revisit(n, stops, ctx)
+                    seq.items.extend(again.items)
+                    n = again.end           # a copied tail that runs to the stop ends there too
                 break
             # a loop header we are not already inside -> emit the whole loop
             if n in self.loops and not any(c.kind == "loop" and c.header == n for c in ctx):
@@ -454,6 +457,8 @@ class Structurer:
                     n = None
                 else:
                     n = nxt
+        if n is not None and n in stops:
+            seq.end = n
         return seq
 
     def _edge(self, target, ctx):
@@ -519,12 +524,12 @@ class Structurer:
         if follow is None:
             follow = self._join(n, t, f, loop, sw, stops)
         stop_set = stops if isinstance(stops, (set, frozenset)) else {stops}
-        if follow is not None and follow not in stop_set and (t in stop_set) != (f in stop_set) and \
-                self._edge_kind(t if t in stop_set else f, ctx) is None:      # (a break leaves on its own)
-            # one side leaves this region (to its stop), and the post-dominator lies beyond it:
-            # the stop is where the `if` ends, or the leaving side would fall into the code
-            # that follows instead of leaving
-            follow = t if t in stop_set else f
+        # sides that leave this region by reaching its stop (not by a break / continue of their own)
+        leave = [x for x in dict.fromkeys((t, f)) if x in stop_set and self._edge_kind(x, ctx) is None]
+        if (follow is None or follow not in stop_set) and len(leave) == 1:
+            # the post-dominator lies beyond the stop (or there is none): the stop is where the
+            # `if` ends, or the leaving side would fall into the code that follows instead
+            follow = leave[0]
 
         # bounds check guarding a jump table -> switch with a default
         for tgt, other, _c in ((f, t, cond), (t, f, _negate(cond))):
@@ -549,6 +554,21 @@ class Structurer:
 
         then = branch(t)
         els = branch(f)
+        if follow is None:
+            # no join, but a side that runs to this region's stop continues there (its other
+            # side leaves on its own): flow after the `if` is that stop. Sides running to two
+            # different stops: one continues, the other says where it goes
+            ran = [x for x in (then, els) if isinstance(x, Seq) and x.end is not None]
+            ends = list(dict.fromkeys(x.end for x in ran))
+            if len(ends) > 1:
+                keep = next((e for e in ends if self._edge_kind(e, ctx) is None), ends[0])
+                for x in ran:
+                    if x.end != keep:
+                        x.items.append(self._edge(x.end, ctx) or self._goto(x.end))
+                        x.end = None
+                ends = [keep]
+            if ends:
+                follow = ends[0]
         if then is None and els is not None:      # keep the taken side non-empty
             cond, then, els = _negate(cond), els, None
         return If(n, cond, then, els), follow
@@ -632,17 +652,10 @@ class Structurer:
                 if not isinstance(last, (Ret, Jump1)):
                     nxt = targets[i + 1] if i + 1 < len(targets) else None
                     # fell off the end: into the next case (fall-through) or out of the switch
-                    if not (nxt is not None and self._falls_into(body, nxt)):
+                    if not (nxt is not None and body.end == nxt):
                         body.items.append(Jump1("break"))
             cases.append(Case(t, labels, is_default, body))
         return Switch(n, idx if idx is not None else term.expr, cases), follow
-
-    def _falls_into(self, body, nxt):
-        """Whether the last block structured in `body` continues straight into `nxt`."""
-        last = None
-        for node in _iter_blocks(body):
-            last = node
-        return last is not None and self.succ.get(last.addr) == [nxt]
 
 
 def _iter_blocks(node):
@@ -695,7 +708,7 @@ def _render(node, depth, out, gotos):
         for it in node.items:
             _render(it, depth, out, gotos)
     elif isinstance(node, Block):
-        if node.addr in gotos:
+        if node.addr in gotos and not node.copy:
             out.append(f"{_ind(depth - 1)}  loc_{node.addr:x}:")
         for s in node.stmts:
             if _is_phi(s):
