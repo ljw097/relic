@@ -79,7 +79,8 @@ int main(void) {
 """
 
 
-@pytest.fixture(scope="module", params=["flow_O0", "flow_O2", "flow32_O0", "flow32_O2", "flow_a64_O0", "flow_a64_O2"])
+@pytest.fixture(scope="module", params=["flow_O0", "flow_O2", "flow32_O0", "flow32_O2", "flow_a64_O0", "flow_a64_O2",
+                                              "flow_arm_O0", "flow_arm_O2", "flow_thumb_O0", "flow_thumb_O2"])
 def flow(request):
     path = request.getfixturevalue(request.param)
     return request.param, analyze(path)
@@ -94,6 +95,12 @@ def test_flow_functions_decompile_without_goto_soup(flow):
             assert target in labels, f"{name}/{fn}: goto {target} without label\n{text}"
 
 
+def _host_m32(cc, tmp_path) -> bool:
+    probe = tmp_path / "m32.c"
+    probe.write_text("#include <stdio.h>\nint main(void) { return 0; }\n")
+    return subprocess.run([cc, "-m32", "-o", str(tmp_path / "m32"), str(probe)], capture_output=True).returncode == 0
+
+
 def test_flow_recompiles_and_matches_source(flow, tmp_path):
     cc = shutil.which("gcc") or shutil.which("cc")
     if cc is None:
@@ -104,7 +111,11 @@ def test_flow_recompiles_and_matches_source(flow, tmp_path):
     src = tmp_path / "re.c"
     src.write_text(_HARNESS % {"code": code, "defines": defines, "src": os.path.join(HERE, "src", "flow.c")})
     exe = tmp_path / "re"
-    m32 = ["-m32"] if name.startswith("flow32") else []
+    m32 = ["-m32"] if name.startswith(("flow32", "flow_arm", "flow_thumb")) else []
+    if m32 and not _host_m32(cc, tmp_path):
+        pytest.skip("no -m32 host toolchain (gcc-multilib) to run 32-bit pseudocode")
+    if name.startswith(("flow_arm", "flow_thumb")):
+        m32.append("-funsigned-char")          # plain char is unsigned on ARM
     r = subprocess.run([cc, *m32, "-w", "-fwrapv", "-o", str(exe), str(src)], capture_output=True, text=True)
     assert r.returncode == 0, f"{name}: pseudocode does not compile:\n{r.stderr[:3000]}\n{code}"
     r = subprocess.run([str(exe)], capture_output=True, text=True, timeout=60)
