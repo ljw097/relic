@@ -348,6 +348,30 @@ class Session:
         r = self.mi.command(f'-data-evaluate-expression "{expr}"')
         return r.results.get("value", "")
 
+    def address_of(self, expr: str) -> int | None:
+        """A live address for what the user typed: `0x7ffd...` as is, a name Relic knows
+        (`main`, `sub_401136+0x10`) through the slide, else gdb's value (`$rsp+8`, `&buf`)."""
+        text = expr.strip()
+        if not text:
+            return None
+        if re.fullmatch(r"(0x)?[0-9a-fA-F]+", text) and (text.startswith("0x") or not text.isalpha()):
+            return int(text, 16)
+        if self.an is not None and not text.startswith(("$", "&", "*", "(")):
+            a = self.an.resolve(text)
+            if a is not None:
+                return self.to_live(a)
+        try:
+            v = self.evaluate(text)
+        except MIError:
+            return None
+        m = re.search(r"0x[0-9a-fA-F]+", v)
+        if m:
+            return int(m.group(), 16)
+        try:
+            return int(v.split()[0], 0) & ((1 << (8 * self.word)) - 1)
+        except (ValueError, IndexError):
+            return None
+
     def execute(self, cli: str) -> str:
         """A raw gdb command (the console panel); returns its output."""
         return self.mi.console(cli)

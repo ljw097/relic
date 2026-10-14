@@ -85,7 +85,22 @@ def test_breakpoint_toggle_and_raw_command(vuln64):
         assert s.toggle_breakpoint(a) is True and a in s.breakpoints
         assert s.toggle_breakpoint(a) is False and not s.breakpoints
         assert "rip" in s.execute("info registers rip")
+        assert s.address_of("$rsp") == s.sp
+        assert s.address_of("$rsp+8") == s.sp + 8
+        assert s.address_of(f"{s.sp:#x}") == s.sp
+        assert s.address_of("menu") == s.to_live(a)
+        assert s.address_of("no_such_thing_here") is None
         s.kill()
     finally:
         s.close()
     assert not os.path.exists(f"/proc/{s.mi.proc.pid}/status") or s.mi.proc.poll() is not None
+
+
+def test_hexdump():
+    from relic.gui.debugger import hexdump
+    out = hexdump(0x1000, b"hello, world!\x00\x01\xff" + b"A" * 4)
+    lines = out.splitlines()
+    assert len(lines) == 2
+    assert lines[0].startswith("0x000000001000  68 65 6c 6c 6f 2c 20 77  6f 72")
+    assert lines[0].endswith("|hello, world!...|")
+    assert lines[1].startswith("0x000000001010  41 41 41 41") and lines[1].endswith("|AAAA|")

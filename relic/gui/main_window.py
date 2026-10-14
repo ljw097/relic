@@ -13,7 +13,8 @@ from PySide6.QtWidgets import (QAbstractItemView, QApplication, QDockWidget, QFi
 from ..analysis import Analysis
 from ..analysis.strings import escape
 from ..progress import Cancelled, Progress
-from .debugger import BacktracePanel, CodePanel, ConsolePanel, DebugController, RegistersPanel, StackPanel
+from .debugger import (BacktracePanel, CodePanel, ConsolePanel, DebugController, MemoryPanel, RegistersPanel,
+                       StackPanel, VmmapPanel, item_value)
 from .views import (DEFAULT_FONT_SIZE, THEME, DisasmView, GraphView, HexView, PseudocodeView, current_theme,
                     font_size, mono_font, set_font_size, set_theme)
 
@@ -270,10 +271,13 @@ class MainWindow(QMainWindow):
         self.dbg_bt = BacktracePanel()
         self.dbg_code = CodePanel()
         self.dbg_console = ConsolePanel()
+        self.dbg_mem = MemoryPanel()
+        self.dbg_vmmap = VmmapPanel()
         right, bottom = Qt.DockWidgetArea.RightDockWidgetArea, Qt.DockWidgetArea.BottomDockWidgetArea
         self.dbg_docks = [self._dock("Registers", self.dbg_regs, right), self._dock("Stack", self.dbg_stack, right),
                           self._dock("Console", self.dbg_console, bottom), self._dock("Code", self.dbg_code, bottom),
-                          self._dock("Backtrace", self.dbg_bt, bottom)]
+                          self._dock("Backtrace", self.dbg_bt, bottom), self._dock("Memory", self.dbg_mem, bottom),
+                          self._dock("Vmmap", self.dbg_vmmap, bottom)]
         # registers, then the stack, below the xrefs / search tabs; console, code and backtrace
         # with the bottom tabs (strings, imports, ...)
         self.splitDockWidget(self.xrefs_dock, self.dbg_docks[0], Qt.Orientation.Vertical)
@@ -289,6 +293,10 @@ class MainWindow(QMainWindow):
         self.dbg_console.stdin_line.connect(self.dbg.send_input)
         self.dbg_console.gdb_line.connect(self.dbg.gdb)
         self.dbg_bt.cellDoubleClicked.connect(self._debug_frame_clicked)
+        self.dbg.memory.connect(self.dbg_mem.show_memory)
+        self.dbg_mem.goto_expr.connect(self.dbg.view_memory)
+        for t in (self.dbg_regs, self.dbg_stack, self.dbg_vmmap):
+            t.cellDoubleClicked.connect(lambda r, c, t=t: self._debug_follow(t, r, c))
 
         self.status = QLabel()
         self.status.setFont(mono_font(9))
@@ -820,7 +828,7 @@ class MainWindow(QMainWindow):
                 self.statusBar().showMessage(f"arguments: {e}", 4000)
 
     def _debug_state(self, snap):
-        for panel in (self.dbg_regs, self.dbg_stack, self.dbg_bt, self.dbg_code):
+        for panel in (self.dbg_regs, self.dbg_stack, self.dbg_bt, self.dbg_code, self.dbg_vmmap):
             panel.show_snapshot(snap)
         if snap.exited:
             self.disasm.set_debug_marks(None, self.dbg.static_bps)
@@ -841,13 +849,29 @@ class MainWindow(QMainWindow):
             self.statusBar().showMessage("running ...")
 
     def _debug_frame_clicked(self, row: int, _col: int):
-        it = self.dbg_bt.item(row, 1)
-        live = it.data(Qt.ItemDataRole.UserRole) if it is not None else None
+        live = item_value(self.dbg_bt.item(row, 1))
         s = self.dbg.session
         if live is not None and s is not None:
             a = s.to_static(live)
             if a is not None:
                 self.goto(a)
+
+    def _debug_follow(self, table, row: int, col: int):
+        """Double-click on a register, stack slot or mapping: code of the analysed binary opens
+        in the listing, anything else in the memory view."""
+        live = item_value(table.item(row, col))
+        if live is None:
+            live = item_value(table.item(row, 1))
+        s = self.dbg.session
+        if live is None or s is None:
+            return
+        a = s.to_static(live)
+        if table is not self.dbg_vmmap and a is not None and self.an.function_at(a) is not None:
+            self.goto(a)
+            return
+        self.dbg.view_memory(live)
+        self.dbg_docks[5].show()
+        self.dbg_docks[5].raise_()
 
     def goto_dialog(self):
         text, ok = QInputDialog.getText(self, "Go to", "Address or symbol (main, 0x401000, main+0x10):")

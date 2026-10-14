@@ -7,8 +7,8 @@ the stack as a telescope, the backtrace -- and hands it to the GUI through a
 signal. The program's own output arrives through `output`.
 
 Panels: `RegistersPanel`, `StackPanel`, `BacktracePanel`, `CodePanel` (gdb's
-disassembly at pc, for code outside the analysed binary too) and
-`ConsolePanel` (program output, a line to type the program's input, and a gdb
+disassembly at pc, for code outside the analysed binary too), `VmmapPanel`,
+`MemoryPanel` (a hexdump at an address or expression) and `ConsolePanel` (program output, a line to type the program's input, and a gdb
 command line).
 """
 from __future__ import annotations
@@ -41,6 +41,7 @@ class Snapshot:
     frames: list = field(default_factory=list)      # (level, addr, symbol)
     code: list = field(default_factory=list)        # (addr, text, symbol)
     breakpoints: list = field(default_factory=list)  # static addresses
+    maps: list = field(default_factory=list)        # Mapping
     word: int = 8
 
 
@@ -51,6 +52,7 @@ class DebugController(QObject):
     output = Signal(bytes)        # program output
     log = Signal(str)             # gdb command output, errors
     busy = Signal(bool)
+    memory = Signal(object, bytes, str)  # (live address, bytes read, what it is) for the memory view
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -59,6 +61,7 @@ class DebugController(QObject):
         self.path = ""
         self.args: list[str] = []
         self.static_bps: set[int] = set()
+        self.mem_addr: int | None = None   # the memory view's address (None: follow the stack pointer)
         self.last = Snapshot()
         self._jobs: queue.Queue = queue.Queue()
         self._worker = threading.Thread(target=self._loop, daemon=True)
@@ -78,6 +81,8 @@ class DebugController(QObject):
                 if snapshot:
                     self.last = self._snapshot()
                     self.state.emit(self.last)
+                    if self.last.pc is not None and not self.last.exited:
+                        self._emit_memory()
             except Exception as e:  # noqa: BLE001 - shown in the console, the GUI stays up
                 self.log.emit(f"error: {e}\n")
                 if snapshot and self.session is not None:
@@ -114,6 +119,7 @@ class DebugController(QObject):
             self._close()
             self.path, self.an, self.args = path, analysis, list(args or [])
             self.session = Session(path, self.args, analysis, on_output=self.output.emit)
+            self.mem_addr = None
             self.session.start(stop_at)
             for a in sorted(self.static_bps):
                 self.session.add_breakpoint(self.session.to_live(a))
@@ -183,6 +189,33 @@ class DebugController(QObject):
         if self.session is not None:
             self.session.send_input(text)
 
+    def view_memory(self, where: str | int | None = None, size: int = 0x100):
+        """Read memory for the memory view: at a live address, an expression (`$rsp+8`, `main`,
+        `0x7ffd...`), or with None again at the last place (or the stack pointer)."""
+        def go():
+            s = self.session
+            if s is None or not s.regs:
+                raise RuntimeError("no stopped program to read memory from")
+            if isinstance(where, str):
+                a = s.address_of(where)
+                if a is None:
+                    raise RuntimeError(f"cannot evaluate {where!r}")
+                self.mem_addr = a
+            elif where is not None:
+                self.mem_addr = where
+            self._emit_memory(size)
+        self._submit(go, snapshot=False)
+
+    def _emit_memory(self, size: int = 0x100):
+        s = self.session
+        a = self.mem_addr if self.mem_addr is not None else s.sp
+        if a is None:
+            return
+        data = s.read_memory(a, size) or b""
+        m = s.mapping_at(a)
+        what = s.symbolize(a) if m is not None and "x" in m.perms else (m.path or m.kind if m else "unmapped")
+        self.memory.emit(a, data, what)
+
     def gdb(self, command: str):
         def go():
             if self.session is None:
@@ -215,6 +248,7 @@ class DebugController(QObject):
                 note = s.symbolize(value) if "x" in m.perms else (repr(s._string_at(value))
                                                                    if s._string_at(value) else m.kind)
             snap.regs.append((name, value, changed, note))
+        snap.maps = list(s.mappings())
         snap.stack = s.telescope(count=16)
         snap.frames = [(f.level, f.addr, s.symbolize(f.addr)) for f in s.backtrace()]
         if snap.pc is not None:
@@ -239,8 +273,14 @@ def _item(text: str, color: str | None = None, data=None) -> QTableWidgetItem:
     if color:
         it.setForeground(QColor(color))
     if data is not None:
-        it.setData(Qt.ItemDataRole.UserRole, data)
+        it.setData(Qt.ItemDataRole.UserRole, str(data))     # as text: Qt ints stop at 2**63
     return it
+
+
+def item_value(it: QTableWidgetItem | None) -> int | None:
+    """The address / value an item of a debugger panel stands for."""
+    v = it.data(Qt.ItemDataRole.UserRole) if it is not None else None
+    return int(v) if v is not None else None
 
 
 def _hex(v: int, word: int) -> str:
@@ -257,7 +297,7 @@ class RegistersPanel(QTableWidget):
         for k, (name, value, changed, note) in enumerate(snap.regs):
             col = THEME["jump"] if changed else None
             self.setItem(k, 0, _item(name, col))
-            self.setItem(k, 1, _item(_hex(value, snap.word), col))
+            self.setItem(k, 1, _item(_hex(value, snap.word), col, value))
             self.setItem(k, 2, _item(note, THEME["comment"]))
 
 
@@ -277,8 +317,9 @@ class StackPanel(QTableWidget):
                 text += f" ◂— {r.note}"
             kind = r.kinds[0] if r.kinds else ""
             self.setItem(k, 0, _item(f"{k:02}:{k * snap.word:04x}", THEME["addr"]))
-            self.setItem(k, 1, _item(_hex(r.addr, snap.word), THEME[_KIND_COLOR.get("stack", "fg")]))
-            self.setItem(k, 2, _item(text, THEME.get(_KIND_COLOR.get(kind, "fg"), THEME["fg"])))
+            self.setItem(k, 1, _item(_hex(r.addr, snap.word), THEME[_KIND_COLOR.get("stack", "fg")], r.addr))
+            self.setItem(k, 2, _item(text, THEME.get(_KIND_COLOR.get(kind, "fg"), THEME["fg"]),
+                                     r.chain[0] if r.chain else None))
 
 
 class BacktracePanel(QTableWidget):
@@ -311,6 +352,74 @@ class CodePanel(QPlainTextEdit):
         if snap.exited:
             lines = [f"[ {snap.exited} ]"]
         self.setPlainText("\n".join(lines))
+
+
+class VmmapPanel(QTableWidget):
+    """The process's memory map (pwndbg `vmmap`), coloured by kind; the main binary's rows bold."""
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        _setup(self, ["Start", "End", "Perm", "Size", "Offset", "File"])
+
+    def show_snapshot(self, snap: Snapshot):
+        self.setRowCount(len(snap.maps))
+        for k, m in enumerate(snap.maps):
+            col = THEME.get(_KIND_COLOR.get(m.kind, "fg"), THEME["fg"])
+            cells = [_hex(m.start, snap.word), _hex(m.end, snap.word), m.perms, f"{m.end - m.start:#x}",
+                     f"{m.offset:#x}", m.path]
+            for c, text in enumerate(cells):
+                self.setItem(k, c, _item(text, col, m.start))
+
+
+def hexdump(addr: int, data: bytes, width: int = 16) -> str:
+    """`addr  00 11 22 ...  |ascii|` lines."""
+    lines = []
+    for off in range(0, len(data), width):
+        chunk = data[off:off + width]
+        hexes = " ".join(f"{b:02x}" for b in chunk)
+        half = width // 2 * 3
+        if len(chunk) > width // 2:
+            hexes = hexes[:half] + " " + hexes[half:]
+        text = "".join(chr(b) if 0x20 <= b < 0x7F else "." for b in chunk)
+        lines.append(f"{addr + off:#014x}  {hexes:<{width * 3}}  |{text}|")
+    return "\n".join(lines)
+
+
+class MemoryPanel(QWidget):
+    """A hexdump of live memory; type an address or expression (`$rsp`, `main`, `$rdi+8`)."""
+
+    goto_expr = Signal(str)
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.where = QLineEdit()
+        self.where.setPlaceholderText("address / expression ($rsp, $rdi+8, main, 0x7ffd...), Enter to view")
+        self.where.setFont(mono_font())
+        self.label = QLabel()
+        self.text = QPlainTextEdit()
+        self.text.setReadOnly(True)
+        self.text.setFont(mono_font())
+        self.text.setLineWrapMode(QPlainTextEdit.LineWrapMode.NoWrap)
+        self.where.returnPressed.connect(self._go)
+        lay = QVBoxLayout(self)
+        lay.setContentsMargins(0, 0, 0, 0)
+        row = QHBoxLayout()
+        row.addWidget(QLabel("at"))
+        row.addWidget(self.where)
+        lay.addLayout(row)
+        lay.addWidget(self.label)
+        lay.addWidget(self.text)
+        self.addr: int | None = None
+
+    def _go(self):
+        t = self.where.text().strip()
+        if t:
+            self.goto_expr.emit(t)
+
+    def show_memory(self, addr: int, data: bytes, what: str):
+        self.addr = addr
+        self.label.setText(f"{addr:#x}  {what}" + ("" if data else "  (cannot read)"))
+        self.text.setPlainText(hexdump(addr, data))
 
 
 class ConsolePanel(QWidget):
@@ -364,5 +473,5 @@ class ConsolePanel(QWidget):
             self.gdb_line.emit(line)
 
 
-__all__ = ["BacktracePanel", "CodePanel", "ConsolePanel", "DebugController", "RegistersPanel", "Snapshot",
-           "StackPanel"]
+__all__ = ["BacktracePanel", "CodePanel", "ConsolePanel", "DebugController", "MemoryPanel", "RegistersPanel",
+           "Snapshot", "StackPanel", "VmmapPanel", "hexdump", "item_value"]

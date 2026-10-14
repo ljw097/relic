@@ -441,6 +441,22 @@ def test_debugger_panels_breakpoints_and_console(app, win):
     assert win.dbg_stack.rowCount() == 16 and "main+" in win.dbg_stack.item(0, 2).text()
     assert win.dbg_bt.item(0, 2).text() == "vuln"
     assert "►" in win.dbg_code.toPlainText()
+    # memory view follows the stack pointer; vmmap lists the binary, stack and libc
+    rsp = next(int(win.dbg_regs.item(k, 1).text(), 16) for k in range(win.dbg_regs.rowCount())
+               if win.dbg_regs.item(k, 0).text() == "rsp")
+    assert _debug_wait(app, win, lambda: win.dbg_mem.addr == rsp)
+    assert win.dbg_mem.text.toPlainText().startswith(f"{rsp:#014x}")
+    paths = [win.dbg_vmmap.item(k, 5).text() for k in range(win.dbg_vmmap.rowCount())]
+    assert "[stack]" in paths and any(p.endswith("vuln64") for p in paths)
+    win.dbg_mem.where.setText("$rsp+0x10")
+    win.dbg_mem._go()
+    assert _debug_wait(app, win, lambda: win.dbg_mem.addr == rsp + 0x10)
+    row = next(k for k in range(win.dbg_regs.rowCount()) if win.dbg_regs.item(k, 0).text() == "rip")
+    win.goto(an.function_by_name("main").addr)
+    win._debug_follow(win.dbg_regs, row, 1)             # code of the binary: the listing
+    assert win.cur == vuln
+    win._debug_follow(win.dbg_vmmap, paths.index("[stack]"), 0)    # a mapping: the memory view
+    assert _debug_wait(app, win, lambda: win.dbg_mem.label.text().endswith("[stack]"))
     win.dbg.step_over()
     assert _debug_wait(app, win, lambda: win.disasm.debug_pc not in (None, vuln))
     win.dbg_console.stdin.setText("relic")

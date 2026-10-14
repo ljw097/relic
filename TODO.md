@@ -16,7 +16,7 @@
 
 - [x] GDB/MI 레코드 파서·프로세스 래퍼(`relic/debugger/mi.py`), 세션(`session.py`): pty 입출력, 시작(entry/main)·계속·단계 실행·커서까지·중단·종료, 중단점, PIE 슬라이드(`to_live`/`to_static`), 레지스터 변경 추적, `telescope`, 백트레이스
 - [x] GUI(`relic/gui/debugger.py`): 작업 스레드 컨트롤러, Registers·Stack·Backtrace·Code·Console 패널, Debug 메뉴(F9/F7/F8/F4/F2), 리스팅 pc·중단점 표시
-- [ ] **P1** vmmap 패널, 메모리(hexdump) 뷰와 레지스터·스택 값 따라가기
+- [x] vmmap 패널, 메모리(hexdump) 뷰(주소·gdb 식·Relic 이름), 레지스터·스택 값 더블클릭으로 리스팅/메모리 따라가기
 - [ ] **P1** 중단점 목록 패널(조건·활성/비활성), 하드웨어 watchpoint
 - [ ] **P2** glibc 힙 정보(bins/chunks), 의사 코드 뷰에서 현재 줄 표시
 - [ ] **P2** 레지스터·메모리 값 편집
