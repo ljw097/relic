@@ -18,6 +18,8 @@ class Sig:
     ret: str = "int"
     noreturn: bool = False
     args: str = ""       # C types of the fixed arguments, one code each (see ARG_TYPES)
+    types: tuple[str, ...] = ()   # exact C types of the fixed arguments (from a prototype)
+    variadic: bool = False        # more arguments may follow the fixed ones (no format to count them)
 
 
 # argument type codes: `s` string, `p` memory, `n` size, `F` stream, `i` int; `.` anything else
@@ -26,6 +28,8 @@ ARG_TYPES = {"s": "char *", "p": "void *", "n": "size_t", "F": "FILE *", "i": "i
 
 def arg_type(sig: Sig, k: int) -> str | None:
     """The C type of fixed argument `k`, when the table knows it."""
+    if k < len(sig.types):
+        return sig.types[k]
     return ARG_TYPES.get(sig.args[k]) if k < len(sig.args) else None
 
 
@@ -90,8 +94,43 @@ def base_name(name: str | None) -> str:
     return name.split("@", 1)[0]
 
 
-def lookup(name: str | None) -> Sig | None:
-    return SIGS.get(base_name(name))
+def lookup(name: str | None, an=None) -> Sig | None:
+    """The signature of a library function: a prototype from a header imported into `an` (the
+    user's word wins), else the table above, else the bundled libc / POSIX prototypes."""
+    base = base_name(name)
+    if not base:
+        return None
+    if an is not None:
+        proto = an.user_types.get("prototypes", {}).get(base)
+        if proto is not None:
+            return sig_of(proto["params"], proto["ret"], proto.get("variadic", False), proto.get("names", ()))
+    return SIGS.get(base) or bundled().get(base)
+
+
+def sig_of(params: list[str], ret: str, variadic: bool, names=()) -> Sig:
+    """A Sig for a prototype (C types of its parameters). A variadic function whose last fixed
+    parameter is a `char *` named like a format (`fmt`, `format`) counts its arguments from it."""
+    fmt = None
+    if variadic and params and params[-1] == "char *" and \
+            (not names or "fmt" in names[-1].lower() or "format" in names[-1].lower()):
+        fmt = len(params) - 1
+    return Sig(len(params), fmt, ret, False, "", tuple(params), variadic and fmt is None)
+
+
+_BUNDLED: dict[str, Sig] | None = None
+
+
+def bundled() -> dict[str, Sig]:
+    """Signatures of the prototypes in `libc_h.LIBC_H` (parsed once)."""
+    global _BUNDLED
+    if _BUNDLED is None:
+        from .cheader import parse
+        from .libc_h import LIBC_H
+        h = parse(LIBC_H)
+        _BUNDLED = {n: sig_of([t.spell() for _, t in p.params], p.ret.spell(), p.variadic,
+                              [pn for pn, _ in p.params])
+                    for n, p in h.prototypes.items()}
+    return _BUNDLED
 
 
 def count_conversions(fmt: str) -> int:
@@ -135,5 +174,5 @@ def format_types(fmt: str, scan: bool = False) -> list[str | None]:
     return out
 
 
-__all__ = ["ARG_TYPES", "Sig", "SIGS", "arg_count", "arg_type", "base_name", "count_conversions", "format_types",
-           "lookup"]
+__all__ = ["ARG_TYPES", "Sig", "SIGS", "arg_count", "arg_type", "base_name", "bundled", "count_conversions",
+           "format_types", "lookup", "sig_of"]

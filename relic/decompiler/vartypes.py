@@ -382,7 +382,7 @@ _HINT_RANK = {"void *": 1, "size_t": 1, "ssize_t": 1}
 
 
 def library_types(fn: IRFunction, ptr_bits: int, ret_reg: str, callee=lambda call: None,
-                  cstring=lambda addr: None) -> dict[str, CType]:
+                  cstring=lambda addr: None, an=None) -> dict[str, CType]:
     """Types variables get from the library calls they meet: an argument of `strlen` is a
     `char *`, of `malloc` a `size_t`, the result of `fopen` a `FILE *` (sigs.SIGS), what a
     constant format string's `%s` consumes a `char *`. Only plain variables of the type's width
@@ -394,6 +394,12 @@ def library_types(fn: IRFunction, ptr_bits: int, ret_reg: str, callee=lambda cal
     found: dict[str, str | None] = {}
 
     def give(v: Expr, t: str | None):
+        if t is not None and t not in widths and t.endswith("*"):
+            try:                                 # an exact pointer type from a prototype
+                parse_ctype(t)
+                widths[t] = ptr_bits
+            except ValueError:
+                return
         if t not in widths or not isinstance(v, (Var, StackVar)) or v.bits != widths[t]:
             return
         old = found.get(v.name, "")
@@ -405,7 +411,7 @@ def library_types(fn: IRFunction, ptr_bits: int, ret_reg: str, callee=lambda cal
             found[v.name] = None              # disagreement: no hint
 
     def call(c: Call, name: str | None) -> Sig | None:
-        sig = lookup(name)
+        sig = lookup(name, an)
         if sig is None:
             return None
         for k, a in enumerate(c.args):

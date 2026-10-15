@@ -333,9 +333,9 @@ def cmd_types(args):
     an = _analyze(args)
     if args.headers:
         for path, got in _import_headers(an, args.headers):
-            parts = [f"{len(got[k])} {k}" for k in ("structs", "enums", "typedefs", "functions") if got[k]]
+            parts = [f"{len(got[k])} {k}" for k in ("structs", "enums", "typedefs", "functions", "imports") if got[k]]
             print(f"{path}: {', '.join(parts) or 'nothing new'}")
-            for k in ("structs", "enums", "typedefs", "functions"):
+            for k in ("structs", "enums", "typedefs", "functions", "imports"):
                 if got[k]:
                     print(f"  {k}: {', '.join(got[k])}")
         if not args.no_save:

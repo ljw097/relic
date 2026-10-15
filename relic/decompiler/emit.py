@@ -98,7 +98,7 @@ class CWriter:
         # library calls name what plain integers really are (`strlen(a1)`: a1 is a `char *`); a
         # pointer type recovered from how memory is accessed says more and is kept
         for name, t in library_types(prep.fn, self.ptr_bits, prep.arch.ret, self._callee_name,
-                                     lambda a: an.bin.read_cstring(a, 512)).items():
+                                     lambda a: an.bin.read_cstring(a, 512), an).items():
             cur = self.types.get(name)
             if cur is not None and cur.ptr == 0:
                 self.types[name] = t
@@ -248,6 +248,64 @@ class CWriter:
     def _enum_text(self, other: Expr, c: Expr) -> str | None:
         if isinstance(c, Const):
             return self.enum_value(self.enum_of(other), c.value, c.bits)
+        return None
+
+    # ----------------------------------------------------------- bit-fields
+    def _unit_bitfield(self, load: Expr, bit: int, width: int | None) -> str | None:
+        """`p->flags` when `load` reads (part of) an imported struct's bit-field storage unit and
+        the bits from `bit` (of the load) on, `width` of them (None: up to the load's top), are
+        exactly one bit-field."""
+        while isinstance(load, Cast):
+            load = load.a
+        if "structs" not in self.__dict__:
+            return None
+        if isinstance(load, (Var, StackVar)):            # `v1 = p->unit` read once, used twice
+            load = self.structs.defs.get(load.name)
+            while isinstance(load, Cast):
+                load = load.a
+        if not isinstance(load, Load):
+            return None
+        from .structs import split_addr
+        sp = split_addr(load.addr)
+        if sp is None:
+            return None
+        st = self.structs.struct_of(sp[0])
+        if st is None:
+            return None
+        fields = self.an.struct_names.get(st.name, {}).get("bitfields")
+        if not fields:
+            return None
+        width = load.bits - bit if width is None else width
+        for f in st.fields.values():
+            bfs = fields.get(f.name)
+            if bfs and f.offset <= sp[1] < f.end:
+                pos = (sp[1] - f.offset) * 8 + bit
+                for name, b, w in bfs:
+                    if b == pos and w == width and pos + width <= (sp[1] - f.offset) * 8 + load.bits:
+                        return f"{self.expr(sp[0], PREC_POSTFIX)}->{name}"
+        return None
+
+    def _bit_unit(self, st, f) -> bool:
+        """`f` is the storage of bit-fields (C has no name for it, nor its address): memory there
+        that is not one bit-field is shown as plain memory."""
+        return f is not None and bool(self.an.struct_names.get(st.name, {}).get("bitfields", {}).get(f.name))
+
+    def bitfield(self, e: Expr) -> str | None:
+        """A read of one bit-field: `(unit >> k) & (2^w - 1)`, `unit & (2^w - 1)`, `unit >> k`
+        (the top bits)."""
+        while isinstance(e, Cast) and e.kind in ("low", "zext"):
+            e = e.a
+        if isinstance(e, BinOp) and e.op == "&" and isinstance(e.b, Const):
+            m = e.b.value & ((1 << e.b.bits) - 1)
+            if m and m & (m + 1) == 0:
+                x = e.a
+                while isinstance(x, Cast) and x.kind in ("low", "zext"):
+                    x = x.a
+                if isinstance(x, BinOp) and x.op in (">>u", ">>s") and isinstance(x.b, Const):
+                    return self._unit_bitfield(x.a, x.b.value, m.bit_length())
+                return self._unit_bitfield(x, 0, m.bit_length())
+        if isinstance(e, BinOp) and e.op == ">>u" and isinstance(e.b, Const):
+            return self._unit_bitfield(e.a, e.b.value, e.bits - e.b.value)
         return None
 
     # ------------------------------------------------------------- structs
@@ -420,7 +478,7 @@ class CWriter:
             if imp is not None and imp.name:
                 return base_name(imp.name)
         fa = self.structs.field(addr, bits)
-        if fa is not None:
+        if fa is not None and not self._bit_unit(*fa[1:]):
             return f"{self.expr(fa[0], PREC_POSTFIX)}->{self.fname(*fa[1:])}"
         ar = self.structs.array_ref(addr, bits)
         if ar is not None:
@@ -428,7 +486,7 @@ class CWriter:
             return f"{self.expr(base, PREC_POSTFIX)}->{self.fname(st, f)}[{self.expr(_bare(idx))}]"
         if self.an.bin.endian == "little":
             pa = self.structs.part_of_field(addr, bits)
-            if pa is not None:                    # the low bytes of a wider field
+            if pa is not None and not self._bit_unit(*pa[1:]):     # the low bytes of a wider field
                 return f"*({int_type(bits)} *)&{self.expr(pa[0], PREC_POSTFIX)}->{self.fname(*pa[1:])}"
         idx = self._indexed(addr, size)
         if idx is not None:
@@ -634,9 +692,23 @@ class CWriter:
         return str(e), PREC_POSTFIX
 
     def _binop(self, e: BinOp) -> tuple[str, int]:
+        bf = self.bitfield(e) if e.op in ("&", ">>u") else None
+        if bf is not None:                        # `p->ihl`
+            return bf, PREC_POSTFIX
+        if e.op in ("==", "!=") and isinstance(e.b, Const) and isinstance(e.a, BinOp) and e.a.op == "&" and \
+                isinstance(e.a.b, Const):
+            # `(unit & 0xe0) == 0x40`: the bit-field there compared with 2
+            m = e.a.b.value & ((1 << e.a.b.bits) - 1)
+            low = (m & -m).bit_length() - 1 if m else 0
+            run = m >> low
+            if m and run & (run + 1) == 0 and e.b.value & ~m & ((1 << e.b.bits) - 1) == 0:
+                bf = self._unit_bitfield(e.a.a, low, run.bit_length())
+                if bf is not None:
+                    op = BIN[e.op][0]
+                    return f"{bf} {op} {number(e.b.value >> low)}", BIN[e.op][1]
         if e.op == "+" and e.bits == self.ptr_bits:
             fa = self.structs.field_addr(e)
-            if fa is not None:                    # the address of a field: `&p->f_8`
+            if fa is not None and not self._bit_unit(*fa[1:]):     # the address of a field: `&p->f_8`
                 return f"&{self.expr(fa[0], PREC_POSTFIX)}->{self.fname(*fa[1:])}", PREC_UNARY
         if e.op[0] == "f" and (e.op in FARITH or e.op in FCMP):
             return self._fbinop(e)
@@ -752,7 +824,7 @@ class CWriter:
         name = self._callee_name(c) or f"(*{self.expr(c.target, PREC_UNARY)})"
         fl = dict(c.fargs)
         from .sigs import arg_type, lookup
-        sig = lookup(name)
+        sig = lookup(name, self.an)
         args = []
         for k, a in enumerate(c.args):
             if k in fl:
@@ -962,7 +1034,7 @@ class CWriter:
             return str(self.types[v.name])
         if isinstance(v, ir.Call):               # `return strdup(s)`: the library's result type
             from .sigs import lookup
-            sig = lookup(self._callee_name(v))
+            sig = lookup(self._callee_name(v), self.an)
             if sig is not None and sig.ret.endswith("*") and v.bits == self.ptr_bits:
                 return sig.ret
         return int_type(v.bits) if v.bits != 1 else "bool"

@@ -86,6 +86,8 @@ class Member:
     name: str
     type: CType
     offset: int = 0
+    width: int | None = None    # a bit-field's width in bits
+    bit: int = 0                # a bit-field's first bit, from the start of the aggregate
 
 
 @dataclass
@@ -115,6 +117,7 @@ class Header:
     prototypes: dict[str, Prototype] = field(default_factory=dict)
     constants: dict[str, int] = field(default_factory=dict)             # every enumerator
     bare: set[str] = field(default_factory=set)       # names of typedef'd anonymous aggregates / enums
+    defines: dict[str, int] = field(default_factory=dict)              # `#define NAME 16`
 
 
 # ------------------------------------------------------------------------ lexer
@@ -128,14 +131,21 @@ _TOKEN = re.compile(r"""
 """, re.X)
 
 
-def _strip(text: str) -> str:
-    """Drop comments and preprocessor lines (keeping line numbers)."""
+_DEFINE = re.compile(r"\s*#\s*define\s+([A-Za-z_]\w*)(?!\()\s+(.+)")
+
+
+def _strip(text: str, defines: list | None = None) -> str:
+    """Drop comments and preprocessor lines (keeping line numbers); object-like `#define NAME
+    value` lines go to `defines` as (line, name, value text)."""
     text = re.sub(r"/\*.*?\*/", lambda m: "\n" * m.group(0).count("\n"), text, flags=re.S)
     text = re.sub(r"//[^\n]*", "", text)
     out = []
     cont = False
-    for line in text.split("\n"):
+    for n, line in enumerate(text.split("\n"), 1):
         if cont or line.lstrip().startswith("#"):
+            m = _DEFINE.match(line) if not cont else None
+            if m is not None and defines is not None and not line.rstrip().endswith("\\"):
+                defines.append((n, m.group(1), m.group(2).strip()))
             cont = line.rstrip().endswith("\\")
             out.append("")
             continue
@@ -143,10 +153,10 @@ def _strip(text: str) -> str:
     return "\n".join(out)
 
 
-def _tokens(text: str) -> list[tuple[str, str, int]]:
+def _tokens(text: str, defines: list | None = None) -> list[tuple[str, str, int]]:
     out = []
     pos, line = 0, 1
-    text = _strip(text)
+    text = _strip(text, defines)
     while pos < len(text):
         m = _TOKEN.match(text, pos)
         if m is None:
@@ -166,7 +176,8 @@ _ESC = {"n": 10, "t": 9, "r": 13, "0": 0, "\\": 92, "'": 39, '"': 34, "a": 7, "b
 # ------------------------------------------------------------------------ parser
 class _Parser:
     def __init__(self, text: str, model: Model, into: Header):
-        self.t = _tokens(text)
+        self.defines: list = []
+        self.t = _tokens(text, self.defines)
         self.k = 0
         self.m = model
         self.h = into
@@ -221,9 +232,25 @@ class _Parser:
     # -- top level
     def run(self):
         while self.k < len(self.t):
+            self.macros(self.line())
             if self.accept(";"):
                 continue
             self.declaration()
+        self.macros(None)
+
+    def macros(self, before: int | None):
+        """The `#define NAME value` lines above `before` (all: None) whose value is an integer
+        constant become constants (array sizes, enum values); others are left alone."""
+        while self.defines and (before is None or self.defines[0][0] < before):
+            line, name, value = self.defines.pop(0)
+            try:
+                toks = _tokens(value)
+                v = _Eval(toks, self).run() if toks else None
+            except HeaderError:
+                continue
+            if v is not None:
+                self.h.constants[name] = v
+                self.h.defines[name] = v
 
     def declaration(self):
         self.skip_attributes()
@@ -369,7 +396,14 @@ class _Parser:
             while True:
                 mname, mtype, _ = self.declarator(base)
                 if self.accept(":"):
-                    self.fail(f"bit-field {mname or ''!r} in {key}: bit-fields are not supported")
+                    width = self.const_expr(stop=(",", ";"))
+                    s, _a = self.size_align(mtype)
+                    if mtype.ptr or mtype.dims or width < 0 or width > s * 8 or width == 0 and mname:
+                        self.fail(f"bad bit-field {mname or ''!r} in {key}")
+                    members.append(Member(mname or "", mtype, width=width))
+                    if not self.accept(","):
+                        break
+                    continue
                 if mname is None:
                     self.fail(f"member without a name in {key}")
                 members.append(Member(mname, mtype))
@@ -530,18 +564,38 @@ class _Parser:
         self.fail(f"{b!r} has no known size")
 
     def _layout(self, agg: Aggregate):
-        off, align, size = 0, 1, 0
+        """System V layout. Bit-fields are packed into containers of their declared type: one that
+        does not fit the container at the last boundary of its type's alignment starts at the next
+        boundary, a zero-width one moves to the next boundary; unnamed ones do not add to the
+        alignment."""
+        pos, align, size = 0, 1, 0              # (pos: bits)
         for m in agg.members:
             s, a = self.size_align(m.type)
+            if m.width is not None:
+                if m.name:
+                    align = max(align, a)
+                unit = a * 8
+                if agg.kind == "union":
+                    m.offset, m.bit = 0, 0
+                    size = max(size, (m.width + 7) // 8)
+                    continue
+                # (it must fit a sizeof(T) container starting at the last alignof(T) boundary)
+                if m.width == 0 or pos // unit * unit + s * 8 < pos + m.width:
+                    pos = (pos + unit - 1) // unit * unit
+                m.bit = pos
+                m.offset = pos // unit * unit // 8
+                pos += m.width
+                size = (pos + 7) // 8
+                continue
             align = max(align, a)
             if agg.kind == "union":
                 m.offset = 0
                 size = max(size, s)
             else:
-                off = (off + a - 1) // a * a
+                off = ((pos + 7) // 8 + a - 1) // a * a
                 m.offset = off
-                off += s
-                size = off
+                pos = (off + s) * 8
+                size = off + s
         agg.size = (size + align - 1) // align * align
         agg.align = align
         agg.complete = True
@@ -670,13 +724,15 @@ def parse(text: str, model: Model | None = None, into: Header | None = None) -> 
 
 
 # ------------------------------------------------------------- to relic's structs
-def struct_layout(h: Header, key: str, model: Model) -> tuple[dict, dict, dict]:
+def struct_layout(h: Header, key: str, model: Model) -> tuple[dict, dict, dict, dict]:
     """A struct / union as relic's saved-struct entries: (layout {"0x8": [bits, ctype(, count)]},
-    field names {"f_8": name}, field types {"f_8": ctype}). Nested structs by value are
-    flattened (`hdr.len`); a union keeps its largest member."""
+    field names {"f_8": name}, field types {"f_8": ctype}, bit-fields {"f_8": [[name, first bit,
+    width], ...]} of a storage unit). Nested structs by value are flattened (`hdr.len`); a union
+    keeps its largest member; the bit-fields sharing a storage unit are one field."""
     layout: dict = {}
     names: dict = {}
     types: dict = {}
+    bitfields: dict = {}
     p = _Parser("", model, h)
 
     def add(agg: Aggregate, base: int, prefix: str):
@@ -687,6 +743,21 @@ def struct_layout(h: Header, key: str, model: Model) -> tuple[dict, dict, dict]:
             off = base + m.offset
             t = m.type
             label = f"{prefix}{m.name}" if m.name else prefix.rstrip(".")
+            if m.width is not None:
+                # bit-fields: one field per storage unit, named after the bit-fields in it
+                if not m.name:
+                    continue
+                key = f"{off:#x}"
+                bitfields.setdefault(f"f_{off:x}", []).append([label, base * 8 + m.bit - off * 8, m.width])
+                if key in layout and names.get(f"f_{off:x}", "").startswith(prefix):
+                    names[f"f_{off:x}"] += "_" + m.name
+                    continue
+                bits = p.size_align(t)[0] * 8
+                layout[key] = [bits, "" if t.spell() in _PLAIN.get(bits, ()) else t.spell()]
+                names[f"f_{off:x}"] = label
+                if t.spell() not in _PLAIN.get(bits, ()):
+                    types[f"f_{off:x}"] = t.spell()
+                continue
             if not t.ptr and not t.func and t.base in h.aggregates:
                 inner = h.aggregates[t.base]
                 if not t.dims:
@@ -714,7 +785,7 @@ def struct_layout(h: Header, key: str, model: Model) -> tuple[dict, dict, dict]:
             if spell not in _PLAIN.get(elem_bits, ()):
                 types[f"f_{off:x}"] = spell
     add(h.aggregates[key], 0, "")
-    return layout, names, types
+    return layout, names, types, bitfields
 
 
 def declaration(h: Header, key: str) -> tuple[list[str], list[str]]:
@@ -732,6 +803,8 @@ def declaration(h: Header, key: str) -> tuple[list[str], list[str]]:
             for x in inner.members:
                 out += member(x, ind + "    ")
             return out + [f"{ind}}}{' ' + m.name if m.name else ''}{dims};"]
+        if m.width is not None:
+            return [f"{ind}{t.base}{' ' + m.name if m.name else ''} : {m.width};"]
         if t.func:
             return [f"{ind}void ({'*' * max(t.ptr, 1)}{m.name}{dims})();"]
         if not t.ptr and t.base in h.aggregates:

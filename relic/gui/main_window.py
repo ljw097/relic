@@ -1317,7 +1317,7 @@ class MainWindow(QMainWindow):
         except (OSError, HeaderError) as e:
             QMessageBox.warning(self, "Import C header", f"{os.path.basename(path)}: {e}")
             return None
-        parts = [f"{len(got[k])} {k}" for k in ("structs", "enums", "typedefs", "functions") if got[k]]
+        parts = [f"{len(got[k])} {k}" for k in ("structs", "enums", "typedefs", "functions", "imports") if got[k]]
         self.statusBar().showMessage(f"{os.path.basename(path)}: {', '.join(parts) or 'nothing new'}", 6000)
         self._after_edit()
         return got

@@ -44,6 +44,13 @@ NI int count_running(struct job *head)
     return n;
 }
 
+NI int packet_len(struct packet *p)
+{
+    if (p->version != 4 || p->ttl > MAX_PRIO)
+        return -1;
+    return p->ihl * 4 + p->frag + (p->flags == 2);
+}
+
 int main(int argc, char **argv)
 {
     job_t a = {0}, b = {0};
@@ -55,5 +62,7 @@ int main(int argc, char **argv)
     run_job(&a, RUNNING, OPT_VERBOSE | OPT_DRY);
     run_job(&b, STOPPED, OPT_VERBOSE);
     printf("%d %s\n", count_running(&a), state_name((enum state)(argc + 3)));
+    struct packet pk = {4, 5, 0, 100, 2, 3};
+    printf("%d\n", packet_len(&pk));
     return 0;
 }
