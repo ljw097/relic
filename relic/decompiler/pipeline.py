@@ -40,6 +40,7 @@ class Prepared:
     gotos: set
     ret_bits: int | None = None   # width of the result, when known
     ret_float: bool = False       # the result is a float / double (in xmm0)
+    hidden: frozenset = frozenset()   # ids of statements the structurer made redundant
 
 
 def prepare(an: "Analysis", func: "Function") -> Prepared:
@@ -123,7 +124,7 @@ def prepare(an: "Analysis", func: "Function") -> Prepared:
     tree = st.run()
     from .chains import switchify
     tree = switchify(tree, frozenset(st.gotos))     # compare chains on one value -> switch
-    return Prepared(fn, arch, frame, params, rets, tree, st.gotos, w, fret is not None)
+    return Prepared(fn, arch, frame, params, rets, tree, st.gotos, w, fret is not None, frozenset(st.hidden))
 
 
 def _type_bits(ctype: str, ptr_bits: int) -> int | None:

@@ -359,6 +359,8 @@ class CWriter:
                 self.types[r] = parse_ctype(self.MAIN_PARAMS[k][1])
         n = 0
         for s in self.p.fn.stmts():
+            if id(s) in self.p.hidden:
+                continue
             for d in ir.stmt_defs(s):
                 if isinstance(d, Var) and d.name.startswith("_v") and d.name not in self.names:
                     n += 1
@@ -927,6 +929,8 @@ class CWriter:
             if n.addr in self.p.gotos and not n.copy:
                 self.emit(f"loc_{n.addr:x}:", n.addr, max(depth - 1, 0))
             for s in n.stmts:
+                if id(s) in getattr(self.p, "hidden", ()):
+                    continue
                 text = self.stmt(s)
                 if text is not None:
                     self.emit(text, s.addr, depth)

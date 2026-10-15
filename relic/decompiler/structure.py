@@ -216,6 +216,7 @@ class _Ctx:
 class Structurer:
     def __init__(self, fn: IRFunction):
         self.fn = fn
+        self.hidden: set[int] = set()       # statements not to print (ids): see _switch_index_via
         self.blocks = fn.blocks
         self.succ = {a: [s for s in b.succs if s in fn.blocks] for a, b in self.blocks.items()}
         self.pred = {a: [p for p in b.preds if p in fn.blocks] for a, b in self.blocks.items()}
@@ -620,6 +621,23 @@ class Structurer:
         cands = [m for m in sorted(cands, key=self.rpo_index.__getitem__) if joins(m)]
         return cands[0] if cands else None
 
+    def _switch_index_via(self, term: IndirectJump):
+        """The index of a jump through a variable holding the computed target (`v2 = base +
+        table[v1]; goto *v2`): from its single definition, which is dropped when nothing else
+        reads it (the switch shows the index instead)."""
+        from .ir import StackVar, Var
+        if not isinstance(term.expr, (Var, StackVar)):
+            return None, 0
+        defs, uses = _var_defs_and_uses(self.fn)
+        hit = defs.get(term.expr)
+        if hit is None:
+            return None, 0
+        b, d = hit
+        idx, bias = _switch_index(d.src)
+        if idx is not None and uses.get(term.expr, 0) == 1 and term.expr not in set(walk(idx)):
+            self.hidden.add(id(d))          # (the emitter leaves it out)
+        return idx, bias
+
     def _switch(self, n, term: IndirectJump, default, ctx, follow):
         """Switch on `term`'s jump table; `follow` is where every case ends up (or None)."""
         loop = next((c for c in reversed(ctx) if c.kind == "loop"), None)
@@ -628,6 +646,8 @@ class Structurer:
         c = _Ctx("switch", n, follow)
         inner = ctx + [c]
         idx, bias = _switch_index(term.expr)
+        if idx is None:
+            idx, bias = self._switch_index_via(term)
         values: dict[int, list[int]] = {}
         for k, t in enumerate(term.table or term.targets):
             values.setdefault(t, []).append(k + bias)
@@ -660,6 +680,22 @@ class Structurer:
                         body.items.append(Jump1("break"))
             cases.append(Case(t, labels, is_default, body))
         return Switch(n, idx if idx is not None else term.expr, cases), follow
+
+
+def _var_defs_and_uses(fn: IRFunction):
+    from .ir import Assign, StackVar, Var, stmt_defs, stmt_exprs
+    defs: dict = {}
+    uses: dict = {}
+    for b in fn.blocks.values():
+        for s in b.stmts:
+            for d in stmt_defs(s):
+                if isinstance(d, (Var, StackVar)):
+                    defs.setdefault(d, []).append((b, s))
+            for top in stmt_exprs(s):
+                for x in walk(top):
+                    if isinstance(x, (Var, StackVar)):
+                        uses[x] = uses.get(x, 0) + 1
+    return {v: d[0] for v, d in defs.items() if len(d) == 1 and isinstance(d[0][1], Assign)}, uses
 
 
 def _iter_blocks(node):
