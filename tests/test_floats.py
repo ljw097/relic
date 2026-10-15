@@ -24,7 +24,8 @@ def _c(an, name):
 
 
 @pytest.fixture(scope="module", params=["floats_O0", "floats_O2", "floats_a64_O0", "floats_a64_O2",
-                                        "floats_arm_O0", "floats_arm_O2", "floats_thumb_O2"])
+                                        "floats_arm_O0", "floats_arm_O2", "floats_thumb_O2", "floats_rv64_O0",
+                                        "floats_rv64_O2"])
 def an(request):
     return request.param, analyze(request.getfixturevalue(request.param))
 
@@ -41,8 +42,11 @@ def test_signatures(an):
     assert sig["clampd"] == "double clampd(double a1, double a2, double a3)", sig
     assert sig["narrow"] == "float narrow(double a1)", sig
     assert sig["avg"].startswith("double avg(int *a1, int a2)"), sig
-    assert sig["count_above"] == "int count_above(double *a1, int a2, double a3)", sig
-    assert sig["sum_f"] == "double sum_f(float *a1, int a2)", sig
+    # RV64 passes an int sign-extended: one only compared and used as an index compiles exactly
+    # like a long
+    n_ = "(int|int64_t)" if a.bin.arch == "riscv64" else "int"
+    assert re.fullmatch(rf"int count_above\(double \*a1, {n_} a2, double a3\)", sig["count_above"]), sig
+    assert re.fullmatch(rf"double sum_f\(float \*a1, {n_} a2\)", sig["sum_f"]), sig
     # integer parameters first, then the float ones (the registers do not say how C interleaved them)
     assert sig["mix"] == f"double mix(int a1, {long_} a2, double a3, float a4)", sig
 
@@ -181,7 +185,7 @@ def test_recompiled_pseudocode_matches(an, tmp_path):
     name, a = an
     run = []
     cross = {"a64": ("aarch64-linux-gnu-gcc", "qemu-aarch64"), "arm": ("arm-linux-gnueabihf-gcc", "qemu-arm"),
-             "thumb": ("arm-linux-gnueabihf-gcc", "qemu-arm")}
+             "thumb": ("arm-linux-gnueabihf-gcc", "qemu-arm"), "rv64": ("riscv64-linux-gnu-gcc", "qemu-riscv64")}
     kind = next((k for k in cross if f"_{k}_" in name), None)
     if kind is not None:
         cc, qemu = (shutil.which(t) for t in cross[kind])
@@ -285,7 +289,7 @@ def test_optimisation_preserves_meaning(an, fname):
                 else:
                     m.regs[f"d{k}"] = bits
                 continue
-            m.regs[f"v{k}" if a.bin.arch == "arm64" else f"xmm{k}"] = bits
+            m.regs[{"arm64": f"v{k}", "riscv64": f"fa{k}"}.get(a.bin.arch, f"xmm{k}")] = bits
         it = Interpreter(fn, m)
         it.run()
         return it.result

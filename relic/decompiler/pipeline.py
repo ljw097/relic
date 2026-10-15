@@ -73,7 +73,10 @@ def prepare(an: "Analysis", func: "Function") -> Prepared:
         live = livein_regs(an, arch, func.addr)
         params = list(regs[:max((k + 1 for k, r in enumerate(regs) if r in live), default=0)])
     else:
-        params = _livein_arg_regs(an, arch, func.addr) + [r for r, _ in fp_params(an, arch, func.addr)]
+        from .fpabi import float_int_params
+        fints = [r for r, _ in float_int_params(an, arch, func.addr)]       # RISC-V: floats past fa7
+        params = [r for r in _livein_arg_regs(an, arch, func.addr) if r not in fints] + \
+            [r for r, _ in fp_params(an, arch, func.addr)] + fints
         from .calls import param_base, stack_param_count, stack_params_used
         if stack_params_used(arch):
             # parameters past the registers, on the stack (above the return address on x86-64,
@@ -99,6 +102,9 @@ def prepare(an: "Analysis", func: "Function") -> Prepared:
     # otherwise only compared is one
     narrow(fn, sext_params=set(int_arg_regs(arch)) if arch.name.startswith("riscv") else frozenset())
     from .fpconst import fold_float_constants
+    from .cleanup import propagate_ro_loads
+    if arch.name.startswith("riscv"):
+        propagate_ro_loads(an, fn)          # `fld` of a constant into a register used several times
     fold_float_constants(an, fn)
     inline_single_use(fn)
     _fold_pass(fn)          # constants exposed by narrowing and inlining

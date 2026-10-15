@@ -816,8 +816,9 @@ class FunctionAnalyzer:
         return cand
 
     def _scan_gaps(self):
-        """Pick up functions only reachable indirectly (prologue scan: x86, ARM, AArch64, MIPS)."""
-        if self.dis.arch not in ("x86", "x64", "arm", "arm64", "mips"):
+        """Pick up functions only reachable indirectly (prologue scan: x86, ARM, AArch64, MIPS,
+        RISC-V)."""
+        if self.dis.arch not in ("x86", "x64", "arm", "arm64", "mips", "riscv64"):
             return
         prologues = (b"\xf3\x0f\x1e\xfa", b"\xf3\x0f\x1e\xfb", b"\x55\x48\x89\xe5", b"\x55\x89\xe5")
         tried: set[int] = set()
@@ -842,6 +843,8 @@ class FunctionAnalyzer:
                     start = self._arm_gap_function(s, e)
                 elif self.dis.arch == "mips":
                     start = self._mips_gap_function(s, e)
+                elif self.dis.arch == "riscv64":
+                    start = self._riscv_gap_function(s, e)
                 else:
                     start = self._gap_function(s, e, prologues)
                 if start is None or start in tried:
@@ -902,6 +905,29 @@ class FunctionAnalyzer:
                                      (w & 0x0F000000) == 0x0A000000 and w >> 28 == 0xE))
             at_start = False
             a += step
+        return None
+
+    def _riscv_gap_function(self, s: int, e: int) -> int | None:
+        """First RISC-V prologue in [s, e): `addi sp, sp, -n` (`c.addi16sp sp, -n`), at the start
+        of the gap after padding or right after an instruction that ends a function."""
+        a = (s + 1) & ~1
+        at_start, prev_end = True, False
+        while a + 2 <= e:
+            i = self.dis.decode(a)
+            if i is None:
+                a += 2
+                at_start, prev_end = False, False
+                continue
+            if i.mnemonic in ("nop", "c.nop") or self.bin.read_int(a, 2) == 0:
+                a += i.size if i.mnemonic in ("nop", "c.nop") else 2
+                continue
+            ops = i.cs.operands
+            if (at_start or prev_end) and i.mnemonic in ("addi", "c.addi16sp", "c.addi") and ops and \
+                    i.cs.reg_name(ops[0].reg) == "sp" and any(o.type == 2 and o.imm < 0 for o in ops):
+                return a
+            prev_end = i.kind in (RET, JMP)
+            at_start = False
+            a += i.size
         return None
 
     def _mips_gap_function(self, s: int, e: int) -> int | None:

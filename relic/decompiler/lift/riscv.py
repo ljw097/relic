@@ -197,6 +197,8 @@ class RiscVLifter:
             self._branch(i, m, ops)
         elif m in _NOPS:
             pass
+        elif m.startswith(("lr.", "sc.", "amo")):
+            self._atomic(i, m, ops)
         elif m.startswith("f") and "." in m:
             self._fp(i, m, ops)
         else:
@@ -406,6 +408,44 @@ class RiscVLifter:
             self.emit(Store(i.addr, addr, val if size == 64 else cast("low", val, size)))
         else:
             self.emit(Store(i.addr, addr, self.freg(ops[0], _FSTORE[m])))
+
+    _AMO = {"amoswap": None, "amoadd": "+", "amoand": "&", "amoor": "|", "amoxor": "^",
+            "amomin": ("<s", True), "amomax": ("<s", False), "amominu": ("<u", True), "amomaxu": ("<u", False)}
+
+    def _atomic(self, i, m, ops):
+        """`lr.w rd, (rs1)`, `sc.w rd, rs2, (rs1)` (taken to succeed: rd = 0), `amo<op>.w rd, rs2,
+        (rs1)` (rd = the old value, memory = old <op> rs2), acquire / release orderings aside."""
+        parts = m.split(".")
+        size = {"w": 32, "d": 64}[parts[1]]
+        regs = [self.name(o) for o in ops if o.type == OP_REG]
+        addr = self.read_reg(regs[-1])
+        if not isinstance(addr, Const):
+            addr = self.tmp(addr)
+        if parts[0] == "lr":
+            v: Expr = Load(addr, size)
+            self.write_reg(regs[0], v if size == 64 else cast("sext", v, 64))
+            return
+        src = self.read_reg(regs[1])
+        src = src if size == 64 else cast("low", src, size)
+        if parts[0] == "sc":
+            self.emit(Store(i.addr, addr, src))
+            self.write_reg(regs[0], Const(0, 64))
+            return
+        if parts[0] not in self._AMO:
+            raise LiftError(m)
+        src = self.tmp(src)
+        old = self.tmp(Load(addr, size))
+        op = self._AMO[parts[0]]
+        if op is None:
+            new: Expr = src
+        elif isinstance(op, tuple):
+            cmp, smaller = op
+            new = Ite(BinOp(cmp, old, src, 1), old, src, size) if smaller else \
+                Ite(BinOp(cmp, old, src, 1), src, old, size)
+        else:
+            new = BinOp(op, old, src, size)
+        self.emit(Store(i.addr, addr, new))
+        self.write_reg(regs[0], old if size == 64 else cast("sext", old, 64))
 
     def _effect(self, i, name):
         if name == "syscall":

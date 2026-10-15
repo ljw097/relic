@@ -56,22 +56,23 @@ jobs:
         with:
           python-version: "3.13"
           cache: pip
-      - name: System packages (ARM / AArch64 / MIPS cross compilers)
+      - name: System packages (ARM / AArch64 / MIPS / RISC-V cross compilers)
         run: |
           sudo apt-get update -q
           sudo apt-get install -y -q gcc binutils
           sudo apt-get install -y -q gcc-aarch64-linux-gnu || sudo apt-get install -y -q gcc-14-aarch64-linux-gnu
           sudo apt-get install -y -q gcc-arm-linux-gnueabihf || sudo apt-get install -y -q gcc-14-arm-linux-gnueabihf
           sudo apt-get install -y -q gcc-mipsel-linux-gnu || sudo apt-get install -y -q gcc-14-mipsel-linux-gnu
-          sudo apt-get install -y -q qemu-user        # runs the recompiled MIPS / AArch64 / ARM pseudocode
+          sudo apt-get install -y -q gcc-riscv64-linux-gnu || sudo apt-get install -y -q gcc-14-riscv64-linux-gnu
+          sudo apt-get install -y -q qemu-user        # runs the recompiled MIPS / AArch64 / ARM / RISC-V pseudocode
           ls /usr/bin/aarch64-linux-gnu-gcc* /usr/bin/arm-linux-gnueabihf-gcc*
       - name: Install
         run: pip install -e '.[dev]'
-      - name: Test (ARM / AArch64 / MIPS samples)
+      - name: Test (ARM / AArch64 / MIPS / RISC-V samples)
         run: |
-          pytest -q -rs tests/test_arm64.py tests/test_arm.py tests/test_mips.py
-          pytest -q -rs tests/test_flow.py -k "a64 or arm or thumb or mips"
-          pytest -q -rs tests/test_floats.py -k "a64 or arm or thumb"
+          pytest -q -rs tests/test_arm64.py tests/test_arm.py tests/test_mips.py tests/test_riscv.py
+          pytest -q -rs tests/test_flow.py -k "a64 or arm or thumb or mips or rv64"
+          pytest -q -rs tests/test_floats.py -k "a64 or arm or thumb or rv64"
       - uses: actions/upload-artifact@v4
         with:
           name: cross-samples
@@ -80,3 +81,4 @@ jobs:
             tests/bins/*arm*.out
             tests/bins/*thumb*.out
             tests/bins/*mips*.out
+            tests/bins/*rv64*.out

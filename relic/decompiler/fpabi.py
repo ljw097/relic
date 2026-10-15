@@ -199,12 +199,12 @@ def _fp_return(an, func, arch) -> int | None:
         return None
     if xmm_w:
         return 32 if all(w == 32 for w in xmm_w) else 64
-    return last
+    return last or None
 
 
 def _last_writes(an, fn: IRFunction, arch: ArchInfo) -> int | None:
     """Width of the float in xmm0 at every `return`, when each path's last write of xmm0 / rax
-    is xmm0 with a float; None otherwise."""
+    is xmm0 with a float (0: only zeroed, or an untouched float parameter); None otherwise."""
     widths = set()
     for b in fn.blocks.values():
         if not b.stmts or not isinstance(b.stmts[-1], Return):
@@ -214,8 +214,8 @@ def _last_writes(an, fn: IRFunction, arch: ArchInfo) -> int | None:
             return None
         widths.add(w)
     widths.discard(0)
-    if not widths:                  # nothing but zeroing: not evidence of a float result
-        return None
+    if not widths:                  # nothing but zeroing / float parameters: no evidence either way
+        return 0
     return 32 if widths == {32} else 64
 
 
@@ -330,6 +330,43 @@ def fp_params(an: "Analysis", arch: ArchInfo, target: int) -> list[tuple[str, in
             else:
                 out.append((r, widths[r]))
     c[target] = out
+    return out
+
+
+def float_int_params(an: "Analysis", arch: ArchInfo, target: int) -> list[tuple[str, int]]:
+    """RISC-V: once fa0-fa7 are taken, further float arguments travel in the integer argument
+    registers. The ones an internal callee moves straight into an FP register (`fmv.d.x fa5, a0`)
+    with the width moved (64 double, 32 float); empty unless every fa register is a parameter."""
+    if not arch.name.startswith("riscv") or len(fp_params(an, arch, target)) < len(FP_ARGS[arch.name]):
+        return []
+    c = _cache(an, "fint")
+    if target in c:
+        return c[target]
+    from .calls import _entry_ssa, int_arg_regs
+    ssa = _entry_ssa(an, arch, target)
+    found: dict[str, int] = {}
+    if ssa is not None:
+        from .ir import Load, Store
+        regs = set(int_arg_regs(arch))
+        # -O0 spills the register and reloads the slot into an FP register (`sd a0, -80(s0)`,
+        # `fld fa5, -80(s0)`)
+        spilled = {s.dst: s.src for s in ssa.stmts() if isinstance(s, Store) and isinstance(s.src, Var)
+                   and s.src.version == 0 and s.src.name in regs}
+        for s in ssa.stmts():
+            if not (isinstance(s, Assign) and isinstance(s.dst, Var) and is_fp_reg(s.dst.name)):
+                continue
+            src = s.src
+            if isinstance(src, Load) and src.addr in spilled:
+                src = spilled[src.addr] if src.bits == 64 else Cast("low", spilled[src.addr], src.bits)
+                if src.bits < 64:
+                    src = Cast("zext", src, 64)
+            w = 64
+            if isinstance(src, Cast) and src.kind in ("zext", "sext") and isinstance(src.a, Cast) and \
+                    src.a.kind == "low":
+                src, w = src.a.a, src.a.bits
+            if isinstance(src, Var) and src.version == 0 and src.name in regs:
+                found[src.name] = w
+    c[target] = out = [(r, found[r]) for r in int_arg_regs(arch) if r in found]
     return out
 
 

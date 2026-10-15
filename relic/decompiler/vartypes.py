@@ -89,7 +89,8 @@ def _narrow_widths(fn: IRFunction, cands: dict[str, Var], sx: dict[str, int] | N
             if not top and cands.get(e.name) == e:
                 bad.add(e.name)
             return
-        elif isinstance(e, BinOp) and e.op in _CMPS and e.bits == 1:
+        elif isinstance(e, BinOp) and (e.op in _CMPS and e.bits == 1 or e.op in ("&", "|", "^")):
+            # (a bitwise operation on `sext(v)` narrows back with it: `low32(sext(v) ^ k)` is `v ^ k`)
             for k in (e.a, e.b):
                 if isinstance(k, Var) and k.name in sx and cands.get(k.name) == k:
                     continue
@@ -128,32 +129,46 @@ def _collect_vars(fn: IRFunction) -> dict[str, Var]:
 
 
 def _sext_vars(fn: IRFunction, cands: dict[str, Var], params: set[str]) -> dict[str, int]:
-    """Variables every definition of which is a sign extension from n bits (`v = sext64(x32)`,
-    RISC-V `addw` / `lw` / `sext.w`), or a constant that is one: name -> n. `params` (entry
-    values the calling convention passes sign-extended) count as 32-bit."""
-    widths: dict[str, int] = {}
-    bad: set[str] = set()
-    real: set[str] = set()                       # with a sign extension, not only constants
+    """Variables every definition of which is a sign-extended n-bit value (`v = sext64(x32)`,
+    RISC-V `addw` / `lw` / `sext.w`; a bitwise operation on such values, a small zero-extension, a
+    constant that fits, a copy of another such variable): name -> n. `params` (entry values the
+    calling convention passes sign-extended) count as 32-bit."""
+    defs: dict[str, list] = {}
     for s in fn.stmts():
         for d in _defs(s):
-            if not isinstance(d, Var) or cands.get(d.name) != d:
-                continue
-            src = s.src if isinstance(s, Assign) and s.dst == d else None
-            n = None
-            if isinstance(src, Cast) and src.kind == "sext" and 8 <= src.a.bits < src.bits:
-                n = src.a.bits
-                real.add(d.name)
-            elif isinstance(src, Const):
-                n = next((k for k in (8, 16, 32) if k < src.bits and _fits_signed(src.value, k, src.bits)), None)
-            if n is None:
-                bad.add(d.name)
-            else:
-                widths[d.name] = max(widths.get(d.name, 0), n)
-    for n, v in cands.items():
-        if v.version == 0 and v.name in params:
-            widths[n] = max(widths.get(n, 32), 32)
-            real.add(n)
-    return {n: w for n, w in widths.items() if n not in bad and n in real}
+            if isinstance(d, Var) and cands.get(d.name) == d:
+                defs.setdefault(d.name, []).append(s.src if isinstance(s, Assign) and s.dst == d else None)
+    pars = {n for n, v in cands.items() if v.version == 0 and v.name in params}
+    # optimistic: every variable with a sign extension among its definitions, then drop the ones a
+    # definition contradicts until none does (`h = sext(...)` and `h ^= 0x1337` keep each other)
+    live = pars | {n for n, srcs in defs.items()
+                   if any(isinstance(x, Cast) and x.kind in ("sext", "zext") for x in srcs)}
+
+    def width(e: Expr | None) -> int | None:
+        """n when `e` is a sign-extended n-bit value (32 for one built from such values)."""
+        if isinstance(e, Cast) and e.kind == "sext" and 8 <= e.a.bits < e.bits:
+            return e.a.bits
+        if isinstance(e, Cast) and e.kind == "zext" and e.a.bits < 32 and e.a.bits < e.bits:
+            return 32                            # `lbu`: 0..255
+        if isinstance(e, Const):
+            return next((k for k in (8, 16, 32) if k < e.bits and _fits_signed(e.value, k, e.bits)), None)
+        if isinstance(e, Var):
+            return 32 if e.name in live else None
+        if isinstance(e, BinOp) and e.op in ("&", "|", "^"):
+            wa, wb = width(e.a), width(e.b)
+            return max(wa, wb, 32) if wa and wb else None
+        return None
+
+    while True:
+        drop = {n for n in live if n not in pars and not all(width(x) for x in defs.get(n, ()))}
+        if not drop:
+            break
+        live -= drop
+    out = {}
+    for n in live:
+        ws = [width(x) for x in defs.get(n, ())]
+        out[n] = max([32 if n in pars else 0, *(w for w in ws if w)]) or 32
+    return out
 
 
 def _fits_signed(v: int, n: int, bits: int) -> bool:
@@ -180,6 +195,9 @@ def narrow(fn: IRFunction, keep: set[str] = frozenset(), sext_params: set[str] =
         if params:
             low_read = {n for n in params if _int_evidence(fn, cands[n], sx, params)}
             widths = {n: w for n, w in widths.items() if n not in params or n in low_read}
+            # an int parameter also used whole (`p + n` indexes with the sign-extended value):
+            # every such use is `(long)n`, exactly
+            widths.update({n: sx[n] for n in low_read if n in sx})
         found = {n: w for n, w in widths.items() if w < cands[n].bits}
         if not found:
             break

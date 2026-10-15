@@ -120,6 +120,11 @@
   - [x] MIPS32 리프터(`lift/mips.py`, o32): 지연 슬롯은 분기 조건·호출 대상을 먼저 계산한 뒤 슬롯 명령, 그다음 분기(`lift_delayed`), `$gp`는 상수 `_gp`(쓰기·cprestore 저장 무시), 로컬 GOT 항목은 링크 시 상수, `jalr $t9`는 GOT 슬롯의 import 이름, hi/lo(mult/div), movn/movz, ext/ins; 점프 테이블(절대·`$gp` 상대 `.gpword`, `sltiu` 범위). 재컴파일 검증은 mipsel-gcc `-static` + `qemu-mipsel`
   - [x] 공통 개선(MIPS에서 발견): 스택 프레임의 반환 주소 슬롯은 x86 계열만(진입 sp+0은 호출자 영역: o32 인자 홈 슬롯 `arg_0`), 콜리 저장 레지스터 요약이 capstone `regs_access` 없는 아키텍처는 리프트 결과로, import GOT 슬롯을 통한 호출은 이름으로 출력, 가드 주소를 레지스터에 두는 카나리 인식, 분기형 부호 보정(`if (x < 0) x += 15`, 두 return)을 select로 바꿔 `/ 16`·`% 8` 복원, `sltiu x, 1` → `x == 0`
   - [x] x86-32: cdecl 스택 인자, 스택 매개변수(`a1`…), PC 썽크(`__x86.get_pc_thunk.*`, stripped는 본문으로 인식), `main`의 스택 재정렬, GOT 경유 전역(`stdout`)
+  - [x] RISC-V RV64GC 리프터(`lift/riscv.py`, LP64D): 정수(RV64IMC, Zba/Zbb 일부), `w` 연산은 하위 32비트 계산 후 부호 확장, 압축 명령(`c.ldsp`·`c.addi16sp`·`c.addi4spn` 등, capstone이 메모리 피연산자를 즉치값+기준 레지스터로 줌), `auipc`/`lui` 쌍은 상수, `jal`/`jalr` 호출·`ret`·`j`/`jr` 꼬리 호출, F/D 부동소수점(산술·`fmadd` 계열→`fma`·비교·변환·`fmv`), `__global_pointer$`가 있으면 `gp`는 상수
+    - 호출 규약: a0–a7 / fa0–fa7 인자, a0 / fa0 반환, s0–s11·fs0–fs11 콜리 저장; 가변 인자 함수의 `double`은 정수 레지스터(`printf("%f")`), fa0–fa7이 다 차면 남은 `double` 인자는 정수 레지스터로(피호출 쪽에서 `fmv.d.x`/스택 경유 `fld`로 확인해 순서 복원)
+    - 분석: 분기·`jal` 대상은 pc 상대, PLT 스텁(`auipc t3; ld t3; jalr t1, t3`)은 점프이고 import 이름, `auipc`+`addi` 상수 전파로 문자열 xref, 리스팅에서 호출 대상 이름, 점프 테이블(`auipc`+`addi` 기준, `lw` 오프셋/`ld` 절대 항목, `bltu` 범위), pyelftools가 모르는 RISC-V 재배치 이름, `.got`의 `R_RISCV_64`는 데이터 import(`stdout`), stripped 바이너리 프롤로그 스캔(`addi sp, sp, -n`), 인자 추적 취약점 탐지
+    - 공통 개선(RISC-V에서 발견): 부호/0 확장된 두 값(또는 들어맞는 상수)의 비교는 안쪽 폭으로(`(int64_t)x <= 1` → `x <= 1`), 정의가 모두 부호 확장인 변수(비트 연산·작은 0 확장·복사 포함, 낙관적 고정점)는 통째로 비교·비트 연산돼도 `int`로 좁힘, RISC-V `int` 매개변수(하위 32비트 읽기나 부호 확장 값과의 비교가 근거), 부호 확장 상수 반환(`li a0, -1`)은 `int`, float 매개변수를 그대로 돌려주는 경로는 반환 폭 판단에서 중립, 여러 번 쓰는 읽기 전용 상수 로드는 사용처마다 리터럴
+    - 재컴파일 검증: riscv64-gcc `-static` + `qemu-riscv64` (flow·floats, -O0/-O2)
 
 ## 완료
 

@@ -75,7 +75,7 @@ COMPILERS = {"vuln64_pe": "x86_64-w64-mingw32-gcc", "vuln32_pe": "i686-w64-mingw
                                                      "floats_rv64_O0", "floats_rv64_O2")},
              **{n: "arm-linux-gnueabihf-gcc" for n in ("vuln_arm", "vuln_thumb", "flow_arm_O0", "flow_arm_O2",
                                                        "flow_thumb_O0", "flow_thumb_O2", "floats_arm_O0",
-                                                       "floats_arm_O2", "floats_thumb_O2", "floats_rv64_O0", "floats_rv64_O2")}}
+                                                       "floats_arm_O2", "floats_thumb_O2")}}
 SOURCES = {"structs_O0": os.path.join(HERE, "src", "structs.c"), "structs_O2": os.path.join(HERE, "src", "structs.c"),
            **{n: os.path.join(HERE, "src", "libtypes.c") for n in ("libtypes_O0", "libtypes_O2")},
            **{n: os.path.join(HERE, "src", "floats.c") for n in ("floats_O0", "floats_O2", "floats_a64_O0",
@@ -90,7 +90,7 @@ SOURCES = {"structs_O0": os.path.join(HERE, "src", "structs.c"), "structs_O2": o
 
 # libraries go after the source: linkers drop the ones nothing before them uses
 LIBS = {n: ["-lm"] for n in ("floats_O0", "floats_O2", "floats_a64_O0", "floats_a64_O2", "floats_arm_O0",
-                              "floats_arm_O2", "floats_thumb_O2")}
+                              "floats_arm_O2", "floats_thumb_O2", "floats_rv64_O0", "floats_rv64_O2")}
 
 
 def _build(name: str) -> str:
