@@ -1,4 +1,5 @@
-"""Register constant propagation for data references (AArch64, ARM / Thumb, x86-32 PIC, MIPS).
+"""Register constant propagation for data references (AArch64, ARM / Thumb, x86-32 PIC, MIPS,
+RISC-V).
 
 x86-64 code names its data directly (`lea rax, [rip + x]`), so every string
 or global it touches already is an instruction reference. Elsewhere the
@@ -10,6 +11,7 @@ address is built over several instructions:
     x86-32 PIC  call __x86.get_pc_thunk.bx ; add ebx, off ; lea eax, [ebx - k]
     MIPS        lui v0, hi ; addiu a0, v0, lo             (absolute, non-PIC)
                 lw t9, -0x7fc0(gp) ; jalr t9              (a call through the GOT)
+    RISC-V      auipc a0, hi ; addi a0, a0, lo            (pc-relative; lui for absolute)
 
 This pass follows constant register values through each function (a forward
 dataflow over its CFG: a value survives a join only when every predecessor
@@ -376,8 +378,69 @@ class _Mips(_Target):
         self.kill_written(i, st)
 
 
+class _RiscV(_Target):
+    """`auipc a0, hi ; addi a0, a0, lo` (pc-relative, the usual PIC form), `lui a0, hi ; addi`
+    (absolute), and loads / stores at `lo(a0)` of such a base -- GOT slots included."""
+    clobbered_by_call = frozenset(["ra", *(f"t{k}" for k in range(7)), *(f"a{k}" for k in range(8))])
+    _LOADS = {"ld": 8, "lw": 4, "lwu": 4, "c.ld": 8, "c.lw": 4, "c.ldsp": 8, "c.lwsp": 4}
+
+    def canon(self, name: str) -> str:
+        return {"fp": "s0", "x0": "zero"}.get(name, name)
+
+    @staticmethod
+    def _hi20(imm: int) -> int:
+        v = imm & 0xFFFFF
+        return (v - (1 << 20) if v & 0x80000 else v) << 12
+
+    def transfer(self, i, st, refs):
+        c = i.cs
+        ops = c.operands
+        m = i.mnemonic
+        name = c.reg_name
+        regs = [self.canon(name(o.reg)) for o in ops if o.type == OP_REG]
+        dst = regs[0] if ops and ops[0].type == OP_REG else None
+        if m == "auipc" and len(ops) == 2:
+            st[dst] = ((i.addr + self._hi20(ops[1].imm)) & self.mask, True)
+            return
+        if m in ("lui", "c.lui") and len(ops) == 2:
+            v = self._hi20(ops[1].imm) & self.mask
+            st[dst] = (v, not self.pie and self.bin.is_mapped(v))
+            return
+        if m in ("addi", "addiw", "c.addi", "c.addiw") and ops[-1].type == OP_IMM:
+            src = st.get(regs[1] if len(regs) > 1 else dst)
+            if src is not None:
+                v = (src[0] + ops[-1].imm) & self.mask
+                if m.endswith("w"):
+                    v = ((v & 0xFFFFFFFF) ^ 0x80000000) - 0x80000000 & self.mask
+                st[dst] = (v, src[1])
+                if src[1]:
+                    refs.append(v)
+                return
+        if m in ("mv", "c.mv") and len(regs) == 2:
+            src = st.get(regs[1])
+            if src is not None:
+                st[dst] = src
+                return
+        mem = next((o for o in ops if o.type == OP_MEM), None)
+        if mem is not None:
+            base = st.get(self.canon(name(mem.mem.base)))
+            if base is not None and base[1]:
+                addr = (base[0] + mem.mem.disp) & self.mask
+                refs.append(addr)
+                self.kill_written(i, st)
+                size = self._LOADS.get(m)
+                if size and dst is not None and self.readonly(addr):
+                    v = self.bin.read_int(addr, size)
+                    if v is not None:
+                        st[dst] = (v, self.bin.is_mapped(v))
+                return
+        self.kill_written(i, st)
+
+
 def _target_for(an: "Analysis") -> _Target | None:
     arch = an.bin.arch
+    if arch.startswith("riscv"):
+        return _RiscV(an)
     if arch == "arm64":
         return _Arm64(an)
     if arch == "arm":

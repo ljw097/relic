@@ -252,6 +252,27 @@ def _resolve_plt(b: Binary, got_names: dict[int, str]):
                     ip = None
                 else:
                     ip = None if insn.mnemonic != "add" else ip
+    elif b.arch.startswith("riscv"):
+        # `auipc t3, %pcrel_hi(slot); l[dw] t3, %pcrel_lo(t3); jalr t1, t3; nop`
+        bits = 64 if b.arch == "riscv64" else 32
+        md = cs.Cs(cs.CS_ARCH_RISCV, (cs.CS_MODE_RISCV64 if bits == 64 else cs.CS_MODE_RISCV32) | cs.CS_MODE_RISCVC)
+        md.detail = True
+        mask = (1 << bits) - 1
+        for sec in plt_secs:
+            code = b.data[sec.offset:sec.offset + sec.size]
+            insns = list(md.disasm(code, sec.addr))
+            for k in range(len(insns) - 1):
+                a, ld = insns[k], insns[k + 1]
+                if a.mnemonic != "auipc" or ld.mnemonic not in ("ld", "lw"):
+                    continue
+                ao, lo = a.operands, ld.operands
+                if len(ao) != 2 or len(lo) != 2 or lo[1].type != cs.riscv.RISCV_OP_MEM or \
+                        lo[1].mem.base != ao[0].reg:
+                    continue
+                slot = (a.address + (ao[1].imm << 12) + lo[1].mem.disp) & mask
+                if slot in got_names and a.address not in found:
+                    b.imports.append(Import(got_names[slot], a.address, slot))
+                    found[a.address] = got_names[slot]
     # fallback: order of .rela.plt entries -> sequential PLT stubs
     if not found and plt_secs and got_names:
         plt = plt_secs[0]
