@@ -51,6 +51,15 @@ NI int packet_len(struct packet *p)
     return p->ihl * 4 + p->frag + (p->flags == 2);
 }
 
+NI void packet_set(struct packet *p, int ihl, int flags)
+{
+    p->version = 4;
+    p->ihl = ihl;
+    p->flags = flags;
+    if (flags & 1)
+        p->frag = 0;
+}
+
 int main(int argc, char **argv)
 {
     job_t a = {0}, b = {0};
@@ -63,6 +72,7 @@ int main(int argc, char **argv)
     run_job(&b, STOPPED, OPT_VERBOSE);
     printf("%d %s\n", count_running(&a), state_name((enum state)(argc + 3)));
     struct packet pk = {4, 5, 0, 100, 2, 3};
+    packet_set(&pk, argc + 4, argc);
     printf("%d\n", packet_len(&pk));
     return 0;
 }
