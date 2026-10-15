@@ -413,3 +413,27 @@ def test_unoptimised_compare_tree_is_a_switch(tmp_path):
     r = subprocess.run([cc, "-w", "-o", str(out), str(harness)], capture_output=True, text=True)
     assert r.returncode == 0, r.stderr + text
     assert subprocess.run([str(out)], capture_output=True, text=True).stdout.strip() == "ok"
+
+
+def test_switch_through_a_variable_shows_the_index():
+    """`v = base + table[i * 4]; goto *v` (the target computed into a variable): the switch is on
+    `i`, with case values, and the computation is not printed."""
+    from relic.decompiler.ir import (Assign, BinOp, Cast, Const, IndirectJump, IRBlock, IRFunction, Load, Return,
+                                     Var)
+    from relic.decompiler.structure import Switch
+    i, t = Var("i", 0, 32), Var("t", 0, 64)
+    calc = BinOp("+", Cast("sext", Load(BinOp("+", Const(0x5000, 64), BinOp("*", Cast("zext", i, 64),
+                                                                              Const(4, 64), 64), 64), 32), 64),
+                 Const(0x5000, 64), 64)
+    fn = IRFunction(0x100, "f")
+    fn.blocks[0x100] = IRBlock(0x100, [Assign(0x100, t, calc), IndirectJump(0x104, t, [0x200, 0x300],
+                                                                              [0x200, 0x300, 0x200])],
+                               succs=[0x200, 0x300])
+    for a in (0x200, 0x300):
+        fn.blocks[a] = IRBlock(a, [Return(a, Const(a, 32))], preds=[0x100])
+    st = Structurer(fn)
+    tree = st.run()
+    sw = next(x for x in tree.items if isinstance(x, Switch))
+    assert sw.expr == i
+    assert sorted(v for c in sw.cases for v in c.values) == [0, 1, 2]
+    assert len(st.hidden) == 1                       # the target computation is left out
