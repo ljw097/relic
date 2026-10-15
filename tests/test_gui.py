@@ -970,3 +970,34 @@ def test_import_c_header(win, tmp_path):
     with mock.patch("relic.gui.main_window.QMessageBox.warning") as warn:
         assert win.import_header(str(bad)) is None
     assert "bit-field" in warn.call_args[0][2]
+
+
+def test_export_pseudocode_in_the_background(win, tmp_path):
+    target = tmp_path / "all.c"
+    t = win.export_pseudocode(str(target))
+    assert t.wait(120000)
+    QApplication.processEvents()
+    assert target.exists() and not (tmp_path / "all.c.part").exists()
+    assert "// main @" in target.read_text()
+    assert "all.c:" in win.statusBar().currentMessage()
+
+
+def test_types_window_lists_and_clears_imported_types(win, tmp_path):
+    h = tmp_path / "t.h"
+    h.write_text("typedef unsigned int u32;\nenum color { RED, GREEN = 4 };\n"
+                 "struct pt { int x; int y; };\nint shade(enum color c);\n")
+    win.import_header(str(h))
+    d = win.show_types()
+    tops = {d.tree.topLevelItem(k).text(0): d.tree.topLevelItem(k) for k in range(d.tree.topLevelItemCount())}
+    assert tops["enums"].child(0).text(0) == "enum color" and tops["enums"].child(0).child(1).text(1) == "4"
+    assert tops["typedefs"].child(0).text(1) == "unsigned int"
+    assert tops["structs"].child(0).text(0) == "struct pt"
+    assert tops["prototypes"].child(0).text(1) == "int shade(enum color)"
+    from unittest import mock
+    from PySide6.QtWidgets import QMessageBox
+    with mock.patch("relic.gui.types.QMessageBox.question", return_value=QMessageBox.StandardButton.Yes):
+        d.clear()
+    assert not win.an.user_types and "pt" not in win.an.struct_names
+    assert d.tree.topLevelItem(0).childCount() == 0
+    win.an.undo()                                # the clear is one undo step
+    assert win.an.enum("color") == {"RED": 0, "GREEN": 4}
