@@ -574,6 +574,18 @@ class Session:
             return ""
         return m.group(1) + (f"+{int(m.group(2)):#x}" if m.group(2) else "")
 
+    # --------------------------------------------------------------- heap
+    HEAP_MAX = 4 << 20            # bytes of the heap read at most
+
+    def heap(self):
+        """The glibc main-arena heap (`[heap]`): its chunks and tcache lists (debugger.heap);
+        None while the process has no heap yet."""
+        from .heap import walk
+        m = next((m for m in self.mappings() if m.path == "[heap]"), None)
+        if m is None:
+            return None
+        return walk(self.read_memory, m.start, min(m.end, m.start + self.HEAP_MAX), self.word)
+
     # ---------------------------------------------------------- telescope
     def telescope(self, addr: int | None = None, count: int = 12, depth: int = 4) -> list[TeleRow]:
         """pwndbg's telescope: each word from `addr` (default: the stack pointer), followed
