@@ -6,6 +6,7 @@ machine instruction it came from.
 """
 from __future__ import annotations
 
+import copy
 from dataclasses import dataclass, field
 
 
@@ -355,11 +356,32 @@ class IRBlock:
     preds: list[int] = field(default_factory=list)
 
 
+def copy_stmt(s: Stmt) -> Stmt:
+    """A statement to change independently of `s`: its own containers (`uses`, `defs`, jump
+    tables), the same immutable expressions."""
+    c = copy.copy(s)
+    for cls in type(s).__mro__:
+        for name in getattr(cls, "__slots__", ()):
+            v = getattr(s, name, None)
+            if isinstance(v, (list, dict, set)):
+                setattr(c, name, type(v)(v))
+    return c
+
+
 @dataclass
 class IRFunction:
     addr: int
     name: str
     blocks: dict[int, IRBlock] = field(default_factory=dict)
+
+    def __deepcopy__(self, memo):
+        # expressions are immutable: new blocks and statements share them (much faster than a
+        # generic deep copy, which would rebuild every statement through copyreg)
+        new = copy.copy(self)
+        new.__dict__ = {k: copy.deepcopy(v, memo) for k, v in self.__dict__.items() if k != "blocks"}
+        new.blocks = {a: IRBlock(b.addr, [copy_stmt(st) for st in b.stmts], list(b.succs), list(b.preds))
+                      for a, b in self.blocks.items()}
+        return new
 
     def stmts(self):
         for a in sorted(self.blocks):

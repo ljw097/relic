@@ -164,6 +164,9 @@ def _recognise(full: Expr, x: Expr) -> Expr | None:
     return None
 
 
+_R_SAMPLES = 1024
+
+
 def _divisibility(full: Expr, x: Expr) -> Expr | None:
     """`(x * inv - k) <=u lim` and friends: the test `x % c == r`."""
     w = x.bits
@@ -188,9 +191,13 @@ def _divisibility(full: Expr, x: Expr) -> Expr | None:
             continue
         for signed in (True, False):
             mod = (lambda v, c=c: _s(_smod(v, c, w), w)) if signed else (lambda v, c=c: (v & mask(w)) % c)
-            # r: read it off the samples where the test holds
+            # r: read it off the samples where the test holds (a bounded set: every candidate is
+            # checked on the full samples below; the multiples of c find the usual `% c == 0`)
+            vals = range(0, min(4 * c, _R_SAMPLES))
+            if 4 * c > _R_SAMPLES:
+                vals = [*vals, *(k * c for k in range(1, 9))]
             try:
-                hits = {mod(v) for v in range(0, 4 * c) if _eval(full, x, v)}
+                hits = {mod(v) for v in vals if _eval(full, x, v)}
             except InterpError:
                 return None
             if len(hits) != 1:
