@@ -35,5 +35,6 @@ const char *state_name(enum state s);
 int count_running(struct job *head);
 void add_option(job_t *j, options_t o);
 int packet_len(struct packet *p);
+void packet_set(struct packet *p, int ihl, int flags);
 
 #endif

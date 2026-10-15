@@ -172,7 +172,8 @@ def test_import_summary(typed):
     _, an, got = typed
     assert got == {"structs": ["header", "job", "packet"], "enums": ["options_t", "state"],
                    "typedefs": ["job_t", "options_t"],
-                   "functions": ["add_option", "count_running", "packet_len", "run_job", "state_name"], "imports": []}
+                   "functions": ["add_option", "count_running", "packet_len", "packet_set", "run_job", "state_name"],
+                   "imports": []}
     assert an.enum("state") == {"IDLE": 0, "RUNNING": 1, "STOPPED": 5, "FAILED": 6}
     assert an.resolve_type("job_t *") == "struct job *"
 
@@ -197,6 +198,11 @@ def test_enumerators_fields_and_signatures(typed):
     code = _c(an, "packet_len")
     assert "->version != 4" in code and "->ihl" in code and "->frag" in code and "->flags == 2" in code, code
     assert "unsigned int version : 4;" in code and "version_ihl" not in code.split("{", 2)[-1].split("return")[-1]
+    # the read-modify-write of a bit-field's storage unit is an assignment to the field
+    code = _c(an, "packet_set")
+    for line in ("->version = 4;", "->ihl = ", "->flags = ", "->frag = 0;"):
+        assert line in code, code
+    assert "& 31" not in code and "-0x2000" not in code and "(char *)" not in code.split("{", 2)[-1], code
     code = _c(an, "main")
     assert "run_job(" in code and ", RUNNING, " in code and ", STOPPED, " in code
     assert "add_option(" in code and ", OPT_FORCE)" in code, code
@@ -240,11 +246,16 @@ int main(int argc, char **argv)
     for (int k = 0; k < 64; k++) {
         struct packet pk = {k & 15, (k * 7) & 15, 0, (k * 1234) & 0x1fff, k & 7, k %% 12};
         printf("%%d\n", re ? p_packet_len(&pk) : packet_len(&pk));
+        if (re)
+            p_packet_set(&pk, k * 3, k >> 1);
+        else
+            packet_set(&pk, k * 3, k >> 1);
+        printf("%%u %%u %%u %%u %%u %%d\n", pk.version, pk.ihl, pk.tos, pk.frag, pk.flags, pk.ttl);
     }
     return 0;
 }
 """
-FUNCS = ("state_name", "add_option", "run_job", "count_running", "packet_len")
+FUNCS = ("state_name", "add_option", "run_job", "count_running", "packet_len", "packet_set")
 
 
 def test_recompiled_pseudocode_behaves_like_the_original(typed, tmp_path):

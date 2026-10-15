@@ -90,6 +90,8 @@ FLIP = {"<": ">", "<=": ">="}
 
 
 class CWriter:
+    _bf_vars: set[str] = frozenset()     # reads only a bit-field store used: see _bitfield_stores
+
     def __init__(self, an: "Analysis", prep: "Prepared"):
         self.an = an
         self.p = prep
@@ -129,6 +131,7 @@ class CWriter:
         self.shown: dict[str, str] = {}
         self.commented: set[int] = set()
         self.out: list[Line] = []
+        self._bf_vars = set()
         self._name_vars()
         if self._is_main():
             self._spread_types([r for r in self.p.params[1:3]])
@@ -284,6 +287,153 @@ class CWriter:
                     if b == pos and w == width and pos + width <= (sp[1] - f.offset) * 8 + load.bits:
                         return f"{self.expr(sp[0], PREC_POSTFIX)}->{name}"
         return None
+
+    def _unit_of(self, e: Expr) -> Load | None:
+        """The memory read `e` is (through casts, or a variable set once from it)."""
+        while isinstance(e, Cast):
+            e = e.a
+        if isinstance(e, (Var, StackVar)):
+            e = self.structs.defs.get(e.name)
+            while isinstance(e, Cast):
+                e = e.a
+        return e if isinstance(e, Load) else None
+
+    def bitfield_writes(self, s: Store) -> list[str] | None:
+        """A store to an imported struct's bit-field storage unit, as one assignment per bit-field
+        it changes: `unit = unit & keep | (x & m) << k | c` -> `p->f = x; p->g = c;` (the
+        read-modify-write a compiler makes of `p->f = x`). None when it is not exactly that."""
+        if "structs" not in self.__dict__:
+            return None
+        from .structs import split_addr
+        sp = split_addr(s.dst)
+        st = self.structs.struct_of(sp[0]) if sp is not None else None
+        fields = self.an.struct_names.get(st.name, {}).get("bitfields") if st is not None else None
+        if not fields:
+            return None
+        size = s.bits
+        # (a container can overlap the next unit: `unsigned int a : 4` then a `short` unit at +2)
+        inside, partly = [], []
+        for unit in st.fields.values():
+            if inside or not fields.get(unit.name) or not unit.offset <= sp[1] < sp[1] + size // 8 <= unit.end:
+                continue
+            base = (sp[1] - unit.offset) * 8
+            near = [(n, b - base, w) for n, b, w in fields[unit.name] if b < base + size and b + w > base]
+            partly = [(p, w) for _, p, w in near if p < 0 or p + w > size]   # its bits there must be kept
+            inside = [x for x in near if 0 <= x[1] and x[1] + x[2] <= size]
+        if not inside:
+            return None
+        terms: list[Expr] = []
+
+        def flat(e):
+            while isinstance(e, Cast) and e.kind in ("low", "zext"):
+                e = e.a
+            if isinstance(e, BinOp) and e.op == "|":
+                flat(e.a)
+                flat(e.b)
+            else:
+                terms.append(e)
+        flat(s.src)
+        keep, const, values, kept_var = 0, 0, [], None
+        full = (1 << size) - 1
+        for t in terms:
+            if isinstance(t, Const):
+                const |= t.value & full
+                continue
+            if isinstance(t, BinOp) and t.op == "&" and isinstance(t.b, Const):
+                old = self._unit_of(t.a)
+                if old is not None and old.addr == s.dst and old.bits >= size:
+                    if keep:
+                        return None
+                    keep = t.b.value & full
+                    a = t.a
+                    while isinstance(a, Cast):
+                        a = a.a
+                    kept_var = a if isinstance(a, Var) else None
+                    continue
+            k = 0
+            if isinstance(t, BinOp) and t.op == "<<" and isinstance(t.b, Const):
+                t, k = t.a, t.b.value
+                while isinstance(t, Cast) and t.kind in ("low", "zext"):
+                    t = t.a
+            if not 0 <= k < size:
+                return None
+            m = t.b.value if isinstance(t, BinOp) and t.op == "&" and isinstance(t.b, Const) else 0
+            if m and m & (m + 1) == 0 and k + m.bit_length() <= size:
+                values.append([k, m.bit_length(), t.a, False])
+            else:
+                values.append([k, size - k, t, False])
+        for p, w in partly:
+            lo, hi = max(p, 0), min(p + w, size)
+            fm = ((1 << (hi - lo)) - 1) << lo
+            if keep & fm != fm or const & fm or any(v[0] < hi and v[0] + v[1] > lo for v in values):
+                return None
+        ptr = self.expr(sp[0], PREC_POSTFIX)
+        out = []
+        for name, p, w in sorted(inside, key=lambda x: x[1]):
+            fm = ((1 << w) - 1) << p
+            hits = [v for v in values if v[0] < p + w and v[0] + v[1] > p]
+            if keep & fm == fm:
+                if hits or const & fm:
+                    return None
+                continue
+            if keep & fm:
+                return None                      # part of the field kept, part written
+            if not hits:
+                out.append(f"{ptr}->{name} = {number((const >> p) & ((1 << w) - 1))};")
+                continue
+            if len(hits) != 1 or hits[0][0] != p or hits[0][1] != w or const & fm:
+                return None
+            hits[0][3] = True
+            x = hits[0][2]
+            while isinstance(x, Cast) and x.kind in ("low", "zext") and x.bits >= w:
+                x = x.a
+            out.append(f"{ptr}->{name} = {self.expr(_bare(x))};")
+        if not out or not all(v[3] for v in values):
+            return None
+        if kept_var is not None and not self._unit_unchanged(kept_var.name, s, sp):
+            return None
+        self._bf_kept = kept_var
+        return out
+
+    def _unit_unchanged(self, name: str, s: Store, sp) -> bool:
+        """No store can change the bytes `s` writes between `name = <them>` and `s`: both in one
+        block with no such store between, else no such store anywhere in the function."""
+        from .structs import split_addr
+        lo, hi = sp[1], sp[1] + s.bits // 8
+
+        def clobbers(o) -> bool:
+            if not isinstance(o, Store):
+                return False
+            op = split_addr(o.dst)
+            return op is None or op[0] == sp[0] and op[1] < hi and op[1] + o.bits // 8 > lo
+        for b in self.p.fn.blocks.values():
+            d = next((k for k, o in enumerate(b.stmts) if isinstance(o, Assign) and isinstance(o.dst, Var)
+                      and o.dst.name == name), None)
+            w = next((k for k, o in enumerate(b.stmts) if isinstance(o, Store) and o.addr == s.addr
+                      and o.dst == s.dst), None)
+            if d is not None and w is not None and d < w:
+                return not any(clobbers(o) for o in b.stmts[d + 1:w])
+        return not any(clobbers(o) for o in self.p.fn.stmts() if not (o.addr == s.addr and o.dst == s.dst))
+
+    def _bitfield_stores(self):
+        """Find the stores `bitfield_writes` shows as field assignments (before the body is
+        written), and hide the read of the old unit when that store was its only use (`v1 =
+        *(char *)(p + 3)` at -O2)."""
+        if not any(d.get("bitfields") for d in self.an.struct_names.values()):
+            return
+        stmts = list(self.p.fn.stmts())
+        uses: dict[str, int] = {}
+        for s in stmts:
+            for top in ir.stmt_exprs(s):
+                for x in ir.walk(top):
+                    if isinstance(x, Var):
+                        uses[x.name] = uses.get(x.name, 0) + 1
+        for s in stmts:
+            if isinstance(s, Store):
+                self._bf_kept = None
+                if self.bitfield_writes(s) is not None:
+                    if self._bf_kept is not None and uses.get(self._bf_kept.name) == 1:
+                        self._bf_vars.add(self._bf_kept.name)
 
     def _bit_unit(self, st, f) -> bool:
         """`f` is the storage of bit-fields (C has no name for it, nor its address): memory there
@@ -877,6 +1027,9 @@ class CWriter:
                 return f"{lhs} = {name};"
             return f"{lhs} = {self.expr(_bare(src) if self._implicit(s.dst, src) else src)};"
         if isinstance(s, Store):
+            bf = self.bitfield_writes(s)
+            if bf is not None:
+                return ", ".join(t.rstrip(";") for t in bf) + ";"
             name = self._enum_text(ir.Load(s.dst, s.bits), _bare(s.src))
             return f"{self.mem(s.dst, s.bits)} = {name or self.expr(s.src)};"
         if isinstance(s, CallStmt):
@@ -929,7 +1082,13 @@ class CWriter:
             if n.addr in self.p.gotos and not n.copy:
                 self.emit(f"loc_{n.addr:x}:", n.addr, max(depth - 1, 0))
             for s in n.stmts:
-                if id(s) in getattr(self.p, "hidden", ()):
+                if id(s) in getattr(self.p, "hidden", ()) or \
+                        isinstance(s, Assign) and isinstance(s.dst, Var) and s.dst.name in self._bf_vars:
+                    continue
+                bf = self.bitfield_writes(s) if isinstance(s, Store) else None
+                if bf is not None:
+                    for text in bf:
+                        self.emit(text, s.addr, depth)
                     continue
                 text = self.stmt(s)
                 if text is not None:
@@ -1078,7 +1237,7 @@ class CWriter:
                       key=lambda n: int(self.names[n][1:]))
         for v in regs:
             t = self.types.get(v)
-            if t is not None:
+            if t is not None and v not in self._bf_vars:
                 self.emit(f"{t.decl(self.vname(v))};", None, depth)
         if self.out and self.out[-1].depth == depth:
             self.emit("", None, depth)
@@ -1086,6 +1245,7 @@ class CWriter:
     def render(self) -> list[Line]:
         self.emit(self.signature(), self.p.fn.addr, 0)
         self.emit("{", None, 0)
+        self._bitfield_stores()
         self.declarations(1)
         body = _flatten(self.p.tree)
         if body and isinstance(body[-1], Ret) and body[-1].stmt.value is None:
