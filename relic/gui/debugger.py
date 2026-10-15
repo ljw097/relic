@@ -76,6 +76,7 @@ class Snapshot:
     code: list = field(default_factory=list)        # (addr, text, symbol)
     breakpoints: list = field(default_factory=list)  # Breakpoint
     maps: list = field(default_factory=list)        # Mapping
+    heap: object = None                              # debugger.heap.Heap, None: no heap yet
     word: int = 8
 
 
@@ -462,6 +463,10 @@ class DebugController(QObject):
         snap.frames = [(f.level, f.addr, s.symbolize(f.addr)) for f in s.backtrace()]
         if snap.pc is not None:
             snap.code = [(a, t, s.symbolize(a)) for a, t in s.disassemble(snap.pc, 10)]
+        try:
+            snap.heap = s.heap()
+        except Exception as e:  # noqa: BLE001 - a heap that cannot be walked leaves the panel empty
+            self.log.emit(f"heap: {e}\n")
         return snap
 
 
@@ -608,6 +613,70 @@ class VmmapPanel(QTableWidget):
                      f"{m.offset:#x}", m.path]
             for c, text in enumerate(cells):
                 self.setItem(k, c, _item(text, col, m.start))
+
+
+_STATE_COLOR = {"used": "fg", "free": "ret", "tcache": "call", "top": "addr"}
+
+
+class HeapPanel(QWidget):
+    """The glibc heap (pwndbg `heap` / `tcachebins`): every chunk of `[heap]` with its state,
+    and the tcache lists. Double-clicking a chunk or a list entry shows it in the memory view."""
+
+    view = Signal(object)        # live address to show in the memory view (Qt ints are 32-bit)
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.label = QLabel("no heap")
+        self.chunks = QTableWidget()
+        _setup(self.chunks, ["Chunk", "Size", "State", "Flags", "Data"])
+        self.bins = QTableWidget()
+        _setup(self.bins, ["tcache", "Count", "Entries"])
+        for t in (self.chunks, self.bins):
+            t.cellDoubleClicked.connect(lambda r, c, t=t: self._clicked(t, r, c))
+        lay = QVBoxLayout(self)
+        lay.setContentsMargins(0, 0, 0, 0)
+        lay.addWidget(self.label)
+        row = QHBoxLayout()
+        row.addWidget(self.chunks, 3)
+        row.addWidget(self.bins, 2)
+        lay.addLayout(row)
+
+    def _clicked(self, table, r, c):
+        it = table.item(r, 0)
+        if table is self.bins:
+            cell = table.item(r, 2)
+            text = cell.text().split(" -> ")[0] if cell is not None else ""
+            target = int(text, 16) if text.startswith("0x") else None
+        else:
+            target = int(it.data(Qt.ItemDataRole.UserRole)) if it is not None else None
+        if target is not None:
+            self.view.emit(target)
+
+    def show_snapshot(self, snap: Snapshot):
+        h = snap.heap
+        if h is None:
+            self.label.setText("no heap (nothing allocated yet)" if not snap.exited else "")
+            self.chunks.setRowCount(0)
+            self.bins.setRowCount(0)
+            return
+        w = snap.word
+        free = sum(c.state in ("free", "tcache") for c in h.chunks)
+        link = {True: ", safe-linking", False: "", None: ""}[h.safe_linking]
+        self.label.setText(f"[heap] {h.start:#x}-{h.end:#x}: {len(h.chunks)} chunks, {free} free{link}"
+                           + (f"  ({h.note})" if h.note else ""))
+        self.chunks.setRowCount(len(h.chunks))
+        for k, c in enumerate(h.chunks):
+            col = THEME.get(_STATE_COLOR.get(c.state, "fg"), THEME["fg"])
+            text = "".join(chr(b) if 0x20 <= b < 0x7F else "." for b in c.data)
+            cells = [_hex(c.addr, w), f"{c.size:#x}", c.state, c.flag_text(), f"{c.data.hex(' ')}  |{text}|"]
+            for col_k, t in enumerate(cells):
+                self.chunks.setItem(k, col_k, _item(t, col, c.user))
+        self.bins.setRowCount(len(h.tcache))
+        for k, b in enumerate(h.tcache):
+            chain = " -> ".join(f"{p:#x}" for p in b.entries) + (f"  ({b.broken})" if b.broken else "")
+            col = THEME["ret"] if b.broken else None
+            for col_k, t in enumerate([f"{b.size:#x}", str(b.count), chain]):
+                self.bins.setItem(k, col_k, _item(t, col))
 
 
 def hexdump(addr: int, data: bytes, width: int = 16) -> str:
@@ -771,4 +840,5 @@ class ConsolePanel(QWidget):
 
 
 __all__ = ["Breakpoint", "BreakpointsPanel", "BacktracePanel", "CodePanel", "ConsolePanel", "DebugController",
-           "MemoryPanel", "RegistersPanel", "Snapshot", "StackPanel", "VmmapPanel", "hexdump", "item_value"]
+           "HeapPanel", "MemoryPanel", "RegistersPanel", "Snapshot", "StackPanel", "VmmapPanel", "hexdump",
+           "item_value"]

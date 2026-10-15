@@ -13,8 +13,8 @@ from PySide6.QtWidgets import (QAbstractItemView, QApplication, QComboBox, QDial
 from ..analysis import Analysis
 from ..analysis.strings import escape
 from ..progress import Cancelled, Progress
-from .debugger import (BacktracePanel, BreakpointsPanel, CodePanel, ConsolePanel, DebugController, MemoryPanel,
-                       RegistersPanel, StackPanel, VmmapPanel, item_value)
+from .debugger import (BacktracePanel, BreakpointsPanel, CodePanel, ConsolePanel, DebugController, HeapPanel,
+                       MemoryPanel, RegistersPanel, StackPanel, VmmapPanel, item_value)
 from .views import (DEFAULT_FONT_SIZE, THEME, DisasmView, GraphView, HexView, PseudocodeView, current_theme,
                     font_size, mono_font, set_font_size, set_theme)
 
@@ -335,12 +335,13 @@ class MainWindow(QMainWindow):
         self.dbg_console = ConsolePanel()
         self.dbg_mem = MemoryPanel()
         self.dbg_vmmap = VmmapPanel()
+        self.dbg_heap = HeapPanel()
         self.dbg_bps = BreakpointsPanel()
         right, bottom = Qt.DockWidgetArea.RightDockWidgetArea, Qt.DockWidgetArea.BottomDockWidgetArea
         self.dbg_docks = [self._dock("Registers", self.dbg_regs, right), self._dock("Stack", self.dbg_stack, right),
                           self._dock("Console", self.dbg_console, bottom), self._dock("Code", self.dbg_code, bottom),
                           self._dock("Backtrace", self.dbg_bt, bottom), self._dock("Memory", self.dbg_mem, bottom),
-                          self._dock("Vmmap", self.dbg_vmmap, bottom),
+                          self._dock("Vmmap", self.dbg_vmmap, bottom), self._dock("Heap", self.dbg_heap, bottom),
                           self._dock("Breakpoints", self.dbg_bps, bottom)]
         # registers, then the stack, below the xrefs / search tabs; console, code and backtrace
         # with the bottom tabs (strings, imports, ...)
@@ -359,6 +360,7 @@ class MainWindow(QMainWindow):
         self.dbg_bt.cellDoubleClicked.connect(self._debug_frame_clicked)
         self.dbg.memory.connect(self.dbg_mem.show_memory)
         self.dbg_mem.goto_expr.connect(self.dbg.view_memory)
+        self.dbg_heap.view.connect(self._debug_view_heap)
         self.dbg_bps.changed.connect(self._debug_breakpoint_edited)
         self.dbg_bps.removed.connect(self._debug_breakpoint_removed)
         self.dbg_regs.edit_requested.connect(self.debug_set_register_dialog)
@@ -1034,6 +1036,11 @@ class MainWindow(QMainWindow):
         if self.cur is not None:
             self.dbg.run_to(self.cur)
 
+    def _debug_view_heap(self, addr: int):
+        """A heap chunk (or tcache entry) double-clicked: its memory, in the memory view."""
+        self.dbg.view_memory(addr)
+        next(d for d in self.dbg_docks if d.widget() is self.dbg_mem).raise_()
+
     def debug_arguments_dialog(self):
         text, ok = QInputDialog.getText(self, "Program arguments", "Arguments (space-separated):",
                                         text=" ".join(self.dbg_args))
@@ -1046,7 +1053,8 @@ class MainWindow(QMainWindow):
 
     def _debug_state(self, snap):
         self.dbg_bps.an = self.an
-        for panel in (self.dbg_regs, self.dbg_stack, self.dbg_bt, self.dbg_code, self.dbg_vmmap, self.dbg_bps):
+        for panel in (self.dbg_regs, self.dbg_stack, self.dbg_bt, self.dbg_code, self.dbg_vmmap, self.dbg_heap,
+                      self.dbg_bps):
             panel.show_snapshot(snap)
         if snap.exited:
             self._debug_marks(None)

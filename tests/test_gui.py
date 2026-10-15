@@ -1035,3 +1035,27 @@ def test_merge_project_from_another_analyst(win, vuln64, tmp_path):
     assert win.an.renames[f] == "bobs_main" and "added 1 renames" in win.statusBar().currentMessage()
     win.an.undo()
     assert f not in win.an.renames
+
+
+def test_heap_panel_lists_chunks_and_tcache(app, win):
+    from relic.gui.debugger import Snapshot
+    from test_heap import BASE, _heap, _reader, _tcache_struct
+
+    from relic.debugger.heap import walk
+    b = BASE + 0x2b0
+    data = _heap([(0x291, _tcache_struct({0: b + 0x10}, {0: 1})), (0x21, b"AAAA"),
+                  (0x21, ((b + 0x10) >> 12).to_bytes(8, "little"))])
+    snap = Snapshot(heap=walk(_reader(data), BASE, BASE + len(data) + 0x1000), word=8)
+    p = win.dbg_heap
+    p.show_snapshot(snap)
+    assert "4 chunks, 1 free, safe-linking" in p.label.text()
+    assert [p.chunks.item(k, 2).text() for k in range(p.chunks.rowCount())] == ["used", "used", "tcache", "top"]
+    assert "41 41 41 41" in p.chunks.item(1, 4).text() and "|AAAA" in p.chunks.item(1, 4).text()
+    assert p.bins.item(0, 0).text() == "0x20" and p.bins.item(0, 2).text() == f"{b + 0x10:#x}"
+    got = []
+    p.view.connect(got.append)
+    p._clicked(p.chunks, 1, 0)
+    p._clicked(p.bins, 0, 2)
+    assert got == [BASE + 0x290 + 0x10, b + 0x10]
+    p.show_snapshot(Snapshot())
+    assert p.chunks.rowCount() == 0 and "no heap" in p.label.text()
