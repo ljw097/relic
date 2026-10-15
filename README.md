@@ -25,7 +25,7 @@
 진행률은 "IDA Pro가 그 영역에서 하는 일 중 Relic이 같은 수준으로 하는 비율"을 어림한 값입니다.
 전체 값은 영역 가중 평균(가중치는 리버싱 실무에서의 비중)입니다.
 
-**전체: 약 44%** — 분석·디컴파일 핵심 경로는 x86/ARM/MIPS/RISC-V 계열에서 실사용 가능, 파일 포맷(Mach-O)·타입 시스템(열거형·공용체·헤더)·디컴파일 품질(goto, SIMD)이 큰 격차.
+**전체: 약 45%** — 분석·디컴파일 핵심 경로는 x86/ARM/MIPS/RISC-V 계열에서 실사용 가능, 파일 포맷(Mach-O)·타입 시스템(타입 자동 전파·라이브러리 타입)·디컴파일 품질(goto, SIMD)이 큰 격차.
 
 | 영역 (가중치) | IDA Pro 기준 | Relic 현재 | 진행률 |
 |---|---|---|---|
@@ -33,7 +33,7 @@
 | 프로세서 (8) | 60여 개 CPU 계열 | 디스어셈블 7종(x86, x64, ARM/Thumb, AArch64, MIPS, RISC-V, PPC), 분석·리프팅·디컴파일은 x86/x64/ARM/AArch64/MIPS32/RV64 | 46% |
 | 자동 분석 (14) | 함수·CFG·xref·점프 테이블·noreturn·문자열·stripped 복구 | 재귀 하강 + 프롤로그 스캔, 점프 테이블(x86/ARM/AArch64/MIPS/RISC-V), 레지스터 상수 전파로 데이터 xref, stripped `main` 복구, ARM/Thumb 상호 운용 | 55% |
 | 라이브러리 식별 (8) | FLIRT 시그니처, Lumina | FLIRT 방식 시그니처(`relic sigs build`로 정적 라이브러리에서 생성, stripped 정적 바이너리의 libc 함수 이름), 심볼·import·PLT 이름 | 30% |
-| 타입 시스템 (10) | 구조체·열거형·로컬 타입, 타입 라이브러리, 타입 전파 | int/포인터/unsigned 추론, libc 시그니처 일부, 구조체 자동 복원(필드 오프셋·폭·포인터 타입, 중첩·자기 참조, 전역을 통해 함수 간 공유, 이름 변경), 배열 필드(`l->vals[i]`), 호출을 통한 구조체 공유(전역·지역), 변수·필드 타입 직접 지정(`Y`, 구조체를 다른 함수에 적용), 구조체 편집 창 | 40% |
+| 타입 시스템 (10) | 구조체·열거형·로컬 타입, 타입 라이브러리, 타입 전파 | int/포인터/unsigned 추론, libc 시그니처 일부, 구조체 자동 복원(필드 오프셋·폭·포인터 타입, 중첩·자기 참조, 전역을 통해 함수 간 공유, 이름 변경), 배열 필드(`l->vals[i]`), 호출을 통한 구조체 공유(전역·지역), 변수·필드·반환 타입 직접 지정(`Y`, 구조체를 다른 함수에 적용), 구조체 편집 창, C 헤더 가져오기(구조체·공용체·열거형·typedef·함수 원형, 대상 ABI 레이아웃; 열거형 상수 이름·플래그 조합 `A | B`로 출력) | 50% |
 | 디컴파일러 (20) | Hex-Rays: 다수 아키텍처, 타입·구조체 대화형 수정, 부동소수점 | x86-64/x86-32/AArch64/ARM32/MIPS32/RV64GC, 재컴파일 검증, 구조화(switch·for·&&), 상수 나눗셈, -fipa-ra 레지스터 보존, 구조체 복원·대화형 재타입(`Y`), x86-64 SSE·AArch64·ARM VFP(armhf)·RISC-V F/D 부동소수점(`float`/`double` 인자·반환값·리터럴·변환·비교·`fma`, 레지스터보다 많은 인자, 비트 단위 재컴파일 검증); x87 부동소수점, SIMD 없음 | 52% |
 | 대화형 UI (12) | 리스팅·그래프·xref·이름/주석·검색·패치·undo·북마크·구조체 창 | 리스팅·그래프(층별 레이아웃)·의사 코드·헥스, 이름/주석/변수 이름, xref, 이동 기록, 테마·확대, 검색(바이트·텍스트·즉치값·명령어), 바이트 패치(NOP·분기 반전·어셈블, 프로젝트에 저장, 패치된 파일 내보내기), 모든 편집(이름·주석·타입·구조체·북마크·패치)의 undo/redo, 북마크, 함수 안 데이터(리터럴 풀·인라인 점프 테이블·패딩) 표시 | 62% |
 | 스크립팅·확장 (8) | IDAPython, IDC, SDK, 플러그인 | Python 라이브러리 API, 스크립팅 API(`here()`·`rename()`·`decompile()`·`patch()` …), GUI Python 콘솔, 플러그인(`register(api)` → Plugins 메뉴, 리스팅 줄 꾸미기·분석 완료·커서 이동 훅), `relic script` 배치 실행, CLI | 40% |
@@ -47,7 +47,7 @@ IDA Pro에 없는 Relic 쪽 기능: checksec(ELF/PE 보호 기법), 포너블 �
 1. ~~검색(텍스트·바이트 패턴·즉치값·명령어)~~, ~~바이트 패치·패치된 바이너리 저장~~ (완료)
 2. ~~GUI 안의 Python 콘솔과 플러그인 진입점 (IDAPython 대응)~~ (완료: `relic.scripting`)
 3. ~~정적 링크 라이브러리 함수 식별 (FLIRT 대응 시그니처)~~ (완료: x86/x64; 다른 아키텍처 남음)
-4. 구조체·타입 시스템과 디컴파일러 연동 (~~자동 복원·필드 접근·중첩·배열·이름 변경·타입 지정·편집 창~~ 완료; 열거형, 공용체, C 헤더 가져오기 남음)
+4. 구조체·타입 시스템과 디컴파일러 연동 (~~자동 복원·필드 접근·중첩·배열·이름 변경·타입 지정·편집 창, 열거형·공용체·C 헤더 가져오기~~ 완료; 라이브러리 함수 원형 가져오기 남음)
 5. Mach-O 로더, PPC 리프터 (MIPS32·RISC-V RV64는 완료)
 6. ~~디버거 보강: watchpoint, 레지스터·메모리 값 편집~~ (완료)
 
@@ -96,6 +96,8 @@ relic vulns     ./chall              # 포너블 휴리스틱
 relic ir        ./chall vuln         # 디컴파일러 IR (리프팅 직후, 디버깅용)
 relic opt       ./chall checksum --xrefs  # SSA + 최적화 IR, 문자열·교차참조, 스택 프레임
 relic decompile ./chall main         # C 유사 의사 코드 (--addrs: 줄마다 명령어 주소, -a: 모든 함수)
+relic decompile ./chall main --header chall.h   # C 선언(구조체·열거형·typedef·원형)을 써서 디컴파일
+relic types     ./chall chall.h      # C 헤더를 프로젝트에 가져오기 (인자 없이: 가져온 타입 목록)
 relic search    ./chall --bytes '48 8b ?? 05'   # 바이트 패턴 (--text, --imm 0x186a0, --insn 'call.*system')
 relic script    ./chall rename_all.py arg1      # 스크립팅 API로 Python 실행 (--save: 프로젝트 저장, 옵션은 스크립트 앞에)
 relic sigs build /usr/lib/x86_64-linux-gnu/libc.a -o ~/.relic/sigs/glibc-x64.sig   # 라이브러리 시그니처

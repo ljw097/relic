@@ -955,3 +955,18 @@ def test_plugin_hooks_analysis_and_listing(app, vuln64, tmp_path, monkeypatch):
     finally:
         w.dirty = False
         w.close()
+
+
+def test_import_c_header(win, tmp_path):
+    h = tmp_path / "notes.h"
+    h.write_text("enum kind { NONE, TEXT = 3 };\nstruct note { char *data; int size; enum kind kind; };\n")
+    got = win.import_header(str(h))
+    assert got["structs"] == ["note"] and got["enums"] == ["kind"]
+    assert "notes.h: 1 structs, 1 enums" in win.statusBar().currentMessage()
+    assert win.an.struct_names["note"]["imported"] and win.dirty
+    bad = tmp_path / "bad.h"
+    bad.write_text("struct s { int a : 1; };")
+    from unittest import mock
+    with mock.patch("relic.gui.main_window.QMessageBox.warning") as warn:
+        assert win.import_header(str(bad)) is None
+    assert "bit-field" in warn.call_args[0][2]

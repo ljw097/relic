@@ -125,6 +125,13 @@
     - 분석: 분기·`jal` 대상은 pc 상대, PLT 스텁(`auipc t3; ld t3; jalr t1, t3`)은 점프이고 import 이름, `auipc`+`addi` 상수 전파로 문자열 xref, 리스팅에서 호출 대상 이름, 점프 테이블(`auipc`+`addi` 기준, `lw` 오프셋/`ld` 절대 항목, `bltu` 범위), pyelftools가 모르는 RISC-V 재배치 이름, `.got`의 `R_RISCV_64`는 데이터 import(`stdout`), stripped 바이너리 프롤로그 스캔(`addi sp, sp, -n`), 인자 추적 취약점 탐지
     - 공통 개선(RISC-V에서 발견): 부호/0 확장된 두 값(또는 들어맞는 상수)의 비교는 안쪽 폭으로(`(int64_t)x <= 1` → `x <= 1`), 정의가 모두 부호 확장인 변수(비트 연산·작은 0 확장·복사 포함, 낙관적 고정점)는 통째로 비교·비트 연산돼도 `int`로 좁힘, RISC-V `int` 매개변수(하위 32비트 읽기나 부호 확장 값과의 비교가 근거), 부호 확장 상수 반환(`li a0, -1`)은 `int`, float 매개변수를 그대로 돌려주는 경로는 반환 폭 판단에서 중립, 여러 번 쓰는 읽기 전용 상수 로드는 사용처마다 리터럴
     - 재컴파일 검증: riscv64-gcc `-static` + `qemu-riscv64` (flow·floats, -O0/-O2)
+  - [x] C 헤더 가져오기(`decompiler/cheader.py`, `Analysis.import_header`, `relic types`, `relic decompile --header`, File ▸ Import C header, 스크립팅 `import_header`)
+    - 파서: 구조체·공용체(익명·중첩)·열거형(상수식, `sizeof`, 앞 열거자 참조)·typedef(`typedef struct { … } point;`는 이름을 그대로, 출력도 `point`)·함수 원형(본문은 건너뜀)·함수 포인터·다차원/유연 배열, 주석·전처리 줄·`__attribute__` 무시; 비트필드·알 수 없는 타입·정의되지 않은 매크로는 줄 번호와 함께 거부(가져오기 전체 취소)
+    - 레이아웃: 대상 ABI(LP64, Windows LLP64, ILP32, i386 SysV의 8바이트 정렬 4) — gcc `offsetof`/`sizeof`와 x86-64·i386·ARM·AArch64에서 일치를 테스트로 확인
+    - 디컴파일러: 구조체는 태그 이름으로(중첩 구조체는 `p->hdr.len`으로 펼침, 공용체는 가장 큰 멤버), 선언은 헤더에 적힌 그대로(값으로 담은 구조체 먼저, 사용자가 필드를 고치면 복원 레이아웃 보기로), 함수 원형은 매개변수·반환 타입(`char *state_name(enum state a1)`; 반환 타입은 반환 폭 축소에도 반영, `Y`를 함수 이름에서 누르면 반환 타입 지정), 복사(`var_c = a1`)로 열거형·구조체 포인터 타입 전파
+    - 열거형 출력: 비교·대입·저장·복합 대입·switch case·내부 함수 인자의 상수를 열거자 이름으로, 모두 2의 거듭제곱인 열거형은 플래그 조합(`OPT_VERBOSE | OPT_DRY`), 비트 검사(`tbz`: `((o >> 2) & 1) != 0`)는 `(o & OPT_DRY) != 0`
+    - 프로젝트에 저장(`c_types`), 가져오기 한 번이 undo 한 단계; 두 번째 헤더는 앞 헤더의 typedef·구조체·열거자를 씀
+    - 검증: `tests/src/types.c`를 -O0/-O2로 빌드해 헤더를 가져온 의사 코드를 헤더와 함께 다시 컴파일, 원본과 같은 입력으로 실행해 출력 비교
 
 ## 완료
 

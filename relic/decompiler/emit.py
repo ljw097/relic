@@ -13,6 +13,8 @@ the CLI and the GUI can map between pseudocode and disassembly.
 """
 from __future__ import annotations
 
+import re
+
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
 
@@ -137,6 +139,16 @@ class CWriter:
             gen = self.names.get(name, name)
             if gen in wanted:
                 user_types[name] = wanted[gen]
+        # plain copies of a variable the user typed `struct X *` (`var_18 = a1` at -O0) point to X too
+        todo = [n for n, t in user_types.items() if t.startswith("struct ") and t.count("*") == 1]
+        while todo:
+            n = todo.pop()
+            for st in prep.fn.stmts():
+                if isinstance(st, Assign) and isinstance(st.src, (Var, StackVar)) and st.src.name == n and \
+                        isinstance(st.dst, (Var, StackVar)) and st.dst.bits == self.ptr_bits and \
+                        st.dst.name not in user_types:
+                    user_types[st.dst.name] = user_types[n]
+                    todo.append(st.dst.name)
         from .structs import StructView
         self.structs = StructView(an, prep.fn, self.ptr_bits, user_types)
         for name in list(self.types):
@@ -162,6 +174,81 @@ class CWriter:
                                   "(rename a recovered struct to it first)")
             else:
                 self.types[name] = ct
+        self.ret_type = an.var_types.get(prep.fn.addr, {}).get("@return")
+        self._spread_user_types([n for n, t in self.types.items() if t.base.startswith("enum ") and not t.ptr])
+        if self.ret_type and self.ret_type.endswith("*"):
+            # what is returned is a pointer of that type (`v1 = "idle"; ... return v1;`)
+            rt = parse_ctype(self.ret_type)
+            for s in prep.fn.stmts():
+                if isinstance(s, Return) and s.value is not None and isinstance(_bare(s.value), (Var, StackVar)):
+                    v = _bare(s.value)
+                    cur = self.types.get(v.name)
+                    if v.bits == self.ptr_bits and (cur is None or not cur.ptr):
+                        self.types[v.name] = rt
+                        self._spread_user_types([v.name])
+
+    def _spread_user_types(self, names: list[str]):
+        """Plain copies of these variables (`var_c = a1` at -O0) and variables they are copied
+        from get their type when theirs is a plain integer of the same width."""
+        todo = list(names)
+        while todo:
+            n = todo.pop()
+            t = self.types.get(n)
+            for st in self.p.fn.stmts():
+                if not (isinstance(st, Assign) and isinstance(st.src, (Var, StackVar)) and
+                        isinstance(st.dst, (Var, StackVar)) and st.dst.bits == st.src.bits):
+                    continue
+                other = st.dst.name if st.src.name == n else st.src.name if st.dst.name == n else None
+                if other is None or other == n or str(self.types.get(other)) == str(t):
+                    continue
+                cur = self.types.get(other)
+                if cur is None or not cur.ptr and not cur.base.startswith(("struct ", "enum ")) and \
+                        cur.base not in ("float", "double"):
+                    self.types[other] = t
+                    todo.append(other)
+
+    # --------------------------------------------------------------- enums
+    def enum_of(self, e: Expr) -> dict[str, int] | None:
+        """The enumerators of `e`'s type when it is an imported enum: a variable typed `enum X`
+        or a struct field of that type."""
+        while isinstance(e, Cast):
+            e = e.a
+        t = None
+        if "types" not in self.__dict__:           # (a bare writer: structure tests)
+            return None
+        if isinstance(e, (Var, StackVar)):
+            ct = self.types.get(e.name)
+            if ct is not None and ct.ptr == 0:
+                t = ct.base
+        elif isinstance(e, Load):
+            fa = self.structs.field(e.addr, e.bits)
+            if fa is not None:
+                t = self.ftype(fa[1], fa[2])
+        if t and t.startswith("enum ") and "*" not in t:
+            return self.an.enum(t[5:].strip())
+        return None
+
+    def enum_value(self, values: dict[str, int] | None, v: int, bits: int = 32) -> str | None:
+        """An enumerator for `v` (`RED`), or an OR of flag enumerators (`MODE_A | MODE_C`)."""
+        if not values:
+            return None
+        v &= (1 << bits) - 1
+        if v >> (bits - 1):
+            v -= 1 << bits
+        for name, x in values.items():
+            if x == v:
+                return name
+        flags = [(n, x) for n, x in values.items() if x > 0 and x & (x - 1) == 0]
+        if v > 0 and flags and len(flags) == sum(1 for x in values.values() if x):
+            parts = [n for n, x in sorted(flags, key=lambda nx: nx[1]) if v & x]
+            if sum(values[n] for n in parts) == v:
+                return " | ".join(parts)
+        return None
+
+    def _enum_text(self, other: Expr, c: Expr) -> str | None:
+        if isinstance(c, Const):
+            return self.enum_value(self.enum_of(other), c.value, c.bits)
+        return None
 
     # ------------------------------------------------------------- structs
     def sname(self, st) -> str:
@@ -561,11 +648,27 @@ class CWriter:
             b = e.b
             if isinstance(a, Const) or isinstance(b, Const):
                 op, p = BIN[e.op]
-                ta = self._num(a) if isinstance(a, Const) else self.expr(a, p)
-                tb = self._num(b) if isinstance(b, Const) else self.expr(b, p + 1)
+                flag = self._enum_text(b, a) or None if e.op in ("&", "|", "^") else None
+                ta = flag if flag else self._num(a) if isinstance(a, Const) else self.expr(a, p)
+                flag = self._enum_text(a, b) if e.op in ("&", "|", "^") else None
+                tb = flag if flag else self._num(b) if isinstance(b, Const) else self.expr(b, p + 1)
                 return f"{ta} {op} {tb}", p
         op, p = BIN[e.op]
         a, b = e.a, e.b
+        if e.op in ("==", "!=") and isinstance(b, Const) and b.value == 0 and isinstance(a, BinOp) and \
+                a.op == "&" and isinstance(a.b, Const) and a.b.value == 1 and isinstance(a.a, BinOp) and \
+                a.a.op in (">>u", ">>s") and isinstance(a.a.b, Const):
+            # a bit test (`tbz`) of a flag: `((o >> 2) & 1) != 0` is `(o & OPT_DRY) != 0`
+            x, k = a.a.a, a.a.b.value
+            name = self.enum_value(self.enum_of(x), 1 << k) if k < 31 else None
+            if name is not None and " " not in name:
+                return f"({self.expr(x, 8)} & {name}) {op} 0", p
+        if p in (9, 10):                                            # `state == RUNNING`
+            x, y = (b, a) if isinstance(a, Const) and not isinstance(b, Const) else (a, b)
+            name = self._enum_text(x, y)
+            if name is not None:
+                op2 = FLIP.get(op, op) if x is not a else op
+                return f"{self.expr(x, p)} {op2} {name if ' ' not in name else f'({name})'}", p
         if p == 10:
             if isinstance(a, Const) and not isinstance(b, Const):   # `5 < x` reads as `x > 5`
                 a, b, op = b, a, FLIP[op]
@@ -661,8 +764,20 @@ class CWriter:
                 if lit is not None:
                     args.append(lit)
                     continue
+            ptype = self._param_type(c, k)
+            if ptype is not None and ptype.startswith("enum ") and isinstance(_bare(a), Const):
+                text = self.enum_value(self.an.enum(ptype[5:]), _bare(a).value, _bare(a).bits)
+                if text is not None:                    # `set_mode(MODE_A | MODE_C)`
+                    args.append(text)
+                    continue
             args.append(self.expr(_bare(a)))
         return f"{name}({', '.join(args)})"
+
+    def _param_type(self, c: ir.Call, k: int) -> str | None:
+        """The type the user gave (or a header declared for) parameter `k` of the function called."""
+        if not isinstance(c.target, Const) or c.target.value not in self.an.functions:
+            return None
+        return self.an.var_types.get(c.target.value, {}).get(f"a{k + 1}")
 
     # --------------------------------------------------------- statements
     def stmt(self, s) -> str | None:
@@ -679,12 +794,17 @@ class CWriter:
                         return f"{lhs} = {self.expr(src)};"
                 if src.op in ("+", "-") and isinstance(b, Const) and b.value == 1:
                     return f"{lhs}{src.op}{src.op};"
-                return f"{lhs} {BIN[src.op][0]}= {self.expr(b)};"
+                name = self._enum_text(s.dst, b) if src.op in ("&", "|", "^") else None
+                return f"{lhs} {BIN[src.op][0]}= {name or self.expr(b)};"
             if self._float_var(s.dst):
                 return f"{lhs} = {self.fexpr(src, 0, s.dst.bits if s.dst.bits in (32, 64) else None)};"
+            name = self._enum_text(s.dst, _bare(src))
+            if name is not None:
+                return f"{lhs} = {name};"
             return f"{lhs} = {self.expr(_bare(src) if self._implicit(s.dst, src) else src)};"
         if isinstance(s, Store):
-            return f"{self.mem(s.dst, s.bits)} = {self.expr(s.src)};"
+            name = self._enum_text(ir.Load(s.dst, s.bits), _bare(s.src))
+            return f"{self.mem(s.dst, s.bits)} = {name or self.expr(s.src)};"
         if isinstance(s, CallStmt):
             text = self.call(s.call)
             from .fpabi import callee_ret
@@ -791,8 +911,13 @@ class CWriter:
             self.emit(f"}} while ({self.expr(n.cond)});" if n.kind == "dowhile" else "}", None, depth)
         elif isinstance(n, Switch):
             self.emit(f"switch ({self.expr(_bare(n.expr))}) {{", self._term_addr(n.addr), depth)
+            values = self.enum_of(_bare(n.expr))
+
+            def label_of(v: int) -> str:
+                name = self.enum_value(values, v, 64) if values else None
+                return name if name is not None and " " not in name else number(v)
             for case in n.cases:
-                for label in case_labels(case, number):
+                for label in case_labels(case, label_of):
                     self.emit(f"{label}:", case.addr, depth)
                 self.node(case.body, depth + 1)
             self.emit("}", None, depth)
@@ -819,7 +944,9 @@ class CWriter:
             t = self.types.get(r) or CType(int_type(self.ptr_bits))
             params.append(t.decl(self.vname(r)))
         ret = "void"
-        if self.p.returns:
+        if self.ret_type:
+            ret = self.ret_type
+        elif self.p.returns:
             vals = [s.value for s in fn.stmts() if isinstance(s, Return) and s.value is not None]
             if self.p.ret_float:
                 ret = "double" if self.p.ret_bits == 64 else "float"
@@ -892,10 +1019,20 @@ class CWriter:
         if len(self.out) >= 2 and self.out[-1].text == "return;" and self.out[-1].depth == 1:
             self.out.pop()
         self.emit("}", None, 0)
+        bare = self.an.user_types.get("bare")
+        if bare:
+            # `enum options_t` / `struct point` of a typedef'd anonymous enum / struct: C names it bare
+            pat = re.compile(r"\b(?:enum|struct|union) (" + "|".join(map(re.escape, bare)) + r")\b")
+            for ln in self.out:
+                ln.text = pat.sub(r"\1", ln.text)
         if self.structs.used:                     # the structs the body refers to, above it
-            head = [Line(t, None, 0) for st in self.structs.used
-                    for t in st.declaration(self.sname, lambda f, st=st: self.fname(st, f),
-                                            lambda f, st=st: self.ftype(st, f)) + [""]]
+            from .structs import struct_declaration
+            done: set = set()
+            head = []
+            for st in self.structs.used:
+                lines = struct_declaration(self.an, st, self.sname, lambda f, st=st: self.fname(st, f),
+                                           lambda f, st=st: self.ftype(st, f), done)
+                head += [Line(t, None, 0) for t in lines + ([""] if lines else [])]
             self.out[:0] = head
         return self.out
 

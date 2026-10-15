@@ -30,7 +30,7 @@ import sys
 from . import __version__
 
 COMMANDS = ("info", "checksec", "funcs", "disasm", "cfg", "strings", "imports", "xrefs", "vulns", "ir", "opt",
-            "decompile", "search", "patch", "script", "sigs", "gui")
+            "decompile", "search", "patch", "script", "sigs", "types", "gui")
 
 
 def _parser() -> argparse.ArgumentParser:
@@ -71,6 +71,11 @@ def _parser() -> argparse.ArgumentParser:
     s = add("decompile", "C-like pseudocode", where=True)
     s.add_argument("-a", "--all", action="store_true", help="every function in the binary")
     s.add_argument("--addrs", action="store_true", help="prefix each line with its instruction address")
+    s.add_argument("--header", action="append", metavar="FILE.h",
+                   help="C declarations to use (structs, enums, typedefs, prototypes; repeatable, not saved)")
+    s = add("types", "import C headers into the project (structs, enums, typedefs, prototypes), or list them")
+    s.add_argument("headers", nargs="*", metavar="FILE.h", help="headers to import (none: list what is imported)")
+    s.add_argument("--no-save", action="store_true", help="check the headers without saving the project")
     s = add("search", "search bytes, text, immediates or instructions")
     how = s.add_mutually_exclusive_group(required=True)
     how.add_argument("--bytes", metavar="PATTERN", help="hex bytes, `??` for any byte: '48 8b ?? 05'")
@@ -312,9 +317,52 @@ def cmd_opt(args):
             print(f";   {r.frm:#x}  {r.kind:6} -> {an.label(r.to)}")
 
 
+def _import_headers(an, paths):
+    from .decompiler.cheader import HeaderError
+    for path in paths or ():
+        with open(path) as fp:
+            text = fp.read()
+        try:
+            got = an.import_header(text)
+        except HeaderError as e:
+            sys.exit(f"relic: {path}: {e}")
+        yield path, got
+
+
+def cmd_types(args):
+    an = _analyze(args)
+    if args.headers:
+        for path, got in _import_headers(an, args.headers):
+            parts = [f"{len(got[k])} {k}" for k in ("structs", "enums", "typedefs", "functions") if got[k]]
+            print(f"{path}: {', '.join(parts) or 'nothing new'}")
+            for k in ("structs", "enums", "typedefs", "functions"):
+                if got[k]:
+                    print(f"  {k}: {', '.join(got[k])}")
+        if not args.no_save:
+            an.save_project()
+            print(f"saved {an.project_path}")
+        return
+    ut = an.user_types
+    structs = sorted(n for n, d in an.struct_names.items() if d.get("imported"))
+    if not (structs or ut.get("enums") or ut.get("typedefs")):
+        print("no C declarations imported (relic types FILE header.h)")
+        return
+    for n in structs:
+        print(f"struct {n}  ({len(an.struct_names[n].get('layout', {}))} fields)")
+    for n, vals in sorted(ut.get("enums", {}).items()):
+        print(f"enum {n} {{ {', '.join(f'{k} = {v}' for k, v in vals.items())} }}")
+    for n, t in sorted(ut.get("typedefs", {}).items()):
+        print(f"typedef {t} {n}")
+    for a, types in sorted(an.var_types.items()):
+        if "@return" in types:
+            params = ", ".join(f"{t} {v}" for v, t in sorted(types.items()) if v != "@return")
+            print(f"{types['@return']} {an.name(a)}({params})")
+
+
 def cmd_decompile(args):
     from .decompiler.emit import decompile
     an = _analyze(args)
+    list(_import_headers(an, args.header))
     if args.all:
         funcs = [f for f in sorted(an.functions.values(), key=lambda f: f.addr) if not f.is_import]
     else:

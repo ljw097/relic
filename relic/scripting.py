@@ -109,6 +109,27 @@ class Api:
         if self.win is not None:
             self.win._after_edit()
 
+    def import_header(self, text_or_path: str) -> dict:
+        """Import C declarations (structs, unions, enums, typedefs, prototypes) from header text or
+        a file path; what was imported, by kind."""
+        import os
+        if "\n" not in text_or_path and os.path.exists(text_or_path):
+            with open(text_or_path) as fp:
+                text_or_path = fp.read()
+        got = self.an.import_header(text_or_path)
+        if self.win is not None:
+            self.win._after_edit()
+        return got
+
+    def set_return_type(self, func, ctype: str):
+        """The C type a function returns (`char *`, `void`; empty resets)."""
+        f = self.func(func)
+        if f is None:
+            raise ValueError(f"no function at {func!r}")
+        self.an.set_return_type(f.addr, ctype)
+        if self.win is not None:
+            self.win._after_edit()
+
     def set_field_type(self, struct: str, field: str, ctype: str):
         """Give a field (`f_8`) of a recovered struct (`s_notes`) a C type."""
         self.an.set_field_type(struct, field, ctype)
@@ -215,7 +236,7 @@ def namespace(an: "Analysis", win=None) -> dict:
     api = Api(an, win)
     ns = {"an": an, "bin": an.bin, "api": api, "win": win}
     for n in ("addr", "here", "goto", "name", "rename", "rename_struct", "rename_field", "set_type",
-              "set_field_type", "add_field", "remove_field", "comment", "func",
+              "set_field_type", "add_field", "remove_field", "comment", "func", "import_header", "set_return_type",
               "functions", "xrefs_to", "xrefs_from",
               "disasm", "decompile", "strings", "search", "patch", "nop", "invert", "assemble", "revert", "save"):
         ns[n] = getattr(api, n)

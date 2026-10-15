@@ -5,6 +5,7 @@ import bisect
 import copy
 import functools
 import json
+import re
 import os
 from collections import defaultdict
 from dataclasses import dataclass
@@ -40,6 +41,9 @@ class Analysis:
         # recovered structs: generated struct name -> {"name": user name, "fields": {f_8: user name},
         # "types": {f_8: C type}}
         self.struct_names: dict[str, dict] = {}
+        # imported C declarations: {"headers": [text, ...], "enums": {name: {constant: value}},
+        # "typedefs": {name: C type}} (their structs live in struct_names, marked "imported")
+        self.user_types: dict = {}
         # byte patches: address -> (original bytes, new bytes), applied to `bin.data`
         self.patches: dict[int, tuple[bytes, bytes]] = {}
         # undo / redo of patch edits: (address, the patch there before the edit, or None)
@@ -117,12 +121,14 @@ class Analysis:
     def reanalyze(self) -> "Analysis":
         """Analyse again (after a patch), keeping names, comments, variable names and patches."""
         keep = (self.renames, self.comments, self.var_names, self.patches, self.struct_names, self.var_types,
-                self.patch_undo, self.patch_redo, self.sig_paths, self.bookmarks, self.edit_undo, self.edit_redo)
+                self.patch_undo, self.patch_redo, self.sig_paths, self.bookmarks, self.edit_undo, self.edit_redo,
+                self.user_types)
         b = self.bin
         self.__dict__.clear()                    # decompiler caches live on the instance too
         self.__init__(b)
         (self.renames, self.comments, self.var_names, self.patches, self.struct_names, self.var_types,
-         self.patch_undo, self.patch_redo, self.sig_paths, self.bookmarks, self.edit_undo, self.edit_redo) = keep
+         self.patch_undo, self.patch_redo, self.sig_paths, self.bookmarks, self.edit_undo, self.edit_redo,
+         self.user_types) = keep
         return self.run(load_project=False)
 
     # ------------------------------------------------------------- patches
@@ -193,7 +199,7 @@ class Analysis:
 
     # ------------------------------------------------------ undo of all edits
     UNDO_MAX = 500
-    NOTES = ("renames", "comments", "var_names", "var_types", "struct_names", "bookmarks")
+    NOTES = ("renames", "comments", "var_names", "var_types", "struct_names", "bookmarks", "user_types")
 
     def _notes(self) -> tuple:
         return copy.deepcopy(tuple(getattr(self, k) for k in self.NOTES))
@@ -474,6 +480,7 @@ class Analysis:
         """Give a decompiler variable / parameter of the function at `func` a C type (`char *`,
         `struct note *`); empty resets to the inferred one. ValueError for what is not a type."""
         from ..decompiler.vartypes import parse_ctype
+        ctype = self.resolve_type(ctype)
         t = parse_ctype(ctype) if ctype.strip() else None     # ValueError before anything changes
         types = self.var_types.setdefault(func, {})
         if t is not None:
@@ -491,6 +498,7 @@ class Analysis:
     def set_field_type(self, struct: str, generated: str, ctype: str):
         """Give a field of a recovered struct a C type; empty resets it."""
         from ..decompiler.vartypes import parse_ctype
+        ctype = self.resolve_type(ctype)
         t = parse_ctype(ctype) if ctype.strip() else None
         types = self.struct_names.setdefault(struct, {}).setdefault("types", {})
         if t is not None:
@@ -526,6 +534,116 @@ class Analysis:
         if set(d) <= {"layout"}:                 # nothing the user set: no entry
             self.struct_names.pop(struct, None)
 
+    # ------------------------------------------------------- C declarations
+    def resolve_type(self, ctype: str) -> str:
+        """A type written with an imported typedef name -> the type it stands for
+        (`node_t *` -> `struct node *`); anything else unchanged."""
+        t = ctype.strip()
+        defs = self.user_types.get("typedefs", {})
+        m = re.fullmatch(r"(?:const\s+)?([A-Za-z_]\w*)\s*((?:\*\s*)*)", t)
+        seen = set()
+        while m and m.group(1) in defs and m.group(1) not in seen:
+            seen.add(m.group(1))
+            stars = m.group(2).count("*")
+            base = defs[m.group(1)]
+            t = base + ("*" * stars if base.endswith("*") else (" " + "*" * stars if stars else ""))
+            m = re.fullmatch(r"(?:const\s+)?([A-Za-z_]\w*)\s*((?:\*\s*)*)", t)
+        return t
+
+    def set_return_type(self, func: int, ctype: str):
+        """The C type the function at `func` returns (`char *`, `void`); empty resets to the
+        inferred one."""
+        from ..decompiler.vartypes import parse_ctype
+        ctype = self.resolve_type(ctype)
+        if ctype.strip() and ctype.strip() != "void":
+            ctype = str(parse_ctype(ctype))
+        types = self.var_types.setdefault(func, {})
+        if ctype.strip():
+            types["@return"] = ctype.strip()
+        else:
+            types.pop("@return", None)
+        if not types:
+            self.var_types.pop(func, None)
+
+    def enum(self, name: str) -> dict[str, int] | None:
+        return self.user_types.get("enums", {}).get(name)
+
+    def import_header(self, text: str) -> dict:
+        """Import C declarations (see `decompiler.cheader`): structs and unions become structs the
+        decompiler shows (by their tag; apply one with `set_var_type(f, "a1", "struct node *")`),
+        enums name constants compared with / assigned to / switched on variables of their type,
+        typedefs can be used in types, and prototypes of this binary's functions type their
+        parameters. Headers imported before stay usable (their typedefs, structs, enumerators).
+        HeaderError (a ValueError) with the line for what cannot be parsed; nothing changes then.
+        Returns what was imported: {"structs": [...], "enums": [...], "typedefs": [...],
+        "functions": [...]}."""
+        from ..decompiler.cheader import Model, declaration, parse, struct_layout
+        from ..decompiler.vartypes import parse_ctype
+        model = Model.for_binary(self.bin)
+        headers = list(self.user_types.get("headers", []))
+        h = None
+        for old in headers:
+            h = parse(old, model, h)
+        before = (set(h.aggregates), set(h.enums), set(h.typedefs), set(h.prototypes)) if h else \
+            (set(), set(), set(), set())
+        from ..decompiler.cheader import Header
+        h = parse(text, model, h if h is not None else Header())
+        headers.append(text)
+        self.user_types["headers"] = headers
+        self.user_types["enums"] = {n: dict(v) for n, v in h.enums.items() if not n.startswith("__anon")}
+        self.user_types["typedefs"] = {n: t.spell() for n, t in h.typedefs.items()}
+        self.user_types["bare"] = sorted(h.bare)
+        out = {"structs": [], "enums": sorted(n for n in set(h.enums) - before[1] if not n.startswith("__anon")),
+               "typedefs": sorted(set(h.typedefs) - before[2]), "functions": []}
+        for key, agg in h.aggregates.items():
+            if not agg.complete or agg.name.startswith("__anon"):
+                continue
+            layout, names, types = struct_layout(h, key, model)
+            decl, deps = declaration(h, key)
+            entry = {"imported": True, "layout": layout, "decl": decl,
+                     "as_imported": {"fields": dict(names), "types": dict(types)}}
+            if deps:
+                entry["deps"] = deps
+            if names:
+                entry["fields"] = names
+            if types:
+                entry["types"] = types
+            old = self.struct_names.get(agg.name, {})
+            if old and not old.get("imported") and key not in before[0]:
+                entry = {**old, **entry}
+            self.struct_names[agg.name] = entry
+            if key not in before[0]:
+                out["structs"].append(agg.name)
+        # prototypes: parameter types of the functions this binary defines (integer-class parameters
+        # are a1, a2, ... in order, then the float ones -- the decompiler's parameter order)
+        by_name = {}
+        for f in self.functions.values():
+            if not f.is_import:
+                by_name.setdefault(self.name(f.addr) or f.name, f)
+        for name, proto in h.prototypes.items():
+            f = by_name.get(name)
+            if f is None:
+                continue
+            ints = [t for _, t in proto.params if t.ptr or t.base not in ("float", "double", "long double")]
+            floats = [t for _, t in proto.params if not t.ptr and t.base in ("float", "double")]
+            types = self.var_types.setdefault(f.addr, {})
+            for k, t in enumerate(ints + floats):
+                try:
+                    types[f"a{k + 1}"] = str(parse_ctype(t.spell()))
+                except ValueError:
+                    continue
+            try:
+                types["@return"] = str(parse_ctype(proto.ret.spell()))
+            except ValueError:
+                pass
+            if not types:
+                self.var_types.pop(f.addr, None)
+            elif name not in before[3]:
+                out["functions"].append(name)
+        out["structs"].sort()
+        out["functions"].sort()
+        return out
+
     def comment(self, addr: int, text: str):
         if text:
             self.comments[addr] = text
@@ -551,6 +669,8 @@ class Analysis:
             "types": {f"{a:#x}": dict(sorted(v.items())) for a, v in sorted(self.var_types.items())},
             "bookmarks": {f"{a:#x}": t for a, t in sorted(self.bookmarks.items())},
         }
+        if self.user_types:
+            data["c_types"] = self.user_types
         with open(path or self.project_path, "w") as fp:
             json.dump(data, fp, indent=2)
 
@@ -566,6 +686,7 @@ class Analysis:
         self.struct_names = {k: dict(v) for k, v in data.get("structs", {}).items()}
         self.var_types = {int(a, 16): dict(v) for a, v in data.get("types", {}).items()}
         self.bookmarks = {int(a, 16): t for a, t in data.get("bookmarks", {}).items()}
+        self.user_types = dict(data.get("c_types", {}))
         return True
 
 
@@ -590,7 +711,7 @@ def _undoable(method):
 
 
 for _name in ("rename", "rename_var", "rename_struct", "rename_field", "set_var_type", "set_field_type",
-              "add_field", "remove_field", "comment", "bookmark"):
+              "add_field", "remove_field", "comment", "bookmark", "import_header", "set_return_type"):
     setattr(Analysis, _name, _undoable(getattr(Analysis, _name)))
 
 

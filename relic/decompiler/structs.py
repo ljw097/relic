@@ -687,6 +687,26 @@ def known_structs(an: "Analysis", ptr_bits: int) -> list[Struct]:
     return [apply_edits(an, st, ptr_bits) for _, st in sorted(out.items())]
 
 
+def struct_declaration(an: "Analysis", st: Struct, sname, fname, ftype, done: set | None = None) -> list[str]:
+    """C lines declaring `st`: as its header wrote it when it was imported and the user has not
+    edited its fields since (with the structs it holds by value first), else from its layout."""
+    done = set() if done is None else done
+    if st.name in done:
+        return []
+    done.add(st.name)
+    d = an.struct_names.get(st.name, {})
+    if d.get("decl") and not d.get("added") and not d.get("removed") and not d.get("name") and \
+            d.get("fields", {}) == d.get("as_imported", {}).get("fields", {}) and \
+            d.get("types", {}) == d.get("as_imported", {}).get("types", {}):
+        out: list[str] = []
+        for dep in d.get("deps", ()):
+            if dep not in done and an.struct_names.get(dep, {}).get("decl"):
+                done.add(dep)
+                out += an.struct_names[dep]["decl"] + [""]
+        return out + list(d["decl"])
+    return st.declaration(sname, fname, ftype)
+
+
 class StructView:
     """The structs one function's pseudocode uses, and how to print accesses through them."""
 
