@@ -29,6 +29,7 @@ _INT_ARGS = {
     "arm-aapcs": ("r0", "r1", "r2", "r3"),
     "arm-aapcs-vfp": ("r0", "r1", "r2", "r3"),
     "mips-o32": ("a0", "a1", "a2", "a3"),
+    "riscv64-lp64d": tuple(f"a{k}" for k in range(8)),
 }
 
 
@@ -337,7 +338,7 @@ def param_base(arch: ArchInfo) -> int:
 
 def stack_params_used(arch: ArchInfo) -> bool:
     """Whether calls on this convention get stack arguments recovered (cdecl has its own path)."""
-    return arch.name.startswith(("x64", "arm64", "arm-aapcs"))
+    return arch.name.startswith(("x64", "arm64", "arm-aapcs", "riscv"))
 
 
 def stack_param_floats(an: "Analysis", arch: ArchInfo, target: int) -> dict[int, int]:
@@ -513,6 +514,12 @@ def recover_calls(fn: IRFunction, an: "Analysis", arch: ArchInfo) -> IRFunction:
                     v = _pair_value(uses[lo_r], uses[hi_r], defs)
                     fargs.append((len(args), 64))
                     args.append(v)
+                    continue
+                if r[:1] == "=":                  # a float in a core register (variadic RISC-V)
+                    if r[1:] not in uses:
+                        continue
+                    fargs.append((len(args), 32 if pos < len(classes) and classes[pos] == "f" else 64))
+                    args.append(uses[r[1:]])
                     continue
                 full, lo, part = fp_part(r) if is_fp_reg(r) else (r, 0, None)
                 if full not in uses:

@@ -128,7 +128,8 @@ def load_elf(path: str, data: bytes) -> Binary:
                 except Exception:
                     name = ""
             off = rel["r_offset"]
-            b.relocs.append(Relocation(off, name, describe_reloc_type(rel["r_info_type"], elf),
+            kind = _RISCV_RELOCS.get(rel["r_info_type"], "") if b.arch == "riscv64" else ""
+            b.relocs.append(Relocation(off, name, kind or describe_reloc_type(rel["r_info_type"], elf),
                                        rel["r_addend"] if rel.is_RELA() else 0))
             if name:
                 got_names[off] = name
@@ -139,6 +140,13 @@ def load_elf(path: str, data: bytes) -> Binary:
     _resolve_plt(b, got_names)
     b._finalize()
     return b
+
+
+# dynamic relocation types pyelftools does not name for RISC-V
+_RISCV_RELOCS = {1: "R_RISCV_32", 2: "R_RISCV_64", 3: "R_RISCV_RELATIVE", 4: "R_RISCV_COPY",
+                 5: "R_RISCV_JUMP_SLOT", 6: "R_RISCV_TLS_DTPMOD32", 7: "R_RISCV_TLS_DTPMOD64",
+                 8: "R_RISCV_TLS_DTPREL32", 9: "R_RISCV_TLS_DTPREL64", 10: "R_RISCV_TLS_TPREL32",
+                 11: "R_RISCV_TLS_TPREL64", 58: "R_RISCV_IRELATIVE"}
 
 
 def _resolve_mips_got(b: Binary, elf: ELFFile, got_names: dict[int, str]):
@@ -286,7 +294,10 @@ def _resolve_plt(b: Binary, got_names: dict[int, str]):
     # data imports (GLOB_DAT): no stub, referenced through GOT
     have = {i.got for i in b.imports}
     for r in b.relocs:
-        if r.name and r.addr not in have and ("GLOB_DAT" in r.kind or "JUMP_SLOT" in r.kind):
+        # (RISC-V has no GLOB_DAT: a symbol's GOT slot is an R_RISCV_64 in .got)
+        got_slot = r.kind in ("R_RISCV_64",) and any(s.name == ".got" and s.addr <= r.addr < s.addr + s.size
+                                                    for s in b.sections)
+        if r.name and r.addr not in have and ("GLOB_DAT" in r.kind or "JUMP_SLOT" in r.kind or got_slot):
             b.imports.append(Import(r.name, 0, r.addr))
             have.add(r.addr)
     for imp in b.imports:

@@ -94,7 +94,10 @@ def prepare(an: "Analysis", func: "Function") -> Prepared:
         w = return_width(an, func, arch.ret)
         if w is not None:
             narrow_returns(fn, w)
-    narrow(fn)
+    from .calls import int_arg_regs
+    # RISC-V passes an `int` sign-extended to 64 bits: a parameter read as its low half and
+    # otherwise only compared is one
+    narrow(fn, sext_params=set(int_arg_regs(arch)) if arch.name.startswith("riscv") else frozenset())
     from .fpconst import fold_float_constants
     fold_float_constants(an, fn)
     inline_single_use(fn)

@@ -20,7 +20,8 @@ if TYPE_CHECKING:
 
 FP_ARGS = {"x64-sysv": tuple(f"xmm{k}" for k in range(8)), "x64-win": tuple(f"xmm{k}" for k in range(4)),
            "arm64-aapcs": tuple(f"v{k}" for k in range(8)),
-           "arm-aapcs-vfp": tuple(f"d{k}" for k in range(8))}
+           "arm-aapcs-vfp": tuple(f"d{k}" for k in range(8)),
+           "riscv64-lp64d": tuple(f"fa{k}" for k in range(8))}
 FP_RET = "xmm0"                  # x86-64; AArch64 returns floats in v0 (see fp_ret_reg)
 
 
@@ -29,12 +30,17 @@ def fp_ret_reg(arch: ArchInfo) -> str:
         return "v0"
     if arch.name == "arm-aapcs-vfp":
         return "d0"                      # a float result is s0, its low half
+    if arch.name.startswith("riscv"):
+        return "fa0"
     return FP_RET
 
 
 def fp_part(name: str) -> tuple[str, int, int | None]:
     """(register holding it, low bit, width or None for the whole) of an FP argument location:
-    ARM `s5` is the high half of `d2`; `d2`, `xmm3`, `v3` are themselves."""
+    ARM `s5` is the high half of `d2`; `d2`, `xmm3`, `v3` are themselves; RISC-V `=a1` (a float
+    a variadic call passes in a core register) is `a1`."""
+    if name[:1] == "=":
+        return name[1:], 0, None
     if name[:1] == "s" and name[1:].isdigit():
         k = int(name[1:])
         return f"d{k // 2}", 32 * (k & 1), 32
@@ -42,13 +48,14 @@ def fp_part(name: str) -> tuple[str, int, int | None]:
 
 
 def reg_bits(name: str) -> int:
-    """Width of a full FP register: ARM `d` 64, SSE / AArch64 128."""
-    return 64 if name[:1] == "d" else 128
+    """Width of a full FP register: ARM `d` and RISC-V `fa` 64, SSE / AArch64 128."""
+    return 64 if name[:1] in ("d", "f") else 128
 
 
 def is_fp_reg(name: str) -> bool:
-    """An SSE / SIMD-and-FP register (`xmm3`, AArch64 `v3`, ARM VFP `d3` / `s5`)."""
-    return name.startswith("xmm") or name[:1] in ("v", "d", "s") and name[1:].isdigit()
+    """An SSE / SIMD-and-FP register (`xmm3`, AArch64 `v3`, ARM VFP `d3` / `s5`, RISC-V `fa3`)."""
+    return name.startswith("xmm") or name[:1] in ("v", "d", "s") and name[1:].isdigit() or \
+        name[:2] in ("fa", "ft", "fs") and name[2:].isdigit()
 FLOAT_CONVS = "eEfFgGaA"
 # libc functions taking / returning floating point: argument codes `d` double, `f` float
 FP_SIGS = {
@@ -175,7 +182,7 @@ def _fp_return(an, func, arch) -> int | None:
     xr = result_reads(an, func, fp_ret_reg(arch))
     ir_ = result_reads(an, func, arch.ret)
     xmm_w = [r for r in xr if isinstance(r, int)]
-    if fp_ret_reg(arch)[:1] == "d":                     # ARM: d0 read whole is a double
+    if fp_ret_reg(arch)[:1] in ("d", "f"):              # ARM d0 / RISC-V fa0 read whole: a double
         xmm_w += [64 for r in xr if r == "whole"]
     int_r = [r for r in ir_ if r != "none"]
     if int_r and not xmm_w:
@@ -398,6 +405,12 @@ def place_args(arch: ArchInfo, classes: list[str], int_regs: tuple[str, ...],
             else:
                 free[slot] = False
                 out.append(f"s{slot}")
+        return out
+    if arch.name.startswith("riscv") and variadic:
+        # the variadic arguments of a RISC-V call travel in core registers, floats too (and the
+        # fixed ones of printf-like functions are pointers and integers)
+        out = [None if k >= len(int_regs) else ("=" if c in "df" else "") + int_regs[k]
+               for k, c in enumerate(classes)]
         return out
     if arch.name == "x64-win":
         for k, c in enumerate(classes):

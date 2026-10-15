@@ -209,6 +209,33 @@ def _has_fcmp(e: Expr) -> bool:
     return any(is_fcmp(x) for x in walk(e))
 
 
+_EXT_CMP = ("==", "!=", "<s", "<=s", "<u", "<=u")
+
+
+def _narrow_cmp(op: str, a: Expr, b: Expr) -> Expr | None:
+    """`(long)x <= 1` with x an int (RISC-V keeps ints sign-extended in 64-bit registers):
+    extending both sides the same way keeps their order, so compare the narrow values."""
+    ext = a if isinstance(a, Cast) else b
+    other = b if ext is a else a
+    if not (isinstance(ext, Cast) and ext.kind in ("sext", "zext") and 1 < ext.a.bits < ext.bits):
+        return None
+    n, kind, w = ext.a.bits, ext.kind, ext.bits
+    if isinstance(other, Cast) and other.kind == kind and other.a.bits == n:
+        narrow = other.a
+    elif isinstance(other, Const):
+        v = other.value & mask(n)
+        if kind == "sext" and v >> (n - 1):
+            v |= mask(w) & ~mask(n)
+        if v != other.value:
+            return None
+        narrow = Const(other.value & mask(n), n)
+    else:
+        return None
+    if kind == "zext" and op in ("<s", "<=s"):     # zero-extended values are never negative
+        op = "<u" if op == "<s" else "<=u"
+    return BinOp(op, ext.a, narrow, 1) if ext is a else BinOp(op, narrow, ext.a, 1)
+
+
 def _simp_node(e: Expr) -> Expr:
     if e.bits == 1 and isinstance(e, (BinOp, UnOp, Ite)) and (not isinstance(e, BinOp) or e.op[0] != "f"):
         f = fold_fcmp(e)
@@ -264,6 +291,10 @@ def _simp_node(e: Expr) -> Expr:
             return Const(int(op == "!="), 1)          # `(x | 1) == 0` never holds
         elif op in ("==", "!=") and z(b) and isinstance(a, Cast) and a.kind == "zext" and a.a.bits == 1:
             return a.a if op == "!=" else _not(a.a)   # `(int)c == 0` -> `!c`
+        if op in _EXT_CMP:
+            r = _narrow_cmp(op, a, b)
+            if r is not None:
+                return r
     elif isinstance(e, UnOp) and isinstance(e.a, UnOp) and e.op == e.a.op and e.op in ("-", "~"):
         return e.a.a
     elif isinstance(e, UnOp) and e.op == "!" and isinstance(e.a, UnOp) and e.a.op == "!" and e.a.a.bits == 1:

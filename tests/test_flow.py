@@ -81,7 +81,7 @@ int main(void) {
 
 @pytest.fixture(scope="module", params=["flow_O0", "flow_O2", "flow32_O0", "flow32_O2", "flow_a64_O0", "flow_a64_O2",
                                               "flow_arm_O0", "flow_arm_O2", "flow_thumb_O0", "flow_thumb_O2",
-                                              "flow_mips_O0", "flow_mips_O2"])
+                                              "flow_mips_O0", "flow_mips_O2", "flow_rv64_O0", "flow_rv64_O2"])
 def flow(request):
     path = request.getfixturevalue(request.param)
     return request.param, analyze(path)
@@ -112,11 +112,13 @@ def test_flow_recompiles_and_matches_source(flow, tmp_path):
     src = tmp_path / "re.c"
     src.write_text(_HARNESS % {"code": code, "defines": defines, "src": os.path.join(HERE, "src", "flow.c")})
     exe = tmp_path / "re"
-    if name.startswith("flow_mips"):
-        # MIPS pseudocode runs as MIPS: the cross compiler, statically linked, under qemu-user
-        mcc, qemu = shutil.which("mipsel-linux-gnu-gcc"), shutil.which("qemu-mipsel")
+    if name.startswith(("flow_mips", "flow_rv64")):
+        # MIPS / RISC-V pseudocode runs as such: the cross compiler, statically linked, under qemu-user
+        tool, emu = ("mipsel-linux-gnu-gcc", "qemu-mipsel") if "mips" in name else \
+            ("riscv64-linux-gnu-gcc", "qemu-riscv64")
+        mcc, qemu = shutil.which(tool), shutil.which(emu)
         if mcc is None or qemu is None:
-            pytest.skip("no mipsel-linux-gnu-gcc / qemu-mipsel to run MIPS pseudocode")
+            pytest.skip(f"no {tool} / {emu} to run the pseudocode")
         r = subprocess.run([mcc, "-static", "-w", "-fwrapv", "-o", str(exe), str(src)], capture_output=True, text=True)
         assert r.returncode == 0, f"{name}: pseudocode does not compile:\n{r.stderr[:3000]}\n{code}"
         r = subprocess.run([qemu, str(exe)], capture_output=True, text=True, timeout=120)
