@@ -406,7 +406,7 @@ __all__ = ["hide_canary", "returns_value", "drop_return_values", "rewrite_locals
 
 
 # --------------------------------------------------------------- result widths
-_INT_RETS = {"int": (32, "sext"), "unsigned": (32, "zext"), "void": (0, "")}
+_INT_RETS = {"int": (32, "sext"), "unsigned": (32, "zext"), "unsigned int": (32, "zext"), "void": (0, "")}
 
 
 def return_width(an: "Analysis", func: "Function", ret_reg: str) -> int | None:
@@ -605,7 +605,7 @@ def _clean(e: Expr, bits: int, defs: dict, an: "Analysis", ret_reg: str, seen: s
         if d is None:
             return False
         if isinstance(d, CallStmt):
-            sig = lookup(d.name)
+            sig = lookup(d.name, an)
             if sig is not None:
                 return sig.ret in _INT_RETS and _INT_RETS[sig.ret][0] == bits
             f = an.functions.get(d.call.target.value) if isinstance(d.call.target, Const) else None

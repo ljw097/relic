@@ -594,11 +594,11 @@ class Analysis:
         self.user_types["typedefs"] = {n: t.spell() for n, t in h.typedefs.items()}
         self.user_types["bare"] = sorted(h.bare)
         out = {"structs": [], "enums": sorted(n for n in set(h.enums) - before[1] if not n.startswith("__anon")),
-               "typedefs": sorted(set(h.typedefs) - before[2]), "functions": []}
+               "typedefs": sorted(set(h.typedefs) - before[2]), "functions": [], "imports": []}
         for key, agg in h.aggregates.items():
             if not agg.complete or agg.name.startswith("__anon"):
                 continue
-            layout, names, types = struct_layout(h, key, model)
+            layout, names, types, bitfields = struct_layout(h, key, model)
             decl, deps = declaration(h, key)
             entry = {"imported": True, "layout": layout, "decl": decl,
                      "as_imported": {"fields": dict(names), "types": dict(types)}}
@@ -608,6 +608,8 @@ class Analysis:
                 entry["fields"] = names
             if types:
                 entry["types"] = types
+            if bitfields:
+                entry["bitfields"] = bitfields
             old = self.struct_names.get(agg.name, {})
             if old and not old.get("imported") and key not in before[0]:
                 entry = {**old, **entry}
@@ -620,9 +622,22 @@ class Analysis:
         for f in self.functions.values():
             if not f.is_import:
                 by_name.setdefault(self.name(f.addr) or f.name, f)
+        from ..decompiler.sigs import sig_of
+        protos = dict(self.user_types.get("prototypes", {}))
+        formats = dict(self.user_types.get("formats", {}))
         for name, proto in h.prototypes.items():
+            params = [t.spell() for _, t in proto.params]
+            sig = sig_of(params, proto.ret.spell(), proto.variadic, [n for n, _ in proto.params])
+            if sig.fmt is not None:
+                formats[name] = sig.fmt              # a printf-like function (format-string checks)
             f = by_name.get(name)
+            # how calls to it are shown: argument count and types (floats placed in their registers,
+            # a printf-like function's arguments counted from its format), result
+            protos[name] = {"ret": proto.ret.spell(), "params": params, "variadic": proto.variadic,
+                            "names": [n for n, _ in proto.params]}
             if f is None:
+                if name not in before[3]:
+                    out["imports"].append(name)
                 continue
             ints = [t for _, t in proto.params if t.ptr or t.base not in ("float", "double", "long double")]
             floats = [t for _, t in proto.params if not t.ptr and t.base in ("float", "double")]
@@ -640,8 +655,13 @@ class Analysis:
                 self.var_types.pop(f.addr, None)
             elif name not in before[3]:
                 out["functions"].append(name)
+        if protos:
+            self.user_types["prototypes"] = protos
+        if formats:
+            self.user_types["formats"] = formats
         out["structs"].sort()
         out["functions"].sort()
+        out["imports"].sort()
         return out
 
     def comment(self, addr: int, text: str):

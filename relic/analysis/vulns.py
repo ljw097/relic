@@ -162,8 +162,9 @@ def find_vulns(an: "Analysis") -> list[Finding]:
                         return resolve_reg(insns, idx, reg) if b.arch == "x64" else ("unknown", None)
                     return _arg_state(args, k)
 
-                if base in FORMAT_ARG:
-                    k = FORMAT_ARG[base]
+                fmt_k = FORMAT_ARG.get(base, an.user_types.get("formats", {}).get(base))
+                if fmt_k is not None:
+                    k = fmt_k
                     state, val = arg(k, regs[k] if k < len(regs) else "")
                     fmt = b.read_cstring(val) if state == "const" and val else None
                     if state == "var" or (state == "const" and fmt is None):

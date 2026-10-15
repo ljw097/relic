@@ -378,10 +378,11 @@ def arg_classes(sig, fmt: str | None, fsig=None, scan: bool = False) -> list[str
     if sig is None:
         return None
     from .sigs import _CONV
-    out = ["i"] * sig.argc
+    fixed = [{"double": "d", "float": "f"}.get(t, "i") for t in sig.types] if sig.types else []
+    out = (fixed + ["i"] * sig.argc)[:sig.argc]
     if sig.fmt is None or fmt is None:
         return out
-    out = ["i"] * (sig.fmt + 1)
+    out = out[:sig.fmt + 1]
     for m in _CONV.finditer(fmt):
         conv = m.group(6)
         if conv == "%":

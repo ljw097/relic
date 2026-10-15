@@ -21,9 +21,19 @@ typedef struct job {
     int prio[3];
 } job_t;
 
+#define MAX_PRIO 9
+struct packet {
+    unsigned int version : 4;
+    unsigned int ihl : 4;
+    unsigned char tos;
+    unsigned short frag : 13, flags : 3;
+    int ttl;
+};
+
 int run_job(job_t *j, enum state target, options_t opts);
 const char *state_name(enum state s);
 int count_running(struct job *head);
 void add_option(job_t *j, options_t o);
+int packet_len(struct packet *p);
 
 #endif

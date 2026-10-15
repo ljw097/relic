@@ -88,6 +88,46 @@ def test_layout_matches_the_compiler(abi, tmp_path):
     assert got == want
 
 
+BITS_H = r"""
+#define WIDE 40
+struct flags { unsigned a : 3; unsigned b : 5; char c; unsigned d : 30; unsigned e : 4; short f : 3;
+               int : 0; char g; long long h : WIDE; char i; unsigned char j : 1; };
+struct small { char x; unsigned char p : 4, q : 4; short r : 9; char s; };
+union ub { int a : 5; char b; };
+"""
+
+
+@pytest.mark.parametrize("abi", ["x64", "x86", "arm"])
+def test_bitfield_layout_matches_the_compiler(abi, tmp_path):
+    cc, run, model = {"x64": (["gcc"], [], Model()), "x86": (["gcc", "-m32"], [], Model(4, 4, 4, 4, 12)),
+                      "arm": (["arm-linux-gnueabihf-gcc", "-static"], ["qemu-arm"], Model(4, 4, 4, 8, 8))}[abi]
+    if shutil.which(cc[0]) is None or run and shutil.which(run[0]) is None:
+        pytest.skip(f"no {cc[0]}")
+    (tmp_path / "bf.h").write_text(BITS_H)
+    (tmp_path / "bf.c").write_text('#include <stdio.h>\n#include <stddef.h>\n#include "bf.h"\nint main(void) {'
+                                   'printf("%zu %zu %zu %zu %zu %zu %zu %zu\\n", offsetof(struct flags, c), '
+                                   'offsetof(struct flags, g), offsetof(struct flags, i), sizeof(struct flags), '
+                                   'offsetof(struct small, s), sizeof(struct small), sizeof(union ub), '
+                                   '_Alignof(struct small)); }\n')
+    exe = tmp_path / "bf"
+    if subprocess.run([*cc, "-o", str(exe), str(tmp_path / "bf.c")], capture_output=True).returncode:
+        pytest.skip(f"{' '.join(cc)} cannot build the probe")
+    want = [int(x) for x in subprocess.run([*run, str(exe)], capture_output=True, text=True).stdout.split()]
+    h = parse(BITS_H, model)
+    f, s, u = h.aggregates["struct flags"], h.aggregates["struct small"], h.aggregates["union ub"]
+    m = {x.name: x for x in f.members}
+    ms = {x.name: x for x in s.members}
+    assert [m["c"].offset, m["g"].offset, m["i"].offset, f.size, ms["s"].offset, s.size, u.size, s.align] == want
+    assert h.defines == {"WIDE": 40}
+
+
+def test_defines():
+    h = parse("#define N 4\n#define MASK (1u << N) | 1\n#define F(x) x\n#define S \"s\"\n"
+              "enum e { A = N * 2, B = MASK };\nstruct s { char b[N + 1]; };\n")
+    assert h.defines == {"N": 4, "MASK": 17} and h.enums["e"] == {"A": 8, "B": 17}
+    assert h.aggregates["struct s"].size == 5
+
+
 def test_enums_typedefs_and_prototypes():
     h = parse(LAYOUT_H)
     assert h.enums["color"] == {"RED": 0, "GREEN": 5, "BLUE": 6, "ALPHA": 16, "MASK": 21, "NEG": -2}
@@ -102,7 +142,7 @@ def test_enums_typedefs_and_prototypes():
 
 
 @pytest.mark.parametrize("text,msg", [
-    ("struct s {\n  int a : 3;\n};", "line 2: bit-field 'a'"),
+    ("struct s {\n  int a : 33;\n};", "line 2: bad bit-field 'a'"),
     ("struct s { mystery_t x; };", "line 1"),
     ("enum e { A = UNDEFINED_MACRO };", "not a known constant"),
     ("struct s { int a; ", "end of input"),
@@ -130,8 +170,9 @@ def _c(an, name):
 
 def test_import_summary(typed):
     _, an, got = typed
-    assert got == {"structs": ["header", "job"], "enums": ["options_t", "state"], "typedefs": ["job_t", "options_t"],
-                   "functions": ["add_option", "count_running", "run_job", "state_name"]}
+    assert got == {"structs": ["header", "job", "packet"], "enums": ["options_t", "state"],
+                   "typedefs": ["job_t", "options_t"],
+                   "functions": ["add_option", "count_running", "packet_len", "run_job", "state_name"], "imports": []}
     assert an.enum("state") == {"IDLE": 0, "RUNNING": 1, "STOPPED": 5, "FAILED": 6}
     assert an.resolve_type("job_t *") == "struct job *"
 
@@ -153,6 +194,9 @@ def test_enumerators_fields_and_signatures(typed):
     assert "    struct header hdr;" in code and "    enum state state;" in code and "hdr.len;" not in code
     code = _c(an, "count_running")
     assert "->state == RUNNING" in code and "->next" in code and "f_" not in code, code
+    code = _c(an, "packet_len")
+    assert "->version != 4" in code and "->ihl" in code and "->frag" in code and "->flags == 2" in code, code
+    assert "unsigned int version : 4;" in code and "version_ihl" not in code.split("{", 2)[-1].split("return")[-1]
     code = _c(an, "main")
     assert "run_job(" in code and ", RUNNING, " in code and ", STOPPED, " in code
     assert "add_option(" in code and ", OPT_FORCE)" in code, code
@@ -193,10 +237,14 @@ int main(int argc, char **argv)
         int n = re ? p_count_running(j) : count_running(j);
         printf("%%d %%d %%u %%u %%d\n", r, n, j[1].opts, j[0].hdr.len, j[0].state);
     }
+    for (int k = 0; k < 64; k++) {
+        struct packet pk = {k & 15, (k * 7) & 15, 0, (k * 1234) & 0x1fff, k & 7, k %% 12};
+        printf("%%d\n", re ? p_packet_len(&pk) : packet_len(&pk));
+    }
     return 0;
 }
 """
-FUNCS = ("state_name", "add_option", "run_job", "count_running")
+FUNCS = ("state_name", "add_option", "run_job", "count_running", "packet_len")
 
 
 def test_recompiled_pseudocode_behaves_like_the_original(typed, tmp_path):
@@ -284,3 +332,29 @@ def test_cli(types_O0, tmp_path):
                        cwd=os.path.dirname(HERE))
     assert "enum state { IDLE = 0, RUNNING = 1, STOPPED = 5, FAILED = 6 }" in r.stdout
     assert "struct job" in r.stdout and "char * state_name(enum state a1)" in r.stdout
+
+
+# --------------------------------------------------------------- library prototypes
+def test_bundled_prototypes_shape_library_calls(libcalls_O1):
+    an = analyze(libcalls_O1)
+    assert "socket(2, 1, 0)" in _c(an, "serve") and "listen(" in _c(an, "serve")
+    assert re.search(r"bind\(\w+, &\w+, 16\)", _c(an, "serve"))
+    assert "mmap(0, a1, 3, 34, -1, 0)" in _c(an, "region")          # an `int` parameter: -1
+    assert "strtoul(a1, " in _c(an, "parse_num") and ", 16)" in _c(an, "parse_num")
+    assert 'execl("/bin/sh", "sh", "-c", "id", 0)' in _c(an, "shell")   # variadic: what was set
+    assert re.search(r"getline\(\w+, &\w+, stdin\)", _c(an, "main"))
+
+
+def test_header_prototype_of_a_variadic_wrapper(libcalls_O1, tmp_path):
+    path = tmp_path / "libcalls"
+    shutil.copy(libcalls_O1, path)
+    an = analyze(str(path))
+    assert not any(v.func == "shell" and v.kind == "format-string" for v in an.vulns())
+    got = an.import_header("void log_msg(int level, const char *fmt, ...);\n"
+                           "unsigned long strtoul(const char *nptr, char **endp, int base);\n")
+    assert got["functions"] == ["log_msg"] and got["imports"] == ["strtoul"]
+    code = _c(an, "shell")
+    assert code.startswith("void shell(char *a1)"), code
+    assert "log_msg(2, a1);" in code and 'log_msg(1, "user %s\\n", a1);' in code
+    found = [v for v in an.vulns() if v.func == "shell" and v.kind == "format-string"]
+    assert found and "log_msg()" in found[0].message

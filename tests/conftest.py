@@ -67,6 +67,8 @@ VARIANTS = {
     # C declarations imported from a header (enums, structs, prototypes)
     "types_O0": ["-O0", "-fno-stack-protector", "-no-pie"],
     "types_O2": ["-O2", "-fno-stack-protector", "-no-pie"],
+    # library calls known only from the bundled prototypes
+    "libcalls_O1": ["-O1", "-fno-stack-protector", "-no-pie"],
     # C++ (demangling)
     "shapes": ["-O0", "-no-pie", "-fno-inline"],
 }
@@ -85,6 +87,7 @@ SOURCES = {"structs_O0": os.path.join(HERE, "src", "structs.c"), "structs_O2": o
                                                                 "floats_a64_O2", "floats_arm_O0", "floats_arm_O2",
                                                                 "floats_thumb_O2", "floats_rv64_O0",
                                                                 "floats_rv64_O2")},
+           "libcalls_O1": os.path.join(HERE, "src", "libcalls.c"),
            "types_O0": os.path.join(HERE, "src", "types.c"), "types_O2": os.path.join(HERE, "src", "types.c"),
            "flow_O0": FLOW_SRC, "flow_O2": FLOW_SRC, "flow32_O0": FLOW_SRC, "flow32_O2": FLOW_SRC,
            "shapes": os.path.join(HERE, "src", "shapes.cpp"), "flow_a64_O0": FLOW_SRC, "flow_a64_O2": FLOW_SRC,
@@ -204,6 +207,7 @@ flow_rv64_O0 = _fixture("flow_rv64_O0")
 flow_rv64_O2 = _fixture("flow_rv64_O2")
 floats_rv64_O0 = _fixture("floats_rv64_O0")
 floats_rv64_O2 = _fixture("floats_rv64_O2")
+libcalls_O1 = _fixture("libcalls_O1")
 types_O0 = _fixture("types_O0")
 types_O2 = _fixture("types_O2")
 flow_mips_O0 = _fixture("flow_mips_O0")

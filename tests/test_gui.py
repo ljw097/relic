@@ -965,7 +965,7 @@ def test_import_c_header(win, tmp_path):
     assert "notes.h: 1 structs, 1 enums" in win.statusBar().currentMessage()
     assert win.an.struct_names["note"]["imported"] and win.dirty
     bad = tmp_path / "bad.h"
-    bad.write_text("struct s { int a : 1; };")
+    bad.write_text("struct s { int a : 99; };")
     from unittest import mock
     with mock.patch("relic.gui.main_window.QMessageBox.warning") as warn:
         assert win.import_header(str(bad)) is None

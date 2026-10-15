@@ -115,9 +115,16 @@ def narrow_call_args(an: "Analysis", arch: ArchInfo, fn) -> int:
     n = 0
     for s in fn.stmts():
         call = s.call if isinstance(s, CallStmt) else None
-        if call is None or not isinstance(call.target, Const) or call.target.value not in an.functions:
+        if call is None:
             continue
-        widths = param_bits(an, arch, call.target.value)
+        sig = lookup(s.name or (an.name(call.target.value) if isinstance(call.target, Const) else None), an)
+        if sig is not None and sig.types:
+            # a library function's `int` parameters (`mmap(..., -1, 0)`: `mov ecx, -1` zero-extends)
+            widths = {regs[k]: 32 for k, t in enumerate(sig.types[:len(regs)]) if t in _INT32}
+        elif isinstance(call.target, Const) and call.target.value in an.functions:
+            widths = param_bits(an, arch, call.target.value)
+        else:
+            continue
         args = list(call.args)
         changed = False
         for k, a in enumerate(args):
@@ -129,6 +136,9 @@ def narrow_call_args(an: "Analysis", arch: ArchInfo, fn) -> int:
             n += 1
             s.call = Call(call.target, tuple(args), call.bits, call.fargs)
     return n
+
+
+_INT32 = ("int", "unsigned int", "uid_t", "gid_t", "pid_t", "mode_t", "socklen_t")
 
 
 def livein_regs(an: "Analysis", arch: ArchInfo, target: int) -> set[str]:
@@ -195,13 +205,13 @@ def _compute_livein(an: "Analysis", arch: ArchInfo, target: int, prefix: bool = 
             # a register handed on untouched says nothing
             tops += [v for r, v in s.uses if not (isinstance(v, Var) and v.version == 0 and v.name == r)
                      and not isinstance(v, (Var, Const))]
-            sig = lookup(s.name or (an.name(s.call.target.value) if isinstance(s.call.target, Const) else None))
+            sig = lookup(s.name or (an.name(s.call.target.value) if isinstance(s.call.target, Const) else None), an)
             if sig is not None:
                 argregs = int_arg_regs(arch)
                 uses = dict(s.uses)
                 fmt = _read_format(an, uses.get(argregs[sig.fmt])) if sig.fmt is not None and \
                     sig.fmt < len(argregs) else None
-                n = arg_count(sig, fmt)
+                n = len(argregs) if sig.variadic else arg_count(sig, fmt)
                 keep = set(argregs[:n])
                 if is_fp_arch(arch) and fmt is not None:
                     classes = arg_classes(sig, fmt, scan="scanf" in (s.name or ""))
@@ -392,7 +402,9 @@ def _recover_cdecl(fn: IRFunction, an: "Analysis", arch: ArchInfo):
                     if off is not None and off >= base and (off - base) % word == 0 and off not in stores:
                         stores[off] = j
             tgt = s.call.target.value if isinstance(s.call.target, Const) else None
-            sig = lookup(s.name or (an.name(tgt) if tgt is not None else None))
+            sig = lookup(s.name or (an.name(tgt) if tgt is not None else None), an)
+            if sig is not None and sig.variadic:
+                sig = None                       # (how many follow the fixed ones: the stores say)
             f = an.functions.get(tgt) if tgt is not None else None
             if sig is not None:
                 fmt_val = b.stmts[stores[base + sig.fmt * word]].src \
@@ -451,7 +463,7 @@ def recover_calls(fn: IRFunction, an: "Analysis", arch: ArchInfo) -> IRFunction:
             uses = dict(s.uses)
             tgt = s.call.target.value if isinstance(s.call.target, Const) else None
             name = s.name or (an.name(tgt) if tgt is not None else None)
-            sig = lookup(name)
+            sig = lookup(name, an)
             f = an.functions.get(tgt) if tgt is not None else None
             fsig = fp_sig(name) if is_fp_arch(arch) else None
             placed: list | None = None          # per argument: register, or None (on the stack)
@@ -461,11 +473,17 @@ def recover_calls(fn: IRFunction, an: "Analysis", arch: ArchInfo) -> IRFunction:
             elif sig is not None:
                 fmt = _read_format(an, uses.get(argregs[sig.fmt])) if sig.fmt is not None and \
                     sig.fmt < len(argregs) else None
-                if is_fp_arch(arch) and fmt is not None:
+                if is_fp_arch(arch) and (fmt is not None or any(t in ("double", "float") for t in sig.types)):
                     classes = arg_classes(sig, fmt, scan="scanf" in (name or ""))
-                    placed = place_args(arch, classes, argregs, variadic=True)
+                    placed = place_args(arch, classes, argregs, variadic=fmt is not None)
                 else:
                     selected = list(argregs[:arg_count(sig, fmt)])
+                    if sig.variadic:                 # `execl(path, arg, ..., 0)`: what was set too
+                        if own is None:
+                            own = _livein_arg_regs(an, arch, fn.addr)
+                        more = _set_before_call(fn, argregs, uses, own)
+                        if len(more) > len(selected):
+                            selected = more
             elif f is not None and not f.is_import:
                 selected = _livein_arg_regs(an, arch, tgt)
                 fps = fp_params(an, arch, tgt)
