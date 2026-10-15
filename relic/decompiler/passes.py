@@ -84,10 +84,12 @@ def _rewrite(fn: IRFunction, f) -> bool:
     changed = False
     for b in fn.blocks.values():
         for s in b.stmts:
-            before = list(stmt_exprs(s))
+            before = stmt_exprs(s)
             map_stmt(s, f)
-            if stmt_exprs(s) != before:
-                changed = True
+            if not changed:
+                after = stmt_exprs(s)
+                # (an unchanged expression comes back as the same object: compare others only)
+                changed = len(after) != len(before) or any(a is not b and a != b for a, b in zip(after, before))
     return changed
 
 
