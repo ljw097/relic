@@ -154,6 +154,7 @@ def _entry_opt(an: "Analysis", arch: ArchInfo, target: int):
     from .fpabi import fp_return_pending
     if fp_return_pending(an, target):
         return _entry_ssa(an, arch, target)      # its float result is not known yet: do not keep this
+    done = an.__dict__.setdefault("_entry_opt_done", set())
     if target not in cache:
         ssa = _entry_ssa(an, arch, target)
         cache[target] = ssa                 # (while this one is worked out: the unoptimised reads)
@@ -165,13 +166,33 @@ def _entry_opt(an: "Analysis", arch: ArchInfo, target: int):
             from .passes import optimize
             from .ssa import to_ssa
             try:
-                fn = lift_function(an, f)
-                set_fp_returns(an, f, fn)   # a float result keeps the computation of it alive
-                opt = optimize(to_ssa(fn, arch), arch)
+                from .fpabi import fp_return
+                if fp_return(an, f) is None:
+                    # no float result to keep alive: the same SSA as the unoptimised one
+                    import copy
+                    opt = optimize(copy.deepcopy(ssa), arch)
+                else:
+                    fn = lift_function(an, f)
+                    set_fp_returns(an, f, fn)   # a float result keeps the computation of it alive
+                    opt = optimize(to_ssa(fn, arch), arch)
+                if not fp_return_pending(an, target):
+                    done.add(target)
             except Exception:  # noqa: BLE001 - fall back to the unoptimised reads
                 opt = ssa
         cache[target] = opt
     return cache[target]
+
+
+def optimized_ssa(an: "Analysis", arch: ArchInfo, target: int):
+    """The function's optimised SSA before call recovery -- what `decompile_ir` recovers calls
+    in, and what its callers read its parameters from (computed once for both) -- or None when it
+    is not settled yet (its float result is being worked out, it does not lift). Shared: copy it
+    before changing it."""
+    from .fpabi import fp_return_pending
+    if fp_return_pending(an, target):
+        return None
+    opt = _entry_opt(an, arch, target)
+    return opt if target in an.__dict__.get("_entry_opt_done", ()) else None
 
 
 def _compute_livein(an: "Analysis", arch: ArchInfo, target: int, prefix: bool = True):
@@ -272,12 +293,9 @@ def stack_param_count(an: "Analysis", arch: ArchInfo, target: int) -> int:
     f = an.functions.get(target)
     if f is None or f.is_import:
         return 0
-    from .lift import lift_function
-    from .ssa import to_ssa
     from .stack import _build_spoff, Frame
-    try:
-        ssa = to_ssa(lift_function(an, f), arch)
-    except Exception:
+    ssa = _entry_ssa(an, arch, target)           # (shared, read only)
+    if ssa is None:
         return 0
     frame = Frame(arch, _build_spoff(ssa, arch))
     from .fpconst import float_operands
