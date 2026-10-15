@@ -60,22 +60,41 @@ def simplify_low(e: Expr) -> Expr:
     return transform(e, node)
 
 
-def _narrow_widths(fn: IRFunction, cands: dict[str, Var]) -> dict[str, int]:
+_CMPS = ("==", "!=", "<s", "<=s", "<u", "<=u")
+
+
+def _narrow_widths(fn: IRFunction, cands: dict[str, Var], sx: dict[str, int] | None = None) -> dict[str, int]:
     """For every candidate variable, the width all its uses agree on, when every use only reads
-    its low bits (`low_n(v)`) or hands it on whole (a call argument, `return`). One walk."""
+    its low bits (`low_n(v)`) or hands it on whole (a call argument, `return`). One walk.
+
+    `sx`: variables known to hold a sign-extended n-bit value (name -> n); comparing one whole
+    is a use of that value too, and low reads of it may be narrower."""
     width: dict[str, int] = {}
     bad: set[str] = set()
+    sx = sx or {}
 
     def visit(e: Expr, top: bool):
         if isinstance(e, Cast) and e.kind == "low" and isinstance(e.a, Var):
             v = cands.get(e.a.name)
             if v is not None and e.a == v:
-                if width.setdefault(v.name, e.bits) != e.bits:
+                if v.name in sx:
+                    if e.bits <= sx[v.name]:
+                        width[v.name] = sx[v.name]
+                        return
+                    bad.add(v.name)
+                elif width.setdefault(v.name, e.bits) != e.bits:
                     bad.add(v.name)
                 return
         elif isinstance(e, Var):
             if not top and cands.get(e.name) == e:
                 bad.add(e.name)
+            return
+        elif isinstance(e, BinOp) and (e.op in _CMPS and e.bits == 1 or e.op in ("&", "|", "^")):
+            # (a bitwise operation on `sext(v)` narrows back with it: `low32(sext(v) ^ k)` is `v ^ k`)
+            for k in (e.a, e.b):
+                if isinstance(k, Var) and k.name in sx and cands.get(k.name) == k:
+                    continue
+                visit(k, False)
             return
         for k in children(e):
             visit(k, False)
@@ -91,6 +110,8 @@ def _narrow_widths(fn: IRFunction, cands: dict[str, Var]) -> dict[str, int]:
         else:
             for x in stmt_exprs(s):
                 visit(x, False)
+    for n, w in sx.items():                      # compared and handed on only
+        width.setdefault(n, w)
     return {n: w for n, w in width.items() if n not in bad}
 
 
@@ -107,15 +128,77 @@ def _collect_vars(fn: IRFunction) -> dict[str, Var]:
     return seen
 
 
-def narrow(fn: IRFunction, keep: set[str] = frozenset()) -> dict[str, int]:
+def _sext_vars(fn: IRFunction, cands: dict[str, Var], params: set[str]) -> dict[str, int]:
+    """Variables every definition of which is a sign-extended n-bit value (`v = sext64(x32)`,
+    RISC-V `addw` / `lw` / `sext.w`; a bitwise operation on such values, a small zero-extension, a
+    constant that fits, a copy of another such variable): name -> n. `params` (entry values the
+    calling convention passes sign-extended) count as 32-bit."""
+    defs: dict[str, list] = {}
+    for s in fn.stmts():
+        for d in _defs(s):
+            if isinstance(d, Var) and cands.get(d.name) == d:
+                defs.setdefault(d.name, []).append(s.src if isinstance(s, Assign) and s.dst == d else None)
+    pars = {n for n, v in cands.items() if v.version == 0 and v.name in params}
+    # optimistic: every variable with a sign extension among its definitions, then drop the ones a
+    # definition contradicts until none does (`h = sext(...)` and `h ^= 0x1337` keep each other)
+    live = pars | {n for n, srcs in defs.items()
+                   if any(isinstance(x, Cast) and x.kind in ("sext", "zext") for x in srcs)}
+
+    def width(e: Expr | None) -> int | None:
+        """n when `e` is a sign-extended n-bit value (32 for one built from such values)."""
+        if isinstance(e, Cast) and e.kind == "sext" and 8 <= e.a.bits < e.bits:
+            return e.a.bits
+        if isinstance(e, Cast) and e.kind == "zext" and e.a.bits < 32 and e.a.bits < e.bits:
+            return 32                            # `lbu`: 0..255
+        if isinstance(e, Const):
+            return next((k for k in (8, 16, 32) if k < e.bits and _fits_signed(e.value, k, e.bits)), None)
+        if isinstance(e, Var):
+            return 32 if e.name in live else None
+        if isinstance(e, BinOp) and e.op in ("&", "|", "^"):
+            wa, wb = width(e.a), width(e.b)
+            return max(wa, wb, 32) if wa and wb else None
+        return None
+
+    while True:
+        drop = {n for n in live if n not in pars and not all(width(x) for x in defs.get(n, ()))}
+        if not drop:
+            break
+        live -= drop
+    out = {}
+    for n in live:
+        ws = [width(x) for x in defs.get(n, ())]
+        out[n] = max([32 if n in pars else 0, *(w for w in ws if w)]) or 32
+    return out
+
+
+def _fits_signed(v: int, n: int, bits: int) -> bool:
+    lo = v & ((1 << n) - 1)
+    if lo >> (n - 1):
+        lo |= ((1 << bits) - 1) & ~((1 << n) - 1)
+    return lo == v
+
+
+def narrow(fn: IRFunction, keep: set[str] = frozenset(), sext_params: set[str] = frozenset()) -> dict[str, int]:
     """Narrow wide variables that are only read as their low bits (in place); name -> new width.
 
     Narrowing one variable can expose another (`v1 = v2 + 1` becomes `v1 = low32(v2) + 1`), so
-    rounds repeat until nothing more narrows."""
+    rounds repeat until nothing more narrows. A variable holding a sign-extended value (see
+    `_sext_vars`) may also be compared whole: it becomes `sext(v)` there. `sext_params`: entry
+    registers the calling convention fills sign-extended (RISC-V `int` arguments); they narrow
+    only with a low read to show they are `int`s."""
     done: dict[str, int] = {}
     while True:
         cands = {n: v for n, v in _collect_vars(fn).items() if n not in keep and n not in done and v.bits > 8}
-        found = {n: w for n, w in _narrow_widths(fn, cands).items() if w < cands[n].bits}
+        sx = _sext_vars(fn, cands, sext_params)
+        widths = _narrow_widths(fn, cands, sx)
+        params = {n for n, v in cands.items() if v.version == 0 and v.name in sext_params}
+        if params:
+            low_read = {n for n in params if _int_evidence(fn, cands[n], sx, params)}
+            widths = {n: w for n, w in widths.items() if n not in params or n in low_read}
+            # an int parameter also used whole (`p + n` indexes with the sign-extended value):
+            # every such use is `(long)n`, exactly
+            widths.update({n: sx[n] for n in low_read if n in sx})
+        found = {n: w for n, w in widths.items() if w < cands[n].bits}
         if not found:
             break
         olds = {cands[n]: Var(n, cands[n].version, w) for n, w in found.items()}
@@ -132,7 +215,7 @@ def narrow(fn: IRFunction, keep: set[str] = frozenset()) -> dict[str, int]:
             if isinstance(x, Cast) and x.kind == "low" and x.a in news:
                 return x.a if x.bits == x.a.bits else Cast("low", x.a, x.bits)
             if isinstance(x, Var) and x in olds:
-                return Cast("zext", olds[x], x.bits)
+                return Cast("sext" if x.name in sx else "zext", olds[x], x.bits)
             return x
 
         def sub(e: Expr) -> Expr:
@@ -154,6 +237,21 @@ def narrow(fn: IRFunction, keep: set[str] = frozenset()) -> dict[str, int]:
             for s in b.stmts:
                 map_stmt(s, simplify_low)
     return done
+
+
+def _int_evidence(fn: IRFunction, v: Var, sx: dict[str, int], params: set[str]) -> bool:
+    """`v` is read as its low half, or compared with a sign-extended int (`v == (long)i`)."""
+    def ext(e: Expr) -> bool:
+        return isinstance(e, Cast) and e.kind == "sext" and e.a.bits <= 32 or \
+            isinstance(e, Var) and e.name in sx and e.name not in params
+    for s in fn.stmts():
+        for top in stmt_exprs(s):
+            for x in walk(top):
+                if isinstance(x, Cast) and x.kind == "low" and x.a == v:
+                    return True
+                if isinstance(x, BinOp) and x.op in _CMPS and (x.a == v and ext(x.b) or x.b == v and ext(x.a)):
+                    return True
+    return False
 
 
 def _defs(s):

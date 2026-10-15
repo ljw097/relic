@@ -36,6 +36,9 @@ def _callee_saved(arch: ArchInfo) -> set[str]:
     if arch.name.startswith("arm"):
         # r4-r11 (r11 = frame pointer), link register; d8-d15 (s16-s31)
         return {f"r{k}" for k in range(4, 12)} | {"lr"} | {f"d{k}" for k in range(8, 16)}
+    if arch.name.startswith("riscv"):
+        # s0-s11 (s0 = frame pointer), the return address; fs0-fs11
+        return {f"s{k}" for k in range(12)} | {"ra"} | {f"fs{k}" for k in range(12)}
     if arch.name.startswith("mips"):
         return {f"s{k}" for k in range(8)} | {"fp", "ra"}
     if arch.name == "x64-win":

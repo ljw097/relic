@@ -14,7 +14,7 @@ from typing import TYPE_CHECKING
 from .arch import ArchInfo
 from .ir import (Assign, Call, CallStmt, Cast, Const, Expr, Extract, IRFunction, Phi, Return, Var, children,
                  stmt_exprs, walk)
-from .fpabi import arg_classes, fp_params, fp_part, fp_sig, is_fp_arch, is_fp_reg, place_args
+from .fpabi import arg_classes, float_int_params, fp_params, fp_part, fp_sig, is_fp_arch, is_fp_reg, place_args
 from .sigs import arg_count, lookup
 
 if TYPE_CHECKING:
@@ -29,6 +29,7 @@ _INT_ARGS = {
     "arm-aapcs": ("r0", "r1", "r2", "r3"),
     "arm-aapcs-vfp": ("r0", "r1", "r2", "r3"),
     "mips-o32": ("a0", "a1", "a2", "a3"),
+    "riscv64-lp64d": tuple(f"a{k}" for k in range(8)),
 }
 
 
@@ -337,7 +338,7 @@ def param_base(arch: ArchInfo) -> int:
 
 def stack_params_used(arch: ArchInfo) -> bool:
     """Whether calls on this convention get stack arguments recovered (cdecl has its own path)."""
-    return arch.name.startswith(("x64", "arm64", "arm-aapcs"))
+    return arch.name.startswith(("x64", "arm64", "arm-aapcs", "riscv"))
 
 
 def stack_param_floats(an: "Analysis", arch: ArchInfo, target: int) -> dict[int, int]:
@@ -469,10 +470,13 @@ def recover_calls(fn: IRFunction, an: "Analysis", arch: ArchInfo) -> IRFunction:
                 selected = _livein_arg_regs(an, arch, tgt)
                 fps = fp_params(an, arch, tgt)
                 widths = dict(fps)
+                fints = dict(float_int_params(an, arch, tgt))      # RISC-V: floats past fa7
+                selected = [r for r in selected if r not in fints]
                 slots = stack_param_slots(an, arch, tgt) if stack_params_used(arch) else []
                 if fps or slots:
-                    placed = selected + [r for r, _ in fps] + [None] * len(slots)
+                    placed = selected + [r for r, _ in fps] + ["=" + r for r in fints] + [None] * len(slots)
                     classes = ["i"] * len(selected) + ["d"] * len(fps) + \
+                        ["f" if w == 32 else "d" for w in fints.values()] + \
                         [("f" if fw == 32 else "d") if fw else "i" for _, _, fw in slots]
                     stack_offs = [rel for rel, _, _ in slots]
                     stack_sizes = [size for _, size, _ in slots]
@@ -513,6 +517,12 @@ def recover_calls(fn: IRFunction, an: "Analysis", arch: ArchInfo) -> IRFunction:
                     v = _pair_value(uses[lo_r], uses[hi_r], defs)
                     fargs.append((len(args), 64))
                     args.append(v)
+                    continue
+                if r[:1] == "=":                  # a float in a core register (variadic RISC-V)
+                    if r[1:] not in uses:
+                        continue
+                    fargs.append((len(args), 32 if pos < len(classes) and classes[pos] == "f" else 64))
+                    args.append(uses[r[1:]])
                     continue
                 full, lo, part = fp_part(r) if is_fp_reg(r) else (r, 0, None)
                 if full not in uses:

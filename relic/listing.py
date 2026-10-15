@@ -30,7 +30,11 @@ def operands(an: Analysis, i: Insn) -> str:
     op = i.op_str
     if i.target is not None and i.kind != "normal":
         name = an.label(i.target)
-        op = _HEX.sub(lambda m: name if int(m.group(), 16) == i.target else m.group(), op)
+        if an.bin.arch.startswith("riscv"):
+            # the operand is an offset from the instruction (`jal -0x488`): the last number is it
+            op = re.sub(r"-?(0x[0-9a-fA-F]+|\d+)$", name, op)
+        else:
+            op = _HEX.sub(lambda m: name if int(m.group(), 16) == i.target else m.group(), op)
     return op
 
 

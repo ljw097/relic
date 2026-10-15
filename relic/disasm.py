@@ -297,6 +297,9 @@ class Disassembler:
                     (base == "ldr" and ops.startswith("pc,[pc,")) or (base == "mov" and ops.startswith("pc,")):
                 i.kind = JMP                      # switch dispatch / computed jump
                 return
+        if arch.startswith("riscv"):
+            self._classify_riscv(c, i)
+            return
         if cs.CS_GRP_RET in groups or m in ("ret", "c.ret") or \
                 (arch.startswith("ppc") and m == "blr") or \
                 (arch.startswith("mips") and m == "jr" and c.op_str.strip() == "$ra") or \
@@ -336,6 +339,38 @@ class Disassembler:
                 v &= self._mask
                 if v > 0xFF and self.bin.is_mapped(v):
                     i.refs.append(v)
+
+    def _classify_riscv(self, c, i: Insn):
+        """RISC-V control flow by its operands (capstone's groups call `jr t3` and the PLT's
+        `jalr t1, t3` calls). Branch and jump immediates are offsets from the instruction."""
+        m = c.mnemonic
+        ops = c.operands
+        regs = [c.reg_name(o.reg) for o in ops if o.type == OP_REG]
+        imm = next((o.imm for o in ops if o.type == OP_IMM), None)
+        rel = (i.addr + imm) & self._mask if imm is not None else None
+        if m in ("ret", "c.ret"):
+            i.kind = RET
+        elif m in ("jal", "c.jal"):
+            rd = regs[0] if regs else "ra"               # `jal off` links ra
+            i.kind = JMP if rd == "zero" else CALL
+            i.target = rel
+        elif m in ("j", "c.j"):
+            i.kind, i.target = JMP, rel
+        elif m in ("jr", "c.jr"):
+            i.kind = RET if regs[:1] == ["ra"] and not imm else JMP
+        elif m == "c.jalr":
+            i.kind = CALL
+        elif m == "jalr":
+            rd = regs[0] if len(regs) == 2 else "ra"     # `jalr rs` links ra
+            rs = regs[-1] if regs else ""
+            if rd == "zero":
+                i.kind = RET if rs == "ra" and not imm else JMP
+            else:
+                i.kind = CALL if rd == "ra" else JMP     # `jalr t1, t3`: a PLT stub's jump
+        elif cs.CS_GRP_JUMP in set(c.groups) or cs.CS_GRP_BRANCH_RELATIVE in set(c.groups):
+            i.kind, i.cond, i.target = CJMP, False, rel
+        elif m in _HALT or m in ("ebreak", "c.ebreak", "unimp", "c.unimp"):
+            i.kind = HALT
 
     @property
     def _mask(self) -> int:

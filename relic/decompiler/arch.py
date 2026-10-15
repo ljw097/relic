@@ -90,6 +90,18 @@ MIPS_O32 = ArchInfo(
 )
 
 
+_RV_ARGS = tuple(f"a{k}" for k in range(8))
+_RV_FARGS = tuple(f"fa{k}" for k in range(8))
+RISCV64 = ArchInfo(
+    "riscv64-lp64d", 64, "sp", "a0",
+    call_reads=(*_RV_ARGS, "sp", *_RV_FARGS),
+    # ra, t0-t6, a0-a7 and ft0-ft11, fa0-fa7 are caller-saved
+    call_clobbers=("ra", *(f"t{k}" for k in range(7)), *_RV_ARGS, *(f"ft{k}" for k in range(12)), *_RV_FARGS),
+    syscall_reads=("a7", *_RV_ARGS[:6]),
+    syscall_clobbers=("a0",),
+)
+
+
 def arch_for(binary) -> ArchInfo:
     if binary.arch == "x64":
         return X64_WIN if binary.format == "PE" else X64_SYSV
@@ -101,4 +113,6 @@ def arch_for(binary) -> ArchInfo:
         return ARM_VFP if getattr(binary, "arm_hard_float", False) else ARM
     if binary.arch == "mips" and binary.bits == 32:
         return MIPS_O32
+    if binary.arch == "riscv64":
+        return RISCV64
     raise NotImplementedError(f"no calling convention for {binary.arch} yet")

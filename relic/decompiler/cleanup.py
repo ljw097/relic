@@ -470,6 +470,44 @@ def _reads(e: Expr) -> tuple[set, bool]:
     return names, mem
 
 
+def propagate_ro_loads(an: "Analysis", fn: IRFunction) -> int:
+    """`v5 = [rodata]; f(v5); g(v5)` -> `f([rodata]); g([rodata])`: a temporary defined once, by
+    a load from read-only memory (a float constant, which `fold_float_constants` then turns into
+    a literal at each use)."""
+    from .fpconst import _ro_value
+    from .ir import map_stmt, stmt_defs, transform
+    defs: dict[str, list] = {}
+    for b in fn.blocks.values():
+        for s in b.stmts:
+            for d in stmt_defs(s):
+                if isinstance(d, Var):
+                    defs.setdefault(d.name, []).append(s)
+    from .ir import Store
+    copied = {s.src.name for s in fn.stmts() if isinstance(s, (Assign, Store)) and isinstance(s.src, Var)}
+    sub = {}
+    for name, ss in defs.items():
+        s = ss[0]
+        if len(ss) == 1 and isinstance(s, Assign) and s.dst.version == 0 and name.startswith("_v") and \
+                _ro_value(an, s.src) is not None:
+            sub[s.dst] = s.src
+    if not sub:
+        return 0
+
+    def rewrite(e: Expr) -> Expr:
+        return transform(e, lambda x: sub.get(x, x) if isinstance(x, Var) else x)
+    for b in fn.blocks.values():
+        # copies into locals keep reading the variable (its float type says what the local holds),
+        # and its definition stays for them
+        b.stmts = [s for s in b.stmts if not (isinstance(s, Assign) and s.dst in sub and s.dst.name not in copied)]
+        for s in b.stmts:
+            if isinstance(s, (Assign, Store)) and isinstance(s.src, Var) and s.src in sub:
+                continue
+            if isinstance(s, Assign) and s.dst in sub:
+                continue
+            map_stmt(s, rewrite)
+    return len(sub)
+
+
 def inline_single_use(fn: IRFunction) -> bool:
     """Fold a temporary defined once and used once later in the same block into its use.
 
@@ -552,9 +590,13 @@ def _clean(e: Expr, bits: int, defs: dict, an: "Analysis", ret_reg: str, seen: s
     from .ir import Cast
     from .sigs import lookup
     if isinstance(e, Const):
-        return e.value < (1 << bits)
+        # RISC-V keeps an int sign-extended: `li a0, -1` is the int -1
+        return e.value < (1 << bits) or an.bin.arch == "riscv64" and e.value >> (bits - 1) == \
+            (1 << (e.bits - bits + 1)) - 1
     if isinstance(e, Cast) and e.kind in ("zext", "sext"):
         return e.a.bits <= bits
+    if isinstance(e, BinOp) and e.op in ("&", "|", "^"):
+        return _clean(e.a, bits, defs, an, ret_reg, seen) and _clean(e.b, bits, defs, an, ret_reg, seen)
     if isinstance(e, Var):
         if e in seen:
             return True

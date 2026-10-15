@@ -619,8 +619,71 @@ class FunctionAnalyzer:
             out.append(t)
         return out if bound is None or len(out) == bound else []
 
+    def _riscv_jump_table(self, jmp: Insn) -> list[int]:
+        """gcc's RISC-V switch dispatch, bounded by a `bltu K, idx` (K in a register) before it:
+
+            auipc a4, hi ; addi a4, a4, lo      table T
+            slli a0, a0, 2 ; add a0, a0, a4
+            lw a5, 0(a0) ; add a5, a5, a4       entries are offsets from T (PIC)
+            jr a5                               (non-PIC: `ld` of absolute addresses)
+        """
+        b, msk = self.bin, self.dis._mask
+        hist = list(reversed(self._back(jmp.addr, 24)))
+        consts: dict[str, int] = {}
+        table = entry = None
+        bound = None
+        for i in hist:
+            c, m = i.cs, i.mnemonic
+            ops = c.operands
+            regs = [c.reg_name(o.reg) for o in ops if o.type == 1]
+            imm = next((o.imm for o in ops if o.type == 2), None)
+            d = regs[0] if regs else None
+            new = None
+            if m == "auipc" and imm is not None:
+                hi = imm & 0xFFFFF
+                new = (i.addr + ((hi - (1 << 20) if hi & 0x80000 else hi) << 12)) & msk
+            elif m in ("li", "c.li") and imm is not None:
+                new = imm & msk
+            elif m in ("addi", "c.addi") and imm is not None:
+                src = regs[1] if len(regs) > 1 else d
+                if src in consts:
+                    new = (consts[src] + imm) & msk
+            elif m in ("mv", "c.mv") and len(regs) == 2 and regs[1] in consts:
+                new = consts[regs[1]]
+            elif m in ("bltu", "bgeu") and len(regs) == 2:
+                if m == "bltu" and regs[0] in consts:          # K <u idx: the default case
+                    bound = consts[regs[0]] + 1
+                elif m == "bgeu" and regs[1] in consts:        # idx >=u K
+                    bound = consts[regs[1]]
+                continue
+            elif m in ("lw", "ld", "c.lw", "c.ld"):
+                entry = 4 if m.endswith("lw") else 8
+            if new is not None and d is not None:
+                consts[d] = new
+                sec = b.section_at(new)
+                if sec is not None and not sec.x and sec.name not in (".got", ".got.plt"):
+                    table = new
+            elif d is not None:
+                consts.pop(d, None)
+        if table is None or entry is None or not bound or bound > 4096:
+            return []
+        sec = b.section_at(jmp.addr)
+        out = []
+        for k in range(bound):
+            if entry == 4:
+                v = b.read_int(table + 4 * k, 4, signed=True)
+                t = (table + v) & msk if v is not None else None
+            else:
+                t = b.read_ptr(table + 8 * k)
+            if t is None or not (sec and sec.contains(t)):
+                return []
+            out.append(t)
+        return out
+
     def _jump_table(self, jmp: Insn) -> list[int]:
         """Resolve `jmp reg` / `jmp [table+reg*N]` switch dispatch on x86."""
+        if self.dis.arch.startswith("riscv"):
+            return self._riscv_jump_table(jmp)
         if self.dis.arch == "arm":
             return self._arm_jump_table(jmp)
         if self.dis.arch == "arm64":
@@ -753,8 +816,9 @@ class FunctionAnalyzer:
         return cand
 
     def _scan_gaps(self):
-        """Pick up functions only reachable indirectly (prologue scan: x86, ARM, AArch64, MIPS)."""
-        if self.dis.arch not in ("x86", "x64", "arm", "arm64", "mips"):
+        """Pick up functions only reachable indirectly (prologue scan: x86, ARM, AArch64, MIPS,
+        RISC-V)."""
+        if self.dis.arch not in ("x86", "x64", "arm", "arm64", "mips", "riscv64"):
             return
         prologues = (b"\xf3\x0f\x1e\xfa", b"\xf3\x0f\x1e\xfb", b"\x55\x48\x89\xe5", b"\x55\x89\xe5")
         tried: set[int] = set()
@@ -779,6 +843,8 @@ class FunctionAnalyzer:
                     start = self._arm_gap_function(s, e)
                 elif self.dis.arch == "mips":
                     start = self._mips_gap_function(s, e)
+                elif self.dis.arch == "riscv64":
+                    start = self._riscv_gap_function(s, e)
                 else:
                     start = self._gap_function(s, e, prologues)
                 if start is None or start in tried:
@@ -839,6 +905,29 @@ class FunctionAnalyzer:
                                      (w & 0x0F000000) == 0x0A000000 and w >> 28 == 0xE))
             at_start = False
             a += step
+        return None
+
+    def _riscv_gap_function(self, s: int, e: int) -> int | None:
+        """First RISC-V prologue in [s, e): `addi sp, sp, -n` (`c.addi16sp sp, -n`), at the start
+        of the gap after padding or right after an instruction that ends a function."""
+        a = (s + 1) & ~1
+        at_start, prev_end = True, False
+        while a + 2 <= e:
+            i = self.dis.decode(a)
+            if i is None:
+                a += 2
+                at_start, prev_end = False, False
+                continue
+            if i.mnemonic in ("nop", "c.nop") or self.bin.read_int(a, 2) == 0:
+                a += i.size if i.mnemonic in ("nop", "c.nop") else 2
+                continue
+            ops = i.cs.operands
+            if (at_start or prev_end) and i.mnemonic in ("addi", "c.addi16sp", "c.addi") and ops and \
+                    i.cs.reg_name(ops[0].reg) == "sp" and any(o.type == 2 and o.imm < 0 for o in ops):
+                return a
+            prev_end = i.kind in (RET, JMP)
+            at_start = False
+            a += i.size
         return None
 
     def _mips_gap_function(self, s: int, e: int) -> int | None:

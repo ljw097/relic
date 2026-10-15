@@ -24,6 +24,9 @@ def lifter_for(an: Analysis):
     if an.bin.arch == "mips" and an.bin.bits == 32:
         from .mips import MipsLifter
         return MipsLifter(an)
+    if an.bin.arch == "riscv64":
+        from .riscv import RiscVLifter
+        return RiscVLifter(an)
     raise NotImplementedError(f"no lifter for {an.bin.arch} yet")
 
 

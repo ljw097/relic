@@ -81,6 +81,14 @@ def _canon_mips():
     return canon
 
 
+def _canon_riscv():
+    from .lift.riscv import RiscVLifter
+
+    def canon(name: str) -> tuple[str, ...]:
+        return (RiscVLifter.canon(name),)
+    return canon
+
+
 def _canon_for(an: "Analysis"):
     arch = an.bin.arch
     if arch in ("x86", "x64"):
@@ -91,6 +99,8 @@ def _canon_for(an: "Analysis"):
         return _canon_arm()
     if arch == "mips" and an.bin.bits == 32:
         return _canon_mips()
+    if arch == "riscv64":
+        return _canon_riscv()
     return None
 
 
