@@ -54,14 +54,22 @@ def test_static_stripped_binary_gets_library_names(static_bins):
     assert "strlen(" in joined and "malloc(" in joined, joined
 
 
-CROSS = {"arm": ("arm-linux-gnueabihf", "/usr/arm-linux-gnueabihf/lib/libc.a"),
-         "arm64": ("aarch64-linux-gnu", "/usr/aarch64-linux-gnu/lib/libc.a")}
+# arch -> (toolchain, libc.a, functions to be named, share of all functions named at least)
+# (Thumb `fopen` is `movs r2, #1; b.n __fopen_internal`: 4 bytes, too few to tell; RISC-V
+# signatures stop where the linker may relax a call, so they name fewer)
+CROSS = {"arm": ("arm-linux-gnueabihf", "/usr/arm-linux-gnueabihf/lib/libc.a",
+                 {"malloc", "free", "fgetc", "fclose"}, 0.5),
+         "arm64": ("aarch64-linux-gnu", "/usr/aarch64-linux-gnu/lib/libc.a",
+                   {"malloc", "free", "fgetc", "fclose", "fopen"}, 0.5),
+         "mips": ("mipsel-linux-gnu", "/usr/mipsel-linux-gnu/lib/libc.a",
+                  {"malloc", "free", "fgetc", "fclose", "fopen", "strlen"}, 0.5),
+         "riscv64": ("riscv64-linux-gnu", "/usr/riscv64-linux-gnu/lib/libc.a", {"fgetc", "fclose", "strlen"}, 0.2)}
 
 
 @pytest.mark.parametrize("arch", sorted(CROSS))
 def test_cross_static_binaries_get_library_names(arch, tmp_path):
-    """ARM (Thumb-2 libc: a symbol's address has bit 0 set) and AArch64 signatures."""
-    triple, libc = CROSS[arch]
+    """ARM (Thumb-2 libc: a symbol's address has bit 0 set), AArch64, MIPS and RISC-V signatures."""
+    triple, libc, want, share = CROSS[arch]
     cc, strip = shutil.which(f"{triple}-gcc"), shutil.which(f"{triple}-strip")
     if cc is None or strip is None or not os.path.exists(libc):
         pytest.skip(f"needs {triple}-gcc, strip and a static libc")
@@ -77,10 +85,8 @@ def test_cross_static_binaries_get_library_names(arch, tmp_path):
     truth = {f.addr & ~1: f.name for f in analyze(full, sigs=[]).functions.values()}
     an = analyze(stripped, sigs=[sig])
     names = set(an.lib_names.values())
-    # (Thumb `fopen` is `movs r2, #1; b.n __fopen_internal`: 4 bytes, too few to tell)
-    want = {"malloc", "free", "fgetc", "fclose"} | ({"fopen"} if arch == "arm64" else set())
     assert want <= names, sorted(names)[:80]
-    assert len(an.lib_names) > 0.5 * sum(1 for f in an.functions.values() if not f.is_import)
+    assert len(an.lib_names) > share * sum(1 for f in an.functions.values() if not f.is_import)
     aliases = {}
     for s in db.sigs:
         for n in s.names:
@@ -90,8 +96,26 @@ def test_cross_static_binaries_get_library_names(arch, tmp_path):
         # (a static function with the same code as a library one has a name libc.a does not export)
         if not t.startswith("sub_") and libsigs._plain(t) in aliases:
             assert libsigs._plain(t) in aliases.get(libsigs._plain(n), {libsigs._plain(n)}), (hex(a), n, t)
-    main = an.function_by_name("main")
-    assert main is not None and main.addr & ~1 == next(a for a, n in truth.items() if n == "main")
+    if arch != "mips":                           # (MIPS `_start` calls through the GOT: no main yet)
+        main = an.function_by_name("main")
+        assert main is not None and main.addr & ~1 == next(a for a, n in truth.items() if n == "main")
+
+
+def test_cross_riscv_signatures_stop_where_calls_may_be_relaxed(tmp_path):
+    """`call f` (auipc + jalr) may become `jal f`: the code after it moves."""
+    gcc = shutil.which("riscv64-linux-gnu-gcc")
+    if gcc is None:
+        pytest.skip("needs riscv64-linux-gnu-gcc")
+    src = tmp_path / "f.c"
+    src.write_text("int g(int);\nint f(int x) { x = x * 7 + 3; x ^= x >> 2; return g(x) + 1; }\n")
+    obj = tmp_path / "f.o"
+    subprocess.run([gcc, "-O2", "-c", "-o", str(obj), str(src)], check=True)
+    arch, sigs = libsigs.object_signatures(obj.read_bytes())
+    s = next(s for s in sigs if "f" in s.names)
+    assert arch == "riscv64" and s.prefix and not s.refs        # cut before the call to g
+    db = libsigs.SigDB(arch, [s])
+    db.save(str(tmp_path / "f.sig"))
+    assert libsigs.SigDB.load(str(tmp_path / "f.sig")).sigs[0].prefix
 
 
 def test_signature_file_round_trip(tmp_path):

@@ -25,7 +25,7 @@
 ## P1 — 분석
 
 - [x] 정적 링크된 stripped 바이너리의 라이브러리 함수 이름 찾기(시그니처) — `relic/analysis/libsigs.py`, `relic sigs build`, File ▸ Apply library signatures
-  - [ ] 남은 일: 코드가 같은 짧은 스텁(`__chk_fail`/`__fortify_fail` 류, Thumb `fopen`처럼 어셈블러가 푼 분기 하나뿐인 함수) 구분, libgcc·libstdc++ 시그니처, MIPS·RISC-V 재배치의 비트 단위 마스크
+  - [ ] 남은 일: 코드가 같은 짧은 스텁(`__chk_fail`/`__fortify_fail` 류, Thumb `fopen`처럼 어셈블러가 푼 분기 하나뿐인 함수) 구분, libgcc·libstdc++ 시그니처, RISC-V는 완화(relaxation)될 수 있는 첫 호출에서 패턴이 끝나 이름이 적음(완화 모델링), stripped 정적 MIPS의 `main`(`_start`가 GOT로 `__libc_start_main` 호출 — `bal`로 만든 `gp`를 리프터가 풀지 못함)
 - [x] capstone 일괄 디코딩: 캐시에 없을 때 x86 명령 8개까지 한 번에 디코딩해 캐시(정적 바이너리 분석 약 9% 단축). 남은 비용은 capstone 파이썬 바인딩의 명령당 객체·detail 생성(약 70µs) — detail 없이(`disasm_lite`) 디코딩하고 필요할 때만 detail을 만드는 방법은 명령의 약 37%에만 해당해 보류
 
 ## P2

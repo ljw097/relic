@@ -32,6 +32,7 @@ MIN_FIXED = 12      # known (unmasked) bytes a pattern needs to be used
 REF_WEIGHT = 4      # ... where each checked reference counts as this many bytes
 MIN_SHORT = 16      # (a shorter pattern needs this much with its references counted)
 LONG_FIXED = 64     # known bytes past which a match needs no check of where the function ends
+PREFIX_FIXED = 32   # known bytes a prefix signature needs (function prologues look alike)
 PREFIX = 16         # bytes indexed for lookup
 MAX_LEN = 4096      # bytes of a function compared at most
 
@@ -60,7 +61,21 @@ _FIELDS = {
             # ARM: bl / b may become blx (the condition field and bit 24 change too)
             1: (0xF1FFFFFF, 4), 28: (0xF1FFFFFF, 4), 29: (0xF1FFFFFF, 4),
             43: (0x000F0FFF, 4), 44: (0x000F0FFF, 4)},                           # MOVW / MOVT
+    # MIPS: the 26-bit jump field, 16-bit immediates (%hi / %lo / %got / %call16 / branches);
+    # R_MIPS_JALR is a hint the linker may act on (jalr -> bal): whole word
+    "mips": {4: (0x03FFFFFF, 4), 5: (0xFFFF, 4), 6: (0xFFFF, 4), 7: (0xFFFF, 4), 9: (0xFFFF, 4),
+             10: (0xFFFF, 4), 11: (0xFFFF, 4), 19: (0xFFFF, 4), 20: (0xFFFF, 4), 21: (0xFFFF, 4),
+             22: (0xFFFF, 4), 23: (0xFFFF, 4), 30: (0xFFFF, 4), 31: (0xFFFF, 4)},
+    # RISC-V: U (auipc / lui), I, S and B immediates, jal, an unrelaxed call (auipc + jalr), the
+    # compressed branches and jumps
+    "riscv64": {23: (0xFFFFF000, 4), 26: (0xFFFFF000, 4), 20: (0xFFFFF000, 4),
+                24: (0xFFF00000, 4), 27: (0xFFF00000, 4), 25: (0xFE000F80, 4), 28: (0xFE000F80, 4),
+                16: (0xFE000F80, 4), 17: (0xFFFFF000, 4), 18: (0xFFF00000_FFFFF000, 8),
+                19: (0xFFF00000_FFFFF000, 8), 44: (0x1C7C, 2), 45: (0x1FFC, 2)},
 }
+# RISC-V R_RISCV_RELAX (the relocation at the same place may be relaxed: code after it moves)
+# and R_RISCV_ALIGN (nops the linker deletes)
+_RV_MOVES = {51, 43}
 
 # x86-64 relocations the linker may rewrite the instruction around (GOT relaxation, TLS models)
 _X64_RELAX = {41: 3, 42: 3, 9: 3}          # GOTPCREL(X): opcode / ModRM / REX before the field
@@ -89,6 +104,9 @@ class Signature:
     mask: bytes                    # bits that must match (0: filled in by the linker)
     # what the masked bytes refer to: (offset of the relocated field, symbol name)
     refs: list[tuple[int, str]] = field(default_factory=list)
+    # only the start of the function: past it the linker may move code (RISC-V relaxation
+    # shortens calls), so it says nothing about where the function ends
+    prefix: bool = False
 
     @property
     def fixed(self) -> int:
@@ -117,9 +135,7 @@ class SigDB:
     def save(self, path: str) -> None:
         os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
         data = {"arch": self.arch, "source": self.source,
-                "sigs": [[s.groups, _encode(s.pattern, s.mask), s.refs]
-                         + ([s.mask.hex()] if any(m not in (0, 0xFF) for m in s.mask) else [])
-                         for s in self.sigs]}
+                "sigs": [_entry(s) for s in self.sigs]}
         with gzip.open(path, "wt") as fp:
             json.dump(data, fp)
 
@@ -130,10 +146,23 @@ class SigDB:
         db = cls(data["arch"], source=data.get("source", path))
         for groups, text, *rest in data["sigs"]:
             pattern, mask = _decode(text)
-            if len(rest) > 1:                    # some bytes only partly known
+            if len(rest) > 1 and rest[1]:        # some bytes only partly known
                 mask = bytes.fromhex(rest[1])
-            db.sigs.append(Signature(groups, pattern, mask, [tuple(r) for r in rest[0]] if rest else []))
+            db.sigs.append(Signature(groups, pattern, mask, [tuple(r) for r in rest[0]] if rest else [],
+                                     len(rest) > 2 and bool(rest[2])))
         return db
+
+
+def _entry(s: Signature) -> list:
+    """[groups, pattern text, refs] (+ full mask when some bytes are only partly known, + 1 for a
+    prefix signature)."""
+    out = [s.groups, _encode(s.pattern, s.mask), s.refs]
+    partial = any(m not in (0, 0xFF) for m in s.mask)
+    if partial or s.prefix:
+        out.append(s.mask.hex() if partial else "")
+    if s.prefix:
+        out.append(1)
+    return out
 
 
 def _encode(pattern: bytes, mask: bytes) -> str:
@@ -184,6 +213,7 @@ def object_signatures(data: bytes) -> tuple[str, list[Signature]]:
         return arch, []
     # masked bytes per section: what relocations fill in
     masks: dict[int, bytearray] = {}
+    moves: dict[int, list[int]] = {}         # section -> offsets past which code may move
     refs: dict[int, list[tuple[int, str]]] = {}
     for rs in elf.iter_sections():
         if not isinstance(rs, RelocationSection):
@@ -196,6 +226,9 @@ def object_signatures(data: bytes) -> tuple[str, list[Signature]]:
         rsym = elf.get_section(rs["sh_link"])
         for r in rs.iter_relocations():
             off, t = r["r_offset"], r["r_info_type"]
+            if arch == "riscv64" and t in _RV_MOVES:
+                moves.setdefault(rs["sh_info"], []).append(off)
+                continue
             weak_undef = False
             if r["r_info_sym"] and isinstance(rsym, SymbolTableSection):
                 target = rsym.get_symbol(r["r_info_sym"])
@@ -239,10 +272,15 @@ def object_signatures(data: bytes) -> tuple[str, list[Signature]]:
         if arch == "arm":
             value &= ~1                          # (a Thumb function's symbol has bit 0 set)
         code = sec.data()[value:value + min(size, MAX_LEN)]
+        cut = min((o - value for o in moves.get(shndx, ()) if value <= o < value + len(code)), default=None)
+        if cut is not None:
+            code = code[:cut]
+            if not code:
+                continue
         m = masks.get(shndx)
         mask = bytes(m[value:value + len(code)]) if m is not None else b"\xff" * len(code)
         own = sorted((o - value, n) for o, n in refs.get(shndx, ()) if value <= o < value + len(code))
-        out.append(Signature([[n for _weak, n in sorted(set(names))]], bytes(code), mask, own))
+        out.append(Signature([[n for _weak, n in sorted(set(names))]], bytes(code), mask, own, cut is not None))
     return arch, out
 
 
@@ -266,7 +304,7 @@ def build(paths: list[str]) -> SigDB:
             if arch != db.arch:
                 continue
             for s in sigs:
-                key = (s.pattern, s.mask, tuple(s.refs))
+                key = (s.pattern, s.mask, tuple(s.refs), s.prefix)
                 old = seen.get(key)
                 if old is None:
                     seen[key] = s
@@ -287,6 +325,8 @@ class Matcher:
             for s in db.sigs:
                 # a short pattern is usable when what it refers to is checked too (see match)
                 if s.fixed < MIN_FIXED and (not s.refs or s.fixed + REF_WEIGHT * len(s.refs) < MIN_SHORT):
+                    continue
+                if s.prefix and s.fixed + REF_WEIGHT * len(s.refs) < PREFIX_FIXED:
                     continue
                 n = min(PREFIX, len(s.pattern))
                 pm = int.from_bytes(s.mask[:n], "little")
@@ -315,7 +355,8 @@ class Matcher:
                 # (a long match says enough: the analysis may not see where the function ends
                 # when it calls one not yet known not to return)
                 if len(code) < size or int.from_bytes(code[:size], "little") & mask != want or \
-                        (s.fixed < LONG_FIXED and not ends_ok(size)) or (s.fixed < MIN_FIXED and not refs_ok(s)):
+                        (s.fixed < LONG_FIXED and not s.prefix and not ends_ok(size)) or \
+                        (s.fixed < MIN_FIXED and not refs_ok(s)):
                     continue
                 found.setdefault(size, []).append(s)
         # the longest match; a shorter one only when what each longer one refers to is wrong
