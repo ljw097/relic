@@ -30,7 +30,7 @@ import sys
 from . import __version__
 
 COMMANDS = ("info", "checksec", "funcs", "disasm", "cfg", "strings", "imports", "xrefs", "vulns", "ir", "opt",
-            "decompile", "search", "patch", "script", "sigs", "types", "gui")
+            "decompile", "search", "patch", "script", "sigs", "types", "project", "gui")
 
 
 def _parser() -> argparse.ArgumentParser:
@@ -78,6 +78,12 @@ def _parser() -> argparse.ArgumentParser:
     s = add("types", "import C headers into the project (structs, enums, typedefs, prototypes), or list them")
     s.add_argument("headers", nargs="*", metavar="FILE.h", help="headers to import (none: list what is imported)")
     s.add_argument("--no-save", action="store_true", help="check the headers without saving the project")
+    s = add("project", "snapshots of the annotations; merge another analyst's project file")
+    s.add_argument("action", choices=("snapshots", "snapshot", "restore", "delete", "merge"),
+                   help="snapshots: list; snapshot/restore/delete NAME; merge OTHER.relic.json")
+    s.add_argument("arg", nargs="?", metavar="NAME|FILE")
+    s.add_argument("--theirs", action="store_true", help="merge: where both differ, take the other file's value")
+    s.add_argument("--force", action="store_true", help="merge: even if the project is for another binary")
     s = add("search", "search bytes, text, immediates or instructions")
     how = s.add_mutually_exclusive_group(required=True)
     how.add_argument("--bytes", metavar="PATTERN", help="hex bytes, `??` for any byte: '48 8b ?? 05'")
@@ -398,6 +404,42 @@ def cmd_decompile(args):
                 print(f"{tag}  {'    ' * ln.depth}{ln.text}".rstrip())
         else:
             print(d.text)
+
+
+def cmd_project(args):
+    from .analysis.project import ProjectMismatch, summary
+    an = _analyze(args)
+    if args.action == "snapshots":
+        for name, snap in an.snapshots.items():
+            print(f"{name:24} {snap['time']}  {summary(snap['notes'])}")
+        if not an.snapshots:
+            print("no snapshots")
+        return
+    if not args.arg:
+        sys.exit(f"relic: project {args.action} needs a {'file' if args.action == 'merge' else 'name'}")
+    if args.action == "snapshot":
+        snap = an.take_snapshot(args.arg)
+        print(f"snapshot '{args.arg}': {summary(snap['notes'])}")
+    elif args.action == "restore":
+        if args.arg not in an.snapshots:
+            sys.exit(f"relic: no snapshot '{args.arg}'")
+        an.restore_snapshot(args.arg)
+        print(f"restored '{args.arg}'")
+    elif args.action == "delete":
+        if not an.delete_snapshot(args.arg):
+            sys.exit(f"relic: no snapshot '{args.arg}'")
+        print(f"deleted '{args.arg}'")
+    else:
+        try:
+            got = an.merge_project(args.arg, theirs=args.theirs, force=args.force)
+        except (ProjectMismatch, ValueError) as e:
+            sys.exit(f"relic: {e}")
+        added = ", ".join(f"{n} {k}" for k, n in got["added"].items()) or "nothing"
+        print(f"added {added}")
+        for section, key, ours, theirs in got["conflicts"]:
+            key = f"{key:#x}" if isinstance(key, int) else (f"{key[0]:#x} {key[1]}" if isinstance(key, tuple) else key)
+            print(f"conflict {section} {key}: ours {ours!r}, theirs {theirs!r} (kept {got['kept']})")
+    an.save_project()
 
 
 def cmd_search(args):

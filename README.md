@@ -38,7 +38,7 @@
 | 대화형 UI (12) | 리스팅·그래프·xref·이름/주석·검색·패치·undo·북마크·구조체 창 | 리스팅·그래프(층별 레이아웃)·의사 코드·헥스, 이름/주석/변수 이름, xref, 이동 기록, 테마·확대, 검색(바이트·텍스트·즉치값·명령어), 바이트 패치(NOP·분기 반전·어셈블, 프로젝트에 저장, 패치된 파일 내보내기), 모든 편집(이름·주석·타입·구조체·북마크·패치)의 undo/redo, 북마크, 함수 안 데이터(리터럴 풀·인라인 점프 테이블·패딩) 표시 | 62% |
 | 스크립팅·확장 (8) | IDAPython, IDC, SDK, 플러그인 | Python 라이브러리 API, 스크립팅 API(`here()`·`rename()`·`decompile()`·`patch()` …), GUI Python 콘솔, 플러그인(`register(api)` → Plugins 메뉴, 리스팅 줄 꾸미기·분석 완료·커서 이동 훅), `relic script` 배치 실행, CLI | 40% |
 | 디버거 (7) | 로컬·원격(gdbserver 등) 디버깅 | 로컬 GUI 디버거(GDB/MI): 실행·단계 실행·중단점(조건·활성화·적중 횟수, 라이브러리 함수 이름)·하드웨어 watchpoint·리스팅/의사 코드 동기화, pwndbg식 레지스터·스택 telescope·vmmap·메모리 hexdump·백트레이스·콘솔, 레지스터·메모리 편집, PIE 슬라이드 보정; 원격·힙 뷰 없음 | 40% |
-| 프로젝트·협업 (5) | IDB, 스냅숏, Teams, Lumina | `<binary>.relic.json`(이름·주석·변수 이름·타입·구조체·패치·북마크) | 22% |
+| 프로젝트·협업 (5) | IDB, 스냅숏, Teams, Lumina | `<binary>.relic.json`(이름·주석·변수 이름·타입·구조체·패치·북마크, 바이너리 SHA-256), 이름 붙인 스냅숏(복원은 undo 한 단계), 다른 분석가의 프로젝트 파일 병합(충돌 보고, 우리/그쪽 우선) | 35% |
 
 IDA Pro에 없는 Relic 쪽 기능: checksec(ELF/PE 보호 기법), 포너블 휴리스틱(위험 함수, 비상수 포맷 스트링, 폭 없는 `scanf("%s")`, ret2win 후보), 디컴파일 결과의 재컴파일 검증 하네스.
 
@@ -63,7 +63,7 @@ IDA Pro에 없는 Relic 쪽 기능: checksec(ELF/PE 보호 기법), 포너블 �
 | C++ | Itanium 심볼 디맹글링 (`geo::Rect::area() const`), 짧은 이름으로 이동·디컴파일 (`relic decompile ./a.out geo::total`) |
 | checksec | ELF: RELRO / Canary / NX / PIE / FORTIFY / RPATH, PE: ASLR / DEP / CFG / SEH / GS |
 | 포너블 휴리스틱 | `gets`·`strcpy` 등 위험 함수, 비상수 포맷 스트링, 폭 없는 `scanf("%s")`, ret2win 후보 |
-| 프로젝트 | 이름 변경·주석·디컴파일러 변수 이름·바이트 패치를 `<binary>.relic.json`에 저장 (CLI 출력에도 반영, 패치는 열 때 다시 적용) |
+| 프로젝트 | 이름 변경·주석·디컴파일러 변수 이름·바이트 패치를 `<binary>.relic.json`에 저장 (CLI 출력에도 반영, 패치는 열 때 다시 적용); 스냅숏(File ▸ Snapshots), 다른 프로젝트 파일 병합(File ▸ Merge project) |
 | 패치 | 바이트·NOP·조건 분기 반전(x86, ARM/Thumb, AArch64, MIPS)·어셈블(keystone), 패치 후 재분석, 패치된 파일 내보내기(`relic patch`, Edit 메뉴) |
 | GUI | 함수 목록, 디스어셈블리 / CFG 그래프 / 의사 코드 / 헥스, xref·문자열·import·vulns·checksec 패널 |
 | 디컴파일러 (x86-64, x86-32, AArch64, ARM32, MIPS32, RISC-V RV64GC) | 리프팅 → SSA·최적화 → 호출 인자·스택 버퍼·카나리 → out-of-SSA → 구조화 → C 출력(`relic decompile`) |
@@ -99,6 +99,8 @@ relic decompile ./chall main         # C 유사 의사 코드 (--addrs: 줄마�
 relic decompile ./chall main --header chall.h   # C 선언(구조체·열거형·typedef·원형)을 써서 디컴파일
 relic types     ./chall chall.h      # C 헤더를 프로젝트에 가져오기 (인자 없이: 가져온 타입 목록)
 relic decompile ./chall -a -o chall.c   # 바이너리 전체 의사 코드를 C 파일 하나로 (구조체 선언은 한 번)
+relic project   ./chall snapshot before  # 지금의 이름·주석·타입을 스냅숏으로 (snapshots / restore / delete)
+relic project   ./chall merge bob/chall.relic.json   # 다른 분석가의 작업 병합 (--theirs: 충돌 시 그쪽 값)
 relic search    ./chall --bytes '48 8b ?? 05'   # 바이트 패턴 (--text, --imm 0x186a0, --insn 'call.*system')
 relic script    ./chall rename_all.py arg1      # 스크립팅 API로 Python 실행 (--save: 프로젝트 저장, 옵션은 스크립트 앞에)
 relic sigs build /usr/lib/x86_64-linux-gnu/libc.a -o ~/.relic/sigs/glibc-x64.sig   # 라이브러리 시그니처

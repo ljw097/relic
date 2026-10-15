@@ -127,6 +127,23 @@ class Api:
         with open(path, "w") as fp:
             return export_c(self.an, fp)
 
+    def snapshot(self, name: str) -> dict:
+        """Keep a named copy of every annotation (saved with the project)."""
+        return self.an.take_snapshot(name)
+
+    def restore_snapshot(self, name: str):
+        """Put snapshot `name`'s annotations back (undoable)."""
+        self.an.restore_snapshot(name)
+        if self.win is not None:
+            self.win._after_edit()
+
+    def merge(self, path: str, theirs: bool = False) -> dict:
+        """Merge another project file of this binary: {"added", "conflicts", "kept"}."""
+        got = self.an.merge_project(path, theirs)
+        if self.win is not None:
+            self.win._after_edit()
+        return got
+
     def set_return_type(self, func, ctype: str):
         """The C type a function returns (`char *`, `void`; empty resets)."""
         f = self.func(func)
@@ -243,7 +260,7 @@ def namespace(an: "Analysis", win=None) -> dict:
     ns = {"an": an, "bin": an.bin, "api": api, "win": win}
     for n in ("addr", "here", "goto", "name", "rename", "rename_struct", "rename_field", "set_type",
               "set_field_type", "add_field", "remove_field", "comment", "func", "import_header", "set_return_type",
-              "export",
+              "export", "snapshot", "restore_snapshot", "merge",
               "functions", "xrefs_to", "xrefs_from",
               "disasm", "decompile", "strings", "search", "patch", "nop", "invert", "assemble", "revert", "save"):
         ns[n] = getattr(api, n)
