@@ -277,18 +277,20 @@ class CType:
 _BASES = {"void", "char", "short", "int", "long", "bool", "float", "double", "size_t", "ssize_t", "FILE",
           "int8_t", "int16_t", "int32_t", "int64_t", "uint8_t", "uint16_t", "uint32_t", "uint64_t",
           "unsigned char", "unsigned short", "unsigned int", "unsigned long", "unsigned", "signed char",
-          "long long", "unsigned long long", "__int128", "unsigned __int128"}
+          "long long", "unsigned long long", "__int128", "unsigned __int128", "long double", "wchar_t",
+          "intptr_t", "uintptr_t", "ptrdiff_t"}
 
 
 def parse_ctype(text: str) -> CType:
     """`int`, `unsigned int`, `char *`, `struct note *`, `void **` -> CType; ValueError otherwise."""
     import re
     t = " ".join(text.replace("*", " * ").split())
-    m = re.fullmatch(r"(?:const )?((?:struct )?[A-Za-z_][A-Za-z0-9_]*(?: [A-Za-z_][A-Za-z0-9_]*)*)((?: \*)*)", t)
+    m = re.fullmatch(r"(?:const )?((?:struct |enum )?[A-Za-z_][A-Za-z0-9_]*(?: [A-Za-z_][A-Za-z0-9_]*)*)((?: \*)*)",
+                     t)
     if m is None:
         raise ValueError(f"not a C type: {text!r}")
     base, ptr = m.group(1), m.group(2).count("*")
-    if not base.startswith("struct ") and base not in _BASES:
+    if not base.startswith(("struct ", "enum ")) and base not in _BASES:
         raise ValueError(f"unknown type {base!r} (an integer type, void, char, or struct NAME)")
     if base == "void" and not ptr:
         raise ValueError("void is only a pointer target")

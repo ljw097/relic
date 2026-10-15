@@ -52,6 +52,9 @@ def prepare(an: "Analysis", func: "Function") -> Prepared:
     from .fpabi import fp_params, fp_return
     fret = fp_return(an, func)
     rets = fret is not None or returns_value(an, func, fn, arch.ret)
+    user_ret = an.var_types.get(func.addr, {}).get("@return")       # the user's / a header's type
+    if user_ret is not None and fret is None:
+        rets = user_ret != "void"
     if not rets:
         drop_return_values(fn)
     rewrite_locals(fn, frame)
@@ -93,6 +96,10 @@ def prepare(an: "Analysis", func: "Function") -> Prepared:
     w = None
     if fret is not None:
         w = fret
+    elif user_ret is not None:
+        w = _type_bits(user_ret, arch.bits)
+        if w is not None and w < arch.bits:
+            narrow_returns(fn, w)
     elif rets:
         w = return_width(an, func, arch.ret)
         if w is not None:
@@ -117,6 +124,16 @@ def prepare(an: "Analysis", func: "Function") -> Prepared:
     from .chains import switchify
     tree = switchify(tree, frozenset(st.gotos))     # compare chains on one value -> switch
     return Prepared(fn, arch, frame, params, rets, tree, st.gotos, w, fret is not None)
+
+
+def _type_bits(ctype: str, ptr_bits: int) -> int | None:
+    """Width of an integer / pointer C type; None for what is not one (or unknown)."""
+    if ctype.endswith("*"):
+        return ptr_bits
+    if ctype.startswith("enum "):
+        return 32
+    from .structs import _CTYPE_BITS
+    return _CTYPE_BITS.get(ctype, 64 if ctype in ("long", "unsigned long", "size_t", "ssize_t") else None)
 
 
 __all__ = ["Prepared", "prepare"]

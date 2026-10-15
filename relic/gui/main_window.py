@@ -392,6 +392,7 @@ class MainWindow(QMainWindow):
         self._fill_recent_menu()
         act(m, "&Save project", QKeySequence.StandardKey.Save, self.save_project)
         act(m, "Apply library &signatures...", None, self.signatures_dialog)
+        act(m, "Import C &header...", None, self.header_dialog)
         m.addSeparator()
         act(m, "&Cancel background work", "Ctrl+.", self.cancel_work, False)
         m.addSeparator()
@@ -1215,6 +1216,20 @@ class MainWindow(QMainWindow):
             if ok:
                 self.set_var_type(gen, text)
             return
+        func = self.decomp.func
+        if func is not None and self.decomp.textCursor().blockNumber() == self._signature_row() and \
+                self.decomp.word_under_cursor() == (self.an.name(func.addr) or func.name):
+            cur = self.an.var_types.get(func.addr, {}).get("@return", "")
+            text, ok = QInputDialog.getText(self, "Set type", f"Return type of {self.an.name(func.addr)} "
+                                            "(empty: as recovered):", text=cur)
+            if ok:
+                try:
+                    self.an.set_return_type(func.addr, text)
+                except ValueError as e:
+                    self.statusBar().showMessage(f"set type: {e}", 5000)
+                    return
+                self._after_edit()
+            return
         st = self.decomp.struct_under_cursor()
         if st is not None and st[2] is not None:
             shown, struct, fld = st
@@ -1223,6 +1238,13 @@ class MainWindow(QMainWindow):
                                             text=cur)
             if ok:
                 self.set_field_type(struct, fld, text)
+
+    def _signature_row(self) -> int:
+        """The pseudocode row of the function's signature (after the struct declarations)."""
+        lines = self.decomp.toPlainText().split("\n")
+        name = self.an.name(self.decomp.func.addr) or ""
+        return next((k for k, ln in enumerate(lines) if ln and not ln.startswith((" ", "}", "struct", "union", "//"))
+                     and f"{name}(" in ln), -1)
 
     def set_var_type(self, generated: str, ctype: str) -> bool:
         func = self.decomp.func
@@ -1279,6 +1301,26 @@ class MainWindow(QMainWindow):
     def comment(self, addr: int, text: str):
         self.an.comment(addr, text)
         self._after_edit()
+
+    def header_dialog(self):
+        """Pick C headers: their structs, enums, typedefs and prototypes go into the project."""
+        paths, _ = QFileDialog.getOpenFileNames(self, "Import C header", os.path.dirname(self.an.bin.path),
+                                                "C headers (*.h *.hpp *.c);;All files (*)")
+        for p in paths:
+            self.import_header(p)
+
+    def import_header(self, path: str) -> dict | None:
+        from ..decompiler.cheader import HeaderError
+        try:
+            with open(path) as fp:
+                got = self.an.import_header(fp.read())
+        except (OSError, HeaderError) as e:
+            QMessageBox.warning(self, "Import C header", f"{os.path.basename(path)}: {e}")
+            return None
+        parts = [f"{len(got[k])} {k}" for k in ("structs", "enums", "typedefs", "functions") if got[k]]
+        self.statusBar().showMessage(f"{os.path.basename(path)}: {', '.join(parts) or 'nothing new'}", 6000)
+        self._after_edit()
+        return got
 
     def signatures_dialog(self):
         """Pick signature files (or static libraries, built into ~/.relic/sigs) and name the
