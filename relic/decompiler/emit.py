@@ -415,6 +415,35 @@ class CWriter:
                 return not any(clobbers(o) for o in b.stmts[d + 1:w])
         return not any(clobbers(o) for o in self.p.fn.stmts() if not (o.addr == s.addr and o.dst == s.dst))
 
+    def _drop_unit_reads(self):
+        """`v1 = *(char *)a1;` read once for bit-fields that are all shown as `a1->version`,
+        `a1->ihl`: the variable is left only in its declaration and that assignment -- drop both."""
+        if not any(d.get("bitfields") for d in self.an.struct_names.values()):
+            return
+        from .structs import split_addr
+        for st in self.p.fn.stmts():
+            if not (isinstance(st, Assign) and isinstance(st.dst, Var) and st.dst.name in self.names):
+                continue
+            ld = st.src
+            while isinstance(ld, Cast):
+                ld = ld.a
+            sp = split_addr(ld.addr) if isinstance(ld, Load) else None
+            u = self.structs.struct_of(sp[0]) if sp is not None else None
+            if u is None or not self.an.struct_names.get(u.name, {}).get("bitfields"):
+                continue
+            name = self.vname(st.dst.name)
+            word = re.compile(rf"\b{re.escape(name)}\b")
+            hits = [k for k, ln in enumerate(self.out) if word.search(ln.text)]
+            if len(hits) != 2:
+                continue
+            decl, asg = (self.out[k].text for k in hits)
+            if decl.endswith((f" {name};", f"*{name};")) and asg.startswith(f"{name} = "):
+                for k in reversed(hits):
+                    del self.out[k]
+        # declarations all gone: no blank line under the brace
+        if len(self.out) > 2 and self.out[1].text == "{" and self.out[2].text == "" and self.out[2].depth == 1:
+            del self.out[2]
+
     def _bitfield_stores(self):
         """Find the stores `bitfield_writes` shows as field assignments (before the body is
         written), and hide the read of the old unit when that store was its only use (`v1 =
@@ -1251,6 +1280,7 @@ class CWriter:
         if body and isinstance(body[-1], Ret) and body[-1].stmt.value is None:
             body.pop()            # `return;` at the end of a void function says nothing
         self.node(Seq(body), 1)
+        self._drop_unit_reads()
         # a `return;` that ends a void function says nothing
         if len(self.out) >= 2 and self.out[-1].text == "return;" and self.out[-1].depth == 1:
             self.out.pop()

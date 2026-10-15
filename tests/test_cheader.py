@@ -197,6 +197,7 @@ def test_enumerators_fields_and_signatures(typed):
     assert "->state == RUNNING" in code and "->next" in code and "f_" not in code, code
     code = _c(an, "packet_len")
     assert "->version != 4" in code and "->ihl" in code and "->frag" in code and "->flags == 2" in code, code
+    assert "(char *)" not in code.split("packet_len(", 1)[1], code    # (no unused read of the unit)
     assert "unsigned int version : 4;" in code and "version_ihl" not in code.split("{", 2)[-1].split("return")[-1]
     # the read-modify-write of a bit-field's storage unit is an assignment to the field
     code = _c(an, "packet_set")
