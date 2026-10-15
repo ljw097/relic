@@ -98,6 +98,7 @@ relic opt       ./chall checksum --xrefs  # SSA + 최적화 IR, 문자열·교�
 relic decompile ./chall main         # C 유사 의사 코드 (--addrs: 줄마다 명령어 주소, -a: 모든 함수)
 relic decompile ./chall main --header chall.h   # C 선언(구조체·열거형·typedef·원형)을 써서 디컴파일
 relic types     ./chall chall.h      # C 헤더를 프로젝트에 가져오기 (인자 없이: 가져온 타입 목록)
+relic decompile ./chall -a -o chall.c   # 바이너리 전체 의사 코드를 C 파일 하나로 (구조체 선언은 한 번)
 relic search    ./chall --bytes '48 8b ?? 05'   # 바이트 패턴 (--text, --imm 0x186a0, --insn 'call.*system')
 relic script    ./chall rename_all.py arg1      # 스크립팅 API로 Python 실행 (--save: 프로젝트 저장, 옵션은 스크립트 앞에)
 relic sigs build /usr/lib/x86_64-linux-gnu/libc.a -o ~/.relic/sigs/glibc-x64.sig   # 라이브러리 시그니처

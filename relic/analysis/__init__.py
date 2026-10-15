@@ -565,6 +565,13 @@ class Analysis:
         if not types:
             self.var_types.pop(func, None)
 
+    def clear_imported_types(self):
+        """Forget every imported C declaration: headers, enums, typedefs, prototypes and the
+        structs they defined (types the user set by hand stay)."""
+        self.user_types = {}
+        for name in [n for n, d in self.struct_names.items() if d.get("imported")]:
+            del self.struct_names[name]
+
     def enum(self, name: str) -> dict[str, int] | None:
         return self.user_types.get("enums", {}).get(name)
 
@@ -731,7 +738,8 @@ def _undoable(method):
 
 
 for _name in ("rename", "rename_var", "rename_struct", "rename_field", "set_var_type", "set_field_type",
-              "add_field", "remove_field", "comment", "bookmark", "import_header", "set_return_type"):
+              "add_field", "remove_field", "comment", "bookmark", "import_header", "set_return_type",
+              "clear_imported_types"):
     setattr(Analysis, _name, _undoable(getattr(Analysis, _name)))
 
 

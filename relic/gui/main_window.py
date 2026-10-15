@@ -108,6 +108,29 @@ class VulnsThread(WorkThread):
         self.done.emit(self.an.vulns())
 
 
+class ExportThread(WorkThread):
+    """Writes the whole binary's pseudocode to a C file (relic.decompiler.export)."""
+
+    done = Signal(object, str)          # result, path
+
+    def __init__(self, an: Analysis, path: str, parent=None):
+        super().__init__(parent)
+        self.an, self.path = an, path
+
+    def work(self):
+        from ..decompiler.export import export_c
+        tmp = self.path + ".part"
+        try:
+            with open(tmp, "w") as fp:
+                res = export_c(self.an, fp)
+        except BaseException:
+            if os.path.exists(tmp):
+                os.remove(tmp)              # (a cancelled export leaves no half-written file)
+            raise
+        os.replace(tmp, self.path)
+        self.done.emit(res, self.path)
+
+
 class SearchThread(WorkThread):
     """Runs one search (relic.analysis.search) off the GUI thread."""
 
@@ -393,6 +416,7 @@ class MainWindow(QMainWindow):
         act(m, "&Save project", QKeySequence.StandardKey.Save, self.save_project)
         act(m, "Apply library &signatures...", None, self.signatures_dialog)
         act(m, "Import C &header...", None, self.header_dialog)
+        act(m, "&Export pseudocode...", None, self.export_dialog)
         m.addSeparator()
         act(m, "&Cancel background work", "Ctrl+.", self.cancel_work, False)
         m.addSeparator()
@@ -448,6 +472,7 @@ class MainWindow(QMainWindow):
         m = mb.addMenu("&View")
         act(m, "&Python console", "Ctrl+Shift+P", self.show_python_console, False)
         act(m, "&Structures...", "Ctrl+Shift+S", self.show_structs)
+        act(m, "C &types...", None, self.show_types)
         self.light_act = act(m, "&Light theme", "Ctrl+Shift+L",
                              lambda on: self.set_appearance(theme="light" if on else "dark"), False)
         self.light_act.setCheckable(True)
@@ -607,7 +632,8 @@ class MainWindow(QMainWindow):
             self.progress.setFormat(f"{what}: {stage} {done}" if done else f"{what}: {stage}")
 
     def running_work(self) -> list[WorkThread]:
-        return [t for t in (self.thread, self.vulns_thread, getattr(self, "search_thread", None))
+        return [t for t in (self.thread, self.vulns_thread, getattr(self, "search_thread", None),
+                            getattr(self, "export_thread", None))
                 if t is not None and t.isRunning()]
 
     def _work_finished(self):
@@ -1301,6 +1327,41 @@ class MainWindow(QMainWindow):
     def comment(self, addr: int, text: str):
         self.an.comment(addr, text)
         self._after_edit()
+
+    def export_dialog(self):
+        """Write the pseudocode of every function to a C file, in the background."""
+        if getattr(self, "export_thread", None) is not None and self.export_thread.isRunning():
+            self.statusBar().showMessage("an export is already running", 3000)
+            return
+        start = self.an.bin.path + ".c"
+        path, _ = QFileDialog.getSaveFileName(self, "Export pseudocode", start, "C files (*.c);;All files (*)")
+        if path:
+            self.export_pseudocode(path)
+
+    def export_pseudocode(self, path: str) -> "ExportThread":
+        t = ExportThread(self.an, path, self)
+        t.done.connect(self._exported)
+        t.failed.connect(lambda msg: QMessageBox.warning(self, "Export pseudocode", msg.split("\n\n")[0]))
+        t.cancelled.connect(lambda: self.statusBar().showMessage("export cancelled", 4000))
+        self.export_thread = t
+        self._track(t, "export")
+        t.start()
+        return t
+
+    def _exported(self, res: dict, path: str):
+        more = f", {len(res['failed'])} not decompiled" if res["failed"] else ""
+        self.statusBar().showMessage(f"{os.path.basename(path)}: {res['functions']} functions{more}", 8000)
+
+    def show_types(self):
+        """The imported C types window."""
+        from .types import TypesDialog
+        if getattr(self, "types_dialog", None) is None:
+            self.types_dialog = TypesDialog(self)
+        else:
+            self.types_dialog.refresh()
+        self.types_dialog.show()
+        self.types_dialog.raise_()
+        return self.types_dialog
 
     def header_dialog(self):
         """Pick C headers: their structs, enums, typedefs and prototypes go into the project."""

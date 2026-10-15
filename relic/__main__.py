@@ -71,6 +71,8 @@ def _parser() -> argparse.ArgumentParser:
     s = add("decompile", "C-like pseudocode", where=True)
     s.add_argument("-a", "--all", action="store_true", help="every function in the binary")
     s.add_argument("--addrs", action="store_true", help="prefix each line with its instruction address")
+    s.add_argument("-o", "--output", metavar="FILE.c",
+                   help="write the pseudocode to a C file (with -a: struct declarations once, then every function)")
     s.add_argument("--header", action="append", metavar="FILE.h",
                    help="C declarations to use (structs, enums, typedefs, prototypes; repeatable, not saved)")
     s = add("types", "import C headers into the project (structs, enums, typedefs, prototypes), or list them")
@@ -363,6 +365,13 @@ def cmd_decompile(args):
     from .decompiler.emit import decompile
     an = _analyze(args)
     list(_import_headers(an, args.header))
+    if args.all and args.output:
+        from .decompiler.export import export_c
+        with open(args.output, "w") as fp:
+            res = export_c(an, fp)
+        print(f"{args.output}: {res['functions']} functions, {res['structs']} structs"
+              + (f", {len(res['failed'])} not decompiled" if res["failed"] else ""))
+        return
     if args.all:
         funcs = [f for f in sorted(an.functions.values(), key=lambda f: f.addr) if not f.is_import]
     else:
@@ -379,6 +388,10 @@ def cmd_decompile(args):
             sys.exit(f"relic: {e}")
         if k:
             print()
+        if args.output:
+            with open(args.output, "a" if k else "w") as fp:
+                fp.write(d.text + "\n\n")
+            continue
         if args.addrs:
             for ln in d.lines:
                 tag = f"{ln.addr:8x}" if ln.addr is not None else " " * 8

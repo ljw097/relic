@@ -121,6 +121,12 @@ class Api:
             self.win._after_edit()
         return got
 
+    def export(self, path: str) -> dict:
+        """Write every function's pseudocode to a C file; what was written."""
+        from .decompiler.export import export_c
+        with open(path, "w") as fp:
+            return export_c(self.an, fp)
+
     def set_return_type(self, func, ctype: str):
         """The C type a function returns (`char *`, `void`; empty resets)."""
         f = self.func(func)
@@ -237,6 +243,7 @@ def namespace(an: "Analysis", win=None) -> dict:
     ns = {"an": an, "bin": an.bin, "api": api, "win": win}
     for n in ("addr", "here", "goto", "name", "rename", "rename_struct", "rename_field", "set_type",
               "set_field_type", "add_field", "remove_field", "comment", "func", "import_header", "set_return_type",
+              "export",
               "functions", "xrefs_to", "xrefs_from",
               "disasm", "decompile", "strings", "search", "patch", "nop", "invert", "assemble", "revert", "save"):
         ns[n] = getattr(api, n)
