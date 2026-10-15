@@ -31,6 +31,7 @@ if TYPE_CHECKING:
 MIN_FIXED = 12      # known (unmasked) bytes a pattern needs to be used
 REF_WEIGHT = 4      # ... where each checked reference counts as this many bytes
 MIN_SHORT = 16      # (a shorter pattern needs this much with its references counted)
+LONG_FIXED = 64     # known bytes past which a match needs no check of where the function ends
 PREFIX = 16         # bytes indexed for lookup
 MAX_LEN = 4096      # bytes of a function compared at most
 
@@ -39,6 +40,28 @@ _ARCH = {"EM_X86_64": "x64", "EM_386": "x86", "EM_ARM": "arm", "EM_AARCH64": "ar
 
 # relocation types patching 8 bytes (the rest patch 4: data words and instruction words alike)
 _WIDE = {"x64": {1, 24, 25, 27, 28, 29, 31, 33}, "arm64": {257}, "riscv64": {2}}
+# ARM / AArch64 relocations filling only some bits of an instruction: type -> (bits it may
+# change, as a little-endian int over `size` bytes). The opcode and registers around them stay
+# known. Others (data words, GOT and TLS sequences the linker may relax) mask whole fields.
+_A64_PAGE, _A64_LO12, _A64_B26 = 0x60FFFFE0, 0x003FFC00, 0x03FFFFFF
+_FIELDS = {
+    "arm64": {275: (_A64_PAGE, 4), 276: (_A64_PAGE, 4), 274: (_A64_PAGE, 4),     # adrp / adr
+              277: (_A64_LO12, 4), 278: (_A64_LO12, 4), 284: (_A64_LO12, 4),     # add / ldst lo12
+              285: (_A64_LO12, 4), 286: (_A64_LO12, 4), 299: (_A64_LO12, 4),
+              282: (_A64_B26, 4), 283: (_A64_B26, 4),                            # b / bl
+              280: (0x00FFFFE0, 4), 273: (0x00FFFFE0, 4), 279: (0x0007FFE0, 4),  # b.cond, ldr lit, tbz
+              263: (0x001FFFE0, 4), 264: (0x001FFFE0, 4), 265: (0x001FFFE0, 4),  # movz / movk
+              266: (0x001FFFE0, 4), 267: (0x001FFFE0, 4), 268: (0x001FFFE0, 4), 269: (0x001FFFE0, 4)},
+    # Thumb-2 halfwords (first in the low 16 bits); bl / b.w may become blx (bit 12 of the second)
+    "arm": {10: (0x3FFF07FF, 4), 30: (0x3FFF07FF, 4),                            # THM_CALL / JUMP24
+            51: (0x2FFF043F, 4),                                                 # THM_JUMP19
+            47: (0x70FF040F, 4), 48: (0x70FF040F, 4),                            # THM_MOVW / MOVT
+            102: (0x07FF, 2), 103: (0x00FF, 2),                                  # THM_JUMP11 / JUMP8
+            # ARM: bl / b may become blx (the condition field and bit 24 change too)
+            1: (0xF1FFFFFF, 4), 28: (0xF1FFFFFF, 4), 29: (0xF1FFFFFF, 4),
+            43: (0x000F0FFF, 4), 44: (0x000F0FFF, 4)},                           # MOVW / MOVT
+}
+
 # x86-64 relocations the linker may rewrite the instruction around (GOT relaxation, TLS models)
 _X64_RELAX = {41: 3, 42: 3, 9: 3}          # GOTPCREL(X): opcode / ModRM / REX before the field
 _X64_TLS = {19, 20, 22, 23}                # TLSGD, TLSLD, GOTTPOFF, TPOFF32: whole sequences change
@@ -63,13 +86,14 @@ class Signature:
     # An IFUNC's resolver (the code behind an STT_GNU_IFUNC symbol) is named `<name>_ifunc`
     groups: list[list[str]]
     pattern: bytes
-    mask: bytes                    # 0xff: byte must match; 0: filled in by the linker
+    mask: bytes                    # bits that must match (0: filled in by the linker)
     # what the masked bytes refer to: (offset of the relocated field, symbol name)
     refs: list[tuple[int, str]] = field(default_factory=list)
 
     @property
     def fixed(self) -> int:
-        return sum(1 for m in self.mask if m)
+        """Known bytes (bits / 8)."""
+        return sum(bin(m).count("1") for m in self.mask) // 8
 
     @property
     def names(self) -> list[str]:
@@ -93,7 +117,9 @@ class SigDB:
     def save(self, path: str) -> None:
         os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
         data = {"arch": self.arch, "source": self.source,
-                "sigs": [[s.groups, _encode(s.pattern, s.mask), s.refs] for s in self.sigs]}
+                "sigs": [[s.groups, _encode(s.pattern, s.mask), s.refs]
+                         + ([s.mask.hex()] if any(m not in (0, 0xFF) for m in s.mask) else [])
+                         for s in self.sigs]}
         with gzip.open(path, "wt") as fp:
             json.dump(data, fp)
 
@@ -102,9 +128,11 @@ class SigDB:
         with gzip.open(path, "rt") as fp:
             data = json.load(fp)
         db = cls(data["arch"], source=data.get("source", path))
-        for groups, text, *refs in data["sigs"]:
+        for groups, text, *rest in data["sigs"]:
             pattern, mask = _decode(text)
-            db.sigs.append(Signature(groups, pattern, mask, [tuple(r) for r in refs[0]] if refs else []))
+            if len(rest) > 1:                    # some bytes only partly known
+                mask = bytes.fromhex(rest[1])
+            db.sigs.append(Signature(groups, pattern, mask, [tuple(r) for r in rest[0]] if rest else []))
         return db
 
 
@@ -168,10 +196,20 @@ def object_signatures(data: bytes) -> tuple[str, list[Signature]]:
         rsym = elf.get_section(rs["sh_link"])
         for r in rs.iter_relocations():
             off, t = r["r_offset"], r["r_info_type"]
+            weak_undef = False
             if r["r_info_sym"] and isinstance(rsym, SymbolTableSection):
                 target = rsym.get_symbol(r["r_info_sym"])
                 if target.name and target["st_info"]["type"] != "STT_SECTION":
                     refs.setdefault(rs["sh_info"], []).append((off, target.name))
+                # a call to a weak symbol nothing defines becomes a nop: the whole word changes
+                weak_undef = target["st_info"]["bind"] == "STB_WEAK" and target["st_shndx"] == "SHN_UNDEF"
+            bits = None if weak_undef else _FIELDS.get(arch, {}).get(t)
+            if bits is not None:
+                change, size = bits
+                for k in range(size):
+                    if 0 <= off + k < len(m):
+                        m[off + k] &= ~(change >> (8 * k)) & 0xFF
+                continue
             lo, hi = off, off + (8 if t in _WIDE.get(arch, ()) else 4)
             if arch == "x64":
                 lo -= _X64_RELAX.get(t, 0)
@@ -197,9 +235,10 @@ def object_signatures(data: bytes) -> tuple[str, list[Signature]]:
     out = []
     for (shndx, value), names in funcs.items():
         sec = elf.get_section(shndx)
-        code = sec.data()[value:value + min(sizes[shndx, value], MAX_LEN)]
+        size = sizes[shndx, value]
         if arch == "arm":
-            value &= ~1
+            value &= ~1                          # (a Thumb function's symbol has bit 0 set)
+        code = sec.data()[value:value + min(size, MAX_LEN)]
         m = masks.get(shndx)
         mask = bytes(m[value:value + len(code)]) if m is not None else b"\xff" * len(code)
         own = sorted((o - value, n) for o, n in refs.get(shndx, ()) if value <= o < value + len(code))
@@ -261,8 +300,9 @@ class Matcher:
         every name the code has (its aliases).
         `ends_ok(size)`: whether the function can end `size` bytes in (a short pattern also
         matches the first bytes of a longer, different function). `refs_ok(sig)`: whether what
-        the code refers to fits the signature's references, when several signatures fit."""
-        best: list[Signature] = []
+        the code refers to fits the signature's references, when several signatures fit (True,
+        False, or None: nothing to check)."""
+        found: dict[int, list[Signature]] = {}
         heads = {}
         for (n, pm), table in self.groups.items():
             if len(code) < n:
@@ -272,22 +312,27 @@ class Matcher:
                 head = heads[n] = int.from_bytes(code[:n], "little")
             for s, mask, want in table.get(head & pm, ()):
                 size = len(s.pattern)
+                # (a long match says enough: the analysis may not see where the function ends
+                # when it calls one not yet known not to return)
                 if len(code) < size or int.from_bytes(code[:size], "little") & mask != want or \
-                        not ends_ok(size) or (s.fixed < MIN_FIXED and not refs_ok(s)):
+                        (s.fixed < LONG_FIXED and not ends_ok(size)) or (s.fixed < MIN_FIXED and not refs_ok(s)):
                     continue
-                if not best or size > len(best[0].pattern):
-                    best = [s]
-                elif size == len(best[0].pattern):
-                    best.append(s)
-        names = {s.name for s in best}
-        if len(names) != 1 or None in names or any(s.fixed < MIN_FIXED for s in best):
+                found.setdefault(size, []).append(s)
+        # the longest match; a shorter one only when what each longer one refers to is wrong
+        for size in sorted(found, reverse=True):
+            best = found[size]
+            names = {s.name for s in best}
+            if len(names) == 1 and None not in names and all(s.fixed >= MIN_FIXED for s in best):
+                return names.pop(), {n for s in best for n in s.names}
             # the same bytes with different names: what each refers to tells them apart
-            best = [s for s in best if s.refs and refs_ok(s)]
-            names = {_public(g) for s in best for g in s.groups}
-            if len({_plain(n) for n in names}) != 1:
-                return None
-            names = {_public(sorted(names))}
-        return names.pop(), {n for s in best for n in s.names}
+            fits = {id(s): refs_ok(s) if s.refs else False for s in best}
+            ok = [s for s in best if fits[id(s)]]
+            names = {_public(g) for s in ok for g in s.groups}
+            if len({_plain(n) for n in names}) == 1:
+                return _public(sorted(names)), {n for s in ok for n in s.names}
+            if ok or any(v is None for v in fits.values()):
+                return None                     # several fit, or some cannot be checked
+        return None
 
 
 def _ends_at(an: "Analysis", f, end: int) -> bool:
@@ -389,9 +434,9 @@ def apply(an: "Analysis", dbs: list[SigDB]) -> dict[int, str]:
     return named
 
 
-def _refs_fit(an: "Analysis", addr: int, sig: Signature, aliases: dict[int, set] | None = None) -> bool:
+def _refs_fit(an: "Analysis", addr: int, sig: Signature, aliases: dict[int, set] | None = None) -> bool | None:
     """Whether every reference of `sig` that can be checked names what the code at `addr`
-    refers to there; at least one must be checkable."""
+    refers to there: True, False (one names something else), None (none can be checked)."""
     insns = []
     a, end = addr, addr + len(sig.pattern)
     while a < end:
@@ -416,7 +461,7 @@ def _refs_fit(an: "Analysis", addr: int, sig: Signature, aliases: dict[int, set]
         if not names & {_plain(want), _plain(want + "_ifunc"), _plain(want).removesuffix("_ifunc")}:
             return False
         checked += 1
-    return checked > 0
+    return True if checked else None
 
 
 __all__ = ["Matcher", "SigDB", "Signature", "apply", "ar_members", "available", "build", "object_signatures",
