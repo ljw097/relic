@@ -418,6 +418,9 @@ class MainWindow(QMainWindow):
         act(m, "Import C &header...", None, self.header_dialog)
         act(m, "&Export pseudocode...", None, self.export_dialog)
         m.addSeparator()
+        act(m, "Sna&pshots...", None, self.show_snapshots)
+        act(m, "&Merge project...", None, self.merge_dialog)
+        m.addSeparator()
         act(m, "&Cancel background work", "Ctrl+.", self.cancel_work, False)
         m.addSeparator()
         act(m, "&Quit", QKeySequence.StandardKey.Quit, self.close, False)
@@ -1363,6 +1366,57 @@ class MainWindow(QMainWindow):
         self.types_dialog.raise_()
         return self.types_dialog
 
+    def show_snapshots(self):
+        """The snapshots window."""
+        from .snapshots import SnapshotsDialog
+        if getattr(self, "snapshots_dialog", None) is None:
+            self.snapshots_dialog = SnapshotsDialog(self)
+        else:
+            self.snapshots_dialog.refresh()
+        self.snapshots_dialog.show()
+        self.snapshots_dialog.raise_()
+        return self.snapshots_dialog
+
+    def merge_dialog(self):
+        """Pick another analyst's project file of this binary and merge its annotations."""
+        path, _ = QFileDialog.getOpenFileName(self, "Merge project", os.path.dirname(self.an.bin.path),
+                                              "Relic projects (*.relic.json *.json);;All files (*)")
+        if path:
+            self.merge_project(path)
+
+    def merge_project(self, path: str, theirs: bool = False) -> dict | None:
+        """Merge `path` into the annotations (one undo step); where both differ, ours is kept
+        unless `theirs`. Asks before merging a project made for another binary."""
+        from ..analysis.project import ProjectMismatch
+        name = os.path.basename(path)
+        try:
+            try:
+                got = self.an.merge_project(path, theirs)
+            except ProjectMismatch as e:
+                if QMessageBox.question(self, "Merge project", f"{name}: {e}. Merge anyway?") != \
+                        QMessageBox.StandardButton.Yes:
+                    return None
+                got = self.an.merge_project(path, theirs, force=True)
+        except (OSError, ValueError) as e:
+            QMessageBox.warning(self, "Merge project", f"{name}: {e}")
+            return None
+        added = ", ".join(f"{n} {k}" for k, n in got["added"].items()) or "nothing new"
+        msg = f"{name}: added {added}"
+        if got["conflicts"]:
+            msg += f"; {len(got['conflicts'])} conflicting (kept {got['kept']})"
+            lines = []
+            for section, key, ours, other in got["conflicts"][:30]:
+                where = f"{key:#x}" if isinstance(key, int) else \
+                    (f"{key[0]:#x} {key[1]}" if isinstance(key, tuple) else str(key))
+                lines.append(f"{section} {where}: ours {_short(ours)}, theirs {_short(other)}")
+            more = len(got["conflicts"]) - len(lines)
+            QMessageBox.information(self, "Merge project", msg + ":\n\n" + "\n".join(lines)
+                                    + (f"\n... and {more} more" if more > 0 else ""))
+        self.statusBar().showMessage(msg, 8000)
+        if got["added"] or got["conflicts"] and theirs:
+            self._after_edit()
+        return got
+
     def header_dialog(self):
         """Pick C headers: their structs, enums, typedefs and prototypes go into the project."""
         paths, _ = QFileDialog.getOpenFileNames(self, "Import C header", os.path.dirname(self.an.bin.path),
@@ -1775,3 +1829,8 @@ class MainWindow(QMainWindow):
             t.add_row([x.frm, x.kind, an.location(x.frm), f"{i.mnemonic} {i.op_str}" if i else ""], x.frm)
         t.setSortingEnabled(True)
         t.fit()
+
+
+def _short(v) -> str:
+    text = repr(v)
+    return text if len(text) <= 60 else text[:57] + "..."

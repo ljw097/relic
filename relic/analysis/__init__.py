@@ -56,6 +56,9 @@ class Analysis:
         self.edit_undo: list[tuple] = []
         self.edit_redo: list[tuple] = []
         self._in_edit = False
+        # named copies of the annotations: name -> {"time": ..., "notes": project-file sections}
+        self.snapshots: dict[str, dict] = {}
+        self._sha256: str | None = None
         self._fstarts: list[int] = []
         self._strings_by_addr: dict[int, String] = {}
         # library signature files to name functions with (None: those in libsigs.sig_dirs())
@@ -122,13 +125,13 @@ class Analysis:
         """Analyse again (after a patch), keeping names, comments, variable names and patches."""
         keep = (self.renames, self.comments, self.var_names, self.patches, self.struct_names, self.var_types,
                 self.patch_undo, self.patch_redo, self.sig_paths, self.bookmarks, self.edit_undo, self.edit_redo,
-                self.user_types)
+                self.user_types, self.snapshots)
         b = self.bin
         self.__dict__.clear()                    # decompiler caches live on the instance too
         self.__init__(b)
         (self.renames, self.comments, self.var_names, self.patches, self.struct_names, self.var_types,
          self.patch_undo, self.patch_redo, self.sig_paths, self.bookmarks, self.edit_undo, self.edit_redo,
-         self.user_types) = keep
+         self.user_types, self.snapshots) = keep
         return self.run(load_project=False)
 
     # ------------------------------------------------------------- patches
@@ -685,19 +688,20 @@ class Analysis:
             self.bookmarks[addr] = text.strip()
 
     def save_project(self, path: str | None = None):
-        data = {
-            "version": 1,
-            "binary": os.path.basename(self.bin.path),
-            "renames": {f"{a:#x}": n for a, n in sorted(self.renames.items())},
-            "comments": {f"{a:#x}": c for a, c in sorted(self.comments.items())},
-            "variables": {f"{a:#x}": dict(sorted(v.items())) for a, v in sorted(self.var_names.items())},
-            "patches": {f"{a:#x}": {"old": o.hex(), "new": n.hex()} for a, (o, n) in sorted(self.patches.items())},
-            "structs": dict(sorted(self.struct_names.items())),
-            "types": {f"{a:#x}": dict(sorted(v.items())) for a, v in sorted(self.var_types.items())},
-            "bookmarks": {f"{a:#x}": t for a, t in sorted(self.bookmarks.items())},
-        }
-        if self.user_types:
-            data["c_types"] = self.user_types
+        from .project import notes_to_json, sha256
+        notes = notes_to_json(self)
+        data = {"version": 1, "binary": os.path.basename(self.bin.path)}
+        try:
+            data["sha256"] = sha256(self)
+        except OSError:
+            pass
+        data.update({k: notes[k] for k in ("renames", "comments", "variables")})
+        data["patches"] = {f"{a:#x}": {"old": o.hex(), "new": n.hex()} for a, (o, n) in sorted(self.patches.items())}
+        data.update({k: notes[k] for k in ("structs", "types", "bookmarks")})
+        if "c_types" in notes:
+            data["c_types"] = notes["c_types"]
+        if self.snapshots:
+            data["snapshots"] = self.snapshots
         with open(path or self.project_path, "w") as fp:
             json.dump(data, fp, indent=2)
 
@@ -707,14 +711,38 @@ class Analysis:
             return False
         with open(path) as fp:
             data = json.load(fp)
-        self.renames = {int(a, 16): n for a, n in data.get("renames", {}).items()}
-        self.comments = {int(a, 16): c for a, c in data.get("comments", {}).items()}
-        self.var_names = {int(a, 16): dict(v) for a, v in data.get("variables", {}).items()}
-        self.struct_names = {k: dict(v) for k, v in data.get("structs", {}).items()}
-        self.var_types = {int(a, 16): dict(v) for a, v in data.get("types", {}).items()}
-        self.bookmarks = {int(a, 16): t for a, t in data.get("bookmarks", {}).items()}
-        self.user_types = dict(data.get("c_types", {}))
+        from .project import notes_from_json
+        notes_from_json(self, data)
+        self.snapshots = dict(data.get("snapshots", {}))
         return True
+
+    # ------------------------------------------------------------ snapshots
+    def take_snapshot(self, name: str) -> dict:
+        """Keep a named copy of every annotation (saved with the project); the same name
+        replaces it."""
+        from .project import take
+        return take(self, name)
+
+    def restore_snapshot(self, name: str):
+        """Put the annotations of snapshot `name` back (one undo step)."""
+        from .project import notes_from_json
+        snap = self.snapshots.get(name)
+        if snap is None:
+            raise KeyError(f"no snapshot '{name}'")
+        notes_from_json(self, snap["notes"])
+
+    def delete_snapshot(self, name: str) -> bool:
+        return self.snapshots.pop(name, None) is not None
+
+    def merge_project(self, path: str, theirs: bool = False, force: bool = False) -> dict:
+        """Merge another project file of this binary (another analyst's work) into the
+        annotations (one undo step): see project.merge."""
+        from .project import merge
+        with open(path) as fp:
+            data = json.load(fp)
+        if not isinstance(data, dict) or "renames" not in data and "structs" not in data:
+            raise ValueError(f"{path}: not a relic project file")
+        return merge(self, data, theirs, force)
 
 
 def _undoable(method):
@@ -739,7 +767,7 @@ def _undoable(method):
 
 for _name in ("rename", "rename_var", "rename_struct", "rename_field", "set_var_type", "set_field_type",
               "add_field", "remove_field", "comment", "bookmark", "import_header", "set_return_type",
-              "clear_imported_types"):
+              "clear_imported_types", "restore_snapshot", "merge_project"):
     setattr(Analysis, _name, _undoable(getattr(Analysis, _name)))
 
 

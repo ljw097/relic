@@ -1001,3 +1001,37 @@ def test_types_window_lists_and_clears_imported_types(win, tmp_path):
     assert d.tree.topLevelItem(0).childCount() == 0
     win.an.undo()                                # the clear is one undo step
     assert win.an.enum("color") == {"RED": 0, "GREEN": 4}
+
+
+def test_snapshots_window_takes_and_restores(win):
+    f = win.an.function_by_name("main").addr
+    d = win.show_snapshots()
+    win.an.rename(f, "start_here")
+    d.take("named")
+    assert d.tree.topLevelItemCount() == 1 and d.tree.topLevelItem(0).text(2) == "1 name"
+    win.an.rename(f, "")
+    d.tree.setCurrentItem(d.tree.topLevelItem(0))
+    d.restore()
+    assert win.an.renames[f] == "start_here" and win.dirty
+    from unittest import mock
+    from PySide6.QtWidgets import QMessageBox
+    with mock.patch("relic.gui.snapshots.QMessageBox.question", return_value=QMessageBox.StandardButton.Yes):
+        d.delete()
+    assert not win.an.snapshots and d.tree.topLevelItemCount() == 0
+
+
+def test_merge_project_from_another_analyst(win, vuln64, tmp_path):
+    other_dir = tmp_path / "bob"
+    other_dir.mkdir()
+    shutil.copy(vuln64, other_dir / "vuln64")
+    from relic.analysis import analyze
+    bob = analyze(str(other_dir / "vuln64"))
+    f = bob.function_by_name("main").addr
+    bob.rename(f, "bobs_main")
+    bob.comment(f, "from bob")
+    bob.save_project()
+    got = win.merge_project(bob.project_path)
+    assert got["added"] == {"renames": 1, "comments": 1}
+    assert win.an.renames[f] == "bobs_main" and "added 1 renames" in win.statusBar().currentMessage()
+    win.an.undo()
+    assert f not in win.an.renames
