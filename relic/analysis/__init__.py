@@ -302,8 +302,24 @@ class Analysis:
                 v = self.bin.read_int(v.addr.value, v.bits // 8)
                 v = Const(v, arch.bits) if v is not None else None
             if isinstance(v, Const) and v.value and self.bin.is_exec(v.value & ~1):
-                return v.value
+                return self._through_trampoline(v.value)
         return None
+
+    def _through_trampoline(self, addr: int) -> int:
+        """Where code that only jumps on (nops, then one direct jump: AArch64 glibc's
+        `__wrap_main`) goes; `addr` itself otherwise."""
+        a = addr
+        for _ in range(4):
+            i = self.dis.decode(a)
+            if i is None:
+                break
+            if i.mnemonic == "nop":
+                a = i.end
+                continue
+            if i.kind == JMP and i.target is not None and self.bin.is_exec(i.target & ~1):
+                return i.target
+            break
+        return addr
 
     def _build_xrefs(self):
         total = len(self.functions)

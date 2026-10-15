@@ -54,6 +54,46 @@ def test_static_stripped_binary_gets_library_names(static_bins):
     assert "strlen(" in joined and "malloc(" in joined, joined
 
 
+CROSS = {"arm": ("arm-linux-gnueabihf", "/usr/arm-linux-gnueabihf/lib/libc.a"),
+         "arm64": ("aarch64-linux-gnu", "/usr/aarch64-linux-gnu/lib/libc.a")}
+
+
+@pytest.mark.parametrize("arch", sorted(CROSS))
+def test_cross_static_binaries_get_library_names(arch, tmp_path):
+    """ARM (Thumb-2 libc: a symbol's address has bit 0 set) and AArch64 signatures."""
+    triple, libc = CROSS[arch]
+    cc, strip = shutil.which(f"{triple}-gcc"), shutil.which(f"{triple}-strip")
+    if cc is None or strip is None or not os.path.exists(libc):
+        pytest.skip(f"needs {triple}-gcc, strip and a static libc")
+    full, stripped = str(tmp_path / "libtypes"), str(tmp_path / "libtypes_stripped")
+    r = subprocess.run([cc, "-O2", "-static", "-o", full, os.path.join(HERE, "src", "libtypes.c")], capture_output=True)
+    if r.returncode:
+        pytest.skip("static linking is not available")
+    subprocess.run([strip, "-o", stripped, full], check=True)
+    db = libsigs.build([libc])
+    assert db.arch == arch
+    sig = str(tmp_path / "libc.sig")
+    db.save(sig)
+    truth = {f.addr & ~1: f.name for f in analyze(full, sigs=[]).functions.values()}
+    an = analyze(stripped, sigs=[sig])
+    names = set(an.lib_names.values())
+    # (Thumb `fopen` is `movs r2, #1; b.n __fopen_internal`: 4 bytes, too few to tell)
+    want = {"malloc", "free", "fgetc", "fclose"} | ({"fopen"} if arch == "arm64" else set())
+    assert want <= names, sorted(names)[:80]
+    assert len(an.lib_names) > 0.5 * sum(1 for f in an.functions.values() if not f.is_import)
+    aliases = {}
+    for s in db.sigs:
+        for n in s.names:
+            aliases.setdefault(libsigs._plain(n), set()).update(libsigs._plain(m) for m in s.names)
+    for a, n in an.lib_names.items():
+        t = truth.get(a & ~1, "")
+        # (a static function with the same code as a library one has a name libc.a does not export)
+        if not t.startswith("sub_") and libsigs._plain(t) in aliases:
+            assert libsigs._plain(t) in aliases.get(libsigs._plain(n), {libsigs._plain(n)}), (hex(a), n, t)
+    main = an.function_by_name("main")
+    assert main is not None and main.addr & ~1 == next(a for a, n in truth.items() if n == "main")
+
+
 def test_signature_file_round_trip(tmp_path):
     s = libsigs.Signature([["strlen"], ["__strlen_alias"]], bytes.fromhex("f30f1efa4889f8"),
                           bytes.fromhex("ffffffff00ffff"), [(4, "x")])
@@ -63,6 +103,20 @@ def test_signature_file_round_trip(tmp_path):
     assert back.arch == "x64" and back.sigs[0].groups == s.groups
     assert back.sigs[0].pattern[:4] == s.pattern[:4] and back.sigs[0].mask == s.mask
     assert back.sigs[0].refs == [(4, "x")]
+
+
+def test_partly_known_bytes_round_trip(tmp_path):
+    """AArch64 `bl`: the linker fills the low 26 bits, the opcode bits stay known."""
+    s = libsigs.Signature([["f"]], bytes.fromhex("fd7bbfa9000000941f2003d5fd7bc1a8c0035fd6"),
+                          bytes.fromhex("ffffffff000000fcffffffffffffffffffffffff"), [(4, "g")])
+    db = libsigs.SigDB("arm64", [s], "test")
+    db.save(str(tmp_path / "t.sig"))
+    back = libsigs.SigDB.load(str(tmp_path / "t.sig")).sigs[0]
+    assert back.mask == s.mask and back.fixed == 16
+    m = libsigs.Matcher([libsigs.SigDB("arm64", [back])])
+    tail = "1f2003d5fd7bc1a8c0035fd6"
+    assert m.match(bytes.fromhex("fd7bbfa912345697" + tail))[0] == "f"         # another bl target
+    assert m.match(bytes.fromhex("fd7bbfa912345614" + tail)) is None           # a `b`, not a `bl`
 
 
 def test_matcher_prefers_longest_and_skips_ambiguous():
@@ -78,6 +132,31 @@ def test_matcher_prefers_longest_and_skips_ambiguous():
     # aliases of one symbol: the public name
     d = libsigs.Signature([["__libc_malloc", "malloc"]], fixed, b"\xff" * 20)
     assert libsigs.Matcher([libsigs.SigDB("x64", [d])]).match(fixed)[0] == "malloc"
+
+
+def test_matcher_falls_back_when_longer_matches_refer_elsewhere():
+    """A longer pattern matching the start of the code (and of what follows it) whose references
+    name other functions gives way to the shorter one that fits."""
+    fixed = bytes(range(1, 25))
+    short = libsigs.Signature([["wmemcpy"]], fixed[:20], b"\xff" * 20)
+    longer = [libsigs.Signature([[n]], fixed, b"\xff" * 20 + b"\0" * 4, [(20, t)])
+              for n, t in (("pthread_atfork", "__register_atfork"), ("at_quick_exit", "__cxa_at_quick_exit"))]
+    m = libsigs.Matcher([libsigs.SigDB("arm64", [short, *longer])])
+    assert m.match(fixed, refs_ok=lambda s: False)[0] == "wmemcpy"
+    assert m.match(fixed, refs_ok=lambda s: None) is None           # (cannot tell: no name)
+    assert m.match(fixed, refs_ok=lambda s: s.name == "at_quick_exit")[0] == "at_quick_exit"
+
+
+def test_long_match_needs_no_end():
+    """The analysis may run a function on past its end (a call to one not known not to return):
+    a long match is enough; a short one must end where the function can."""
+    code = bytes(range(1, 101))
+    long_sig = libsigs.Signature([["mbrtowc"]], code, b"\xff" * 100)
+    m = libsigs.Matcher([libsigs.SigDB("x64", [long_sig])])
+    assert m.match(code + b"\0" * 8, ends_ok=lambda size: False)[0] == "mbrtowc"
+    short = libsigs.Signature([["tiny"]], code[:20], b"\xff" * 20)
+    m = libsigs.Matcher([libsigs.SigDB("x64", [short])])
+    assert m.match(code, ends_ok=lambda size: False) is None
 
 
 def test_ar_members(tmp_path):
