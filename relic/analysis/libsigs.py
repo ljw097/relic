@@ -24,6 +24,7 @@ import io
 import json
 import os
 import re
+import struct
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Iterator
 
@@ -224,6 +225,100 @@ def ar_members(data: bytes) -> Iterator[tuple[str, bytes]]:
         yield name.rstrip("/"), body
 
 
+# COFF (MinGW static libraries): machine -> arch; relocation types per arch -> bytes patched
+_COFF_ARCH = {0x8664: "x64", 0x14C: "x86"}
+_COFF_RELOC_SIZE = {"x64": {1: 8, 2: 4, 3: 4, 4: 4, 5: 4, 6: 4, 7: 4, 8: 4, 9: 4, 0xA: 2, 0xB: 4, 0xE: 4},
+                    "x86": {6: 4, 7: 4, 0xA: 2, 0xB: 4, 0x14: 4}}
+
+
+def is_coff(data: bytes) -> bool:
+    """A COFF object (not a short import-library member: machine 0, 0xFFFF)."""
+    if len(data) < 20:
+        return False
+    machine, nsec = struct.unpack_from("<HH", data, 0)
+    return machine in _COFF_ARCH and 0 < nsec < 4096
+
+
+def _trim_padding(code: bytes, arch: str) -> bytes:
+    """`code` without the alignment padding (nops, int3) after its last instruction -- what
+    runs to the next symbol includes it, and it would make a one-instruction stub look long."""
+    import capstone
+    md = capstone.Cs(capstone.CS_ARCH_X86, capstone.CS_MODE_64 if arch == "x64" else capstone.CS_MODE_32)
+    end = 0
+    for i in md.disasm_lite(code, 0):
+        if i[2] not in ("nop", "int3") and not (i[2] == "xchg" and i[3] in ("ax, ax", "eax, eax")):
+            end = i[0] + i[1]
+    return code[:end]
+
+
+def coff_object_signatures(data: bytes) -> tuple[str, list[Signature]]:
+    """The arch and the function signatures of one COFF object (a MinGW library member).
+    COFF does not record a function's size: it runs to the next symbol in its section."""
+    machine, nsec, _ts, symoff, nsyms, opthdr, _ch = struct.unpack_from("<HHIIIHH", data, 0)
+    arch = _COFF_ARCH[machine]
+    strtab = symoff + 18 * nsyms
+
+    def sym_name(raw: bytes) -> str:
+        if raw[:4] == b"\0\0\0\0":
+            off = strtab + struct.unpack_from("<I", raw, 4)[0]
+            end = data.find(b"\0", off)
+            return data[off:end if end >= 0 else None].decode("latin-1", "replace")
+        return raw.rstrip(b"\0").decode("latin-1", "replace")
+
+    def plain(name: str) -> str:
+        if arch == "x86":
+            name = name[1:] if name.startswith("_") else name
+            if "@" in name and name.rsplit("@", 1)[1].isdigit():
+                name = name.rsplit("@", 1)[0]               # stdcall: `_Sleep@4`
+        return name
+    sections = []
+    for k in range(nsec):
+        off = 20 + opthdr + 40 * k
+        (name, _vs, _va, size, raw, reloc, _ln, nreloc, _nln, ch) = struct.unpack_from("<8sIIIIIIHHI", data, off)
+        sections.append((name.rstrip(b"\0"), size, raw, reloc, nreloc, ch))
+    syms: list[tuple[str, int, int, int, int]] = []         # (name, value, section, type, class) by index
+    k = 0
+    while k < nsyms:
+        raw = data[symoff + 18 * k: symoff + 18 * k + 18]
+        if len(raw) < 18:
+            break
+        value, secnum, typ, storage, naux = struct.unpack_from("<IhHBB", raw, 8)
+        syms.append((sym_name(raw[:8]), value, secnum, typ, storage))
+        syms.extend([("", 0, 0, 0, 0)] * naux)
+        k += 1 + naux
+    out = []
+    for sn, (_name, size, raw, reloc, nreloc, ch) in enumerate(sections, start=1):
+        if not ch & 0x20000020 or ch & 0x80 or not raw:         # code, with contents
+            continue
+        body = data[raw:raw + size]
+        mask = bytearray(b"\xff" * len(body))
+        refs = []
+        for r in range(nreloc):
+            roff, rsym, rtype = struct.unpack_from("<IIH", data, reloc + 10 * r)
+            width = _COFF_RELOC_SIZE[arch].get(rtype, 4)
+            for j in range(roff, min(roff + width, len(mask))):
+                mask[j] = 0
+            if rsym < len(syms):
+                tname, _v, tsec, _t, tcls = syms[rsym]
+                if tname and not (tcls == 3 and _v == 0 and tname.startswith(".")):     # (not a section)
+                    refs.append((roff, plain(tname)))
+        starts = sorted({(v, n, t, c) for n, v, s_, t, c in syms if s_ == sn and n and c in (2, 3)
+                         and not (c == 3 and n.startswith("."))})
+        bounds = sorted({v for v, *_ in starts} | {len(body)})
+        names_at: dict[int, list[tuple[bool, str]]] = {}     # aliases share an address
+        for v, n, t, c in starts:
+            if t >> 4 == 2 or (c == 2 and t == 0 and ch & 0x20):             # a function symbol
+                names_at.setdefault(v, []).append((c != 2, plain(n)))
+        for v, names in sorted(names_at.items()):
+            end = next((b for b in bounds if b > v), len(body))
+            code = _trim_padding(bytes(body[v:min(end, v + MAX_LEN)]), arch)
+            if not code:
+                continue
+            own = sorted((o - v, nm) for o, nm in refs if v <= o < v + len(code))
+            out.append(Signature([[n for _local, n in sorted(set(names))]], code, bytes(mask[v:v + len(code)]), own))
+    return arch, out
+
+
 def object_signatures(data: bytes, tables: dict | None = None) -> tuple[str, list[Signature]]:
     """The arch and the function signatures of one relocatable ELF object; with `tables`, the
     pointers its data objects hold are added to it too (see SigDB.tables)."""
@@ -376,6 +471,8 @@ def library_of(paths: list[str], data: bytes) -> tuple[str, str]:
     version: glibc's from its banner, GCC's runtime libraries' from the compiler that built
     them (major version)."""
     base = os.path.basename(paths[0]) if paths else ""
+    if re.fullmatch(r"(crt\w*|dllcrt\w*)\.o", base):
+        return "crt", ""
     stem = base[3:] if base.startswith("lib") else base
     stem = stem.split(".")[0] if stem else ""
     m = _GLIBC_BANNER.search(data)
@@ -434,15 +531,16 @@ def build(paths: list[str]) -> SigDB:
             first_data = data
         members = ar_members(data) if data.startswith(b"!<arch>\n") else [(os.path.basename(path), data)]
         for _name, body in members:
-            if not body.startswith(b"\x7fELF"):
+            coff = not body.startswith(b"\x7fELF") and is_coff(body)
+            if not body.startswith(b"\x7fELF") and not coff:
                 continue
             tables: dict = {}
             try:
-                arch, sigs = object_signatures(body, tables)
+                arch, sigs = coff_object_signatures(body) if coff else object_signatures(body, tables)
             except Exception:  # noqa: BLE001 - one odd member must not stop the rest
                 continue
             if db is None:
-                db = SigDB(arch, source=", ".join(os.path.basename(p) for p in paths))
+                db = SigDB(arch, source=", ".join(os.path.basename(p) for p in paths), format="PE" if coff else "ELF")
             if arch != db.arch:
                 continue
             for name, (size, slots) in tables.items():
@@ -460,7 +558,7 @@ def build(paths: list[str]) -> SigDB:
                 elif s.groups[0] not in old.groups:     # the same code in another object
                     old.groups.append(s.groups[0])
     if db is None:
-        raise ValueError("no ELF objects found")
+        raise ValueError("no ELF or COFF objects found")
     db.tables = {n: t for n, t in db.tables.items() if t and any(f for _, _, f in t[1])}
     db.library, db.version = library_of(named, first_data)
     db.source = ", ".join(os.path.basename(p) for p in named)
@@ -643,38 +741,42 @@ def select(dbs: list[SigDB], toolchain=None, fmt: str | None = None) -> list[Sig
 # ------------------------------------------------------- installed toolchains
 def system_libraries() -> list[tuple[str, list[str]]]:
     """The static libraries of the toolchains installed here, one signature set each:
-    (file name, the archives it is built from) -- glibc's libc.a and libm.a and GCC's
-    libstdc++.a and libgcc.a (+ libgcc_eh.a), for the native and every cross compiler."""
+    (target triple, the archives it is built from) -- glibc's libc.a and libm.a and GCC's
+    libstdc++.a and libgcc.a (+ libgcc_eh.a), for the native and every cross compiler; for
+    MinGW-w64, its libmingwex / libmingw32 / libmsvcrt, start-up objects and libgcc (COFF)."""
     import glob
     out = []
     triples: dict[str, str] = {}               # target triple -> its newest GCC directory
     for root in ("/usr/lib/gcc", "/usr/lib/gcc-cross", "/usr/local/lib/gcc"):
         for d in glob.glob(os.path.join(root, "*", "*")):
             triple, ver = d.split(os.sep)[-2:]
-            if "mingw" in triple or not os.path.exists(os.path.join(d, "libgcc.a")):
-                continue                        # (Windows runtime objects are COFF)
+            if not os.path.exists(os.path.join(d, "libgcc.a")):
+                continue
             old = triples.get(triple)
             if old is None or _ver_key(ver) > _ver_key(os.path.basename(old)):
                 triples[triple] = d
+    def first(names: tuple, dirs: list[str]) -> list[str]:
+        return [next(os.path.join(d, n) for d in dirs if os.path.exists(os.path.join(d, n)))
+                for n in names if any(os.path.exists(os.path.join(d, n)) for d in dirs)]
     for triple, gcc in sorted(triples.items()):
         libdirs = [f"/usr/lib/{triple}", f"/usr/{triple}/lib", f"/usr/local/{triple}/lib"]
-        for name in ("libc.a", "libm.a"):
-            lib = next((os.path.join(d, name) for d in libdirs if os.path.exists(os.path.join(d, name))), None)
-            if lib is not None:
-                out.append((triple, [lib]))
-        for name in ("libstdc++.a",):
-            lib = os.path.join(gcc, name)
-            if os.path.exists(lib):
-                out.append((triple, [lib]))
-        gcc_libs = [os.path.join(gcc, n) for n in ("libgcc.a", "libgcc_eh.a") if os.path.exists(os.path.join(gcc, n))]
-        out.append((triple, gcc_libs))
+        if "mingw" in triple:                   # MinGW-w64: its runtime archives and start-up objects (COFF)
+            out += [(triple, [lib]) for lib in first(("libmingwex.a", "libmingw32.a", "libmsvcrt.a"), libdirs)]
+            crt = first(("crt2.o",), libdirs) + first(("crtbegin.o", "crtend.o"), [gcc])
+            if crt:
+                out.append((triple, crt))
+        else:
+            out += [(triple, [lib]) for lib in first(("libc.a", "libm.a"), libdirs) + first(("libstdc++.a",), [gcc])]
+        gcc_libs = first(("libgcc.a", "libgcc_eh.a"), [gcc])
+        if gcc_libs:
+            out.append((triple, gcc_libs))
     return out
 
 
 def set_name(db: SigDB) -> str:
-    """`glibc-2.39-x64.sig`, `libstdc++-13-arm64.sig`."""
+    """`glibc-2.39-x64.sig`, `libstdcxx-13-arm64.sig`, `libgcc-13-x64-pe.sig` (MinGW's)."""
     lib = (db.library or "lib").replace("+", "x")
-    return f"{lib}-{db.version + '-' if db.version else ''}{db.arch}.sig"
+    return f"{lib}-{db.version + '-' if db.version else ''}{db.arch}{'-pe' if db.format == 'PE' else ''}.sig"
 
 
 def build_system(out_dir: str, progress=None) -> list[tuple[str, SigDB]]:
