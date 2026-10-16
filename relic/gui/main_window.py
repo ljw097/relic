@@ -310,6 +310,8 @@ class MainWindow(QMainWindow):
         self.vulns = Table(["Severity", "Address", "Function", "Kind", "Message"])
         self.checksec = Table(["Property", "Value"])
         self.info = FilteredTable(["Name", "Address", "Size", "Offset", "Perm"], "Filter sections")
+        self.names = FilteredTable(["Address", "Name", "Kind"], "Filter names")
+        self.names.table.activated_addr.connect(self.goto)
         self.strings.table.activated_addr.connect(self.goto_xref_or_addr)
         self.imports.table.activated_addr.connect(self.goto)
         self.vulns.activated_addr.connect(self.goto)
@@ -319,7 +321,8 @@ class MainWindow(QMainWindow):
         self.pyconsole = PythonConsole()
         docks = [self._dock(t, w, bottom) for t, w in (("Strings", self.strings), ("Imports", self.imports),
                                                        ("Vulns", self.vulns), ("Checksec", self.checksec),
-                                                       ("Sections", self.info), ("Python", self.pyconsole))]
+                                                       ("Sections", self.info), ("Names", self.names),
+                                                       ("Python", self.pyconsole))]
         for d in docks[1:]:
             self.tabifyDockWidget(docks[0], d)
         docks[0].raise_()
@@ -441,6 +444,7 @@ class MainWindow(QMainWindow):
         m = mb.addMenu("&Edit")
         act(m, "&Rename...", "N", self.rename_dialog)
         act(m, "&Comment...", ";", self.comment_dialog)
+        act(m, "Re&peatable comment...", ":", self.repeatable_comment_dialog)
         act(m, "Set t&ype...", "Y", self.set_type_dialog)
         act(m, "&Xrefs to...", "X", self.show_xrefs_here)
         n = m.addMenu("&Number")
@@ -786,6 +790,8 @@ class MainWindow(QMainWindow):
         for k, v in checksec.items():
             self.checksec.add_row([k, v])
         self.checksec.fit()
+
+        self._fill_names()
 
         t = self.info.table
         t.setSortingEnabled(False)
@@ -1409,6 +1415,29 @@ class MainWindow(QMainWindow):
         self.an.comment(addr, text)
         self._after_edit()
 
+    def repeatable_comment_dialog(self):
+        """A comment shown here and wherever this address is referred to (calls, jumps, data
+        references)."""
+        a = self._subject()
+        if a is None:
+            return
+        text, ok = QInputDialog.getText(self, "Repeatable comment", f"Repeatable comment at {a:#x}:",
+                                        text=self.an.rcomments.get(a, ""))
+        if ok:
+            self.an.repeatable_comment(a, text.strip())
+            self._after_edit()
+
+    def _fill_names(self):
+        t = self.names.table
+        t.setSortingEnabled(False)
+        t.clear_rows()
+        colors = {"function": THEME["func"], "library": THEME["func"], "import": THEME["call"], "data": None,
+                  "label": None}
+        for a, name, kind in self.an.names():
+            t.add_row([a, name, kind], a, colors.get(kind))
+        t.setSortingEnabled(True)
+        t.fit()
+
     def export_dialog(self):
         """Write the pseudocode of every function to a C file, in the background."""
         if getattr(self, "export_thread", None) is not None and self.export_thread.isRunning():
@@ -1641,6 +1670,7 @@ class MainWindow(QMainWindow):
     def _after_edit(self):
         self.dirty = True
         self.setWindowTitle(self.windowTitle().rstrip(" *") + " *")
+        self._fill_names()
         keep = self.cur
         self.disasm.reload()
         self.graph.reload()

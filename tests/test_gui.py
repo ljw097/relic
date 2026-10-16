@@ -1090,3 +1090,20 @@ def test_number_format_keys_in_listing_and_pseudocode(win):
     assert an.num_formats[f.addr] == {"16": "hex"}
     assert win.decomp.wait_idle()
     assert "malloc(0x10)" in win.decomp.toPlainText()
+
+
+def test_names_window_and_repeatable_comment(win):
+    from unittest import mock
+    an = win.an
+    rows = lambda: {win.names.table.model_.item(r, 1).text() for r in range(win.names.table.model_.rowCount())}
+    assert {"main", "vuln", "notes"} <= rows()
+    menu = an.function_by_name("menu").addr
+    win.goto(menu)
+    with mock.patch("relic.gui.main_window.QInputDialog.getText", return_value=("reads the choice", True)):
+        win.repeatable_comment_dialog()
+    assert an.rcomments[menu] == "reads the choice"
+    win.goto(an.function_by_name("main").addr)
+    assert "⇢ reads the choice" in win.disasm.toPlainText()
+    an.rename(menu, "show_menu")
+    win._after_edit()
+    assert "show_menu" in rows()                     # (the names list follows renames)

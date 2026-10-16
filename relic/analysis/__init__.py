@@ -47,6 +47,8 @@ class Analysis:
         # how numbers are shown: instruction address -> {operand index: "hex" | "dec" | "char" |
         # "bin" | "offset"} in the listing; function address -> {value: format} in the pseudocode
         self.op_formats: dict[int, dict[str, str]] = {}
+        # repeatable comments: shown at the address and at every instruction referring to it
+        self.rcomments: dict[int, str] = {}
         self.num_formats: dict[int, dict[str, str]] = {}
         # byte patches: address -> (original bytes, new bytes), applied to `bin.data`
         self.patches: dict[int, tuple[bytes, bytes]] = {}
@@ -129,13 +131,13 @@ class Analysis:
         """Analyse again (after a patch), keeping names, comments, variable names and patches."""
         keep = (self.renames, self.comments, self.var_names, self.patches, self.struct_names, self.var_types,
                 self.patch_undo, self.patch_redo, self.sig_paths, self.bookmarks, self.edit_undo, self.edit_redo,
-                self.user_types, self.snapshots, self.op_formats, self.num_formats)
+                self.user_types, self.snapshots, self.op_formats, self.num_formats, self.rcomments)
         b = self.bin
         self.__dict__.clear()                    # decompiler caches live on the instance too
         self.__init__(b)
         (self.renames, self.comments, self.var_names, self.patches, self.struct_names, self.var_types,
          self.patch_undo, self.patch_redo, self.sig_paths, self.bookmarks, self.edit_undo, self.edit_redo,
-         self.user_types, self.snapshots, self.op_formats, self.num_formats) = keep
+         self.user_types, self.snapshots, self.op_formats, self.num_formats, self.rcomments) = keep
         return self.run(load_project=False)
 
     # ------------------------------------------------------------- patches
@@ -207,7 +209,7 @@ class Analysis:
     # ------------------------------------------------------ undo of all edits
     UNDO_MAX = 500
     NOTES = ("renames", "comments", "var_names", "var_types", "struct_names", "bookmarks", "user_types",
-             "op_formats", "num_formats")
+             "op_formats", "num_formats", "rcomments")
 
     def _notes(self) -> tuple:
         return copy.deepcopy(tuple(getattr(self, k) for k in self.NOTES))
@@ -701,6 +703,29 @@ class Analysis:
         else:
             self.comments.pop(addr, None)
 
+    def repeatable_comment(self, addr: int, text: str):
+        """A comment shown at `addr` and at every instruction that refers to it (a call, a jump,
+        a data reference); empty removes it."""
+        if text:
+            self.rcomments[addr] = text
+        else:
+            self.rcomments.pop(addr, None)
+
+    def names(self) -> list[tuple[int, str, str]]:
+        """Every named address: (address, name as shown, kind: function / import / library /
+        data / label)."""
+        out: dict[int, tuple[int, str, str]] = {}
+        for a, f in self.functions.items():
+            kind = "import" if f.is_import else "library" if getattr(f, "library", False) else "function"
+            out[a] = (a, self.name(a) or f.name, kind)
+        for a, sym in self.bin.symbols.items():
+            if a not in out and sym.name and self.bin.is_mapped(a):
+                out[a] = (a, self.name(a) or sym.name, "function" if sym.kind == "func" else "data")
+        for a in self.renames:
+            if a not in out:
+                out[a] = (a, self.renames[a], "label")
+        return sorted(out.values())
+
     def set_operand_format(self, addr: int, index: int, fmt: str):
         """Show operand `index` of the instruction at `addr` as hex / dec / char / bin / offset
         (empty: as disassembled)."""
@@ -747,7 +772,7 @@ class Analysis:
         data.update({k: notes[k] for k in ("renames", "comments", "variables")})
         data["patches"] = {f"{a:#x}": {"old": o.hex(), "new": n.hex()} for a, (o, n) in sorted(self.patches.items())}
         data.update({k: notes[k] for k in ("structs", "types", "bookmarks")})
-        data.update({k: notes[k] for k in ("operands", "numbers") if notes[k]})
+        data.update({k: notes[k] for k in ("operands", "numbers", "repeatable") if notes[k]})
         if "c_types" in notes:
             data["c_types"] = notes["c_types"]
         if self.snapshots:
@@ -818,7 +843,7 @@ def _undoable(method):
 for _name in ("rename", "rename_var", "rename_struct", "rename_field", "set_var_type", "set_field_type",
               "add_field", "remove_field", "comment", "bookmark", "import_header", "set_return_type",
               "clear_imported_types", "restore_snapshot", "merge_project", "set_operand_format",
-              "set_number_format"):
+              "set_number_format", "repeatable_comment"):
     setattr(Analysis, _name, _undoable(getattr(Analysis, _name)))
 
 
