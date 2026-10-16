@@ -84,6 +84,13 @@ _RELA = {"x64", "arm64", "riscv64"}
 # RISC-V R_RISCV_RELAX (the relocation at the same place may be relaxed: code after it moves)
 # and R_RISCV_ALIGN (nops the linker deletes)
 _RV_MOVES = {51, 43}
+_RV_RELAX, _RV_ALIGN = 51, 43
+_RV_CALL = {18, 19}                          # CALL / CALL_PLT: auipc + jalr -> jal rd (or c.j)
+_RV_HI = {20, 21, 22, 23, 26, 29}            # GOT_HI20, TLS_GOT/GD, PCREL_HI20, HI20, TPREL_HI20: deleted
+_RV_TPADD = 32                               # TPREL_ADD: `add rd, rd, tp`, deleted
+_RV_LO = {24, 25, 27, 28, 30, 31}            # the instructions using what a HI20 built
+# how the linker may change each kind of point: the forms the binary can hold
+RELAX_KINDS = ("call", "del", "align")
 
 # x86-64 relocations the linker may rewrite the instruction around (GOT relaxation, TLS models)
 _X64_RELAX = {41: 3, 42: 3, 9: 3}          # GOTPCREL(X): opcode / ModRM / REX before the field
@@ -122,11 +129,17 @@ class Signature:
     # only the start of the function: past it the linker may move code (RISC-V relaxation
     # shortens calls), so it says nothing about where the function ends
     prefix: bool = False
+    # RISC-V: places the linker may relax, [offset, kind, size, rd] (see RELAX_KINDS); the code
+    # in the binary is the pattern with each of them in one of its forms
+    relax: list = field(default_factory=list)
 
     @property
     def fixed(self) -> int:
-        """Known bytes (bits / 8)."""
-        return sum(bin(m).count("1") for m in self.mask) // 8
+        """Known bytes (bits / 8) -- of a relaxed pattern, outside what the linker may change."""
+        if not self.relax:
+            return sum(bin(m).count("1") for m in self.mask) // 8
+        skip = {k for off, _kind, size, _rd in self.relax for k in range(off, off + size)}
+        return sum(bin(m).count("1") for k, m in enumerate(self.mask) if k not in skip) // 8
 
     @property
     def names(self) -> list[str]:
@@ -175,19 +188,21 @@ class SigDB:
             if len(rest) > 1 and rest[1]:        # some bytes only partly known
                 mask = bytes.fromhex(rest[1])
             db.sigs.append(Signature(groups, pattern, mask, [tuple(r) for r in rest[0]] if rest else [],
-                                     len(rest) > 2 and bool(rest[2])))
+                                     len(rest) > 2 and bool(rest[2]), rest[3] if len(rest) > 3 else []))
         return db
 
 
 def _entry(s: Signature) -> list:
     """[groups, pattern text, refs] (+ full mask when some bytes are only partly known, + 1 for a
-    prefix signature)."""
+    prefix signature, + the relaxation points)."""
     out = [s.groups, _encode(s.pattern, s.mask), s.refs]
     partial = any(m not in (0, 0xFF) for m in s.mask)
-    if partial or s.prefix:
+    if partial or s.prefix or s.relax:
         out.append(s.mask.hex() if partial else "")
-    if s.prefix:
-        out.append(1)
+    if s.prefix or s.relax:
+        out.append(1 if s.prefix else 0)
+    if s.relax:
+        out.append(s.relax)
     return out
 
 
@@ -335,6 +350,9 @@ def object_signatures(data: bytes, tables: dict | None = None) -> tuple[str, lis
     # masked bytes per section: what relocations fill in
     masks: dict[int, bytearray] = {}
     moves: dict[int, list[int]] = {}         # section -> offsets past which code may move
+    rv_types: dict[int, dict[int, list[int]]] = {}   # RISC-V: section -> offset -> relocation types
+    rv_align: dict[int, dict[int, int]] = {}         # ... -> offset of nops the linker may delete -> bytes
+    rv_lo: dict[int, list] = {}                      # ... -> (offset, label of its PCREL_HI20 or None, type)
     refs: dict[int, list[tuple[int, str]]] = {}
     for rs in elf.iter_sections():
         if not isinstance(rs, RelocationSection):
@@ -349,12 +367,21 @@ def object_signatures(data: bytes, tables: dict | None = None) -> tuple[str, lis
             off, t = r["r_offset"], r["r_info_type"]
             if arch == "riscv64" and t in _RV_MOVES:
                 moves.setdefault(rs["sh_info"], []).append(off)
+                if t == _RV_ALIGN:
+                    rv_align.setdefault(rs["sh_info"], {})[off] = r["r_addend"]
                 continue
+            if arch == "riscv64":
+                rv_types.setdefault(rs["sh_info"], {}).setdefault(off, []).append(t)
+                if t in _RV_LO and r["r_info_sym"] and isinstance(rsym, SymbolTableSection):
+                    label = rsym.get_symbol(r["r_info_sym"])
+                    rv_lo.setdefault(rs["sh_info"], []).append(
+                        (off, label["st_value"] if t in (24, 25) else None, t))
             weak_undef = False
             if r["r_info_sym"] and isinstance(rsym, SymbolTableSection):
                 target = rsym.get_symbol(r["r_info_sym"])
-                if target.name and target["st_info"]["type"] != "STT_SECTION":
-                    refs.setdefault(rs["sh_info"], []).append((off, target.name))
+                if target.name and target["st_info"]["type"] != "STT_SECTION" and not (
+                        target["st_info"]["bind"] == "STB_LOCAL" and target["st_info"]["type"] == "STT_NOTYPE"):
+                    refs.setdefault(rs["sh_info"], []).append((off, target.name))      # (not a local label)
                 # a call to a weak symbol nothing defines becomes a nop: the whole word changes
                 weak_undef = target["st_info"]["bind"] == "STB_WEAK" and target["st_shndx"] == "SHN_UNDEF"
             bits = None if weak_undef else _FIELDS.get(arch, {}).get(t)
@@ -395,16 +422,125 @@ def object_signatures(data: bytes, tables: dict | None = None) -> tuple[str, lis
         if arch == "arm":
             value &= ~1                          # (a Thumb function's symbol has bit 0 set)
         code = sec.data()[value:value + min(size, MAX_LEN)]
-        cut = min((o - value for o in moves.get(shndx, ()) if value <= o < value + len(code)), default=None)
+        m = masks.get(shndx)
+        mask = bytearray(m[value:value + len(code)]) if m is not None else bytearray(b"\xff" * len(code))
+        relax, cut = [], None
+        if arch == "riscv64":
+            relax, cut = _rv_relax_points(code, mask, value, moves.get(shndx, ()), rv_types.get(shndx, {}),
+                                          rv_align.get(shndx, {}), rv_lo.get(shndx, []))
         if cut is not None:
-            code = code[:cut]
+            code, mask = code[:cut], mask[:cut]
+            relax = [r for r in relax if r[0] + r[2] <= cut]
             if not code:
                 continue
-        m = masks.get(shndx)
-        mask = bytes(m[value:value + len(code)]) if m is not None else b"\xff" * len(code)
         own = sorted((o - value, n) for o, n in refs.get(shndx, ()) if value <= o < value + len(code))
-        out.append(Signature([[n for _weak, n in sorted(set(names))]], bytes(code), mask, own, cut is not None))
+        out.append(Signature([[n for _weak, n in sorted(set(names))]], bytes(code), bytes(mask), own,
+                             cut is not None, relax))
     return arch, out
+
+
+def _rv_relax_points(code: bytes, mask: bytearray, base: int, moves, types: dict, align: dict, los: list):
+    """The relaxation points of a RISC-V function at `base` (section offsets): [[offset, kind,
+    size, rd]], and where to cut it instead (an offset, or None) at a point of a kind not
+    modelled. Widens `mask` where a relaxation also changes other bytes (the register a
+    `%lo` / `%pcrel_lo` instruction adds to may become gp or tp, a GOT load an `addi`)."""
+    points, cut = [], None
+    hi_kind: dict[int, int] = {}
+    for o in sorted(set(moves)):
+        if not base <= o < base + len(code):
+            continue
+        rel = o - base
+        if o in align:
+            points.append([rel, "align", align[o], 0])
+            continue
+        ts = types.get(o, [])
+        if any(t in _RV_CALL for t in ts) and rel + 8 <= len(code):
+            rd = (int.from_bytes(code[rel + 4:rel + 8], "little") >> 7) & 0x1F
+            points.append([rel, "call", 8, rd])
+        elif any(t in _RV_HI or t == _RV_TPADD for t in ts) and rel + 4 <= len(code):
+            points.append([rel, "del", 4, 0])
+            hi_kind[o] = next(t for t in ts if t in _RV_HI or t == _RV_TPADD)
+        elif any(t in _RV_LO for t in ts):
+            continue                            # (its own change: masked below)
+        elif cut is None:
+            cut = rel
+    for o, label, _t in los:
+        if not base <= o < base + len(code) or o not in moves:
+            continue
+        rel = o - base
+        if label is not None and hi_kind.get(label) in (20, 21, 22):     # a GOT load may become `addi`
+            keep = 0x00000F80
+        else:
+            keep = ~(0x1F << 15) & 0xFFFFFFFF                           # rs1 may become gp / tp
+        for k in range(4):
+            if rel + k < len(mask):
+                mask[rel + k] &= (keep >> (8 * k)) & 0xFF
+    return sorted(points), cut
+
+
+_RV_NOP, _RV_CNOP = b"\x13\x00\x00\x00", b"\x01\x00"
+
+
+def match_relaxed(code: bytes, sig: Signature) -> tuple[int, list[tuple[int, int]]] | None:
+    """Whether `code` is `sig`'s pattern with each relaxation point in one of its forms: the
+    bytes it takes and where each piece of the pattern is in it ([(pattern offset, code
+    offset)]), or None."""
+    pat, mask = sig.pattern, sig.mask
+    pi = bi = 0
+    pieces = []
+
+    def same(p0: int, b0: int, n: int) -> bool:
+        if b0 + n > len(code):
+            return False
+        return all(code[b0 + k] & mask[p0 + k] == pat[p0 + k] & mask[p0 + k] for k in range(n))
+    for off, kind, size, rd in sig.relax:
+        n = off - pi
+        if not same(pi, bi, n):
+            return None
+        pieces.append((pi, bi))
+        bi += n
+        pi = off
+        if kind == "call":
+            if same(pi, bi, 8):
+                bi += 8
+            else:
+                w = int.from_bytes(code[bi:bi + 4], "little") if bi + 4 <= len(code) else -1
+                h = int.from_bytes(code[bi:bi + 2], "little") if bi + 2 <= len(code) else -1
+                if w >= 0 and w & 0xFFF == (rd << 7) | 0x6F:      # jal rd, f
+                    bi += 4
+                elif rd == 0 and h >= 0 and h & 0xE003 == 0xA001:   # c.j f
+                    bi += 2
+                else:
+                    return None
+        elif kind == "del":
+            if same(pi, bi, size):
+                bi += size                      # (kept)
+            else:
+                pieces.append((off, -1))        # (deleted: what it referred to is not in the code)
+        elif kind == "align":
+            left = size
+            while left > 0:
+                if left >= 4 and code[bi:bi + 4] == _RV_NOP:
+                    bi, left = bi + 4, left - 4
+                elif code[bi:bi + 2] == _RV_CNOP:
+                    bi, left = bi + 2, left - 2
+                else:
+                    break
+        pi = off + size
+    if not same(pi, bi, len(pat) - pi):
+        return None
+    pieces.append((pi, bi))
+    return bi + len(pat) - pi, pieces
+
+
+def _code_offset(pieces: list[tuple[int, int]], off: int) -> int | None:
+    """Where pattern offset `off` is in the code, given match_relaxed's pieces (None: in an
+    instruction the linker deleted)."""
+    p0, b0 = pieces[0]
+    for p, b in pieces:
+        if p <= off:
+            p0, b0 = p, b
+    return None if b0 < 0 else b0 + off - p0
 
 
 def _data_tables(elf, arch: str, symtab, tables: dict) -> None:
@@ -572,10 +708,19 @@ def build(paths: list[str]) -> SigDB:
 
 
 # ---------------------------------------------------------------- matching
+def _strong(s: Signature) -> bool:
+    """Whether the bytes alone say which function it is: enough known bytes -- for a relaxed
+    RISC-V pattern, more (relaxation leaves a call-and-return wrapper little else)."""
+    return s.fixed >= (PREFIX_FIXED if s.relax else MIN_FIXED)
+
+
 class Matcher:
     def __init__(self, dbs: list[SigDB]):
-        # (prefix length, prefix mask) -> masked prefix -> [(signature, mask int, masked pattern int)]
-        self.groups: dict[tuple[int, int], dict[int, list]] = {}
+        # (code offset, prefix length, prefix mask) -> masked bytes there -> [(signature, mask int,
+        # masked pattern int)]: a pattern is looked up by its first bytes, a relaxed RISC-V one
+        # starting with a relaxation point by the bytes after it, wherever its forms leave them
+        self.groups: dict[tuple[int, int, int], dict[int, list]] = {}
+        self.unindexed: list[Signature] = []
         self.tables: dict[str, list] = {}
         for db in dbs:
             for name, slots in db.tables.items():
@@ -586,30 +731,62 @@ class Matcher:
                     continue
                 if s.prefix and s.fixed + REF_WEIGHT * len(s.refs) < PREFIX_FIXED:
                     continue
-                n = min(PREFIX, len(s.pattern))
-                pm = int.from_bytes(s.mask[:n], "little")
-                key = int.from_bytes(s.pattern[:n], "little") & pm
                 mask = int.from_bytes(s.mask, "little")
-                self.groups.setdefault((n, pm), {}).setdefault(key, []).append(
-                    (s, mask, int.from_bytes(s.pattern, "little") & mask))
+                entry = (s, mask, int.from_bytes(s.pattern, "little") & mask)
+                start, skips = 0, (0,)
+                if s.relax and s.relax[0][0] < 4:            # (starts with a relaxation point)
+                    off, kind, size, rd = s.relax[0]
+                    start = off + size
+                    skips = {"call": (off + 8, off + 4) + ((off + 2,) if rd == 0 else ()),
+                             "del": (off + size, off)}.get(kind, ())
+                rest = [r[0] for r in s.relax if r[0] >= start]       # the next point after the indexed bytes
+                stop = rest[0] if rest else len(s.pattern)
+                n = min(PREFIX, max(stop - start, 0))
+                if n < 4 or not skips:
+                    self.unindexed.append(s)
+                    continue
+                pm = int.from_bytes(s.mask[start:start + n], "little")
+                key = int.from_bytes(s.pattern[start:start + n], "little") & pm
+                for skip in skips:
+                    self.groups.setdefault((skip, n, pm), {}).setdefault(key, []).append(entry)
+
+    def _hits(self, code: bytes):
+        """(signature, bytes it takes) for every signature whose bytes the code starts with."""
+        heads: dict[tuple[int, int], int] = {}
+        seen = set()
+        for (skip, n, pm), table in self.groups.items():
+            if len(code) < skip + n:
+                continue
+            head = heads.get((skip, n))
+            if head is None:
+                head = heads[skip, n] = int.from_bytes(code[skip:skip + n], "little")
+            for s, mask, want in table.get(head & pm, ()):
+                if s.relax:
+                    if id(s) in seen:
+                        continue
+                    seen.add(id(s))
+                    got = match_relaxed(code, s)
+                    if got is not None:
+                        yield s, got[0]
+                    continue
+                size = len(s.pattern)
+                if len(code) >= size and int.from_bytes(code[:size], "little") & mask == want:
+                    yield s, size
+        for s in self.unindexed:
+            got = match_relaxed(code, s) if s.relax else None
+            if got is not None:
+                yield s, got[0]
 
     def candidates(self, code: bytes, ends_ok=lambda size: True) -> list[Signature]:
         """Every signature the code at the start of a function matches whole (bytes, and where it
         may end), longest first."""
-        found: list[Signature] = []
-        heads = {}
-        for (n, pm), table in self.groups.items():
-            if len(code) < n:
-                continue
-            head = heads.get(n)
-            if head is None:
-                head = heads[n] = int.from_bytes(code[:n], "little")
-            for s, mask, want in table.get(head & pm, ()):
-                size = len(s.pattern)
-                if len(code) >= size and int.from_bytes(code[:size], "little") & mask == want and \
-                        (s.fixed >= LONG_FIXED or s.prefix or ends_ok(size)):
-                    found.append(s)
-        return sorted(found, key=lambda s: -len(s.pattern))
+        return [s for _size, s in self.sized_candidates(code, ends_ok)]
+
+    def sized_candidates(self, code: bytes, ends_ok=lambda size: True) -> list[tuple[int, Signature]]:
+        """candidates, with the bytes each takes (a relaxed pattern's differ from its length)."""
+        found = [(size, s) for s, size in self._hits(code)
+                 if s.fixed >= LONG_FIXED or s.prefix or ends_ok(size)]
+        return sorted(found, key=lambda x: -x[0])
 
     def match(self, code: bytes, ends_ok=lambda size: True,
               refs_ok=lambda sig: True) -> tuple[str, set, list[Signature]] | None:
@@ -620,27 +797,18 @@ class Matcher:
         the code refers to fits the signature's references, when several signatures fit (True,
         False, or None: nothing to check)."""
         found: dict[int, list[Signature]] = {}
-        heads = {}
-        for (n, pm), table in self.groups.items():
-            if len(code) < n:
+        for s, size in self._hits(code):
+            # (a long match says enough: the analysis may not see where the function ends
+            # when it calls one not yet known not to return)
+            if (s.fixed < LONG_FIXED and not s.prefix and not ends_ok(size)) or \
+                    (not _strong(s) and not refs_ok(s)):
                 continue
-            head = heads.get(n)
-            if head is None:
-                head = heads[n] = int.from_bytes(code[:n], "little")
-            for s, mask, want in table.get(head & pm, ()):
-                size = len(s.pattern)
-                # (a long match says enough: the analysis may not see where the function ends
-                # when it calls one not yet known not to return)
-                if len(code) < size or int.from_bytes(code[:size], "little") & mask != want or \
-                        (s.fixed < LONG_FIXED and not s.prefix and not ends_ok(size)) or \
-                        (s.fixed < MIN_FIXED and not refs_ok(s)):
-                    continue
-                found.setdefault(size, []).append(s)
+            found.setdefault(size, []).append(s)
         # the longest match; a shorter one only when what each longer one refers to is wrong
         for size in sorted(found, reverse=True):
             best = found[size]
             names = {s.name for s in best}
-            if len(names) == 1 and None not in names and all(s.fixed >= MIN_FIXED for s in best):
+            if len(names) == 1 and None not in names and all(_strong(s) for s in best):
                 return names.pop(), {n for s in best for n in s.names}, best
             # the same bytes with different names: what each refers to tells them apart
             fits = {id(s): refs_ok(s) if s.refs else False for s in best}
@@ -882,8 +1050,8 @@ def _resolve(an: "Analysis", m: Matcher, named: dict[int, str], aliases: dict[in
             continue
         a = f.addr & ~1 if an.bin.arch == "arm" else f.addr
         code = an.bin.read(a, MAX_LEN) or b""
-        cands = m.candidates(code, lambda size, f=f, a=a: _ends_at(an, f, a + size)) if code else []
-        cands = [s for s in cands if len(s.pattern) == len(cands[0].pattern)] if cands else []
+        sized = m.sized_candidates(code, lambda size, f=f, a=a: _ends_at(an, f, a + size)) if code else []
+        cands = [s for size, s in sized if size == sized[0][0]] if sized else []
         if cands:
             pend[f.addr] = [(s, _ref_targets(an, a, s)) for s in cands]
     targets = {a: [(s, _ref_targets(an, a & ~1 if an.bin.arch == "arm" else a, s)) for s in sigs]
@@ -927,8 +1095,8 @@ def _resolve(an: "Analysis", m: Matcher, named: dict[int, str], aliases: dict[in
             # alone fit several names, a reference must have told them apart
             several = len({_plain(_public(g)) for s, _ in cands for g in s.groups}) > 1 or \
                 len(keep) < len(cands)
-            if all((s.fixed >= MIN_FIXED or s.fixed + REF_WEIGHT * c >= MIN_SHORT) and (c or not several)
-                   for s, _, c in keep):
+            if all((s.fixed >= MIN_FIXED or s.fixed + REF_WEIGHT * c >= MIN_SHORT) and
+                   (c or not several and _strong(s)) for s, _, c in keep):
                 name(a, _public(sorted(publics)), {n for s, _, _ in keep for n in s.names},
                      [(s, refs) for s, refs, _ in keep])
                 changed = True
@@ -1060,8 +1228,16 @@ def _name_from_tables(an: "Analysis", m: Matcher, targets: dict, pend: dict, nam
 def _ref_targets(an: "Analysis", addr: int, sig: Signature) -> list[tuple[int | None, str]]:
     """What the code at `addr` refers to where `sig` has references: (address or None, the
     name the signature wants there)."""
+    where = lambda off: off  # noqa: E731
+    size = len(sig.pattern)
+    if sig.relax:                                # (offsets of a relaxed pattern move in the code)
+        got = match_relaxed(an.bin.read(addr, MAX_LEN) or b"", sig)
+        if got is None:
+            return [(None, want) for _off, want in sig.refs]
+        size, pieces = got
+        where = lambda off: _code_offset(pieces, off)  # noqa: E731
     insns = []
-    a, end = addr, addr + len(sig.pattern)
+    a, end = addr, addr + size
     while a < end:
         i = an.dis.decode(a)
         if i is None:
@@ -1070,8 +1246,15 @@ def _ref_targets(an: "Analysis", addr: int, sig: Signature) -> list[tuple[int | 
         a = i.end
     out = []
     for off, want in sig.refs:
-        i = next((i for i in insns if i.addr <= addr + off < i.end), None)
-        t = None if i is None else i.target if i.target is not None else (i.refs[0] if i.refs else None)
+        at = where(off)
+        k = None if at is None else next((k for k, i in enumerate(insns) if i.addr <= addr + at < i.end), None)
+        t = None
+        if k is not None:
+            i = insns[k]
+            t = i.target if i.target is not None else (i.refs[0] if i.refs else None)
+            if t is None and i.mnemonic in ("auipc", "lui") and k + 1 < len(insns):
+                j = insns[k + 1]                # (the address an auipc / lui pair builds: on the second)
+                t = j.target if j.target is not None else (j.refs[0] if j.refs else None)
         out.append((t, want))
     return out
 
