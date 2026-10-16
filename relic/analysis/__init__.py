@@ -796,6 +796,12 @@ class Analysis:
         if reanalyze:
             self.reanalyze()
 
+    def load_type_library(self, name: str = "libc") -> dict:
+        """Import a bundled type library (decompiler.typelibs: the C library's structs, laid out
+        for this binary's ABI); one undo step. What was imported, as import_header."""
+        from ..decompiler.typelibs import library_text
+        return self.import_header(library_text(name, self.bin.arch))
+
     def lumina_pull(self, store: str | None = None, overwrite: bool = False) -> dict:
         """Names, comments and variable names / types of matching functions from a shared store
         (lumina; one undo step)."""
@@ -963,7 +969,7 @@ for _name in ("rename", "rename_var", "rename_struct", "rename_field", "set_var_
               "add_field", "remove_field", "comment", "bookmark", "import_header", "set_return_type",
               "clear_imported_types", "restore_snapshot", "merge_project", "set_operand_format",
               "set_number_format", "repeatable_comment", "define_data", "undefine", "create_function",
-              "delete_function", "lumina_pull", "checkout"):
+              "delete_function", "lumina_pull", "checkout", "load_type_library"):
     setattr(Analysis, _name, _undoable(getattr(Analysis, _name)))
 
 

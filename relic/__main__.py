@@ -78,6 +78,7 @@ def _parser() -> argparse.ArgumentParser:
     s = add("types", "import C headers into the project (structs, enums, typedefs, prototypes), or list them")
     s.add_argument("headers", nargs="*", metavar="FILE.h", help="headers to import (none: list what is imported)")
     s.add_argument("--no-save", action="store_true", help="check the headers without saving the project")
+    s.add_argument("--lib", action="append", metavar="NAME", help="import a bundled type library (libc)")
     s = add("project", "snapshots of the annotations; merge another analyst's project file")
     s.add_argument("action", choices=("snapshots", "snapshot", "restore", "delete", "merge", "commit", "log", "diff",
                                       "checkout"),
@@ -352,6 +353,18 @@ def _import_headers(an, paths):
 
 def cmd_types(args):
     an = _analyze(args)
+    if args.lib:
+        for lib in args.lib:
+            try:
+                got = an.load_type_library(lib)
+            except KeyError as e:
+                sys.exit(f"relic: {e.args[0]}")
+            print(f"{lib}: {len(got['structs'])} structs ({', '.join(got['structs'])})")
+        if not args.headers:
+            if not args.no_save:
+                an.save_project()
+                print(f"saved {an.project_path}")
+            return
     if args.headers:
         for path, got in _import_headers(an, args.headers):
             parts = [f"{len(got[k])} {k}" for k in ("structs", "enums", "typedefs", "functions", "imports") if got[k]]

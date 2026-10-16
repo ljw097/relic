@@ -381,6 +381,12 @@ def infer_types(fn: IRFunction, ptr_bits: int, is_addr=lambda v: False,
 _HINT_RANK = {"void *": 1, "size_t": 1, "ssize_t": 1}
 
 
+# C integer types by width (LP64 / ILP32 `long` is taken as the pointer width where it matters)
+_INT_WIDTHS = {"char": 8, "short": 16, "int": 32, "long long": 64, "int8_t": 8, "uint8_t": 8, "int16_t": 16,
+               "uint16_t": 16, "int32_t": 32, "uint32_t": 32, "int64_t": 64, "uint64_t": 64, "bool": 8,
+               "_Bool": 8}
+
+
 def library_types(fn: IRFunction, ptr_bits: int, ret_reg: str, callee=lambda call: None,
                   cstring=lambda addr: None, an=None) -> dict[str, CType]:
     """Types variables get from the library calls they meet: an argument of `strlen` is a
@@ -388,7 +394,7 @@ def library_types(fn: IRFunction, ptr_bits: int, ret_reg: str, callee=lambda cal
     constant format string's `%s` consumes a `char *`. Only plain variables of the type's width
     count; copies carry a type both ways. A variable two calls give different equally specific
     types gets none. `callee(call)` names a call's target, `cstring(addr)` reads a string."""
-    from .sigs import arg_type, format_types, lookup
+    from .sigs import Sig, arg_type, format_types, lookup
     widths = {"char *": ptr_bits, "void *": ptr_bits, "FILE *": ptr_bits, "size_t": ptr_bits,
               "ssize_t": ptr_bits}
     found: dict[str, str | None] = {}
@@ -410,10 +416,34 @@ def library_types(fn: IRFunction, ptr_bits: int, ret_reg: str, callee=lambda cal
         elif _HINT_RANK.get(old, 2) == _HINT_RANK.get(t, 2):
             found[v.name] = None              # disagreement: no hint
 
+    def user_sig(c: Call) -> Sig | None:
+        """A function of the program the user gave parameter / return types (`Y` on it, or a
+        prototype imported for it): those types reach its callers' arguments and results."""
+        if an is None or not isinstance(c.target, Const) or c.target.value not in an.functions:
+            return None
+        wanted = an.var_types.get(c.target.value) or {}
+        params = [wanted.get(f"a{k + 1}") for k in range(len(c.args))]
+        if not any(params) and "@return" not in wanted:
+            return None
+        for t in [*params, wanted.get("@return")]:
+            if t and t not in widths:
+                try:
+                    ct = parse_ctype(t)
+                except ValueError:
+                    continue
+                w = ptr_bits if ct.ptr else _INT_WIDTHS.get(ct.base.replace("unsigned ", "").replace("signed ", ""))
+                if w:
+                    widths[t] = w
+        return Sig(len(c.args), ret=wanted.get("@return") or "", types=tuple(t or "" for t in params))
+
     def call(c: Call, name: str | None) -> Sig | None:
         sig = lookup(name, an)
         if sig is None:
-            return None
+            sig = user_sig(c)
+            if sig is not None:
+                for k, a in enumerate(c.args):
+                    give(a, sig.types[k] or None)
+            return sig
         for k, a in enumerate(c.args):
             give(a, arg_type(sig, k))
         if sig.fmt is not None and sig.fmt < len(c.args) and isinstance(c.args[sig.fmt], Const):
@@ -429,7 +459,12 @@ def library_types(fn: IRFunction, ptr_bits: int, ret_reg: str, callee=lambda cal
         for top in stmt_exprs(s):
             for x in walk(top):
                 if isinstance(x, Call) and not (isinstance(s, CallStmt) and x is s.call):
-                    call(x, callee(x))      # a call inside an expression: `return strlen(p) + 1`
+                    sig = call(x, callee(x))    # a call inside an expression: `return strlen(p) + 1`
+                    src = s.src if isinstance(s, Assign) else None
+                    while isinstance(src, Cast):
+                        src = src.a
+                    if sig is not None and src is x:           # `v = localtime(&t)`: v gets its result type
+                        give(s.dst, sig.ret)
         if isinstance(s, CallStmt):
             sig = call(s.call, s.name or callee(s.call))
             if sig is None:

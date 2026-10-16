@@ -21,7 +21,8 @@ class TypesDialog(QDialog):
         self.tree.setFont(mono_font())
         self.tree.setColumnWidth(0, 220)
         buttons = QHBoxLayout()
-        for text, slot in (("Import header...", self.import_header), ("Remove all", self.clear),
+        for text, slot in (("Import header...", self.import_header), ("Load libc types", self.load_libc),
+                           ("Remove all", self.clear),
                            ("Refresh", self.refresh)):
             b = QPushButton(text)
             b.clicked.connect(slot)
@@ -68,6 +69,15 @@ class TypesDialog(QDialog):
         for top in (enums, typedefs, structs, protos):
             top.setText(1, f"{top.childCount()}")
             top.setExpanded(top.childCount() <= 20)
+
+    def load_libc(self):
+        """The bundled C library type library (struct stat, tm, sockaddr_in, ...)."""
+        if self.an is None:
+            return
+        got = self.an.load_type_library("libc")
+        self.win._after_edit()
+        self.win.statusBar().showMessage(f"libc types: {len(got['structs'])} structs", 5000)
+        self.refresh()
 
     def import_header(self):
         self.win.header_dialog()
