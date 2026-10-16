@@ -111,7 +111,9 @@ class Disassembler:
     def __init__(self, binary: Binary):
         self.bin = binary
         self.arch = binary.arch
-        self.md = capstone_for(binary.arch, binary.endian)
+        from .extend import PROCESSORS
+        self.custom = PROCESSORS.get(binary.arch)       # a plugin's processor module (relic.extend)
+        self.md = capstone_for(binary.arch, binary.endian) if self.custom is None else None
         self.delay_slots = binary.arch in ("mips", "mips64")
         self._cache: dict[int, Insn | None] = {}
         # capstone handles are not thread-safe: the GUI decodes while a background job (the
@@ -150,6 +152,13 @@ class Disassembler:
             addr &= ~1
         if addr in self._cache:
             return self._cache[addr]
+        if self.custom is not None:
+            insn = None
+            if self.bin.is_exec(addr) or self.bin.format == "RAW":
+                code = self.bin.read(addr, 16)
+                insn = self.custom.decode(code, addr) if code else None
+            self._cache[addr] = insn
+            return insn
         with self._lock:
             insn = None
             if self.bin.is_exec(addr) or self.bin.format == "RAW":
@@ -199,7 +208,7 @@ class Disassembler:
 
     def decode_block(self, addr: int, end: int) -> list[Insn]:
         """Linear sweep from addr to end (stops at undecodable bytes)."""
-        if self.md_thumb is not None:
+        if self.md_thumb is not None or self.custom is not None:
             out = []
             while addr < end:
                 i = self.decode(addr)

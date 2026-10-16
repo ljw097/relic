@@ -1441,6 +1441,16 @@ def decompile(an: "Analysis", func: "Function") -> Decompiled:
     prep = prepare(an, func)
     w = CWriter(an, prep)
     lines = w.render()
+    from ..extend import DECOMPILE_HOOKS
+    for hook in DECOMPILE_HOOKS:             # plugins may rewrite the pseudocode (relic.extend)
+        try:
+            new = hook(an, func, lines)
+        except Exception as e:  # noqa: BLE001 - a plugin bug must not lose the pseudocode
+            import sys
+            print(f"relic: decompile hook {getattr(hook, '__name__', hook)}: {e}", file=sys.stderr)
+            continue
+        if new is not None:
+            lines = list(new)
     types = {w.names.get(n, n): str(t) for n, t in w.types.items()}
     return Decompiled(an.name(func.addr) or func.name, func.addr, lines, dict(w.shown), dict(w.shown_structs),
                       {k: list(v) for k, v in w.shown_fields.items()}, types)

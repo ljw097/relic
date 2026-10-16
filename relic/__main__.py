@@ -610,6 +610,11 @@ def main(argv: list[str] | None = None) -> int:
     if not argv or (argv[0] not in COMMANDS and not argv[0].startswith("-")):
         argv.insert(0, "gui")
     args = _parser().parse_args(argv)
+    if args.cmd != "gui":
+        from .scripting import load_plugins
+        _, failed = load_plugins(None)           # plugins' loaders / processors / decompile hooks
+        for name, err in failed:
+            print(f"relic: plugin {name} failed to load:\n{err}", file=sys.stderr)
     try:
         return globals()[f"cmd_{args.cmd}"](args) or 0
     except FileNotFoundError as e:
