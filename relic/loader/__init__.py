@@ -4,7 +4,7 @@ from __future__ import annotations
 from .base import Binary, Import, Section, Segment, Symbol
 
 
-def load(path: str, arch: str | None = None, base: int = 0) -> Binary:
+def load(path: str, arch: str | None = None, base: int | str = 0) -> Binary:
     """Load a file -- or one member of a static library, `lib.a:member.o`."""
     import os
     member = None
@@ -21,7 +21,7 @@ def load(path: str, arch: str | None = None, base: int = 0) -> Binary:
     return load_bytes(data, path, arch, base)
 
 
-def load_bytes(data: bytes, path: str = "<memory>", arch: str | None = None, base: int = 0) -> Binary:
+def load_bytes(data: bytes, path: str = "<memory>", arch: str | None = None, base: int | str = 0) -> Binary:
     from ..extend import LOADERS
     for ld in LOADERS:                       # plugins' loaders first (relic.extend)
         if ld.detect(data, path):
@@ -58,8 +58,9 @@ def _is_text_firmware(data: bytes) -> bool:
     return is_ihex(data) or is_srec(data)
 
 
-def load_raw(path: str, data: bytes, arch: str = "x64", base: int = 0) -> Binary:
-    """Flat shellcode / firmware blob."""
+def load_raw(path: str, data: bytes, arch: str = "x64", base: int | str = 0) -> Binary:
+    """Flat shellcode / firmware blob, at `base` -- or, with base "auto", where `rawbase` guesses
+    the image belongs."""
     b = Binary(path, data)
     b.format = "RAW"
     b.arch = arch
@@ -68,6 +69,11 @@ def load_raw(path: str, data: bytes, arch: str = "x64", base: int = 0) -> Binary
     b.bits = custom.bits if custom else 32 if arch in ("x86", "arm", "mips", "riscv32", "ppc") else 64
     if custom:
         b.endian = custom.endian
+    if base == "auto":
+        from .rawbase import guess_base
+        guesses = guess_base(data, b.bits, "big" if b.endian == "big" else "little", limit=1)
+        base = guesses[0].base if guesses else 0
+        b.info["base guess"] = f"{base:#x} ({guesses[0].reason})" if guesses else "none: loaded at 0"
     b.base = base
     b.entry = base
     b.sections.append(Section(".raw", base, len(data), 0, True, True, True))

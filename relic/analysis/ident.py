@@ -124,6 +124,8 @@ def _msvc(entries: list[tuple[int, int, int]]) -> str | None:
 
 # --------------------------------------------------------------------- main
 def identify(b: "Binary") -> Toolchain:
+    if getattr(b, "elf_type", None) == "ET_CORE":
+        return _core(b)
     tc = Toolchain()
     data = b.data
     if b.format == "ELF":
@@ -151,6 +153,25 @@ def identify(b: "Binary") -> Toolchain:
     if not tc.languages and tc.libc:
         tc.languages.append("C")
     return tc
+
+
+def _core(b: "Binary") -> Toolchain:
+    """A core dump's memory holds every library the process mapped: what built it is what built
+    its executable (the first mapped file), when that file is still on disk."""
+    import os
+
+    from ..loader import load
+    files = getattr(b, "core_files", None) or []
+    exe = files[0][3] if files else None
+    if exe and os.path.isfile(exe):
+        try:
+            tc = identify(load(exe))
+        except Exception:  # noqa: BLE001 - unreadable executable: nothing known
+            tc = Toolchain()
+        else:
+            tc.evidence.insert(0, f"core dump of {exe}")
+            return tc
+    return Toolchain(evidence=["core dump (executable not on disk)"])
 
 
 def _elf_file(b: "Binary"):

@@ -48,6 +48,11 @@ def load_elf(path: str, data: bytes) -> Binary:
         # EF_ARM_ABI_FLOAT_HARD: floating-point arguments and results in VFP registers (armhf)
         b.arm_hard_float = bool(elf["e_flags"] & 0x400)
     b.elf_type = elf["e_type"]
+    if b.elf_type == "ET_CORE":               # a core dump: the process's memory, registers and files
+        from .core import load_core
+        load_core(b, elf)
+        b._finalize()
+        return b
     if b.elf_type == "ET_REL":                # a relocatable object: lay it out and link it alone
         from .elfobj import load_elf_object
         load_elf_object(b, elf)
