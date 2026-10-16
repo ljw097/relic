@@ -443,6 +443,12 @@ class MainWindow(QMainWindow):
         act(m, "&Comment...", ";", self.comment_dialog)
         act(m, "Set t&ype...", "Y", self.set_type_dialog)
         act(m, "&Xrefs to...", "X", self.show_xrefs_here)
+        n = m.addMenu("&Number")
+        act(n, "&Hex / decimal", "H", lambda: self.number_format("hex"))
+        act(n, "&Character", "R", lambda: self.number_format("char"))
+        act(n, "&Binary", "B", lambda: self.number_format("bin"))
+        act(n, "&Offset (address)", "O", lambda: self.number_format("offset"))
+        act(n, "&Reset", None, lambda: self.number_format(""))
         m.addSeparator()
         act(m, "&Patch bytes...", "Ctrl+Alt+P", self.patch_bytes_dialog)
         act(m, "&Assemble...", "Ctrl+Alt+A", self.assemble_dialog)
@@ -1194,6 +1200,70 @@ class MainWindow(QMainWindow):
             return None
         f = self.an.function_at(a)
         return f.addr if f is not None else a
+
+    def number_format(self, fmt: str):
+        """Show the number under the cursor another way (IDA's H / R / B / O): an operand of the
+        listing's instruction, or a constant of the pseudocode. Again on the same format: back to
+        the default (H toggles hex and decimal)."""
+        if self.an is None:
+            return
+        if self.tabs.currentIndex() == self.TAB_DECOMP:
+            self._pseudocode_number(fmt)
+            return
+        ln = self.disasm.current_line()
+        if ln is None or ln.kind != "insn" or not ln.operands:
+            self.statusBar().showMessage("put the cursor on an instruction operand", 4000)
+            return
+        from ..numfmt import numbers_in, operand_at, split_operands
+        start = self.disasm.columns["mnem"] + len(ln.mnemonic) + 1
+        pos = self.disasm.textCursor().positionInBlock() - start
+        spans = split_operands(ln.operands)
+        if 0 <= pos <= len(ln.operands):
+            k = operand_at(ln.operands, pos)
+        else:                                      # not on the operands: the first with a number
+            k = next((j for j, (a, b) in enumerate(spans) if numbers_in(ln.operands[a:b])), 0)
+        text = ln.operands[spans[k][0]:spans[k][1]]
+        cur = self.an.op_formats.get(ln.addr, {}).get(str(k))
+        if fmt == "hex":
+            fmt = "dec" if cur == "hex" or (cur is None and "0x" in text) else "hex"
+        elif fmt and cur == fmt:
+            fmt = ""
+        if fmt and not numbers_in(text):
+            self.statusBar().showMessage(f"operand {k + 1} has no number", 4000)
+            return
+        self.an.set_operand_format(ln.addr, k, fmt)
+        self._after_edit()
+
+    def _pseudocode_number(self, fmt: str):
+        import re
+
+        from PySide6.QtGui import QTextCursor
+        cur = self.decomp.textCursor()
+        cur.select(QTextCursor.SelectionType.WordUnderCursor)
+        word, line = cur.selectedText(), cur.block().text()
+        col = cur.selectionStart() - cur.block().position()
+        before = line[col - 1:col] if col > 0 else ""
+        value = None
+        if before == "'" and word:                 # a character constant: 'ABCD'
+            value = int.from_bytes(word.encode("latin-1", "replace"), "big")
+        elif re.fullmatch(r"0[xX][0-9a-fA-F]+|0b[01]+|\d+", word):
+            value = int(word, 0) if not word.isdigit() else int(word)
+            if before == "-":
+                value = -value
+        func = self.decomp.func.addr if self.decomp.func is not None else None
+        if value is None or func is None:
+            self.statusBar().showMessage("put the cursor on a number", 4000)
+            return
+        if fmt == "offset":
+            self.statusBar().showMessage("an offset is shown in the listing (O on the instruction)", 4000)
+            return
+        current = self.an.num_formats.get(func, {}).get(str(value))
+        if fmt == "hex":
+            fmt = "dec" if current == "hex" or (current is None and word.lower().startswith("0x")) else "hex"
+        elif fmt and current == fmt:
+            fmt = ""
+        self.an.set_number_format(func, value, fmt)
+        self._after_edit()
 
     def rename_dialog(self):
         if self.tabs.currentIndex() == self.TAB_DECOMP:

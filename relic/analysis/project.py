@@ -20,7 +20,7 @@ if TYPE_CHECKING:
 # project-file section -> Analysis attribute, for the {address: value} sections
 FLAT = {"renames": "renames", "comments": "comments", "bookmarks": "bookmarks"}
 # {function address: {generated name: value}}
-NESTED = {"variables": "var_names", "types": "var_types"}
+NESTED = {"variables": "var_names", "types": "var_types", "operands": "op_formats", "numbers": "num_formats"}
 
 
 def sha256(an: "Analysis") -> str:

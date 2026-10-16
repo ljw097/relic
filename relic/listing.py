@@ -26,8 +26,13 @@ class Line:
 
 
 def operands(an: Analysis, i: Insn) -> str:
-    """Operand text with branch targets replaced by symbolic names."""
+    """Operand text with branch targets replaced by symbolic names, and the numbers of the
+    operands the user formatted (H / R / B / O) shown so."""
     op = i.op_str
+    fmts = getattr(an, "op_formats", {}).get(i.addr)
+    if fmts:
+        from .numfmt import apply_formats
+        return apply_formats(op, fmts, an.bin.bits, lambda v: an.label(v) if an.bin.is_mapped(v) else None)
     if i.target is not None and i.kind != "normal":
         name = an.label(i.target)
         if an.bin.arch.startswith("riscv"):

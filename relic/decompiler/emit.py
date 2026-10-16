@@ -564,6 +564,16 @@ class CWriter:
 
     def const(self, c: Const) -> str:
         v = c.value
+        fmt = None
+        if self.an.num_formats:                   # the user's choice (H / R / B on the number), keyed
+            nums = self.an.num_formats.get(self.p.fn.addr, {})          # by the value as shown
+            shown = c.signed if c.bits >= 8 and v >> (c.bits - 1) and c.signed > -0x10000 else v
+            fmt = nums.get(str(shown)) or nums.get(str(v))
+        if fmt is not None:
+            from ..numfmt import format_number
+            text = format_number(v, fmt, c.bits)
+            if text is not None:
+                return text
         if c.bits == self.ptr_bits and v and self.an.bin.is_mapped(v):
             lit = self.string(v)
             if lit is not None:

@@ -1059,3 +1059,34 @@ def test_heap_panel_lists_chunks_and_tcache(app, win):
     assert got == [BASE + 0x290 + 0x10, b + 0x10]
     p.show_snapshot(Snapshot())
     assert p.chunks.rowCount() == 0 and "no heap" in p.label.text()
+
+
+def test_number_format_keys_in_listing_and_pseudocode(win):
+    from PySide6.QtGui import QTextCursor
+    an = win.an
+    f = an.function_by_name("add_note")
+    addr = next(i.addr for b in f.blocks.values() for i in b.insns if i.op_str == "edi, 0x10")
+    win.goto(addr)
+    row = win.disasm.row_of[addr]
+    line = win.disasm.document().findBlockByNumber(row)
+    cur = QTextCursor(line)
+    cur.setPosition(line.position() + line.text().index("0x10"))
+    win.disasm.setTextCursor(cur)
+    win.number_format("hex")                         # H: shown as hex now, so decimal
+    assert an.op_formats[addr] == {"1": "dec"} and "edi, 16" in win.disasm.toPlainText()
+    win.number_format("hex")                         # H again: back to hex
+    assert an.op_formats[addr] == {"1": "hex"}
+    win.number_format("char")                        # R on an unprintable value: nothing changes
+    assert "edi, 0x10" in win.disasm.toPlainText()
+    # pseudocode: the constant under the cursor
+    win.tabs.setCurrentIndex(win.TAB_DECOMP)
+    assert win.decomp.wait_idle()
+    text = win.decomp.toPlainText()
+    k = text.index("malloc(16)") + len("malloc(")
+    cur = win.decomp.textCursor()
+    cur.setPosition(k)
+    win.decomp.setTextCursor(cur)
+    win.number_format("hex")
+    assert an.num_formats[f.addr] == {"16": "hex"}
+    assert win.decomp.wait_idle()
+    assert "malloc(0x10)" in win.decomp.toPlainText()
