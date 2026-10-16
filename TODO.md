@@ -40,6 +40,19 @@
 - [x] 플러그인: 메뉴 동작·단축키, 훅(리스팅 줄·분석·커서·편집·디버거 정지·의사 코드)
 - [x] SDK 대응 확장점: 플러그인 파일 로더·프로세서 모듈(명령 디코더)·의사 코드 훅, GUI와 CLI 모두. 리프터(디컴파일러 아키텍처)는 확장점 없음
 
+## P1 — 라이브러리 식별 100%까지 (README 55%)
+
+- [x] FLIRT 방식 시그니처: 정적 라이브러리에서 생성(`relic sigs build`), x86-64·ARM/Thumb·AArch64·MIPS·RISC-V, 별칭(공개 이름)·IFUNC 스텁
+- [x] Lumina 대응 함수 메타데이터 공유
+- [x] C++ 런타임(libstdc++·libgcc) 시그니처, 정적(local) 함수, 생성자·소멸자 변형(C1/C2, D1/D2)을 한 이름으로
+- [x] 코드가 같은 함수 구분: 참조하는 대상으로 후보를 함께 좁힘, 이름 붙은 함수가 참조하는 함수(짧아서 혼자 못 맞추는 것)에 이름 전파
+- [x] 데이터 테이블(vtable·함수 포인터 표 — glibc `__io_vtables`): 시그니처 파일에 슬롯 저장, 참조로 위치를 찾아 슬롯의 함수(호출되지 않는 가상 메서드도 함수로 만들어) 이름 붙임
+- [ ] 설치된 툴체인에서 시그니처 자동 생성(`relic sigs build --system`), 식별한 라이브러리에 맞는 세트 선택
+- [ ] 컴파일러·런타임 식별(GCC/clang/MSVC/MinGW/Rust/Go 버전, glibc/musl)
+- [ ] PE: COFF 정적 라이브러리(MinGW libgcc·libmingwex·CRT) 시그니처
+- [ ] RISC-V 링커 완화(relaxation) 모델링(현재 첫 완화 가능 호출에서 패턴이 끝남)
+- [ ] GUI 시그니처 창: 불러온 세트, 세트별 이름 붙인 수, 적용·해제
+
 ## P1 — 타입 시스템 100%까지 (README 85%)
 
 - [x] 로컬 타입(구조체·공용체·비트필드·열거형·typedef·함수 원형, C 헤더 가져오기, 편집 창), 구조체 자동 복원
@@ -57,7 +70,7 @@
 ## P1 — 분석
 
 - [x] 정적 링크된 stripped 바이너리의 라이브러리 함수 이름 찾기(시그니처) — `relic/analysis/libsigs.py`, `relic sigs build`, File ▸ Apply library signatures
-  - [ ] 남은 일: 코드가 같은 짧은 스텁(`__chk_fail`/`__fortify_fail` 류, Thumb `fopen`처럼 어셈블러가 푼 분기 하나뿐인 함수) 구분, libgcc·libstdc++ 시그니처, RISC-V는 완화(relaxation)될 수 있는 첫 호출에서 패턴이 끝나 이름이 적음(완화 모델링), stripped 정적 MIPS의 `main`(`_start`가 GOT로 `__libc_start_main` 호출 — `bal`로 만든 `gp`를 리프터가 풀지 못함)
+  - [ ] 남은 일: 코드가 같은 짧은 스텁 중 참조로도 구분되지 않는 것(`__chk_fail`/`__fortify_fail` 류, Thumb `fopen`처럼 어셈블러가 푼 분기 하나뿐인 함수), RISC-V는 완화(relaxation)될 수 있는 첫 호출에서 패턴이 끝나 이름이 적음(완화 모델링), stripped 정적 MIPS의 `main`(`_start`가 GOT로 `__libc_start_main` 호출 — `bal`로 만든 `gp`를 리프터가 풀지 못함)
 - [x] capstone 일괄 디코딩: 캐시에 없을 때 x86 명령 8개까지 한 번에 디코딩해 캐시(정적 바이너리 분석 약 9% 단축). 남은 비용은 capstone 파이썬 바인딩의 명령당 객체·detail 생성(약 70µs) — detail 없이(`disasm_lite`) 디코딩하고 필요할 때만 detail을 만드는 방법은 명령의 약 37%에만 해당해 보류
 
 ## P2

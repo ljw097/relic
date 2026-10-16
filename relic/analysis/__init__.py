@@ -86,14 +86,14 @@ class Analysis:
             self._apply_saved_patches()
         report("functions", 0, force=True)
         finder = self._find_functions()
-        stops = self._library_names()
+        stops = self._library_names(finder)
         if stops:
             # library functions known not to return (exit, abort, __chk_fail) that the analysis
             # did not know: calls to them end their blocks, which changes where functions end --
             # find them again knowing that
             report("functions", 0, force=True)
             finder = self._find_functions(stops)
-            self._library_names()
+            self._library_names(finder)
         if "main" not in self.bin.name_to_addr and not any(f.name == "main" for f in self.functions.values()):
             # (after library names: a static binary's `__libc_start_main` has one only then)
             main = finder._find_main() if self.lib_names else None
@@ -137,12 +137,16 @@ class Analysis:
         self.functions = finder.run()
         return finder
 
-    def _library_names(self) -> set[int]:
+    def _library_names(self, finder: FunctionAnalyzer | None = None) -> set[int]:
         """Name functions without a symbol by library signatures (libsigs); the ones named as
         not returning that were not known to be so."""
         from .libsigs import apply, available
         dbs = available(self.bin.arch, self.sig_paths)
-        self.lib_names = apply(self, dbs) if dbs else {}
+        make = None
+        if finder is not None:
+            def make(addr: int):                  # a virtual method found in a vtable
+                return self.functions.get(finder.add_function(addr))
+        self.lib_names = apply(self, dbs, make) if dbs else {}
         new = set()
         for a in self.lib_names:
             f = self.functions[a]
