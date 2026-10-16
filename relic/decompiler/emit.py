@@ -724,6 +724,11 @@ class CWriter:
             imp = self.an.bin.imports_by_got.get(addr.addr.value)
             if imp is not None and imp.name:
                 return base_name(imp.name)
+        if isinstance(addr, StackAddr) and addr.offset in self.__dict__.get("stack_structs", {}):
+            entry = self.an.struct_names[self.stack_structs[addr.offset][0]]   # its first field
+            lay = entry.get("layout", {}).get("0x0")
+            if lay and lay[0] == bits:
+                return f"{self.vname(addr.name)}.{entry['fields'].get('f_0', 'f_0')}"
         fa = self.structs.field(addr, bits)
         if fa is not None and not self._bit_unit(*fa[1:]):
             return f"{self.expr(fa[0], PREC_POSTFIX)}->{self.fname(*fa[1:])}"

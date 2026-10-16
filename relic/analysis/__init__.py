@@ -796,11 +796,12 @@ class Analysis:
         if reanalyze:
             self.reanalyze()
 
-    def load_type_library(self, name: str = "libc") -> dict:
-        """Import a bundled type library (decompiler.typelibs: the C library's structs, laid out
-        for this binary's ABI); one undo step. What was imported, as import_header."""
-        from ..decompiler.typelibs import library_text
-        return self.import_header(library_text(name, self.bin.arch))
+    def load_type_library(self, name: str | None = None) -> dict:
+        """Import a bundled type library (decompiler.typelibs: the C library's structs, or the
+        Windows API's types and structs -- the default for a PE --, laid out for this binary's
+        ABI); one undo step. What was imported, as import_header."""
+        from ..decompiler.typelibs import default_library, library_text
+        return self.import_header(library_text(name or default_library(self.bin.format), self.bin.arch))
 
     def lumina_pull(self, store: str | None = None, overwrite: bool = False) -> dict:
         """Names, comments and variable names / types of matching functions from a shared store

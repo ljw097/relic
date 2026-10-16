@@ -197,8 +197,9 @@ class Api:
         f = self.func(where)
         return callees(self.an, f.addr) if f is not None else []
 
-    def load_type_library(self, name: str = "libc") -> dict:
-        """Import a bundled type library (`libc`: struct stat, tm, timeval, sockaddr_in, ...)."""
+    def load_type_library(self, name: str | None = None) -> dict:
+        """Import a bundled type library (`libc`: struct stat, tm, timeval, sockaddr_in, ...;
+        `win32`: HANDLE, DWORD, SYSTEM_INFO, STARTUPINFOA, ... -- the default for a PE)."""
         got = self.an.load_type_library(name)
         if self.win is not None:
             self.win._after_edit()

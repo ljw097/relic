@@ -495,7 +495,8 @@ def recover_calls(fn: IRFunction, an: "Analysis", arch: ArchInfo) -> IRFunction:
                     classes = arg_classes(sig, fmt, scan="scanf" in (name or ""))
                     placed = place_args(arch, classes, argregs, variadic=fmt is not None)
                 else:
-                    selected = list(argregs[:arg_count(sig, fmt)])
+                    n = arg_count(sig, fmt)
+                    selected = list(argregs[:n]) + [None] * (n - len(argregs))   # the rest on the stack
                     if sig.variadic:                 # `execl(path, arg, ..., 0)`: what was set too
                         if own is None:
                             own = _livein_arg_regs(an, arch, fn.addr)
@@ -647,7 +648,7 @@ def _stack_values(b, k: int, s: CallStmt, frame, arch: ArchInfo, offs: list[int]
             return
         consumed.add(j)
         v = b.stmts[j].src
-        if sizes is not None and sizes[n] == 8 and v.bits == 32:       # a double stored as two words
+        if word == 4 and sizes is not None and sizes[n] == 8 and v.bits == 32:   # a double stored as two words
             j2 = stores.get(base + rel + 4)
             if j2 is None:
                 return

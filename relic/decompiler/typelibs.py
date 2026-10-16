@@ -1,7 +1,9 @@
-"""Type libraries (IDA's .til): declarations of the C library's structs, imported into a
-project on demand (`Analysis.load_type_library`) and laid out for the binary's ABI like any
-header. With them, `stat(path, &st)` and `localtime()` results read as `st.st_size`,
-`tm->tm_year`."""
+"""Type libraries (IDA's .til): declarations of the C library's structs (`libc`) and of the
+Windows API's types and structs (`win32`), imported into a project on demand
+(`Analysis.load_type_library`) and laid out for the binary's ABI like any header. With them,
+`stat(path, &st)` and `localtime()` results read as `st.st_size`, `tm->tm_year`, and
+`GetSystemInfo(&si)` as `si.dwPageSize`. (The functions' prototypes are known without them:
+`sigs.lookup`.)"""
 from __future__ import annotations
 
 _COMMON = """
@@ -46,15 +48,23 @@ struct stat {
 """,
 }
 
-LIBRARIES = ("libc",)
+LIBRARIES = ("libc", "win32")
+
+
+def default_library(fmt: str) -> str:
+    """The type library for a binary of this file format: the Windows API for PE."""
+    return "win32" if fmt == "PE" else "libc"
 
 
 def library_text(name: str, arch: str) -> str:
     """The declarations of type library `name` for a binary of `arch`."""
+    if name == "win32":
+        from .win32_h import WIN32_STRUCTS, WIN32_TYPES
+        return WIN32_TYPES + WIN32_STRUCTS
     if name != "libc":
         raise KeyError(f"no type library {name!r} (known: {', '.join(LIBRARIES)})")
     stat = _STAT["x64"] if arch == "x64" else _STAT["generic64"] if arch in ("arm64", "riscv64") else ""
     return _COMMON + stat
 
 
-__all__ = ["LIBRARIES", "library_text"]
+__all__ = ["LIBRARIES", "default_library", "library_text"]
