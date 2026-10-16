@@ -99,11 +99,18 @@ class CWriter:
         self.types: dict[str, CType] = infer_types(prep.fn, self.ptr_bits, self.is_addr)
         # library calls name what plain integers really are (`strlen(a1)`: a1 is a `char *`); a
         # pointer type recovered from how memory is accessed says more and is kept
+        lib_structs: dict[str, str] = {}
         for name, t in library_types(prep.fn, self.ptr_bits, prep.arch.ret, self._callee_name,
                                      lambda a: an.bin.read_cstring(a, 512), an).items():
             cur = self.types.get(name)
             if cur is not None and cur.ptr == 0:
                 self.types[name] = t
+            elif t.ptr == 1 and t.base.startswith("struct ") and t.base[7:] in an.struct_names and \
+                    (cur is None or cur.ptr <= 1 and not cur.base.startswith("struct ")):
+                # a prototype's `struct tm *` (with the struct in the project, from a header or
+                # a type library) says more than `int *` guessed from the accesses
+                self.types[name] = t
+                lib_structs[name] = f"{t.base} *"
         # floats and doubles: what floating-point operations read and produce, float parameters
         # and results (fpconst.float_types)
         from .fpabi import callee_ret, fp_params
@@ -142,6 +149,8 @@ class CWriter:
             gen = self.names.get(name, name)
             if gen in wanted:
                 user_types[name] = wanted[gen]
+        for name, t in lib_structs.items():              # (the user's own type still wins)
+            user_types.setdefault(name, t)
         # plain copies of a variable the user typed `struct X *` (`var_18 = a1` at -O0) point to X too
         todo = [n for n, t in user_types.items() if t.startswith("struct ") and t.count("*") == 1]
         while todo:
@@ -545,8 +554,55 @@ class CWriter:
                     n += 1
                     self.names[d.name] = f"v{n}"
 
+    def _find_stack_structs(self):
+        """Stack slots whose address a call takes as a `struct S *` (a prototype, or a function
+        the user typed) with S in the project: `struct stat buf_a8;`, and the stack variables
+        inside it read as its fields (`buf_a8.st_size`)."""
+        self.stack_structs: dict[int, tuple[str, int]] = {}     # slot offset -> (struct, size)
+        self.stack_fields: dict[str, str] = {}                  # inner slot name -> `base.field`
+        self._inner_slots: set[str] = set()
+        if not self.an.struct_names:
+            return
+        from .sigs import lookup
+        for st in self.p.fn.stmts():
+            for top in ir.stmt_exprs(st):
+                for c in ir.walk(top):
+                    if not isinstance(c, ir.Call):
+                        continue
+                    sig = lookup(self._callee_name(c), self.an)
+                    types = list(sig.types) if sig is not None else []
+                    if isinstance(c.target, Const) and c.target.value in self.an.functions:
+                        wanted = self.an.var_types.get(c.target.value) or {}
+                        types = types or [wanted.get(f"a{k + 1}", "") for k in range(len(c.args))]
+                    for k, a in enumerate(c.args):
+                        t = types[k] if k < len(types) else ""
+                        if isinstance(a, StackAddr) and t.startswith("struct ") and t.count("*") == 1:
+                            name = t[7:].replace("*", "").strip()
+                            entry = self.an.struct_names.get(name)
+                            m = re.search(r"(\d+) bytes", (entry or {}).get("decl", [""])[0]) if entry else None
+                            if m:
+                                self.stack_structs[a.offset] = (name, int(m.group(1)))
+        for base, (name, size) in self.stack_structs.items():
+            entry = self.an.struct_names[name]
+            base_slot = self.p.frame.slots.get(base)
+            if base_slot is None:
+                continue
+            for off, sl in self.p.frame.slots.items():
+                rel = off - base
+                if off == base or not 0 < rel < size or sl.kind not in ("local", "buffer"):
+                    continue
+                self._inner_slots.add(sl.name())
+                lay = entry.get("layout", {}).get(f"{rel:#x}")
+                if lay and lay[0] == sl.width * 8:
+                    field = entry["fields"].get(f"f_{rel:x}", f"f_{rel:x}")
+                    self.stack_fields[sl.name()] = f"{base_slot.name()}.{field}"
+
     def vname(self, name: str) -> str:
         """Display name of a variable: the user's name, else the generated one (`v3`, `a1`, `var_c`)."""
+        field = self.__dict__.get("stack_fields", {}).get(name)
+        if field is not None:                        # a field of a stack struct: `buf_a8.st_size`
+            base, _, rest = field.partition(".")
+            return f"{self.vname(base)}.{rest}"
         gen = self.names.get(name, name)
         shown = self.user.get(gen, gen)
         self.shown[shown] = gen
@@ -837,6 +893,8 @@ class CWriter:
             return self.vname(e.name), PREC_POSTFIX
         if isinstance(e, StackAddr):
             slot = self.p.frame.slots.get(e.offset)
+            if e.offset in self.__dict__.get("stack_structs", {}):
+                return f"&{self.vname(e.name)}", PREC_UNARY
             if slot is not None and slot.kind == "buffer":
                 return self.vname(e.name), PREC_POSTFIX
             return f"&{self.vname(e.name)}", PREC_UNARY
@@ -1263,11 +1321,17 @@ class CWriter:
                 self.emit(f"// stack canary at {self._base}-{-slot.offset:#x} (check hidden)", None, depth)
                 continue
             gen = slot.name()
-            if gen not in used:
+            if gen in self._inner_slots and gen in self.stack_fields:
+                continue                         # declared as a field of the stack struct around it
+            if gen not in used and slot.offset not in self.stack_structs:
                 continue
             name = self.vname(gen)
             where = f"// {self._base}-{-slot.offset:#x}" if slot.offset < 0 else f"// {self._base}+{slot.offset:#x}"
-            if slot.kind == "buffer":
+            if slot.offset in self.stack_structs:
+                sname = self.stack_structs[slot.offset][0]
+                shown = self.an.struct_names.get(sname, {}).get("name") or sname
+                self.emit(f"struct {shown} {name};  {where}", None, depth)
+            elif slot.kind == "buffer":
                 self.emit(f"char {name}[{number(slot.size)}];  {where}", None, depth)
             else:
                 t = self.types.get(gen) or CType(int_type(slot.width * 8))
@@ -1285,6 +1349,7 @@ class CWriter:
         self.emit(self.signature(), self.p.fn.addr, 0)
         self.emit("{", None, 0)
         self._bitfield_stores()
+        self._find_stack_structs()
         self.declarations(1)
         body = _flatten(self.p.tree)
         if body and isinstance(body[-1], Ret) and body[-1].stmt.value is None:

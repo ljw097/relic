@@ -197,6 +197,13 @@ class Api:
         f = self.func(where)
         return callees(self.an, f.addr) if f is not None else []
 
+    def load_type_library(self, name: str = "libc") -> dict:
+        """Import a bundled type library (`libc`: struct stat, tm, timeval, sockaddr_in, ...)."""
+        got = self.an.load_type_library(name)
+        if self.win is not None:
+            self.win._after_edit()
+        return got
+
     def lumina_pull(self, store: str | None = None, overwrite: bool = False) -> dict:
         """Names / comments / variable names of matching functions from a shared store."""
         got = self.an.lumina_pull(store, overwrite)
@@ -384,7 +391,7 @@ def namespace(an: "Analysis", win=None) -> dict:
               "set_field_type", "add_field", "remove_field", "comment", "func", "import_header", "set_return_type",
               "export", "snapshot", "restore_snapshot", "merge", "op_format", "number_format", "rcomment", "names",
               "lumina_pull", "lumina_push", "read", "read_int", "sections", "insn", "define", "undefine",
-              "make_function", "delete_function", "bookmark", "callers", "callees",
+              "make_function", "delete_function", "bookmark", "callers", "callees", "load_type_library",
               "functions", "xrefs_to", "xrefs_from",
               "disasm", "decompile", "strings", "search", "patch", "nop", "invert", "assemble", "revert", "save"):
         ns[n] = getattr(api, n)
