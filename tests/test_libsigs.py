@@ -8,6 +8,7 @@ import pytest
 from relic.analysis import analyze
 from relic.analysis import libsigs
 from relic.decompiler.emit import decompile
+from relic.loader import load
 
 HERE = os.path.dirname(__file__)
 LIBC_A = "/usr/lib/x86_64-linux-gnu/libc.a"
@@ -293,3 +294,67 @@ def test_object_file_signatures_name_a_stripped_binary(vuln64_stripped, vuln_sig
         set(an.lib_names.values())
     text = decompile(an, an.function_by_name("main")).text
     assert "menu(" in text, text
+
+
+MINGW = {"x64": "x86_64-w64-mingw32", "x86": "i686-w64-mingw32"}
+
+
+@pytest.mark.parametrize("arch", sorted(MINGW))
+def test_coff_object_signatures(arch, tmp_path):
+    """MinGW library members are COFF: functions run to the next symbol (less the padding after
+    them), aliases are one name, i386 names lose their `_` and a stdcall `@N`."""
+    cc = shutil.which(f"{MINGW[arch]}-gcc")
+    if cc is None:
+        pytest.skip(f"needs {MINGW[arch]}-gcc")
+    (tmp_path / "c.c").write_text(
+        "int g(int);\n"
+        "static int helper(int x) { return x * 7 + g(x); }\n"
+        "int api(int x) { return helper(x) ^ helper(x + 1); }\n"
+        "int api_alias(int x) __attribute__((alias(\"api\")));\n"
+        "int __attribute__((stdcall)) Sum3(int a, int b, int c) { return a * 3 + b * 5 + c * 7 + g(a); }\n"
+        "int tiny(void) { return 0; }\n")
+    obj = tmp_path / "c.o"
+    subprocess.run([cc, "-O1", "-fno-inline", "-c", "-o", str(obj), str(tmp_path / "c.c")], check=True)
+    data = obj.read_bytes()
+    assert libsigs.is_coff(data)
+    got_arch, sigs = libsigs.coff_object_signatures(data)
+    by = {n: s for s in sigs for n in s.names}
+    assert got_arch == arch and {"api", "api_alias", "helper", "Sum3", "tiny"} <= set(by)
+    assert by["api"] is by["api_alias"] and by["api"].name == "api"                # one alias set
+    assert "g" in [n for _, n in by["helper"].refs]                                # (helper: no relocation)
+    assert by["tiny"].pattern.endswith(b"\xc3") and len(by["tiny"].pattern) <= 6   # (no padding after `ret`)
+    db = libsigs.build([str(obj)])
+    assert db.format == "PE" and db.arch == arch and libsigs.set_name(db) == f"c-{arch}-pe.sig"
+
+
+@pytest.mark.parametrize("arch", sorted(MINGW))
+def test_static_mingw_binaries_get_library_names(arch, tmp_path):
+    triple = MINGW[arch]
+    cc, strip = shutil.which(f"{triple}-gcc"), shutil.which(f"{triple}-strip")
+    libs = [libs for t, libs in libsigs.system_libraries() if t == triple]
+    if cc is None or strip is None or not libs:
+        pytest.skip(f"needs {triple}-gcc, strip and its static runtime")
+    full, stripped = str(tmp_path / "libtypes.exe"), str(tmp_path / "stripped.exe")
+    subprocess.run([cc, "-O2", "-static", "-o", full, os.path.join(HERE, "src", "libtypes.c")], check=True)
+    subprocess.run([strip, "-o", stripped, full], check=True)
+    sigs, aliases = [], {}
+    for k, paths in enumerate(libs):
+        db = libsigs.build(paths)
+        assert db.format == "PE" and db.arch == arch
+        sigs.append(str(tmp_path / f"{k}.sig"))
+        db.save(sigs[-1])
+        for s in db.sigs:
+            for n in s.names:
+                aliases.setdefault(libsigs._plain(n), set()).update(libsigs._plain(m) for m in s.names)
+    an = analyze(stripped, sigs=sigs)
+    assert an.toolchain.compiler.startswith("MinGW GCC")
+    names = set(an.lib_names.values())
+    assert {"__mingw_vfprintf", "__mingw_pformat", "_pei386_runtime_relocator", "fwrite"} <= names, sorted(names)
+    truth = {a: s.name for a, s in load(full).symbols.items()}
+    p = libsigs._plain
+    for a, n in an.lib_names.items():
+        t = truth.get(a)
+        if t:
+            assert p(t) in aliases.get(p(n), {p(n)}) | {p(n)}, (hex(a), n, t)
+    with_symbols = [f for f in an.functions.values() if not f.is_import and f.addr in truth]
+    assert sum(1 for f in with_symbols if f.library) > 0.7 * len(with_symbols)

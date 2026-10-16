@@ -177,4 +177,7 @@ def test_system_libraries_finds_the_native_toolchain():
     found = libsigs.system_libraries()
     assert ("x86_64-linux-gnu", [libc]) in found
     assert any(t == "x86_64-linux-gnu" and libs[0].endswith("libgcc.a") for t, libs in found)
-    assert not any("mingw" in t for t, _ in found)
+    mingw = [libs for t, libs in found if t == "x86_64-w64-mingw32"]
+    if os.path.exists("/usr/x86_64-w64-mingw32/lib/libmingwex.a"):            # (MinGW: its COFF runtime)
+        assert ["/usr/x86_64-w64-mingw32/lib/libmingwex.a"] in mingw
+        assert not any(lib.endswith(("libc.a", "libm.a")) for libs in mingw for lib in libs)
