@@ -275,7 +275,16 @@ class MainWindow(QMainWindow):
         self.tabs.addTab(self.decomp, "Pseudocode")
         self.tabs.addTab(self.hex, "Hex")
         self.tabs.currentChanged.connect(self._tab_changed)
-        self.setCentralWidget(self.tabs)
+        from .navband import NavBand
+        self.navband = NavBand()
+        self.navband.navigate.connect(self.goto)
+        central = QWidget()
+        lay = QVBoxLayout(central)
+        lay.setContentsMargins(0, 0, 0, 0)
+        lay.setSpacing(0)
+        lay.addWidget(self.navband)
+        lay.addWidget(self.tabs)
+        self.setCentralWidget(central)
         for v in (self.disasm, self.graph, self.decomp):
             v.navigate.connect(self.goto)
             v.cursor_addr.connect(self._cursor_moved)
@@ -768,6 +777,7 @@ class MainWindow(QMainWindow):
 
     def _fill_tables(self, checksec: dict):
         self._last_checksec = checksec
+        self.navband.set_analysis(self.an)
         an, b = self.an, self.an.bin
         t = self.strings.table
         t.setSortingEnabled(False)
@@ -815,6 +825,7 @@ class MainWindow(QMainWindow):
             del self.back[:-256]
             self.fwd.clear()
         self._show(addr)
+        self.navband.set_current(addr)
         return True
 
     def _show(self, addr: int):
@@ -1155,6 +1166,7 @@ class MainWindow(QMainWindow):
 
     def _cursor_moved(self, addr: int):
         self.cur = addr
+        self.navband.set_current(addr)
         self._show_status(addr)
         self._notify_cursor(addr)
 

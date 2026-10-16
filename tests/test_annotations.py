@@ -56,3 +56,17 @@ def test_call_graph(vuln64):
     leaf = callees(an, add_note)[0]
     levels, _, _ = call_graph(an, leaf, 2)
     assert levels[add_note] == -1 and levels[main] == -2
+
+
+def test_navigation_band_regions(vuln64):
+    from relic.analysis.navband import band_regions
+    an = analyze(vuln64)
+    regs = band_regions(an)
+    kinds = {k for _, _, k in regs}
+    assert {"code", "import", "data"} <= kinds
+    assert all(s < e for s, e, _ in regs) and [r[0] for r in regs] == sorted(r[0] for r in regs)
+    # every loaded section covered exactly once
+    total = sum(e - s for s, e, _ in regs)
+    assert total == sum(s.size for s in an.bin.sections if s.size and s.addr)
+    main = an.function_by_name("main").addr
+    assert next(k for s, e, k in regs if s <= main < e) == "code"

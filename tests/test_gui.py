@@ -1124,3 +1124,21 @@ def test_call_graph_window(win):
     d.draw()
     assert d.nodes[main][0] < d.nodes[menu][0]                     # callers to the left
     d.close()
+
+
+def test_navigation_band(win):
+    band = win.navband
+    win.resize(1200, 800)
+    band.resize(1000, band.height())
+    assert band.total and band.regions
+    main = win.an.function_by_name("main").addr
+    win.goto(main)
+    assert band.cur == main
+    x = band.x_of(main)
+    assert x is not None and abs(band.addr_at(x) - main) < band.total / band.width() * 2
+    got = []
+    band.navigate.connect(got.append)
+    from PySide6.QtCore import QPointF
+    band._go(type("E", (), {"position": lambda self: QPointF(x, 5)})())
+    assert got and abs(got[0] - main) < band.total / band.width() * 2
+    band.repaint()                                   # (paints without errors)
