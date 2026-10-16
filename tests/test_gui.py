@@ -1173,3 +1173,33 @@ def test_data_listing_and_definition_keys(win):
     win.create_function_here()
     assert w in win.an.functions and win.disasm.func is not None
     assert win.undo() and w not in win.an.functions
+
+
+def test_lumina_menu(win, tmp_path):
+    from unittest import mock
+    store = str(tmp_path / "lumina.json")
+    with mock.patch("relic.gui.main_window.QInputDialog.getText", return_value=(store, True)):
+        win.lumina_store_dialog()
+    try:
+        assert win.lumina_store() == store
+        assert win.lumina_push()["pushed"] >= 10 and os.path.exists(store)
+        got = win.lumina_pull()
+        assert got["matched"] >= 10 and "lumina:" in win.statusBar().currentMessage()
+    finally:
+        win.settings().remove("lumina/store")
+
+
+def test_history_window(win):
+    an = win.an
+    main = an.function_by_name("main").addr
+    d = win.show_history()
+    assert "no versions yet" in d.text.toPlainText()
+    d.commit("start")
+    an.rename(main, "entry")
+    d.refresh()
+    assert d.tree.topLevelItemCount() == 1 and "entry" in d.text.toPlainText()     # latest -> now
+    d.commit("named main")
+    d.tree.topLevelItem(1).setSelected(True)                                       # version 1
+    assert "version 1 -> now" in d.text.toPlainText()
+    d.checkout()
+    assert main not in an.renames and "checked out version 1" in win.statusBar().currentMessage()

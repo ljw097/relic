@@ -69,6 +69,9 @@ class Analysis:
         self._in_edit = False
         # named copies of the annotations: name -> {"time": ..., "notes": project-file sections}
         self.snapshots: dict[str, dict] = {}
+        # versions of the annotations (commit / log / diff / checkout): {"id", "time", "author",
+        # "message", "notes"}, oldest first
+        self.history: list[dict] = []
         self._sha256: str | None = None
         self._fstarts: list[int] = []
         self._strings_by_addr: dict[int, String] = {}
@@ -156,14 +159,14 @@ class Analysis:
         keep = (self.renames, self.comments, self.var_names, self.patches, self.struct_names, self.var_types,
                 self.patch_undo, self.patch_redo, self.sig_paths, self.bookmarks, self.edit_undo, self.edit_redo,
                 self.user_types, self.snapshots, self.op_formats, self.num_formats, self.rcomments,
-                self.data_defs, self.func_edits)
+                self.data_defs, self.func_edits, self.history)
         b = self.bin
         self.__dict__.clear()                    # decompiler caches live on the instance too
         self.__init__(b)
         (self.renames, self.comments, self.var_names, self.patches, self.struct_names, self.var_types,
          self.patch_undo, self.patch_redo, self.sig_paths, self.bookmarks, self.edit_undo, self.edit_redo,
          self.user_types, self.snapshots, self.op_formats, self.num_formats, self.rcomments,
-         self.data_defs, self.func_edits) = keep
+         self.data_defs, self.func_edits, self.history) = keep
         return self.run(load_project=False)
 
     # ------------------------------------------------------------- patches
@@ -793,6 +796,17 @@ class Analysis:
         if reanalyze:
             self.reanalyze()
 
+    def lumina_pull(self, store: str | None = None, overwrite: bool = False) -> dict:
+        """Names, comments and variable names / types of matching functions from a shared store
+        (lumina; one undo step)."""
+        from .lumina import Store, pull
+        return pull(self, Store(store), overwrite)
+
+    def lumina_push(self, store: str | None = None) -> dict:
+        """Send the functions' names, comments and variable names / types to a shared store."""
+        from .lumina import Store, push
+        return push(self, Store(store))
+
     def names(self) -> list[tuple[int, str, str]]:
         """Every named address: (address, name as shown, kind: function / import / library /
         data / label)."""
@@ -860,6 +874,8 @@ class Analysis:
             data["c_types"] = notes["c_types"]
         if self.snapshots:
             data["snapshots"] = self.snapshots
+        if self.history:
+            data["history"] = self.history
         with open(path or self.project_path, "w") as fp:
             json.dump(data, fp, indent=2)
 
@@ -872,6 +888,7 @@ class Analysis:
         from .project import notes_from_json
         notes_from_json(self, data)
         self.snapshots = dict(data.get("snapshots", {}))
+        self.history = list(data.get("history", []))
         return True
 
     # ------------------------------------------------------------ snapshots
@@ -891,6 +908,25 @@ class Analysis:
 
     def delete_snapshot(self, name: str) -> bool:
         return self.snapshots.pop(name, None) is not None
+
+    # ------------------------------------------------------------ history
+    def commit(self, message: str, author: str | None = None) -> dict:
+        """Record the annotations as a new version (saved with the project)."""
+        from .project import commit
+        return commit(self, message, author)
+
+    def diff_versions(self, a: int | None = None, b: int | None = None) -> list:
+        """Changes from version `a` (default: the latest) to version `b` (default: now):
+        [(section, key, before, after)]."""
+        from .project import diff, notes_to_json, version
+        old = version(self, a)["notes"] if a is not None else (self.history[-1]["notes"] if self.history else {})
+        new = version(self, b)["notes"] if b is not None else notes_to_json(self)
+        return diff(old, new)
+
+    def checkout(self, vid: int):
+        """Put version `vid`'s annotations back (one undo step)."""
+        from .project import notes_from_json, version
+        notes_from_json(self, version(self, vid)["notes"])
 
     def merge_project(self, path: str, theirs: bool = False, force: bool = False) -> dict:
         """Merge another project file of this binary (another analyst's work) into the
@@ -927,7 +963,7 @@ for _name in ("rename", "rename_var", "rename_struct", "rename_field", "set_var_
               "add_field", "remove_field", "comment", "bookmark", "import_header", "set_return_type",
               "clear_imported_types", "restore_snapshot", "merge_project", "set_operand_format",
               "set_number_format", "repeatable_comment", "define_data", "undefine", "create_function",
-              "delete_function"):
+              "delete_function", "lumina_pull", "checkout"):
     setattr(Analysis, _name, _undoable(getattr(Analysis, _name)))
 
 

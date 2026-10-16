@@ -25,7 +25,7 @@
 진행률은 "IDA Pro가 그 영역에서 하는 일 중 Relic이 같은 수준으로 하는 비율"을 어림한 값입니다.
 전체 값은 영역 가중 평균(가중치는 리버싱 실무에서의 비중)입니다.
 
-**전체: 약 53%** — 분석·디컴파일 핵심 경로는 x86/ARM/MIPS/RISC-V 계열에서 실사용 가능, 파일 포맷(Mach-O)·타입 시스템(타입 자동 전파·라이브러리 타입)·디컴파일 품질(goto, SIMD)이 큰 격차.
+**전체: 약 57%** — 분석·디컴파일 핵심 경로는 x86/ARM/MIPS/RISC-V 계열에서 실사용 가능, 파일 포맷(Mach-O)·타입 시스템(타입 자동 전파·라이브러리 타입)·디컴파일 품질(goto, SIMD)이 큰 격차.
 
 | 영역 (가중치) | IDA Pro 기준 | Relic 현재 | 진행률 |
 |---|---|---|---|
@@ -38,7 +38,7 @@
 | 대화형 UI (12) | 리스팅·그래프·xref·이름/주석·검색·패치·undo·북마크·구조체 창 | 리스팅·그래프(층별 레이아웃)·의사 코드·헥스, 함수 밖 메모리 리스팅(데이터 섹션·미분석 코드: 문자열·포인터·0 반복 자동 표시), 코드·데이터 정의(U/C/D/A/`*`)·함수 만들기·지우기(P/Ctrl+Delete), 이름·주석·반복 주석·변수 이름, xref, 이름 창, 호출 그래프, 내비게이션 밴드, 같은 단어 강조, 숫자 표시 형식(H/R/B/O), 이동 기록, 검색(바이트·텍스트·즉치값·명령어), 바이트 패치(NOP·분기 반전·어셈블, 패치된 파일 내보내기), 모든 편집의 undo/redo, 북마크, 구조체·C 타입 창, 테마·확대 (기준 항목: [TODO.md](TODO.md)의 대화형 UI 목록) | 100% |
 | 스크립팅·확장 (8) | IDAPython, IDC, SDK, 플러그인 | Python 라이브러리 API, 스크립팅 API(`here()`·`rename()`·`decompile()`·`patch()` …), GUI Python 콘솔, 플러그인(`register(api)` → Plugins 메뉴, 리스팅 줄 꾸미기·분석 완료·커서 이동 훅), `relic script` 배치 실행, CLI | 40% |
 | 디버거 (7) | 로컬·원격(gdbserver 등) 디버깅 | 로컬 GUI 디버거(GDB/MI): 실행·단계 실행·중단점(조건·활성화·적중 횟수, 라이브러리 함수 이름)·하드웨어 watchpoint·리스팅/의사 코드 동기화, pwndbg식 레지스터·스택 telescope·vmmap·메모리 hexdump·백트레이스·콘솔, 레지스터·메모리 편집, PIE 슬라이드 보정, glibc 힙 뷰(`[heap]` 청크 걷기 — 사용 중/해제/tcache/top, tcache 목록·safe-linking 자동 판별, libc 심볼 없이); 원격 디버깅 없음 | 46% |
-| 프로젝트·협업 (5) | IDB, 스냅숏, Teams, Lumina | `<binary>.relic.json`(이름·주석·변수 이름·타입·구조체·패치·북마크, 바이너리 SHA-256), 이름 붙인 스냅숏(복원은 undo 한 단계), 다른 분석가의 프로젝트 파일 병합(충돌 보고, 우리/그쪽 우선) | 35% |
+| 프로젝트·협업 (5) | IDB, 스냅숏, Teams, Lumina | `<binary>.relic.json`(이름·주석·반복 주석·변수 이름·타입·구조체·패치·북마크·숫자 형식·데이터 정의·함수 편집, 바이너리 SHA-256), 이름 붙인 스냅숏, 버전 기록(commit·log·diff·checkout, 작성자·메시지 — Teams 대응), 다른 분석가의 프로젝트 파일 병합(충돌 보고), Lumina 대응 함수 메타데이터 공유(위치 독립 지문으로 이름·주석·변수 이름·타입 push/pull, JSON 파일 또는 `relic lumina serve` 서버) (기준 항목: [TODO.md](TODO.md)) | 100% |
 
 IDA Pro에 없는 Relic 쪽 기능: checksec(ELF/PE 보호 기법), 포너블 휴리스틱(위험 함수, 비상수 포맷 스트링, 폭 없는 `scanf("%s")`, ret2win 후보), 디컴파일 결과의 재컴파일 검증 하네스.
 
@@ -101,6 +101,8 @@ relic types     ./chall chall.h      # C 헤더를 프로젝트에 가져오기 
 relic decompile ./chall -a -o chall.c   # 바이너리 전체 의사 코드를 C 파일 하나로 (구조체 선언은 한 번)
 relic project   ./chall snapshot before  # 지금의 이름·주석·타입을 스냅숏으로 (snapshots / restore / delete)
 relic project   ./chall merge bob/chall.relic.json   # 다른 분석가의 작업 병합 (--theirs: 충돌 시 그쪽 값)
+relic project   ./chall commit -m "named the parser"   # 버전 기록 (log / diff [A [B]] / checkout N)
+relic lumina    push ./chall --store team.json   # 함수 이름·주석·타입 공유 (pull: 같은 함수가 있는 다른 바이너리에 적용, serve: 팀 서버)
 relic search    ./chall --bytes '48 8b ?? 05'   # 바이트 패턴 (--text, --imm 0x186a0, --insn 'call.*system')
 relic script    ./chall rename_all.py arg1      # 스크립팅 API로 Python 실행 (--save: 프로젝트 저장, 옵션은 스크립트 앞에)
 relic sigs build /usr/lib/x86_64-linux-gnu/libc.a -o ~/.relic/sigs/glibc-x64.sig   # 라이브러리 시그니처

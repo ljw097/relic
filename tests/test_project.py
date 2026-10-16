@@ -134,3 +134,53 @@ def test_cli_project(copies):
     assert code != 0 and "no snapshot 'missing'" in out
     code, out = relic("merge")
     assert code != 0 and "needs a file" in out
+
+
+def test_history_commit_diff_checkout(copies):
+    an, _ = copies
+    f, g = _two(an)
+    an.rename(f, "first")
+    v1 = an.commit("named the entry", author="alice")
+    assert v1["id"] == 1 and v1["author"] == "alice" and v1["notes"]["renames"] == {f"{f:#x}": "first"}
+    an.rename(f, "start")
+    an.comment(g, "checked")
+    changes = an.diff_versions()                                # latest version -> now
+    assert ("renames", f"{f:#x}", "first", "start") in changes and ("comments", f"{g:#x}", None, "checked") in changes
+    v2 = an.commit("more", author="bob")
+    assert an.diff_versions(1, 2) == changes and an.diff_versions() == []
+    an.checkout(1)
+    assert an.renames == {f: "first"} and g not in an.comments
+    an.undo()                                                   # the checkout is one undo step
+    assert an.renames[f] == "start"
+    an.save_project()
+    again = analyze(an.bin.path)
+    assert [v["message"] for v in again.history] == ["named the entry", "more"] and v2["id"] == 2
+    with pytest.raises(KeyError):
+        an.checkout(9)
+    with pytest.raises(ValueError):
+        an.commit("  ")
+
+
+def test_cli_history(copies):
+    an, _ = copies
+    f, _g = _two(an)
+
+    def relic(*args):
+        r = subprocess.run([sys.executable, "-m", "relic", "project", an.bin.path, *args],
+                           capture_output=True, text=True, cwd=os.path.dirname(HERE))
+        return r.returncode, r.stdout + r.stderr
+    assert relic("log") == (0, "no versions\n")
+    code, out = relic("commit", "-m", "empty", "--author", "carol")
+    assert code == 0 and "version 1: empty" in out
+    cur = analyze(an.bin.path)                                  # (with the version the CLI committed)
+    cur.rename(f, "named")
+    cur.save_project()
+    code, out = relic("diff")
+    assert code == 0 and f"+ renames    {f:#x}: 'named'" in out and "1 added" in out
+    relic("commit", "-m", "named one")
+    code, out = relic("log")
+    assert out.splitlines()[0].split()[0] == "2" and "carol" in out
+    code, out = relic("checkout", "1")
+    assert code == 0 and analyze(an.bin.path).renames == {}
+    code, out = relic("checkout", "7")
+    assert code != 0 and "no such version" in out
