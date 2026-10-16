@@ -1264,3 +1264,50 @@ def test_toolchain_rows_and_building_signatures_from_toolchains(app, vuln64_stri
     assert w.an.function_by_name("checksum").library
     w.dirty = False
     w.close()
+
+
+def test_signatures_window(app, vuln64_stripped, tmp_path, monkeypatch):
+    """File > Library signatures lists the sets, which fit the binary and how many functions
+    each named; applying, taking a set's names back and adding a library work from it."""
+    import subprocess
+    from relic.analysis import libsigs
+    obj = str(tmp_path / "vuln.o")
+    subprocess.run(["gcc", "-O0", "-fno-stack-protector", "-w", "-c", "-o", obj,
+                    os.path.join(os.path.dirname(__file__), "src", "vuln.c")], check=True)
+    sigdir = tmp_path / "sigs"
+    db = libsigs.build([obj])
+    db.save(str(sigdir / "vuln-x64.sig"))
+    other = libsigs.SigDB("arm64", [], "other.a", library="glibc", version="2.39")
+    other.save(str(sigdir / "glibc-2.39-arm64.sig"))
+    monkeypatch.setattr(libsigs, "sig_dirs", lambda: [str(sigdir)])
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))            # (a library added is built under ~/.relic)
+    path = tmp_path / "stripped"
+    shutil.copy(vuln64_stripped, path)
+    w = MainWindow()
+    w.open_file(str(path))
+    assert w.wait()
+    d = w.signatures_window()
+    rows = {r[0]: r for r in (_tree_rows(d.tree))}
+    assert set(rows) == {"vuln-x64.sig", "glibc-2.39-arm64.sig"}
+    assert rows["vuln-x64.sig"][6] == "yes" and rows["glibc-2.39-arm64.sig"][6] == ""   # (arm64: not for it)
+    named_now = int(rows["vuln-x64.sig"][7] or 0)                 # (applied when the binary was opened)
+    assert named_now >= 8 and w.an.function_by_name("checksum").library
+    _select(d.tree, "vuln-x64.sig")
+    assert d.remove_selected() == named_now
+    assert w.an.function_by_name("checksum") is None and not w.an.lib_names
+    _select(d.tree, "vuln-x64.sig")
+    assert d.apply_selected() >= 8 and w.an.function_by_name("checksum").library
+    assert int(dict((r[0], r) for r in _tree_rows(d.tree))["vuln-x64.sig"][7]) >= 8
+    added = d.add_file(obj)                                        # a library: built into ~/.relic/sigs
+    assert added == str(tmp_path / "home" / ".relic" / "sigs" / "vuln-x64.sig")
+    w.dirty = False
+    w.close()
+
+
+def _select(tree, label):
+    for r in range(tree.topLevelItemCount()):
+        tree.topLevelItem(r).setSelected(tree.topLevelItem(r).text(0) == label)
+
+
+def _tree_rows(tree):
+    return [[tree.topLevelItem(r).text(c) for c in range(tree.columnCount())] for r in range(tree.topLevelItemCount())]

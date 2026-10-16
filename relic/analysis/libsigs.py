@@ -167,6 +167,12 @@ class SigDB:
     library: str = ""
     version: str = ""
     format: str = "ELF"
+    path: str = ""                  # the file it was loaded from / saved to
+
+    @property
+    def label(self) -> str:
+        """How the set is shown: its file's name, else what it was built from."""
+        return os.path.basename(self.path) if self.path else self.source
 
     def save(self, path: str) -> None:
         os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
@@ -176,13 +182,15 @@ class SigDB:
             data["tables"] = self.tables
         with gzip.open(path, "wt") as fp:
             json.dump(data, fp)
+        self.path = path
 
     @classmethod
     def load(cls, path: str) -> "SigDB":
         with gzip.open(path, "rt") as fp:
             data = json.load(fp)
         db = cls(data["arch"], source=data.get("source", path), tables=data.get("tables", {}),
-                 library=data.get("library", ""), version=data.get("version", ""), format=data.get("format", "ELF"))
+                 library=data.get("library", ""), version=data.get("version", ""), format=data.get("format", "ELF"),
+                 path=path)
         for groups, text, *rest in data["sigs"]:
             pattern, mask = _decode(text)
             if len(rest) > 1 and rest[1]:        # some bytes only partly known
@@ -722,10 +730,12 @@ class Matcher:
         self.groups: dict[tuple[int, int, int], dict[int, list]] = {}
         self.unindexed: list[Signature] = []
         self.tables: dict[str, list] = {}
+        self.db_of: dict[int, SigDB] = {}     # id(signature) -> its database
         for db in dbs:
             for name, slots in db.tables.items():
                 self.tables.setdefault(name, slots)
             for s in db.sigs:
+                self.db_of[id(s)] = db
                 # a short pattern is usable when what it refers to is checked too (see match)
                 if s.fixed < MIN_FIXED and (not s.refs or s.fixed + REF_WEIGHT * len(s.refs) < MIN_SHORT):
                     continue
@@ -1019,7 +1029,16 @@ def apply(an: "Analysis", dbs: list[SigDB], make_function=None) -> dict[int, str
         _ifunc_stubs(an, named, aliases)
         if len(named) == before:
             break
-    _resolve(an, m, named, aliases, used, make_function)
+    targets, via = _resolve(an, m, named, aliases, used, make_function)
+    # which signature set named each function (one named after another's references: that one's)
+    sources = an.__dict__.setdefault("lib_sources", {})
+    for a in named:
+        b, hops = a, 0
+        while b in via and hops < 16:
+            b, hops = via[b], hops + 1
+        sigs = [x[0] if isinstance(x, tuple) else x for x in (targets.get(b) or used.get(b) or [])]
+        db = m.db_of.get(id(sigs[0])) if sigs else None
+        sources[a] = db.label if db is not None else ""
     return named
 
 
@@ -1057,14 +1076,17 @@ def _resolve(an: "Analysis", m: Matcher, named: dict[int, str], aliases: dict[in
     targets = {a: [(s, _ref_targets(an, a & ~1 if an.bin.arch == "arm" else a, s)) for s in sigs]
                for a, sigs in used.items()}
 
-    def name(addr: int, public: str, names: set, cands: list):
+    def name(addr: int, public: str, names: set, cands: list, src: int | None = None):
         f = an.functions[addr]
         f.name, f.library = public, True
         named[addr] = public
         aliases[addr] = names
         targets[addr] = cands
         pend.pop(addr, None)
+        if not cands and src is not None:
+            via[addr] = src                     # (named after what `src` refers to)
 
+    via: dict[int, int] = {}                # named from another function's references: that function
     done: set[int] = set()                  # named functions whose references were followed
     seen_tables: set[int] = set()
     for _ in range(8):
@@ -1122,12 +1144,13 @@ def _resolve(an: "Analysis", m: Matcher, named: dict[int, str], aliases: dict[in
                         continue
                     name(t, want, {n for s, _ in ok for n in s.names}, ok)
                 else:
-                    name(t, want, {want}, [])
+                    name(t, want, {want}, [], a)
                 changed = True
         if _name_from_tables(an, m, targets, pend, name, seen_tables, make_function):
             changed = True
         if not changed:
             break
+    return targets, via
 
 
 def _table_base(an: "Analysis", t: int, table: list, word: int) -> int | None:
@@ -1188,7 +1211,7 @@ def _name_from_tables(an: "Analysis", m: Matcher, targets: dict, pend: dict, nam
     word = an.bin.bits // 8
     changed = False
     starts = sorted(an.functions)
-    for cands in list(targets.values()):
+    for src, cands in list(targets.items()):
         for t, want in (cands[0][1] if len(cands) == 1 else ()):
             slots = m.tables.get(want)
             if t is None or slots is None or t in an.functions:
@@ -1207,11 +1230,11 @@ def _name_from_tables(an: "Analysis", m: Matcher, targets: dict, pend: dict, nam
                     g = make_function(p)
                     if g is not None and g.name.startswith("sub_"):
                         bisect.insort(starts, g.addr)
-                        a = g.addr & ~1 if an.bin.arch == "arm" else g.addr
-                        cands = m.candidates(an.bin.read(a, MAX_LEN) or b"",
-                                             lambda size, g=g, a=a: _ends_at(an, g, a + size))
-                        if cands:
-                            pend[g.addr] = [(c, _ref_targets(an, a, c)) for c in cands]
+                        ga = g.addr & ~1 if an.bin.arch == "arm" else g.addr
+                        own = m.candidates(an.bin.read(ga, MAX_LEN) or b"",
+                                           lambda size, g=g, ga=ga: _ends_at(an, g, ga + size))
+                        if own:
+                            pend[g.addr] = [(c, _ref_targets(an, ga, c)) for c in own]
                 if g is None or g.is_import or not g.name.startswith("sub_"):
                     continue
                 if g.addr in pend:
@@ -1220,7 +1243,7 @@ def _name_from_tables(an: "Analysis", m: Matcher, targets: dict, pend: dict, nam
                         continue
                     name(g.addr, fname, {n for s, _ in ok for n in s.names}, ok)
                 else:
-                    name(g.addr, fname, {fname}, [])
+                    name(g.addr, fname, {fname}, [], src)
                 changed = True
     return changed
 

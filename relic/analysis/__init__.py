@@ -79,6 +79,7 @@ class Analysis:
         self.sig_paths: list[str] | None = None
         # functions named by a library signature: address -> name
         self.lib_names: dict[int, str] = {}
+        self.lib_sources: dict[int, str] = {}       # ... and the signature set (label) that named it
         self._toolchain = None
 
     # ------------------------------------------------------------------ run
@@ -147,6 +148,7 @@ class Analysis:
         if finder is not None:
             def make(addr: int):                  # a virtual method found in a vtable
                 return self.functions.get(finder.add_function(addr))
+        self.lib_sources = {}
         self.lib_names = apply(self, dbs, make) if dbs else {}
         new = set()
         for a in self.lib_names:
@@ -502,6 +504,18 @@ class Analysis:
     def checksec(self) -> dict[str, str]:
         from .checksec import checksec
         return checksec(self.bin)
+
+    def unapply_signatures(self, label: str) -> int:
+        """Take back the names the signature set `label` gave (functions become `sub_...`
+        again); how many."""
+        gone = [a for a, src in self.lib_sources.items() if src == label]
+        for a in gone:
+            f = self.functions.get(a)
+            if f is not None and f.library:
+                f.name, f.library = f"sub_{a & ~1 if self.bin.arch == 'arm' else a:x}", False
+            self.lib_names.pop(a, None)
+            del self.lib_sources[a]
+        return len(gone)
 
     @property
     def toolchain(self):
