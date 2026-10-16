@@ -19,6 +19,7 @@ THEMES = {
         "func": "#a6e3a1", "current": "#2d2f36", "node": "#26272b", "node_border": "#45475a",
         "edge_true": "#7fb77e", "edge_false": "#f38ba8", "edge": "#89b4fa", "word": "#3e4452",
         "window": "#25262b", "selection": "#3b4261", "pc_line": "#24402c", "bp_line": "#4a252b",
+        "trace_line": "#262d3d",
     },
     "light": {
         "bg": "#fbfbfa", "fg": "#24292f", "addr": "#8c959f", "bytes": "#a0a7b0", "mnem": "#0550ae",
@@ -26,6 +27,7 @@ THEMES = {
         "func": "#116329", "current": "#eef2f7", "node": "#ffffff", "node_border": "#c4cbd4",
         "edge_true": "#1a7f37", "edge_false": "#cf222e", "edge": "#0969da", "word": "#dbe7f5",
         "window": "#eff1f3", "selection": "#b6d4fe", "pc_line": "#d3f2d0", "bp_line": "#f9d4d8",
+        "trace_line": "#e4ecfb",
     },
 }
 # the active colours: one dict changed in place, so every module sees the switch
@@ -282,15 +284,19 @@ class DisasmView(QPlainTextEdit):
         # the cursor band first, then the debugger's marks over it, then the word highlights
         self.setExtraSelections(sel[:1] + self._debug_selections() + sel[1:])
 
-    def set_debug_marks(self, pc: int | None, breakpoints=()):
-        """Mark the stopped-at instruction and the breakpoints (static addresses) while debugging."""
+    def set_debug_marks(self, pc: int | None, breakpoints=(), traced=None):
+        """Mark the stopped-at instruction and the breakpoints (static addresses) while debugging;
+        `traced`: instructions a trace ran (None leaves the ones marked)."""
         self.debug_pc = pc
         self.debug_bps = set(breakpoints)
+        if traced is not None:
+            self.debug_traced = set(traced)
         self._highlight_row(self.textCursor().blockNumber())
 
     def _debug_selections(self) -> list:
         # plugin colours first: the debugger's marks show over them
         marks = [(k, ln.color) for k, ln in enumerate(self.lines) if ln.color]
+        marks += [(self.row_of.get(a), "trace_line") for a in getattr(self, "debug_traced", ())]
         marks += [(self.row_of.get(a), "bp_line") for a in getattr(self, "debug_bps", ())]
         if getattr(self, "debug_pc", None) is not None:
             marks.append((self.row_of.get(self.debug_pc), "pc_line"))
@@ -988,7 +994,7 @@ class PseudocodeView(QPlainTextEdit):
         sel = _row_and_word_selections(self, row)
         self.setExtraSelections(sel[:1] + self._debug_selections() + sel[1:])
 
-    def set_debug_marks(self, pc: int | None, breakpoints=()):
+    def set_debug_marks(self, pc: int | None, breakpoints=(), traced=None):
         """Mark the statement being executed and the lines with breakpoints (static addresses)."""
         self.debug_pc = pc
         self.debug_bps = set(breakpoints)

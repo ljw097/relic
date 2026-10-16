@@ -25,7 +25,7 @@
 진행률은 "IDA Pro가 그 영역에서 하는 일 중 Relic이 같은 수준으로 하는 비율"을 어림한 값입니다.
 전체 값은 영역 가중 평균(가중치는 리버싱 실무에서의 비중)입니다.
 
-**전체: 약 71%** — 분석·디컴파일 핵심 경로는 x86/ARM/MIPS/RISC-V 계열에서 실사용 가능, 파일 포맷(Mach-O)·타입 시스템(타입 자동 전파·라이브러리 타입)·디컴파일 품질(goto, SIMD)이 큰 격차.
+**전체: 약 73%** — 분석·디컴파일 핵심 경로는 x86/ARM/MIPS/RISC-V 계열에서 실사용 가능, 파일 포맷(Mach-O)·타입 시스템(타입 자동 전파·라이브러리 타입)·디컴파일 품질(goto, SIMD)이 큰 격차.
 
 | 영역 (가중치) | IDA Pro 기준 | Relic 현재 | 진행률 |
 |---|---|---|---|
@@ -37,7 +37,7 @@
 | 디컴파일러 (20) | Hex-Rays: 다수 아키텍처, 타입·구조체 대화형 수정, 부동소수점 | x86-64/x86-32/AArch64/ARM32/MIPS32/RV64GC, 재컴파일 검증, 구조화(switch·for·&&), 상수 나눗셈, -fipa-ra 레지스터 보존, 구조체 복원·대화형 재타입(`Y`), x86-64 SSE·AArch64·ARM VFP(armhf)·RISC-V F/D 부동소수점(`float`/`double` 인자·반환값·리터럴·변환·비교·`fma`, 레지스터보다 많은 인자, 비트 단위 재컴파일 검증); x87 부동소수점, SIMD 없음 | 52% |
 | 대화형 UI (12) | 리스팅·그래프·xref·이름/주석·검색·패치·undo·북마크·구조체 창 | 리스팅·그래프(층별 레이아웃)·의사 코드·헥스, 함수 밖 메모리 리스팅(데이터 섹션·미분석 코드: 문자열·포인터·0 반복 자동 표시), 코드·데이터 정의(U/C/D/A/`*`)·함수 만들기·지우기(P/Ctrl+Delete), 이름·주석·반복 주석·변수 이름, xref, 이름 창, 호출 그래프, 내비게이션 밴드, 같은 단어 강조, 숫자 표시 형식(H/R/B/O), 이동 기록, 검색(바이트·텍스트·즉치값·명령어), 바이트 패치(NOP·분기 반전·어셈블, 패치된 파일 내보내기), 모든 편집의 undo/redo, 북마크, 구조체·C 타입 창, 테마·확대 (기준 항목: [TODO.md](TODO.md)의 대화형 UI 목록) | 100% |
 | 스크립팅·확장 (8) | IDAPython, IDC, SDK, 플러그인 | Python API(주석·타입·구조체·패치·데이터 정의·함수 만들기/지우기·메모리 읽기·명령 디코딩·xref·호출 그래프·Lumina·버전 기록 등 GUI에서 하는 모든 편집), GUI Python 콘솔, 스크립트 파일 실행(File ▸ Run script `Alt+F7`, 최근 목록)·`relic script` 배치 실행, 플러그인(`register(api)`: 메뉴 동작·단축키, 리스팅 줄·분석 완료·커서·편집·디버거 정지·의사 코드 훅), SDK 대응 확장점(플러그인 파일 로더·프로세서 모듈·의사 코드 훅 — GUI와 CLI 모두), 자동 생성 API 레퍼런스([docs/scripting.md](docs/scripting.md)) (기준 항목: [TODO.md](TODO.md)) | 100% |
-| 디버거 (7) | 로컬·원격(gdbserver 등) 디버깅 | GUI 디버거(GDB/MI) — 로컬, 원격 gdbserver, 다른 아키텍처(ARM·AArch64·MIPS·RISC-V)는 qemu-user gdb 스텁으로 자동, 실행 중인 프로세스에 붙기/떼기, 환경 변수·작업 디렉터리·입력 파일: 실행·단계 실행·중단점(조건·활성화·적중 횟수, 라이브러리 함수 이름)·하드웨어 watchpoint·리스팅/의사 코드 동기화, pwndbg식 레지스터·스택 telescope·vmmap·메모리 hexdump·백트레이스·콘솔, 레지스터·메모리 편집, PIE 슬라이드 보정, glibc 힙 뷰(`[heap]` 청크 걷기 — 사용 중/해제/tcache/top, tcache 목록·safe-linking 자동 판별, libc 심볼 없이) (기준 항목: [TODO.md](TODO.md)) | 65% |
+| 디버거 (7) | 로컬·원격(gdbserver 등) 디버깅 | GUI 디버거(GDB/MI) — 로컬, 원격 gdbserver, 다른 아키텍처(ARM·AArch64·MIPS·RISC-V)는 qemu-user gdb 스텁으로 자동, 실행 중인 프로세스에 붙기/떼기, 환경 변수·작업 디렉터리·입력 파일, 스레드 목록·전환, 공유 라이브러리 목록·적재 시 정지, 시그널 정지·전달 정책, 명령 추적(리스팅에 실행된 명령 표시): 실행·단계 실행·중단점(조건·활성화·적중 횟수, 라이브러리 함수 이름)·하드웨어 watchpoint·리스팅/의사 코드 동기화, pwndbg식 레지스터·스택 telescope·vmmap·메모리 hexdump·백트레이스·콘솔, 레지스터·메모리 편집, PIE 슬라이드 보정, glibc 힙 뷰(`[heap]` 청크 걷기 — 사용 중/해제/tcache/top, tcache 목록·safe-linking 자동 판별, libc 심볼 없이) (기준 항목: [TODO.md](TODO.md)) | 90% |
 | 프로젝트·협업 (5) | IDB, 스냅숏, Teams, Lumina | `<binary>.relic.json`(이름·주석·반복 주석·변수 이름·타입·구조체·패치·북마크·숫자 형식·데이터 정의·함수 편집, 바이너리 SHA-256), 이름 붙인 스냅숏, 버전 기록(commit·log·diff·checkout, 작성자·메시지 — Teams 대응), 다른 분석가의 프로젝트 파일 병합(충돌 보고), Lumina 대응 함수 메타데이터 공유(위치 독립 지문으로 이름·주석·변수 이름·타입 push/pull, JSON 파일 또는 `relic lumina serve` 서버) (기준 항목: [TODO.md](TODO.md)) | 100% |
 
 IDA Pro에 없는 Relic 쪽 기능: checksec(ELF/PE 보호 기법), 포너블 휴리스틱(위험 함수, 비상수 포맷 스트링, 폭 없는 `scanf("%s")`, ret2win 후보), 디컴파일 결과의 재컴파일 검증 하네스.

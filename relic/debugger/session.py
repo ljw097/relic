@@ -133,6 +133,24 @@ class Frame:
 
 
 @dataclass
+class Thread:
+    id: int
+    target: str                  # gdb's description (`Thread 0x7f... (LWP 123)`)
+    addr: int | None
+    func: str
+    state: str                   # stopped / running
+    current: bool = False
+
+
+@dataclass
+class Module:
+    start: int                   # its code (.text), as gdb reports it
+    end: int
+    path: str
+    symbols: bool = True
+
+
+@dataclass
 class TeleRow:
     """One stack / memory slot: its address, the chain of values it leads to, and a note."""
     addr: int
@@ -542,6 +560,107 @@ class Session:
         self.add_breakpoint(live_addr)
         return True
 
+    # ------------------------------------------------- threads, modules, signals
+    def threads(self) -> list[Thread]:
+        """Every thread of the program, the one being looked at marked current."""
+        try:
+            r = self.mi.command("-thread-info")
+        except MIError:
+            return []
+        cur = r.results.get("current-thread-id")
+        out = []
+        for t in r.results.get("threads", []):
+            fr = t.get("frame", {})
+            try:
+                addr = int(fr["addr"], 16) if "addr" in fr else None
+                out.append(Thread(int(t["id"]), t.get("target-id", ""), addr, fr.get("func", "??"),
+                                  t.get("state", ""), t.get("id") == cur))
+            except (KeyError, ValueError):
+                continue
+        return out
+
+    def select_thread(self, tid: int):
+        """Look at thread `tid`: registers, stack and frames are its."""
+        try:
+            self.mi.command(f"-thread-select {int(tid)}")
+        except MIError as e:
+            raise DebugError(str(e)) from None
+        self.prev_regs = self.regs = self.read_registers()
+
+    def modules(self) -> list[Module]:
+        """The shared libraries loaded (gdb's `info sharedlibrary`), with where their code is."""
+        try:
+            text = self.mi.console("info sharedlibrary")
+        except MIError:
+            return []
+        out = []
+        for line in text.splitlines():
+            m = re.match(r"\s*(0x[0-9a-fA-F]+)\s+(0x[0-9a-fA-F]+)\s+(\S+)(?:\s+\(\*\))?\s+(\S.*)$", line)
+            if m:
+                out.append(Module(int(m.group(1), 16), int(m.group(2), 16), m.group(4).strip(),
+                                  m.group(3) == "Yes"))
+        return out
+
+    def stop_on_library_load(self, on: bool = True):
+        """Stop whenever a shared library is loaded or unloaded (gdb's solib events)."""
+        self.mi.console(f"set stop-on-solib-events {1 if on else 0}")
+
+    def set_signal(self, name: str, stop: bool | None = None, pass_: bool | None = None):
+        """How a signal is handled: whether the program stops on it, whether the program
+        gets it (gdb's `handle`). None leaves that part as it is."""
+        name = name.upper()
+        if not name.startswith("SIG"):
+            name = "SIG" + name
+        words = []
+        if stop is not None:
+            words.append("stop print" if stop else "nostop noprint")
+        if pass_ is not None:
+            words.append("pass" if pass_ else "nopass")
+        if words:
+            try:
+                self.mi.console(f"handle {name} {' '.join(words)}")
+            except MIError as e:
+                raise DebugError(str(e)) from None
+        return self.signal(name)
+
+    def signal(self, name: str) -> dict:
+        """{"stop": bool, "print": bool, "pass": bool} for a signal."""
+        name = name.upper() if name.upper().startswith("SIG") else "SIG" + name.upper()
+        try:
+            text = self.mi.console(f"info signals {name}")
+        except MIError as e:
+            raise DebugError(str(e)) from None
+        m = re.search(rf"^{name}\s+(Yes|No)\s+(Yes|No)\s+(Yes|No)", text, re.M)
+        if not m:
+            raise DebugError(f"no signal {name}")
+        return {"stop": m.group(1) == "Yes", "print": m.group(2) == "Yes", "pass": m.group(3) == "Yes"}
+
+    # ---------------------------------------------------------------- tracing
+    def trace(self, count: int = 1000, until: int | None = None, progress=None) -> list[int]:
+        """Run `count` instructions one at a time (or until live address `until`, a stop that
+        is not a step's -- a breakpoint, a signal -- or the end), recording where each was:
+        the live addresses executed, in order."""
+        out = []
+        pc = self.pc
+        if pc is not None:
+            out.append(pc)
+        for k in range(count):
+            if until is not None and pc == until:
+                break
+            stop = self._run_and_wait("-exec-step-instruction", 30.0)
+            reason = stop.get("reason", "")
+            if reason.startswith("exited") or not self.regs:
+                break
+            pc = self.pc
+            if pc is None:
+                break
+            out.append(pc)
+            if reason not in ("end-stepping-range", ""):
+                break                           # (a breakpoint or a signal on the way)
+            if progress is not None and k % 100 == 0:
+                progress(k)
+        return out
+
     # -------------------------------------------------------------- state
     def read_registers(self) -> dict[str, int]:
         if not self._reg_names:
@@ -887,6 +1006,9 @@ def describe_stop(stop: dict) -> str:
         return f"breakpoint {stop.get('bkptno', '?')}"
     if reason == "signal-received":
         return f"signal {stop.get('signal-name', '?')} ({stop.get('signal-meaning', '')})".replace(" ()", "")
+    if reason == "solib-event":
+        added = [lib.get("id", "?") for lib in stop.get("added", [])] if isinstance(stop.get("added"), list) else []
+        return "library event" + (f": loaded {', '.join(os.path.basename(a) for a in added)}" if added else "")
     return reason.replace("-", " ")
 
 
@@ -894,5 +1016,5 @@ def _quote(a: str) -> str:
     return a if re.fullmatch(r"[\w./:=+-]+", a) else '"' + a.replace("\\", "\\\\").replace('"', '\\"') + '"'
 
 
-__all__ = ["DebugError", "Frame", "Mapping", "Session", "Target", "TeleRow", "describe_stop", "parse_bytes", "qemu_for",
-           "watch_key"]
+__all__ = ["DebugError", "Frame", "Mapping", "Module", "Session", "Target", "TeleRow", "Thread", "describe_stop",
+           "parse_bytes", "qemu_for", "watch_key"]
