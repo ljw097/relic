@@ -1203,3 +1203,24 @@ def test_history_window(win):
     assert "version 1 -> now" in d.text.toPlainText()
     d.checkout()
     assert main not in an.renames and "checked out version 1" in win.statusBar().currentMessage()
+
+
+def test_run_script_file_and_edit_hook(win, tmp_path):
+    script = tmp_path / "name_main.py"
+    script.write_text('rename("main", "entry_point")\nprint("renamed", hex(addr("entry_point")))\n')
+    seen = []
+    win.plugin_hooks["edit"].append(lambda ns: seen.append(ns["an"] is win.an))
+    try:
+        assert win.run_script_file(str(script))
+        assert win.an.renames[win.an.resolve("entry_point")] == "entry_point"
+        out = win.pyconsole.out.toPlainText()
+        assert "[script name_main.py]" in out and "renamed 0x" in out
+        assert win._recent_scripts()[0] == str(script) and win.recent_scripts_menu.actions()
+        assert seen and all(seen)                     # (the edit hook ran with the namespace)
+        bad = tmp_path / "bad.py"
+        bad.write_text("1 / 0\n")
+        assert not win.run_script_file(str(bad))
+        assert "ZeroDivisionError" in win.pyconsole.out.toPlainText()
+    finally:
+        win.plugin_hooks["edit"].clear()
+        win.settings().remove("scripts/recent")

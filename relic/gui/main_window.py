@@ -396,7 +396,7 @@ class MainWindow(QMainWindow):
         self.progress.hide()
         self.cancel_button.hide()
         self._closing = False
-        self.plugin_hooks: dict[str, list] = {"analysis": [], "cursor": []}
+        self.plugin_hooks: dict[str, list] = {"analysis": [], "cursor": [], "edit": [], "debug": []}
         self._actions()
         self._update_actions()
         self._load_plugins()
@@ -430,6 +430,9 @@ class MainWindow(QMainWindow):
         act(m, "&Save project", QKeySequence.StandardKey.Save, self.save_project)
         act(m, "Apply library &signatures...", None, self.signatures_dialog)
         act(m, "Import C &header...", None, self.header_dialog)
+        act(m, "&Run script...", "Alt+F7", self.script_dialog)
+        self.recent_scripts_menu = m.addMenu("Recent scrip&ts")
+        self._fill_recent_scripts()
         act(m, "&Export pseudocode...", None, self.export_dialog)
         m.addSeparator()
         act(m, "Sna&pshots...", None, self.show_snapshots)
@@ -1104,6 +1107,7 @@ class MainWindow(QMainWindow):
         if snap.pc_static is not None:
             self.goto(snap.pc_static, record=False)
         self._debug_marks(snap.pc_static)
+        self._run_hooks("debug", snap)
         where = self.an.location(snap.pc_static) if snap.pc_static is not None else f"{snap.pc:#x}"
         self.statusBar().showMessage(f"stopped at {where}" + (f" ({snap.stop})" if snap.stop else ""), 5000)
         if snap.reason.endswith(("watchpoint-trigger", "watchpoint-scope")):
@@ -1587,6 +1591,55 @@ class MainWindow(QMainWindow):
         self.snapshots_dialog.raise_()
         return self.snapshots_dialog
 
+    # ------------------------------------------------------------- scripts
+    def script_dialog(self):
+        start = (self._recent_scripts() or [os.path.dirname(self.an.bin.path) if self.an else ""])[0]
+        path, _ = QFileDialog.getOpenFileName(self, "Run script", os.path.dirname(start) or start,
+                                              "Python scripts (*.py);;All files (*)")
+        if path:
+            self.run_script_file(path)
+
+    def _recent_scripts(self) -> list[str]:
+        v = self.settings().value("scripts/recent", []) or []
+        return [v] if isinstance(v, str) else list(v)
+
+    def _fill_recent_scripts(self):
+        menu = self.recent_scripts_menu
+        menu.clear()
+        for p in self._recent_scripts():
+            menu.addAction(os.path.basename(p), lambda p=p: self.run_script_file(p)).setToolTip(p)
+        menu.setEnabled(bool(self._recent_scripts()))
+
+    def run_script_file(self, path: str) -> bool:
+        """Run a Python script with the scripting namespace (IDA's Alt+F7); its output and any
+        error go to the Python console."""
+        import contextlib
+        import io
+        import traceback
+
+        from ..scripting import namespace, run_script
+        if self.an is None:
+            self.statusBar().showMessage("open a binary first", 3000)
+            return False
+        recent = [path] + [p for p in self._recent_scripts() if p != path]
+        self.settings().setValue("scripts/recent", recent[:10])
+        self._fill_recent_scripts()
+        out = io.StringIO()
+        ok = True
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(out):
+            try:
+                run_script(path, namespace(self.an, self))
+            except SystemExit:
+                pass
+            except Exception:  # noqa: BLE001 - a script error is shown, the GUI stays up
+                ok = False
+                traceback.print_exc()
+        self.pyconsole.append(f"[script {os.path.basename(path)}]\n{out.getvalue()}")
+        self.statusBar().showMessage(f"{os.path.basename(path)}: {'done' if ok else 'failed (see the Python console)'}",
+                                     5000)
+        self._after_edit()
+        return ok
+
     # ------------------------------------------------------------- lumina
     def lumina_store(self) -> str:
         from ..analysis.lumina import default_store
@@ -1828,6 +1881,7 @@ class MainWindow(QMainWindow):
         self.dirty = True
         self.setWindowTitle(self.windowTitle().rstrip(" *") + " *")
         self._fill_names()
+        self._run_hooks("edit")
         keep = self.cur
         self.disasm.reload()
         self.graph.reload()
