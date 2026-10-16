@@ -1330,3 +1330,45 @@ def test_debugger_target_dialog(app, win, tmp_path):
     d.kind.setCurrentIndex(4)
     assert d.pid.isEnabled() and d.target().kind == "attach"
     win.dbg_target = None
+
+
+def test_debugger_threads_modules_trace_signals(app, tmp_path):
+    """The Threads and Modules panels, picking another thread, Debug > Trace marking the
+    instructions run in the listing, and a signal's handling kept for the session."""
+    import subprocess
+    from test_debugger import _can_debug
+    if not _can_debug():
+        pytest.skip("gdb with ptrace permission is needed")
+    exe = str(tmp_path / "th")
+    subprocess.run(["gcc", "-O0", "-pthread", "-o", exe, os.path.join(os.path.dirname(__file__), "src",
+                                                                       "dbg_threads.c")], check=True)
+    w = MainWindow()
+    w.open_file(exe)
+    assert w.wait()
+    spin = w.an.function_by_name("spin").addr
+    w.goto(spin)
+    w.debug_toggle_breakpoint()
+    w.debug_signals_dialog("SIGUSR1", stop=False, pass_=True)
+    w.debug_start()
+    assert _debug_wait(app, w, lambda: w.dbg_regs.rowCount() > 0)
+    w.debug_start_or_continue()
+    assert _debug_wait(app, w, lambda: w.disasm.debug_pc == spin)
+    assert any("libc.so" in w.dbg_modules.item(k, 3).text() for k in range(w.dbg_modules.rowCount()))
+    assert w.dbg_threads.rowCount() == 3 and w.dbg_threads.item(0, 0).text().startswith("*")
+    w.dbg_threads.select.emit(int(w.dbg_threads.item(1, 0).data(Qt.ItemDataRole.UserRole)))
+    assert _debug_wait(app, w, lambda: w.dbg_threads.item(1, 0).text().startswith("*"))
+    w.dbg_threads.select.emit(int(w.dbg_threads.item(0, 0).data(Qt.ItemDataRole.UserRole)))
+    assert _debug_wait(app, w, lambda: w.dbg_threads.item(0, 0).text().startswith("*"))
+    w.debug_trace_dialog(30)
+    assert _debug_wait(app, w, lambda: bool(getattr(w.disasm, "debug_traced", None)))
+    assert spin in w.disasm.debug_traced and all(w.an.function_at(a).addr == spin for a in w.disasm.debug_traced)
+    w.dbg.clear_trace()
+    assert _debug_wait(app, w, lambda: not w.disasm.debug_traced)
+    w.debug_toggle_breakpoint()
+    w.debug_start_or_continue()                                   # (SIGUSR1: no stop, passed on)
+    assert _debug_wait(app, w, lambda: "caught 10" in w.dbg_console.out.toPlainText() and
+                       "done" in w.dbg_console.out.toPlainText())
+    w.dbg.stop()
+    assert _debug_wait(app, w, lambda: w.dbg.session is None)
+    w.dirty = False
+    w.close()

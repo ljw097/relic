@@ -160,3 +160,51 @@ def test_architecture_tables():
     assert _arch_key("i386:x86-64") == "i386:x86-64" and _arch_key("aarch64") == "aarch64"
     b = load("/bin/true")
     assert Target.for_binary(b).kind == "local"
+
+
+@pytest.fixture(scope="module")
+def threads_bin(tmp_path_factory):
+    if find_gdb() is None or shutil.which("gcc") is None:
+        pytest.skip("needs gdb and gcc")
+    out = str(tmp_path_factory.mktemp("threads") / "th")
+    subprocess.run(["gcc", "-O0", "-pthread", "-o", out, os.path.join(HERE, "src", "dbg_threads.c")], check=True)
+    return out
+
+
+def test_threads_modules_signals_and_trace(threads_bin):
+    """Threads (look at another one's frames), the shared libraries, a signal's handling, and an
+    instruction trace through a loop."""
+    an = analyze(threads_bin)
+    s = Session(threads_bin, [], an)
+    try:
+        s.start("main", 30)
+        libs = [os.path.basename(m.path) for m in s.modules()]
+        assert any(n.startswith("libc.so") for n in libs) and all(m.start < m.end for m in s.modules())
+        assert s.signal("USR1") == {"stop": True, "print": True, "pass": True}
+        s.add_breakpoint(s.to_live(an.function_by_name("spin").addr))
+        s.cont(30)
+        th = s.threads()
+        assert len(th) == 3 and sum(t.current for t in th) == 1
+        cur = next(t for t in th if t.current)
+        assert s.symbolize(cur.addr).startswith("spin")
+        other = next(t for t in th if not t.current)
+        s.select_thread(other.id)
+        assert "usleep" in [f.func for f in s.backtrace()] and not s.symbolize(s.pc).startswith("spin")
+        s.select_thread(cur.id)
+        pcs = s.trace(60)
+        assert len(pcs) == 61 and all(s.symbolize(a).startswith("spin") for a in pcs)
+        assert len(set(pcs)) < len(pcs)                           # (the loop: instructions again)
+        assert describe_stop(s.cont(30)) == "signal SIGUSR1 (User defined signal 1)"
+        assert s.set_signal("SIGUSR1", stop=False, pass_=True) == {"stop": False, "print": False, "pass": True}
+        assert describe_stop(s.cont(30)) == "exited normally"
+        time.sleep(0.2)
+        assert s.read_output() == b"spin 135\ncaught 10\ndone\n"
+    finally:
+        s.close()
+    s = Session(threads_bin, [], an)
+    try:
+        s.stop_on_library_load(True)
+        s.start("entry", 30)
+        assert describe_stop(s.cont(30)).startswith("library event")
+    finally:
+        s.close()

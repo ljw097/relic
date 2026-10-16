@@ -14,7 +14,7 @@ from ..analysis import Analysis
 from ..analysis.strings import escape
 from ..progress import Cancelled, Progress
 from .debugger import (BacktracePanel, BreakpointsPanel, CodePanel, ConsolePanel, DebugController, HeapPanel,
-                       MemoryPanel, RegistersPanel, StackPanel, VmmapPanel, item_value)
+                       MemoryPanel, ModulesPanel, RegistersPanel, StackPanel, ThreadsPanel, VmmapPanel, item_value)
 from .views import (DEFAULT_FONT_SIZE, THEME, DisasmView, GraphView, HexView, PseudocodeView, current_theme,
                     font_size, mono_font, set_font_size, set_theme)
 
@@ -349,12 +349,16 @@ class MainWindow(QMainWindow):
         self.dbg_vmmap = VmmapPanel()
         self.dbg_heap = HeapPanel()
         self.dbg_bps = BreakpointsPanel()
+        self.dbg_threads = ThreadsPanel()
+        self.dbg_modules = ModulesPanel()
         right, bottom = Qt.DockWidgetArea.RightDockWidgetArea, Qt.DockWidgetArea.BottomDockWidgetArea
         self.dbg_docks = [self._dock("Registers", self.dbg_regs, right), self._dock("Stack", self.dbg_stack, right),
                           self._dock("Console", self.dbg_console, bottom), self._dock("Code", self.dbg_code, bottom),
                           self._dock("Backtrace", self.dbg_bt, bottom), self._dock("Memory", self.dbg_mem, bottom),
                           self._dock("Vmmap", self.dbg_vmmap, bottom), self._dock("Heap", self.dbg_heap, bottom),
-                          self._dock("Breakpoints", self.dbg_bps, bottom)]
+                          self._dock("Breakpoints", self.dbg_bps, bottom),
+                          self._dock("Threads", self.dbg_threads, bottom),
+                          self._dock("Modules", self.dbg_modules, bottom)]
         # registers, then the stack, below the xrefs / search tabs; console, code and backtrace
         # with the bottom tabs (strings, imports, ...)
         self.splitDockWidget(self.xrefs_dock, self.dbg_docks[0], Qt.Orientation.Vertical)
@@ -377,6 +381,8 @@ class MainWindow(QMainWindow):
         self.dbg_bps.removed.connect(self._debug_breakpoint_removed)
         self.dbg_regs.edit_requested.connect(self.debug_set_register_dialog)
         self.dbg_bps.cellDoubleClicked.connect(self._debug_breakpoint_clicked)
+        self.dbg_threads.select.connect(self.dbg.select_thread)
+        self.dbg.traced.connect(self._debug_traced)
         for t in (self.dbg_regs, self.dbg_stack, self.dbg_vmmap):
             t.cellDoubleClicked.connect(lambda r, c, t=t: self._debug_follow(t, r, c))
 
@@ -512,6 +518,12 @@ class MainWindow(QMainWindow):
         m.addSeparator()
         act(m, "Program &arguments...", None, self.debug_arguments_dialog)
         act(m, "Debugger &target...", None, self.debug_target_dialog)
+        m.addSeparator()
+        act(m, "T&race instructions...", "Ctrl+Alt+T", self.debug_trace_dialog)
+        act(m, "Clear trace", None, self.dbg.clear_trace, False)
+        act(m, "Si&gnals...", None, self.debug_signals_dialog)
+        self.solib_act = act(m, "Stop on &library load", None, self.dbg.set_solib_stop, False)
+        self.solib_act.setCheckable(True)
         act(m, "&Detach", None, self.dbg.detach, False)
         self.plugins_menu = mb.addMenu("&Plugins")
         m = mb.addMenu("&View")
@@ -1010,6 +1022,33 @@ class MainWindow(QMainWindow):
         self.dbg_bps.an = self.an
         self.dbg_bps.show_breakpoints(self.dbg.breakpoint_list)
 
+    def debug_trace_dialog(self, count: int | None = None):
+        """Run some instructions one at a time; those of the binary are marked in the listing."""
+        if count is None:
+            count, ok = QInputDialog.getInt(self, "Trace", "Instructions to run:", 1000, 1, 1_000_000)
+            if not ok:
+                return
+        self.dbg.trace(count)
+
+    def _debug_traced(self, addrs):
+        self.disasm.set_debug_marks(self.disasm.debug_pc, getattr(self.disasm, "debug_bps", ()), addrs)
+        if addrs:
+            self.statusBar().showMessage(f"{len(addrs)} instructions of the binary traced", 5000)
+
+    def debug_signals_dialog(self, name: str | None = None, stop: bool | None = None, pass_: bool | None = None):
+        """How a signal is handled: stop on it, pass it to the program."""
+        if name is None:
+            name, ok = QInputDialog.getItem(self, "Signals", "Signal:", ["SIGSEGV", "SIGINT", "SIGALRM", "SIGPIPE",
+                                                                          "SIGUSR1", "SIGUSR2", "SIGCHLD", "SIGTRAP"],
+                                            0, True)
+            if not ok or not name.strip():
+                return
+            stop = QMessageBox.question(self, "Signals", f"Stop when the program gets {name}?") == \
+                QMessageBox.StandardButton.Yes
+            pass_ = QMessageBox.question(self, "Signals", f"Pass {name} to the program?") == \
+                QMessageBox.StandardButton.Yes
+        self.dbg.set_signal(name.strip(), bool(stop), bool(pass_))
+
     def _debug_marks(self, pc_static: int | None):
         """pc and enabled breakpoints in the listing and the pseudocode."""
         bps = [a for a, b in self.dbg.static_bps.items() if b.enabled]
@@ -1125,7 +1164,7 @@ class MainWindow(QMainWindow):
     def _debug_state(self, snap):
         self.dbg_bps.an = self.an
         for panel in (self.dbg_regs, self.dbg_stack, self.dbg_bt, self.dbg_code, self.dbg_vmmap, self.dbg_heap,
-                      self.dbg_bps):
+                      self.dbg_bps, self.dbg_threads, self.dbg_modules):
             panel.show_snapshot(snap)
         if snap.exited:
             self._debug_marks(None)

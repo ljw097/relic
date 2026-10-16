@@ -77,6 +77,8 @@ class Snapshot:
     breakpoints: list = field(default_factory=list)  # Breakpoint
     maps: list = field(default_factory=list)        # Mapping
     heap: object = None                              # debugger.heap.Heap, None: no heap yet
+    threads: list = field(default_factory=list)     # debugger.Thread
+    modules: list = field(default_factory=list)     # debugger.Module
     word: int = 8
 
 
@@ -88,6 +90,7 @@ class DebugController(QObject):
     log = Signal(str)             # gdb command output, errors
     busy = Signal(bool)
     memory = Signal(object, bytes, str)  # (live address, bytes read, what it is) for the memory view
+    traced = Signal(object)       # static addresses a trace ran (a set), after each trace
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -98,6 +101,9 @@ class DebugController(QObject):
         self.static_bps: dict[int, Breakpoint] = {}      # in the analysed binary, by static address
         self.other_bps: dict[str, Breakpoint] = {}       # by gdb location / watch key, in insertion order
         self.mem_addr: int | None = None   # the memory view's address (None: follow the stack pointer)
+        self.solib_stop = False            # stop when a shared library is loaded
+        self.signals: dict[str, tuple] = {}  # signal -> (stop, pass) chosen, applied to every session
+        self.trace_static: set[int] = set()   # instructions of the analysed binary traces ran
         self.last = Snapshot()
         self._jobs: queue.Queue = queue.Queue()
         self._worker = threading.Thread(target=self._loop, daemon=True)
@@ -173,6 +179,10 @@ class DebugController(QObject):
                          "attach": f"attached to process {target.pid}"}.get(target.kind, target.kind)
                 self.log.emit(f"[ {where} ]\n")
             self.mem_addr = None
+            if self.solib_stop:
+                self.session.stop_on_library_load(True)
+            for sig, (stop, pass_) in self.signals.items():
+                self.session.set_signal(sig, stop, pass_)
             self.session.start(stop_at)
             for bp in sorted(self.static_bps.values(), key=lambda b: b.addr):
                 bp.hits = 0
@@ -227,6 +237,48 @@ class DebugController(QObject):
         # not through the queue: the worker is blocked waiting for the stop this causes
         if self.session is not None:
             threading.Thread(target=self.session.interrupt, daemon=True).start()
+
+    def select_thread(self, tid: int):
+        def go():
+            if self.session is not None:
+                self.session.select_thread(tid)
+        self._submit(go)
+
+    def set_signal(self, name: str, stop: bool, pass_: bool):
+        """How a signal is handled, in this session and the next ones."""
+        self.signals[name.upper()] = (stop, pass_)
+
+        def go():
+            if self.session is not None:
+                h = self.session.set_signal(name, stop, pass_)
+                self.log.emit(f"[ {name.upper()}: {'stop' if h['stop'] else 'no stop'}, "
+                              f"{'passed to the program' if h['pass'] else 'not passed'} ]\n")
+        self._submit(go, snapshot=False)
+
+    def set_solib_stop(self, on: bool):
+        self.solib_stop = on
+
+        def go():
+            if self.session is not None:
+                self.session.stop_on_library_load(on)
+        self._submit(go, snapshot=False)
+
+    def trace(self, count: int):
+        """Run `count` instructions one at a time; the ones of the analysed binary are marked."""
+        def go():
+            if self.session is None:
+                raise RuntimeError("no program is being debugged (Debug > Start)")
+            pcs = self.session.trace(count)
+            static = {a for a in (self.session.to_static(pc) for pc in pcs) if a is not None}
+            self.trace_static |= static
+            self.log.emit(f"[ traced {len(pcs)} instructions, {len(set(pcs))} distinct, "
+                          f"{len(static)} in the binary ]\n")
+            self.traced.emit(set(self.trace_static))
+        self._submit(go)
+
+    def clear_trace(self):
+        self.trace_static = set()
+        self.traced.emit(set())
 
     def detach(self):
         """Leave the program running without the debugger."""
@@ -482,6 +534,8 @@ class DebugController(QObject):
             snap.heap = s.heap()
         except Exception as e:  # noqa: BLE001 - a heap that cannot be walked leaves the panel empty
             self.log.emit(f"heap: {e}\n")
+        snap.threads = s.threads()
+        snap.modules = s.modules()
         return snap
 
 
@@ -592,6 +646,48 @@ class BacktracePanel(QTableWidget):
             self.setItem(k, 0, _item(str(level), THEME["addr"]))
             self.setItem(k, 1, _item(_hex(addr, snap.word), None, addr))
             self.setItem(k, 2, _item(sym or "??", THEME["func"]))
+
+
+class ThreadsPanel(QTableWidget):
+    """The program's threads; double-click one to look at it (registers, stack, frames)."""
+
+    select = Signal(int)
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        _setup(self, ["ID", "Address", "Function", "State", "Thread"])
+        self.cellDoubleClicked.connect(self._picked)
+
+    def show_snapshot(self, snap: Snapshot):
+        self.setRowCount(len(snap.threads))
+        for k, t in enumerate(snap.threads):
+            col = THEME["func"] if t.current else None
+            self.setItem(k, 0, _item(("* " if t.current else "  ") + str(t.id), col, t.id))
+            self.setItem(k, 1, _item(_hex(t.addr, snap.word) if t.addr is not None else "", None, t.addr))
+            self.setItem(k, 2, _item(t.func, THEME["func"]))
+            self.setItem(k, 3, _item(t.state))
+            self.setItem(k, 4, _item(t.target))
+
+    def _picked(self, row: int, _col: int):
+        it = self.item(row, 0)
+        if it is not None:
+            self.select.emit(int(it.data(Qt.ItemDataRole.UserRole)))
+
+
+class ModulesPanel(QTableWidget):
+    """The shared libraries loaded, with where their code is."""
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        _setup(self, ["Start", "End", "Symbols", "Library"])
+
+    def show_snapshot(self, snap: Snapshot):
+        self.setRowCount(len(snap.modules))
+        for k, m in enumerate(snap.modules):
+            self.setItem(k, 0, _item(_hex(m.start, snap.word), THEME["addr"], m.start))
+            self.setItem(k, 1, _item(_hex(m.end, snap.word), THEME["addr"]))
+            self.setItem(k, 2, _item("yes" if m.symbols else "no"))
+            self.setItem(k, 3, _item(m.path))
 
 
 class CodePanel(QPlainTextEdit):
