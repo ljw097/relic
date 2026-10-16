@@ -456,6 +456,15 @@ class MainWindow(QMainWindow):
         act(m, "Re&peatable comment...", ":", self.repeatable_comment_dialog)
         act(m, "Set t&ype...", "Y", self.set_type_dialog)
         act(m, "&Xrefs to...", "X", self.show_xrefs_here)
+        d = m.addMenu("Code / &data")
+        act(d, "&Undefine", "U", self.undefine_here)
+        act(d, "&Code", "C", lambda: self.define_here("code"))
+        act(d, "&Data (byte / word / dword / qword)", "D", self.data_here)
+        act(d, "&String", "A", lambda: self.define_here("string"))
+        act(d, "&Array...", "*", self.array_dialog)
+        d.addSeparator()
+        act(d, "Create &function", "P", self.create_function_here)
+        act(d, "D&elete function", "Ctrl+Delete", self.delete_function_here)
         n = m.addMenu("&Number")
         act(n, "&Hex / decimal", "H", lambda: self.number_format("hex"))
         act(n, "&Character", "R", lambda: self.number_format("char"))
@@ -839,6 +848,8 @@ class MainWindow(QMainWindow):
                 self.decomp.show_function(an, f, addr)
             if self.tabs.currentIndex() == self.TAB_HEX:
                 self.tabs.setCurrentIndex(self.TAB_DISASM)
+        elif self.tabs.currentIndex() != self.TAB_HEX and self.disasm.show_region(an, addr):
+            self.tabs.setCurrentIndex(self.TAB_DISASM)        # data / unexplored code: listed
         else:
             self.tabs.setCurrentIndex(self.TAB_HEX)
         self.hex.show_addr(an, addr)
@@ -1219,6 +1230,80 @@ class MainWindow(QMainWindow):
             return None
         f = self.an.function_at(a)
         return f.addr if f is not None else a
+
+    # ------------------------------------------------------- code and data
+    def _item_addr(self) -> int | None:
+        a = self.disasm.current_addr() if self.tabs.currentIndex() == self.TAB_DISASM else self.cur
+        return a if a is not None else self.cur
+
+    def define_here(self, kind: str, **kw):
+        a = self._item_addr()
+        if a is None or self.an is None:
+            return
+        try:
+            self.an.define_data(a, kind, **kw)
+        except ValueError as e:
+            self.statusBar().showMessage(str(e), 4000)
+            return
+        self._after_edit()
+        self.goto(a, record=False)
+
+    def data_here(self):
+        """D: a byte, then a word, dword, qword, and round again."""
+        from ..datalist import CYCLE
+        a = self._item_addr()
+        if a is None:
+            return
+        cur = (self.an.data_defs.get(a) or [""])[0]
+        self.define_here(CYCLE[(CYCLE.index(cur) + 1) % len(CYCLE)] if cur in CYCLE else "byte")
+
+    def array_dialog(self):
+        from ..datalist import SIZES
+        a = self._item_addr()
+        if a is None:
+            return
+        cur = (self.an.data_defs.get(a) or ["byte"])[0]
+        n, ok = QInputDialog.getInt(self, "Array", f"Number of {cur if cur in SIZES else 'byte'} elements:",
+                                    16, 1, 1 << 20)
+        if ok:
+            self.define_here("array", count=n, element=cur if cur in SIZES else "byte")
+
+    def undefine_here(self):
+        a = self._item_addr()
+        if a is None:
+            return
+        self.an.undefine(a)
+        self._after_edit()
+        self.goto(a, record=False)
+
+    def create_function_here(self):
+        a = self._item_addr()
+        if a is None:
+            return
+        try:
+            QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
+            try:
+                self.an.create_function(a)
+            finally:
+                QApplication.restoreOverrideCursor()
+        except ValueError as e:
+            self.statusBar().showMessage(str(e), 4000)
+            return
+        self._after_patch(a)
+        self.statusBar().showMessage(f"function at {a:#x}", 4000)
+
+    def delete_function_here(self):
+        f = self.an.function_at(self.cur) if self.an is not None and self.cur is not None else None
+        if f is None or f.is_import:
+            self.statusBar().showMessage("no function here", 3000)
+            return
+        QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
+        try:
+            self.an.delete_function(f.addr)
+        finally:
+            QApplication.restoreOverrideCursor()
+        self._after_patch(f.addr)
+        self.statusBar().showMessage(f"removed the function at {f.addr:#x}", 4000)
 
     def number_format(self, fmt: str):
         """Show the number under the cursor another way (IDA's H / R / B / O): an operand of the
@@ -1612,10 +1697,15 @@ class MainWindow(QMainWindow):
         if step is None:
             return False
         QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
+        funcs = self.an.functions
         try:
             r = step()                            # a patch step analyses again
         finally:
             QApplication.restoreOverrideCursor()
+        if r is not None and r[0] != "patch" and self.an.functions is not funcs:
+            self._after_patch(r[1] if r[1] is not None else self.cur)    # (a function made / removed)
+            self.statusBar().showMessage(f"{done} the function edit", 4000)
+            return True
         if r is None:
             self.statusBar().showMessage(f"nothing to {what}", 3000)
             return False

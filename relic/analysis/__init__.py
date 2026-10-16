@@ -49,6 +49,11 @@ class Analysis:
         self.op_formats: dict[int, dict[str, str]] = {}
         # repeatable comments: shown at the address and at every instruction referring to it
         self.rcomments: dict[int, str] = {}
+        # what the user says memory holds (IDA's D / A / * / C / U): address -> ["byte"] /
+        # ["word"] / ["dword"] / ["qword"] / ["string", n] / ["array", element, count] / ["code"]
+        # / ["undef"]; and functions made or removed by hand: address -> "create" / "delete"
+        self.data_defs: dict[int, list] = {}
+        self.func_edits: dict[int, str] = {}
         self.num_formats: dict[int, dict[str, str]] = {}
         # byte patches: address -> (original bytes, new bytes), applied to `bin.data`
         self.patches: dict[int, tuple[bytes, bytes]] = {}
@@ -93,6 +98,7 @@ class Analysis:
                 main = self._main_from_start()
             if main is not None:
                 finder.add_function(main, "main")
+        self._apply_func_edits(finder, load_project)
         self._fstarts = sorted(self.functions)
         report("data references", 0, force=True)
         from .constprop import propagate_refs
@@ -104,6 +110,24 @@ class Analysis:
         if load_project:
             self.load_project()
         return self
+
+    def _apply_func_edits(self, finder: FunctionAnalyzer, from_project: bool = False):
+        """Functions the user made (P) or removed (Delete); on the first run (the project is
+        loaded after the analysis) read from the project file."""
+        edits = self.func_edits
+        if from_project and os.path.exists(self.project_path):
+            try:
+                with open(self.project_path) as fp:
+                    edits = {int(a, 16): v for a, v in json.load(fp).get("function_edits", {}).items()}
+            except (OSError, ValueError):
+                edits = {}
+        for a, what in sorted(edits.items()):
+            if what == "create" and a not in self.functions and self.bin.is_exec(a & ~1):
+                finder.add_function(a)
+        for a, what in edits.items():
+            f = self.functions.get(a)
+            if what == "delete" and f is not None and not f.is_import:
+                del self.functions[a]
 
     def _find_functions(self, noreturn: set[int] = frozenset()) -> FunctionAnalyzer:
         finder = FunctionAnalyzer(self.bin, self.dis, noreturn)
@@ -131,13 +155,15 @@ class Analysis:
         """Analyse again (after a patch), keeping names, comments, variable names and patches."""
         keep = (self.renames, self.comments, self.var_names, self.patches, self.struct_names, self.var_types,
                 self.patch_undo, self.patch_redo, self.sig_paths, self.bookmarks, self.edit_undo, self.edit_redo,
-                self.user_types, self.snapshots, self.op_formats, self.num_formats, self.rcomments)
+                self.user_types, self.snapshots, self.op_formats, self.num_formats, self.rcomments,
+                self.data_defs, self.func_edits)
         b = self.bin
         self.__dict__.clear()                    # decompiler caches live on the instance too
         self.__init__(b)
         (self.renames, self.comments, self.var_names, self.patches, self.struct_names, self.var_types,
          self.patch_undo, self.patch_redo, self.sig_paths, self.bookmarks, self.edit_undo, self.edit_redo,
-         self.user_types, self.snapshots, self.op_formats, self.num_formats, self.rcomments) = keep
+         self.user_types, self.snapshots, self.op_formats, self.num_formats, self.rcomments,
+         self.data_defs, self.func_edits) = keep
         return self.run(load_project=False)
 
     # ------------------------------------------------------------- patches
@@ -209,7 +235,7 @@ class Analysis:
     # ------------------------------------------------------ undo of all edits
     UNDO_MAX = 500
     NOTES = ("renames", "comments", "var_names", "var_types", "struct_names", "bookmarks", "user_types",
-             "op_formats", "num_formats", "rcomments")
+             "op_formats", "num_formats", "rcomments", "data_defs", "func_edits")
 
     def _notes(self) -> tuple:
         return copy.deepcopy(tuple(getattr(self, k) for k in self.NOTES))
@@ -217,6 +243,12 @@ class Analysis:
     def _set_notes(self, state: tuple):
         for k, v in zip(self.NOTES, copy.deepcopy(state)):
             setattr(self, k, v)
+
+    def _restore_notes(self, state: tuple, reanalyze: bool):
+        before = dict(self.func_edits)
+        self._set_notes(state)
+        if reanalyze and self.func_edits != before:      # functions made or removed: find them again
+            self.reanalyze()
 
     def _record_edit(self, entry: tuple):
         self.edit_undo.append(entry)
@@ -236,7 +268,7 @@ class Analysis:
                 return "patch", addr
             _, state, where = e
             self.edit_redo.append(("notes", self._notes(), where))
-            self._set_notes(state)
+            self._restore_notes(state, reanalyze)
             return "notes", where
         return None
 
@@ -251,7 +283,7 @@ class Analysis:
                 return "patch", addr
             _, state, where = e
             self.edit_undo.append(("notes", self._notes(), where))
-            self._set_notes(state)
+            self._restore_notes(state, reanalyze)
             return "notes", where
         return None
 
@@ -711,6 +743,56 @@ class Analysis:
         else:
             self.rcomments.pop(addr, None)
 
+    # --------------------------------------------- code and data definitions
+    def define_data(self, addr: int, kind: str, count: int | None = None, element: str = "byte"):
+        """Say what is at `addr`: "byte" / "word" / "dword" / "qword", "string" (`count` bytes,
+        default: up to and with the NUL), "array" (`count` elements of `element`), "code" (list
+        it as instructions), "undef" (plain bytes)."""
+        from ..datalist import SIZES, string_length
+        if kind in SIZES or kind in ("code", "undef"):
+            d = [kind]
+        elif kind == "string":
+            d = ["string", count or string_length(self, addr)]
+        elif kind == "array":
+            if element not in SIZES or not count or count < 1:
+                raise ValueError("an array needs an element size (byte/word/dword/qword) and a count")
+            d = ["array", element, count]
+        else:
+            raise ValueError(f"unknown data kind {kind!r}")
+        self.data_defs[addr] = d
+
+    def undefine(self, addr: int):
+        """Forget what was said about `addr` (U): back to what the analysis shows; again on an
+        address the analysis shows as something: plain bytes."""
+        if addr in self.data_defs and self.data_defs[addr] != ["undef"]:
+            del self.data_defs[addr]
+        else:
+            self.data_defs[addr] = ["undef"]
+
+    def create_function(self, addr: int, reanalyze: bool = True):
+        """Make a function start at `addr` (P)."""
+        if not self.bin.is_exec(addr & ~1):
+            raise ValueError(f"{addr:#x} is not in executable memory")
+        if self.func_edits.get(addr) == "delete":
+            del self.func_edits[addr]
+        else:
+            self.func_edits[addr] = "create"
+        self.data_defs.pop(addr, None)
+        if reanalyze:
+            self.reanalyze()
+
+    def delete_function(self, addr: int, reanalyze: bool = True):
+        """Remove the function starting at `addr` (its code is listed as plain bytes)."""
+        f = self.functions.get(addr)
+        if f is None or f.is_import:
+            raise ValueError(f"no function starts at {addr:#x}")
+        if self.func_edits.get(addr) == "create":
+            del self.func_edits[addr]
+        else:
+            self.func_edits[addr] = "delete"
+        if reanalyze:
+            self.reanalyze()
+
     def names(self) -> list[tuple[int, str, str]]:
         """Every named address: (address, name as shown, kind: function / import / library /
         data / label)."""
@@ -772,7 +854,8 @@ class Analysis:
         data.update({k: notes[k] for k in ("renames", "comments", "variables")})
         data["patches"] = {f"{a:#x}": {"old": o.hex(), "new": n.hex()} for a, (o, n) in sorted(self.patches.items())}
         data.update({k: notes[k] for k in ("structs", "types", "bookmarks")})
-        data.update({k: notes[k] for k in ("operands", "numbers", "repeatable") if notes[k]})
+        data.update({k: notes[k] for k in ("operands", "numbers", "repeatable", "data", "function_edits")
+                     if notes[k]})
         if "c_types" in notes:
             data["c_types"] = notes["c_types"]
         if self.snapshots:
@@ -843,7 +926,8 @@ def _undoable(method):
 for _name in ("rename", "rename_var", "rename_struct", "rename_field", "set_var_type", "set_field_type",
               "add_field", "remove_field", "comment", "bookmark", "import_header", "set_return_type",
               "clear_imported_types", "restore_snapshot", "merge_project", "set_operand_format",
-              "set_number_format", "repeatable_comment"):
+              "set_number_format", "repeatable_comment", "define_data", "undefine", "create_function",
+              "delete_function"):
     setattr(Analysis, _name, _undoable(getattr(Analysis, _name)))
 
 
