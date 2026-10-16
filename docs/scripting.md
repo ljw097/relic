@@ -28,7 +28,7 @@ script) and in plugin callbacks. Besides these: `an` (the Analysis), `bin` (its 
 - `import_header(text_or_path: str) -> dict` -- Import C declarations (structs, unions, enums, typedefs, prototypes) from header text or a file path; what was imported, by kind.
 - `insn(where)` -- The decoded instruction (`relic.disasm.Insn`: `.mnemonic`, `.op_str`, `.size`, `.kind`, `.target`, `.refs`) at an address, or None.
 - `invert(where)` -- Negate the conditional branch at an address (patch).
-- `load_type_library(name: str = 'libc') -> dict` -- Import a bundled type library (`libc`: struct stat, tm, timeval, sockaddr_in, ...).
+- `load_type_library(name: str | None = None) -> dict` -- Import a bundled type library (`libc`: struct stat, tm, timeval, sockaddr_in, ...; `win32`: HANDLE, DWORD, SYSTEM_INFO, STARTUPINFOA, ... -- the default for a PE).
 - `lumina_pull(store: str | None = None, overwrite: bool = False) -> dict` -- Names / comments / variable names of matching functions from a shared store.
 - `lumina_push(store: str | None = None) -> dict` -- Send the functions' names / comments / variable names to a shared store.
 - `make_function(where)` -- A function starting at an address (P); the analysis runs again.

@@ -47,7 +47,7 @@ def test_libc_layout_follows_the_abi(vuln64):
     st = an.struct_names["stat"]
     assert st["layout"]["0x30"] == [64, "long"] and st["fields"]["f_30"] == "st_size"   # x86-64
     with pytest.raises(KeyError):
-        an.load_type_library("win32")
+        an.load_type_library("nope")
     an.undo()                                              # one undo step
     assert "stat" not in an.struct_names
 

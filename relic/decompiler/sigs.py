@@ -121,15 +121,18 @@ _BUNDLED: dict[str, Sig] | None = None
 
 
 def bundled() -> dict[str, Sig]:
-    """Signatures of the prototypes in `libc_h.LIBC_H` (parsed once)."""
+    """Signatures of the prototypes in `libc_h.LIBC_H` and `win32_h.WIN32_H` (parsed once; libc's
+    win where both declare a name, as the sockets functions)."""
     global _BUNDLED
     if _BUNDLED is None:
         from .cheader import parse
         from .libc_h import LIBC_H
-        h = parse(LIBC_H)
-        _BUNDLED = {n: sig_of([t.spell() for _, t in p.params], p.ret.spell(), p.variadic,
-                              [pn for pn, _ in p.params])
-                    for n, p in h.prototypes.items()}
+        from .win32_h import WIN32_H
+        _BUNDLED = {}
+        for text in (WIN32_H, LIBC_H):
+            for n, p in parse(text).prototypes.items():
+                _BUNDLED[n] = sig_of([t.spell() for _, t in p.params], p.ret.spell(), p.variadic,
+                                     [pn for pn, _ in p.params])
     return _BUNDLED
 
 
