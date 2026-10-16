@@ -19,7 +19,7 @@ from typing import TYPE_CHECKING
 
 from ..progress import Cancelled
 from .ir import (Assign, BinOp, Branch, CallStmt, Const, Expr, IndirectJump, IRFunction, Jump, Load, Phi, Return,
-                 StackAddr, StackVar, Store, Var, map_stmt, stmt_exprs, walk)
+                 StackAddr, StackVar, Store, Var, map_stmt, stmt_defs, stmt_exprs, walk)
 from .stack import Frame, Slot
 
 if TYPE_CHECKING:
@@ -435,7 +435,7 @@ def narrow_library_results(fn: IRFunction):
     from .sigs import lookup
     defs: dict[Var, int] = {}
     for s in fn.stmts():
-        for d in _all_defs(s):
+        for d in stmt_defs(s):
             if isinstance(d, Var):
                 defs[d] = defs.get(d, 0) + 1
     for s in list(fn.stmts()):
@@ -451,11 +451,6 @@ def narrow_library_results(fn: IRFunction):
                 for b in fn.blocks.values():
                     for t in b.stmts:
                         map_stmt(t, lambda e, v=v, w=wrapped: transform(e, lambda x: w if x == v else x))
-
-
-def _all_defs(s):
-    from .ir import stmt_defs
-    return stmt_defs(s)
 
 
 # ------------------------------------------------------------ expression inlining

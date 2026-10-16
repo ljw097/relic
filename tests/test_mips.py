@@ -102,3 +102,51 @@ def test_stripped_finds_main_and_win(vuln_mips_stripped):
     from relic.decompiler.emit import decompile
     win = [f for f in an.functions.values() if not f.is_import and 'system("/bin/sh")' in decompile(an, f).text]
     assert len(win) == 1 and an.name(win[0].addr).startswith("sub_")      # found by the prologue scan
+
+
+def test_static_binary_gets_gp_from_reginfo(tmp_path):
+    """A static MIPS binary has no DT_PLTGOT: `$gp` comes from `.reginfo` (ri_gp_value), so
+    `$gp`-relative strings and jump tables resolve."""
+    import os
+    import shutil
+    import subprocess
+    cc = shutil.which("mipsel-linux-gnu-gcc")
+    if cc is None:
+        pytest.skip("needs mipsel-linux-gnu-gcc")
+    exe = tmp_path / "vuln_static"
+    r = subprocess.run([cc, "-O2", "-static", "-o", str(exe), os.path.join(os.path.dirname(__file__), "src", "vuln.c")],
+                       capture_output=True)
+    if r.returncode:
+        pytest.skip("static linking is not available")
+    an = analyze(str(exe), sigs=[])
+    assert an.bin.mips_gp is not None and an.bin.is_mapped(an.bin.mips_gp - 0x7FF0)
+    referenced = sum(1 for s in an.strings if an.xrefs_to.get(s.addr))
+    assert referenced > 0.2 * len(an.strings), (referenced, len(an.strings))
+    assert sum(len(f.jump_tables) for f in an.functions.values()) >= 10
+
+
+def test_branch_likely_annuls_its_delay_slot(tmp_path):
+    """`bnel`: the delay slot runs only when the branch is taken. The pseudocode of a hand-written
+    counter (tests/src/mips_likely.S), compiled for the host, counts like the original."""
+    import os
+    import shutil
+    import subprocess
+    cc, host = shutil.which("mipsel-linux-gnu-gcc"), shutil.which("gcc")
+    if cc is None or host is None:
+        pytest.skip("needs mipsel-linux-gnu-gcc and gcc")
+    here = os.path.dirname(__file__)
+    main = tmp_path / "m.c"
+    main.write_text("int cnt(const char *s, int c);\nint main(int c, char **v) { return cnt(v[0], c); }\n")
+    exe = tmp_path / "likely"
+    subprocess.run([cc, "-O1", "-o", str(exe), str(main), os.path.join(here, "src", "mips_likely.S")], check=True)
+    an = analyze(str(exe))
+    code = _c(an, "cnt")
+    assert "__asm" not in code and "?" in code, code             # the slot's effect, predicated
+    src = tmp_path / "re.c"
+    src.write_text('#include <stdio.h>\n#include <stdbool.h>\n' + code +
+                   '\nint main(void) { const char *t[] = {"", "/", "a/b/c//", "abc", "////x"};\n'
+                   '  for (int k = 0; k < 5; k++) printf("%d ", cnt((char *)t[k], 47)); return 0; }\n')
+    re_exe = tmp_path / "re"
+    subprocess.run([host, "-w", "-o", str(re_exe), str(src)], check=True)
+    out = subprocess.run([str(re_exe)], capture_output=True, text=True).stdout.split()
+    assert out == ["0", "1", "4", "0", "4"], (out, code)

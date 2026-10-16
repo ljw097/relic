@@ -1224,3 +1224,19 @@ def test_run_script_file_and_edit_hook(win, tmp_path):
     finally:
         win.plugin_hooks["edit"].clear()
         win.settings().remove("scripts/recent")
+
+
+def test_address_signals_carry_64_bit_addresses(win):
+    """Qt's `int` is 32 bits: a PE64 address (0x140001000) must arrive whole."""
+    big = 0x140001000
+    got = []
+    for sig in (win.disasm.navigate, win.disasm.cursor_addr, win.graph.navigate, win.decomp.navigate,
+                win.funcs.table.activated_addr):
+        sig.connect(got.append)
+        sig.emit(big)
+        sig.disconnect(got.append)
+    from relic.gui.debugger import RegistersPanel
+    p = RegistersPanel()
+    p.edit_requested.connect(lambda name, v: got.append(v))
+    p.edit_requested.emit("rsp", 0x7FFD12345678)
+    assert got == [big] * 5 + [0x7FFD12345678]

@@ -331,6 +331,8 @@ class Session:
         except MIError as e:
             raise DebugError(str(e)) from None
         wpt = next((v for k, v in r.results.items() if k in ("wpt", "hw-rwpt", "hw-awpt")), {})
+        if "number" not in wpt:                  # (an answer gdb gives in no form known here)
+            raise DebugError(f"gdb did not set the watchpoint on {expr}: {r.results}")
         n = int(wpt["number"])
         if condition:
             self._set_condition(n, condition)

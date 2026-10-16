@@ -206,29 +206,6 @@ class Disassembler:
             self.modes.setdefault(c.address, True)
         return it
 
-    def decode_block(self, addr: int, end: int) -> list[Insn]:
-        """Linear sweep from addr to end (stops at undecodable bytes)."""
-        if self.md_thumb is not None or self.custom is not None:
-            out = []
-            while addr < end:
-                i = self.decode(addr)
-                if i is None:
-                    break
-                out.append(i)
-                self.hint(i.end, i.thumb)
-                addr = i.end
-            return out
-        out = []
-        code = self.bin.read(addr, end - addr)
-        with self._lock:
-            for c in self.md.disasm(code, addr):
-                i = self._cache.get(c.address)
-                if i is None:
-                    i = self._convert(c)
-                    self._cache[c.address] = i
-                out.append(i)
-        return out
-
     def linear(self, addr: int, count: int) -> list[Insn]:
         out = []
         while len(out) < count:

@@ -17,7 +17,7 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
 from .ir import (Assign, BinOp, Call, CallStmt, Cast, Const, Expr, IRFunction, Ite, Load, Return, StackVar,
-                 Store, UnOp, Var, children, map_stmt, stmt_exprs, transform, walk)
+                 Store, UnOp, Var, children, map_stmt, stmt_defs, stmt_exprs, transform, walk)
 
 if TYPE_CHECKING:
     from .sigs import Sig
@@ -122,7 +122,7 @@ def _collect_vars(fn: IRFunction) -> dict[str, Var]:
             for x in walk(top):
                 if isinstance(x, Var):
                     seen.setdefault(x.name, x)
-        for d in _defs(s):
+        for d in stmt_defs(s):
             if isinstance(d, Var):
                 seen.setdefault(d.name, d)
     return seen
@@ -135,7 +135,7 @@ def _sext_vars(fn: IRFunction, cands: dict[str, Var], params: set[str]) -> dict[
     calling convention passes sign-extended) count as 32-bit."""
     defs: dict[str, list] = {}
     for s in fn.stmts():
-        for d in _defs(s):
+        for d in stmt_defs(s):
             if isinstance(d, Var) and cands.get(d.name) == d:
                 defs.setdefault(d.name, []).append(s.src if isinstance(s, Assign) and s.dst == d else None)
     pars = {n for n, v in cands.items() if v.version == 0 and v.name in params}
@@ -254,11 +254,6 @@ def _int_evidence(fn: IRFunction, v: Var, sx: dict[str, int], params: set[str]) 
     return False
 
 
-def _defs(s):
-    from .ir import stmt_defs
-    return stmt_defs(s)
-
-
 # ----------------------------------------------------------------------- types
 @dataclass
 class CType:
@@ -352,7 +347,7 @@ def infer_types(fn: IRFunction, ptr_bits: int, is_addr=lambda v: False,
         if isinstance(s, Assign) and isinstance(s.dst, (Var, StackVar)) and isinstance(s.src, (Var, StackVar)) \
                 and s.dst.bits == s.src.bits:
             copies.append((s.dst.name, s.src.name))
-        for d in _defs(s):
+        for d in stmt_defs(s):
             if isinstance(d, (Var, StackVar)):
                 widths.setdefault(d.name, d.bits)
 

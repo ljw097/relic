@@ -87,6 +87,18 @@ def test_patch_persists_reverts_and_refuses_bad_ranges(vuln64, tmp_path):
     assert parse_hex("0x90, 0x90") == b"\x90\x90" and parse_hex("c3") == b"\xc3"
 
 
+def test_patch_a_string(vuln64, tmp_path):
+    """A quoted string is written as its bytes (no NUL added): `"/bin/ls\\0"` over "/bin/sh"."""
+    assert parse_hex('"AB\\n"') == b"AB\n" and parse_hex("b'\\x00\\xff'") == b"\x00\xff"
+    with pytest.raises(PatchError):
+        parse_hex('"unterminated')
+    path = tmp_path / "v"
+    shutil.copy(vuln64, path)
+    an = analyze(str(path))
+    old = an.patch(0x402004, parse_hex('"/bin/ls\\0"'))
+    assert old == b"/bin/sh\0" and an.bin.read(0x402004, 8) == b"/bin/ls\0"
+
+
 def test_assemble(vuln64):
     pytest.importorskip("keystone")
     an = analyze(vuln64)

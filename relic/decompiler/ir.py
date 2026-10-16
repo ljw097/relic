@@ -231,22 +231,31 @@ BARRIERS = (Store, CallStmt, Effect, Unknown)  # statements that may write memor
 
 
 # ------------------------------------------------------------------ traversal
+# every expression kind's sub-expressions, in source order: a dict on the exact type (no class
+# here has subclasses), since `children` runs tens of millions of times in one decompilation
+_KIDS = {
+    Const: lambda e: (),
+    Reg: lambda e: (),
+    Var: lambda e: (),
+    StackVar: lambda e: (),
+    StackAddr: lambda e: (),
+    Load: lambda e: (e.addr,),
+    UnOp: lambda e: (e.a,),
+    Cast: lambda e: (e.a,),
+    Extract: lambda e: (e.a,),
+    BinOp: lambda e: (e.a, e.b),
+    Ite: lambda e: (e.cond, e.a, e.b),
+    Intrinsic: lambda e: e.args,
+    Call: lambda e: (e.target, *e.args),
+    Phi: lambda e: tuple(v for _, v in e.sources),
+}
+
+
 def children(e: Expr) -> tuple[Expr, ...]:
-    if isinstance(e, (Const, Reg, Var, StackVar, StackAddr)):
-        return ()
-    if isinstance(e, (Load, UnOp, Cast, Extract)):
-        return (e.addr,) if isinstance(e, Load) else (e.a,)
-    if isinstance(e, BinOp):
-        return (e.a, e.b)
-    if isinstance(e, Ite):
-        return (e.cond, e.a, e.b)
-    if isinstance(e, Intrinsic):
-        return e.args
-    if isinstance(e, Call):
-        return (e.target, *e.args)
-    if isinstance(e, Phi):
-        return tuple(v for _, v in e.sources)
-    raise TypeError(e)
+    kids = _KIDS.get(type(e))
+    if kids is None:
+        raise TypeError(e)
+    return kids(e)
 
 
 def rebuild(e: Expr, kids: tuple[Expr, ...]) -> Expr:
@@ -275,24 +284,29 @@ def transform(e: Expr, f) -> Expr:
     """Rebuild `e` bottom-up, applying `f` to every node after its children."""
     kids = children(e)
     if kids:
-        new = tuple(transform(k, f) for k in kids)
-        if any(a is not b for a, b in zip(new, kids)):
-            e = rebuild(e, new)
+        new, changed = [], False
+        for k in kids:                       # (no generator and zip per node: this is a hot path)
+            x = transform(k, f)
+            new.append(x)
+            changed = changed or x is not k
+        if changed:
+            e = rebuild(e, tuple(new))
     return f(e)
 
 
 def walk(e: Expr):
-    yield e
-    for k in children(e):
-        yield from walk(k)
+    """`e` and every sub-expression, in pre-order (an explicit stack, not nested generators)."""
+    stack = [e]
+    while stack:
+        x = stack.pop()
+        yield x
+        kids = children(x)
+        if kids:
+            stack.extend(kids[::-1])
 
 
 def size(e: Expr) -> int:
     return 1 + sum(size(k) for k in children(e))
-
-
-def has_load(e: Expr) -> bool:
-    return any(isinstance(x, (Load, Call)) for x in walk(e))
 
 
 def stmt_exprs(s: Stmt) -> list[Expr]:

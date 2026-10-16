@@ -33,7 +33,18 @@ class PatchError(Exception):
 
 
 def parse_hex(text: str) -> bytes:
-    """`90 90`, `9090`, `0x90,0x90` -> bytes."""
+    """`90 90`, `9090`, `0x90,0x90` -> bytes; a quoted string (`"/bin/sh\\0"`, escapes as in
+    Python) -> its bytes, with no NUL added."""
+    stripped = text.strip()
+    if stripped[:1] in ("'", '"') or stripped[:2] in ("b'", 'b"'):
+        import ast
+        try:
+            v = ast.literal_eval(stripped if stripped[0] == "b" else "b" + stripped)
+        except (ValueError, SyntaxError) as e:
+            raise PatchError(f"bad string {text!r}: {e}") from None
+        if not isinstance(v, bytes):
+            raise PatchError(f"bad string {text!r}")
+        return v
     t = text.replace(",", " ").replace("0x", "").replace("\\x", " ")
     try:
         return bytes.fromhex(t.replace(" ", ""))
