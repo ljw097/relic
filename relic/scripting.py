@@ -127,6 +127,22 @@ class Api:
         with open(path, "w") as fp:
             return export_c(self.an, fp)
 
+    def op_format(self, addr, index: int, fmt: str):
+        """Show operand `index` of the instruction at `addr` as hex / dec / char / bin / offset
+        ("" resets)."""
+        self.an.set_operand_format(self.addr(addr), index, fmt)
+        if self.win is not None:
+            self.win._after_edit()
+
+    def number_format(self, func, value: int, fmt: str):
+        """Show the constant `value` in a function's pseudocode as hex / dec / char / bin."""
+        f = self.func(func)
+        if f is None:
+            raise ValueError(f"no function at {func!r}")
+        self.an.set_number_format(f.addr, value, fmt)
+        if self.win is not None:
+            self.win._after_edit()
+
     def snapshot(self, name: str) -> dict:
         """Keep a named copy of every annotation (saved with the project)."""
         return self.an.take_snapshot(name)
@@ -260,7 +276,7 @@ def namespace(an: "Analysis", win=None) -> dict:
     ns = {"an": an, "bin": an.bin, "api": api, "win": win}
     for n in ("addr", "here", "goto", "name", "rename", "rename_struct", "rename_field", "set_type",
               "set_field_type", "add_field", "remove_field", "comment", "func", "import_header", "set_return_type",
-              "export", "snapshot", "restore_snapshot", "merge",
+              "export", "snapshot", "restore_snapshot", "merge", "op_format", "number_format",
               "functions", "xrefs_to", "xrefs_from",
               "disasm", "decompile", "strings", "search", "patch", "nop", "invert", "assemble", "revert", "save"):
         ns[n] = getattr(api, n)
