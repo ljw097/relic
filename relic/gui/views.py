@@ -187,6 +187,7 @@ class DisasmView(QPlainTextEdit):
         self.setStyleSheet(_code_style())
         self.an: Analysis | None = None
         self.func: Function | None = None
+        self.region: tuple[int, int] | None = None     # (start, end) when showing memory outside functions
         self.lines: list[Line] = []
         self.row_of: dict[int, int] = {}
         self.columns = {"bytes": 20, "mnem": 44}
@@ -209,15 +210,42 @@ class DisasmView(QPlainTextEdit):
 
     def show_function(self, an: Analysis, f: Function, addr: int | None = None):
         self.an = an
+        self.region = None
         if f is not self.func or not self.lines:
             self.func = f
             self.reload()
         self.goto(addr if addr is not None else f.addr)
 
+    def show_region(self, an: Analysis, addr: int) -> bool:
+        """Memory outside functions (data, unexplored code) around `addr` (datalist)."""
+        from ..datalist import window
+        w = window(an, addr)
+        if w is None:
+            return False
+        self.an = an
+        if self.func is not None or getattr(self, "region", None) != w or not self.lines:
+            self.func = None
+            self.region = w
+            self.reload()
+        if not self.goto(addr):                  # inside an item: its first line
+            starts = sorted(self.row_of)
+            import bisect
+            k = bisect.bisect_right(starts, addr) - 1
+            if k >= 0:
+                self.goto(starts[k])
+        return True
+
     def reload(self):
-        if self.an is None or self.func is None:
+        if self.an is None:
             return
-        lines = function_lines(self.an, self.func, self.decorators)
+        if self.func is None:
+            if getattr(self, "region", None) is None:
+                return
+            from ..datalist import region_lines
+            from ..listing import decorate
+            lines = decorate(self.an, region_lines(self.an, *self.region), self.decorators)
+        else:
+            lines = function_lines(self.an, self.func, self.decorators)
         text = render(lines, self.show_bytes)
         if text.startswith("\n"):  # render() puts a blank line before the function header
             text = text[1:]

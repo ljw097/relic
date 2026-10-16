@@ -74,9 +74,13 @@ def test_navigation_history(win):
     assert not win.goto_text("no_such_symbol")
 
 
-def test_data_address_opens_hex(win):
+def test_data_address_opens_the_data_listing_or_hex(win):
     s = next(s for s in win.an.strings if "hello" in s.value)
     assert win.goto(s.addr)
+    assert win.tabs.currentIndex() == win.TAB_DISASM and win.disasm.current_addr() == s.addr
+    assert "hello" in win.disasm.toPlainText()
+    win.tabs.setCurrentIndex(win.TAB_HEX)            # the hex view stays when it is shown
+    assert win.goto(s.addr + 1)
     assert win.tabs.currentIndex() == win.TAB_HEX
     assert f"{s.addr & ~0xF:016x}" in win.hex.toPlainText()
 
@@ -1142,3 +1146,30 @@ def test_navigation_band(win):
     band._go(type("E", (), {"position": lambda self: QPointF(x, 5)})())
     assert got and abs(got[0] - main) < band.total / band.width() * 2
     band.repaint()                                   # (paints without errors)
+
+
+def test_data_listing_and_definition_keys(win):
+    from unittest import mock
+    an = win.an
+    win.goto(0x402004)                                     # "/bin/sh" in .rodata: listed, not hex
+    assert win.tabs.currentIndex() == win.TAB_DISASM and win.disasm.func is None
+    assert '"/bin/sh", 0' in win.disasm.toPlainText() and win.disasm.current_addr() == 0x402004
+    win.data_here()                                        # D: byte
+    assert an.data_defs[0x402004] == ["byte"]
+    win.data_here()                                        # D again: word
+    assert an.data_defs[0x402004] == ["word"] and "dw " in win.disasm.toPlainText()
+    with mock.patch("relic.gui.main_window.QInputDialog.getInt", return_value=(4, True)):
+        win.array_dialog()
+    assert an.data_defs[0x402004] == ["array", "word", 4]
+    win.undefine_here()
+    assert 0x402004 not in an.data_defs
+    # P / Delete on a function, undone with Ctrl+Z
+    w = an.function_by_name("win").addr
+    win.goto(w)
+    win.delete_function_here()
+    assert w not in win.an.functions
+    win.goto(w)
+    assert win.disasm.func is None                         # its bytes: the data listing
+    win.create_function_here()
+    assert w in win.an.functions and win.disasm.func is not None
+    assert win.undo() and w not in win.an.functions

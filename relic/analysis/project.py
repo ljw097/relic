@@ -18,7 +18,8 @@ if TYPE_CHECKING:
     from . import Analysis
 
 # project-file section -> Analysis attribute, for the {address: value} sections
-FLAT = {"renames": "renames", "comments": "comments", "bookmarks": "bookmarks", "repeatable": "rcomments"}
+FLAT = {"renames": "renames", "comments": "comments", "bookmarks": "bookmarks", "repeatable": "rcomments",
+        "data": "data_defs", "function_edits": "func_edits"}
 # {function address: {generated name: value}}
 NESTED = {"variables": "var_names", "types": "var_types", "operands": "op_formats", "numbers": "num_formats"}
 
