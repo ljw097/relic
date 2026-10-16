@@ -138,7 +138,11 @@ def _parser() -> argparse.ArgumentParser:
 def _analyze(args):
     from .analysis import Analysis
     from .loader import load
-    an = Analysis(load(args.file, args.arch, args.base))
+    try:
+        b = load(args.file, args.arch, args.base)
+    except (OSError, ValueError) as e:
+        sys.exit(f"relic: {args.file}: {e}")
+    an = Analysis(b)
     an.sig_paths = [] if getattr(args, "no_sigs", False) else getattr(args, "sigs", None)
     return an.run()
 
@@ -155,7 +159,10 @@ def _where(an, text, default=None) -> int:
 
 def cmd_info(args):
     from .loader import load
-    b = load(args.file, args.arch, args.base)
+    try:
+        b = load(args.file, args.arch, args.base)
+    except (OSError, ValueError) as e:
+        sys.exit(f"relic: {args.file}: {e}")
     print(f"File:      {b.path}")
     print(f"Format:    {b.describe()}")
     print(f"Entry:     {b.entry:#x}")

@@ -25,11 +25,11 @@
 진행률은 "IDA Pro가 그 영역에서 하는 일 중 Relic이 같은 수준으로 하는 비율"을 어림한 값입니다.
 전체 값은 영역 가중 평균(가중치는 리버싱 실무에서의 비중)입니다.
 
-**전체: 약 73%** — 분석·디컴파일 핵심 경로는 x86/ARM/MIPS/RISC-V 계열에서 실사용 가능, 파일 포맷(Mach-O)·타입 시스템(타입 자동 전파·라이브러리 타입)·디컴파일 품질(goto, SIMD)이 큰 격차.
+**전체: 약 75%** — 분석·디컴파일 핵심 경로는 x86/ARM/MIPS/RISC-V 계열에서 실사용 가능, 파일 포맷(Mach-O)·타입 시스템(타입 자동 전파·라이브러리 타입)·디컴파일 품질(goto, SIMD)이 큰 격차.
 
 | 영역 (가중치) | IDA Pro 기준 | Relic 현재 | 진행률 |
 |---|---|---|---|
-| 파일 포맷 (8) | ELF, PE, Mach-O, COFF/OMF, 펌웨어·raw 등 수십 종 | ELF, PE(import/export/COFF 심볼/.pdata), RAW | 35% |
+| 파일 포맷 (8) | ELF, PE, Mach-O, COFF/OMF, 펌웨어·raw 등 수십 종 | ELF, PE(import/export/COFF 심볼/.pdata), ELF 재배치 객체(6개 아키텍처 재배치 적용)·COFF 객체·정적 라이브러리 멤버, Intel HEX·S-record, RAW (기준 항목: [TODO.md](TODO.md)) | 55% |
 | 프로세서 (8) | 60여 개 CPU 계열 | 디스어셈블 7종(x86, x64, ARM/Thumb, AArch64, MIPS, RISC-V, PPC), 분석·리프팅·디컴파일은 x86/x64/ARM/AArch64/MIPS32/RV64 | 46% |
 | 자동 분석 (14) | 함수·CFG·xref·점프 테이블·noreturn·문자열·stripped 복구 | 재귀 하강 + 프롤로그 스캔, 점프 테이블(x86/ARM/AArch64/MIPS/RISC-V), 레지스터 상수 전파로 데이터 xref, stripped `main` 복구, ARM/Thumb 상호 운용 | 55% |
 | 라이브러리 식별 (8) | FLIRT 시그니처, Lumina | FLIRT 방식 시그니처(`relic sigs build`로 정적 라이브러리에서 생성, stripped 정적 바이너리의 libc 함수 이름 — x86-64·ARM/Thumb·AArch64·MIPS·RISC-V, 재배치는 명령의 즉치 비트만 가림, RISC-V 링커 완화 형태까지), 정적 함수·C++ 런타임(libstdc++·libgcc, C1/C2 변형), 코드가 같은 함수를 참조 대상으로 함께 구분하고 이름 붙은 함수가 참조하는 함수에 이름 전파, vtable·함수 포인터 표의 슬롯으로 가상 메서드 이름(stripped 정적 C 바이너리에서 심볼 있는 함수의 83~94%(RISC-V 84%), C++ 69%, 오식별 0), 심볼·import·PLT 이름, 컴파일러·런타임 식별(GCC/clang/MSVC/MinGW/rustc/Go, glibc/musl/msvcrt)과 그에 맞는 시그니처 세트 선택, 설치된 툴체인에서 세트 자동 생성(`relic sigs build --system`), MinGW(COFF) 런타임 시그니처(stripped 정적 PE에서 x86-64 85%, i686 77%) 시그니처 창(세트별 적용·되돌리기·이름 붙인 수) (기준 항목: [TODO.md](TODO.md)) | 100% |

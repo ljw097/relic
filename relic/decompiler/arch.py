@@ -104,7 +104,7 @@ RISCV64 = ArchInfo(
 
 def arch_for(binary) -> ArchInfo:
     if binary.arch == "x64":
-        return X64_WIN if binary.format == "PE" else X64_SYSV
+        return X64_WIN if binary.format in ("PE", "COFF") else X64_SYSV
     if binary.arch == "x86":
         return X86_CDECL
     if binary.arch == "arm64":

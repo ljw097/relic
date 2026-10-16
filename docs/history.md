@@ -55,6 +55,10 @@
 - [x] **P1** ARM Thumb 모드: 주소별 명령어 집합(`$a`/`$t` 매핑 심볼, 심볼·엔트리 LSB, `bl`은 유지·`blx label`은 전환), IT 블록(조건을 한 번에 디코딩), Thumb PLT 진입점(`bx pc`)
   - [x] 심볼 없는(stripped) ARM / Thumb / AArch64: `_start`의 리프트된 IR에서 `__libc_start_main` 첫 인자(GOT·리터럴 풀 슬롯)를 읽어 `main` 복원, 함수 사이 빈 구간의 프롤로그 스캔(A32/Thumb `push {…, lr}`, AArch64 `stp x29, x30`·`paciasp`·`bti c`)으로 포인터로만 쓰이는 함수(`win`) 발견
 
+## 파일 포맷
+
+- [x] ELF 재배치 객체(`relic/loader/elfobj.py`): 할당 섹션을 0x100000부터 정렬해 배치, 정의 안 된 심볼은 `.extern` 스텁(import), GOT 형태 재배치는 `.got` 슬롯, 공통 심볼은 `.common`; 재배치 적용 — x86-64(64/PC32/PLT32/32/32S/GOTPCREL(X)), x86(32/PC32/PLT32), AArch64(ABS·PREL·CALL26/JUMP26·ADR(_GOT)_PAGE·ADD/LDST lo12·CONDBR19·TSTBR14), ARM(ABS32·REL32·CALL/JUMP24·THM_CALL/JUMP24·MOVW/MOVT), MIPS o32(32·26·HI16/LO16·GOT16·CALL16·GOT_DISP), RISC-V(32/64·CALL·PCREL_HI20/LO12·HI20/LO12·JAL·BRANCH·RVC); COFF 객체(`coff.py`, AMD64·i386 재배치, `__imp_` 슬롯); 정적 라이브러리 멤버(`archive.py`, `lib.a:member.o`); Intel HEX·S-record(`firmware.py`, 체크섬 확인, 시작 주소 레코드 또는 Cortex-M 리셋 벡터); COFF도 Windows ABI·LLP64; 로드 오류는 CLI 메시지로
+
 ## 테스트 / 인프라
 
 - [x] **P0** GitHub Actions CI (pytest, gcc 설치, Python 3.10 / 3.12 / 3.13)

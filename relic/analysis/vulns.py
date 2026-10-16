@@ -127,7 +127,7 @@ def find_vulns(an: "Analysis") -> list[Finding]:
     out: list[Finding] = []
     ir_cache: dict = {}
     # integer argument registers of the binary's calling convention (SysV or Win64)
-    regs = ("rcx", "rdx", "r8", "r9") if b.format == "PE" else X64_ARGS
+    regs = ("rcx", "rdx", "r8", "r9") if b.format in ("PE", "COFF") else X64_ARGS
     total = len(an.functions)
     for k, f in enumerate(an.functions.values()):
         report("vulns", k, total)
