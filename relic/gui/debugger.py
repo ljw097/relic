@@ -507,7 +507,7 @@ def _hex(v: int, word: int) -> str:
 class RegistersPanel(QTableWidget):
     """General-purpose registers; the context menu (or `E`) edits the selected one."""
 
-    edit_requested = Signal(str, int)      # register name, current value
+    edit_requested = Signal(str, object)   # register name, current value (64-bit: not Qt's int)
 
     def __init__(self, parent=None):
         super().__init__(parent)

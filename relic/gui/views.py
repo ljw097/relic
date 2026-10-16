@@ -176,8 +176,8 @@ class ListingHighlighter(QSyntaxHighlighter):
 class DisasmView(QPlainTextEdit):
     """Read-only linear listing of one function; double-click follows references."""
 
-    navigate = Signal(int)
-    cursor_addr = Signal(int)
+    navigate = Signal(object)       # an address (Qt's int is 32-bit: PE64 images sit above 2**32)
+    cursor_addr = Signal(object)
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -351,8 +351,8 @@ class _Node(QGraphicsItem):
 class GraphView(QGraphicsView):
     """Layered control-flow graph of the current function."""
 
-    navigate = Signal(int)
-    cursor_addr = Signal(int)
+    navigate = Signal(object)       # an address (Qt's int is 32-bit: PE64 images sit above 2**32)
+    cursor_addr = Signal(object)
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -739,7 +739,7 @@ def _decompile_text(an: Analysis, f: Function):
 class DecompileJob(QThread):
     """Decompiles one function off the GUI thread."""
 
-    finished_result = Signal(int, int, object)   # generation, function address, Decompiled | str
+    finished_result = Signal(int, object, object)   # generation, function address, Decompiled | str
 
     def __init__(self, gen: int, an: Analysis, f: Function, parent=None):
         super().__init__(parent)
@@ -781,8 +781,8 @@ class PseudocodeView(QPlainTextEdit):
     from before an invalidation, is not displayed.
     """
 
-    navigate = Signal(int)
-    cursor_addr = Signal(int)
+    navigate = Signal(object)       # an address (Qt's int is 32-bit: PE64 images sit above 2**32)
+    cursor_addr = Signal(object)
 
     def __init__(self, parent=None):
         super().__init__(parent)

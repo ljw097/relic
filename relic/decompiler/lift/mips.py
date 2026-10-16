@@ -14,8 +14,8 @@ runs before control moves. `lift_delayed` lifts the pair: the branch
 condition (or call target) is computed first into a temporary, then the
 delay-slot instruction, then the transfer -- so `bnez $v0, L; move $v0, $0`
 tests the old `$v0`, and arguments set up in the slot of a `jalr` reach the
-call. Branch-likely forms (`beql`, ...), which annul the slot when not
-taken, are left opaque.
+call. Branch-likely forms (`beql`, ...) annul the slot when not taken: its
+writes are predicated on the condition (`x = cond ? new : x`).
 """
 from __future__ import annotations
 
@@ -45,6 +45,27 @@ _NOPS = {"nop", "ssnop", "ehb", "sync", "pause", "synci", "pref", "cache",
 # conditional branches: mnemonic -> (comparison, compares with zero)
 _BRANCH = {"beq": "==", "bne": "!=", "beqz": "==", "bnez": "!=",
            "blez": "<=s", "bgtz": ">s", "bltz": "<s", "bgez": ">=s"}
+
+
+def _likely(m: str) -> bool:
+    """A branch-likely (`beql`, `bnezl`, ...: MIPS II-V): its delay slot is annulled when the
+    branch is not taken."""
+    return m.endswith("l") and m[:-1] in _BRANCH
+
+
+def _predicated(stmts: list[Stmt], cond: Expr) -> list[Stmt]:
+    """A branch-likely's delay slot: its effects happen only when `cond` holds. A register write
+    keeps the old value otherwise, a store writes back what was there; a call or another side
+    effect in the slot is beyond this."""
+    out = []
+    for s in stmts:
+        if isinstance(s, Assign):
+            out.append(Assign(s.addr, s.dst, Ite(cond, s.src, s.dst, s.dst.bits)))
+        elif isinstance(s, Store):
+            out.append(Store(s.addr, s.dst, Ite(cond, s.src, Load(s.dst, s.src.bits), s.src.bits)))
+        else:
+            raise LiftError("branch likely with a side effect in its delay slot")
+    return out
 
 
 def _cmp(op: str, a: Expr, b: Expr) -> Expr:
@@ -151,7 +172,11 @@ class MipsLifter:
         k = next((n for n, s in enumerate(ctl) if not isinstance(s, Assign)), len(ctl))
         prefix, transfer = ctl[:k], ctl[k:]
         if isinstance(slot, Insn) and slot.mnemonic != "nop":
-            prefix += self.lift_insn(slot, func)
+            body = self.lift_insn(slot, func)
+            br = next((s for s in transfer if isinstance(s, Branch)), None)
+            if _likely(i.mnemonic) and br is not None:
+                body = _predicated(body, br.cond)
+            prefix += body
         return prefix + transfer
 
     def _dispatch(self, i, m, ops):
@@ -166,8 +191,8 @@ class MipsLifter:
             pass
         elif m in ("syscall", "break", "sdbbp", "wait", "eret", "deret"):
             self._effect(i, m)
-        elif m.endswith("l") and m[:-1] in _BRANCH:
-            raise LiftError("branch likely")
+        elif _likely(m):
+            self._branch(i, m[:-1], ops)        # its delay slot runs only when it is taken (lift_delayed)
         elif ops and ops[0].type == OP_REG and self.reg_name(ops[0].reg) in _GPR and i.kind == "normal" and \
                 all(o.type in (OP_REG, OP_IMM) for o in ops):
             # FPU moves and the rest (`mfc1`, `cfc1`, `rdhwr`, ...): an opaque value of the sources

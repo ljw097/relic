@@ -137,6 +137,8 @@ def load_elf(path: str, data: bytes) -> Binary:
 
     if arch.startswith("mips"):
         _resolve_mips_got(b, elf, got_names)
+        if getattr(b, "mips_gp", None) is None:
+            _mips_gp_from_reginfo(b, elf)
     _resolve_plt(b, got_names)
     b._finalize()
     return b
@@ -147,6 +149,21 @@ _RISCV_RELOCS = {1: "R_RISCV_32", 2: "R_RISCV_64", 3: "R_RISCV_RELATIVE", 4: "R_
                  5: "R_RISCV_JUMP_SLOT", 6: "R_RISCV_TLS_DTPMOD32", 7: "R_RISCV_TLS_DTPMOD64",
                  8: "R_RISCV_TLS_DTPREL32", 9: "R_RISCV_TLS_DTPREL64", 10: "R_RISCV_TLS_TPREL32",
                  11: "R_RISCV_TLS_TPREL64", 58: "R_RISCV_IRELATIVE"}
+
+
+def _mips_gp_from_reginfo(b: Binary, elf: ELFFile):
+    """`$gp` of a module without a dynamic GOT (a static binary): `ri_gp_value`, the word at
+    offset 20 of `.reginfo` (after ri_gprmask and ri_cprmask[4]). It points 0x7ff0 past the
+    small-data / GOT area, so that area must be mapped."""
+    sec = elf.get_section_by_name(".reginfo")
+    if sec is None:
+        return
+    raw = sec.data()
+    if len(raw) < 24:
+        return
+    v = int.from_bytes(raw[20:24], b.endian)
+    if v and b.is_mapped(v - 0x7FF0):
+        b.mips_gp = v
 
 
 def _resolve_mips_got(b: Binary, elf: ELFFile, got_names: dict[int, str]):

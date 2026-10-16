@@ -100,7 +100,7 @@ def _parser() -> argparse.ArgumentParser:
     s.add_argument("--case", action="store_true", help="case-sensitive --text")
     s = add("patch", "patch bytes / NOP / invert a branch / assemble, write a patched copy", where=True)
     how = s.add_mutually_exclusive_group()
-    how.add_argument("--bytes", metavar="HEX", help="bytes to write: '90 90'")
+    how.add_argument("--bytes", metavar="HEX", help="bytes to write: '90 90', or a quoted string: '\"/bin/sh\\0\"'")
     how.add_argument("--nop", action="store_true", help="replace the instruction with NOPs")
     how.add_argument("--invert", action="store_true", help="negate the conditional branch")
     how.add_argument("--asm", metavar="TEXT", help="assemble (keystone): 'xor eax, eax; ret'")

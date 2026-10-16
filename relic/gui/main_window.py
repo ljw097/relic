@@ -151,7 +151,7 @@ class SearchThread(WorkThread):
 class Table(QTableView):
     """Read-only sortable table; double-click emits the row's address."""
 
-    activated_addr = Signal(int)
+    activated_addr = Signal(object)    # an address (Qt's int is 32-bit)
 
     def __init__(self, headers: list[str], parent=None):
         super().__init__(parent)
