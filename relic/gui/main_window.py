@@ -511,6 +511,8 @@ class MainWindow(QMainWindow):
         act(m, "S&top", "Ctrl+F2", self.dbg.stop, False)
         m.addSeparator()
         act(m, "Program &arguments...", None, self.debug_arguments_dialog)
+        act(m, "Debugger &target...", None, self.debug_target_dialog)
+        act(m, "&Detach", None, self.dbg.detach, False)
         self.plugins_menu = mb.addMenu("&Plugins")
         m = mb.addMenu("&View")
         act(m, "&Python console", "Ctrl+Shift+P", self.show_python_console, False)
@@ -969,7 +971,26 @@ class MainWindow(QMainWindow):
             self.resizeDocks([self.xrefs_dock, regs, stack], [h // 6, h // 3, h // 3], Qt.Orientation.Vertical)
         self.dbg_docks[2].raise_()        # console
         self.dbg_console.append(f"$ {self.an.bin.path} {' '.join(self.dbg_args)}\n")
-        self.dbg.start(self.an.bin.path, self.an, self.dbg_args, stop_at)
+        self.dbg.start(self.an.bin.path, self.an, self.dbg_args, stop_at, self.debug_target())
+
+    def debug_target(self):
+        """Where the program runs: the one chosen in Debug > Target, else here -- or under QEMU
+        for a program of another architecture."""
+        from ..debugger import Target
+        t = getattr(self, "dbg_target", None)
+        if t is None or t.kind == "auto":
+            auto = Target.for_binary(self.an.bin)
+            if t is not None:                    # (automatic, with the environment etc. chosen)
+                t = Target(auto.kind, t.address, t.pid, t.env, t.cwd, t.stdin, t.sysroot)
+            return t or auto
+        return t
+
+    def debug_target_dialog(self):
+        from .debugtarget import TargetDialog
+        d = TargetDialog(self, getattr(self, "dbg_target", None))
+        if d.exec():
+            self.dbg_target = d.target()
+            self.statusBar().showMessage(f"debugger target: {self.dbg_target.kind}", 4000)
 
     def debug_start_or_continue(self):
         if self.dbg.session is None or self.dbg.last.exited:

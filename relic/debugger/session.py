@@ -1,4 +1,8 @@
-"""A local debugging session: gdb (MI) underneath, Relic's view of the binary on top.
+"""A debugging session: gdb (MI) underneath, Relic's view of the binary on top.
+
+Where the program runs (`Target`): locally under gdb, under qemu-user's gdb stub (a program of
+another architecture -- ARM, AArch64, MIPS, RISC-V -- on this machine), on a gdbserver
+somewhere else (`host:port`), or a process already running here (attach).
 
 - the program runs on a pseudo-terminal, so its output and input go through
   `read_output()` / `send_input()` (a GUI console) instead of gdb's own tty;
@@ -13,8 +17,12 @@ from __future__ import annotations
 
 import os
 import re
+import shutil
+import socket
+import subprocess
 import termios
 import threading
+import time
 from dataclasses import dataclass, field
 
 from .mi import GdbMI, MIError
@@ -26,9 +34,66 @@ _GPRS = {
     "i386": ["eax", "ebx", "ecx", "edx", "edi", "esi", "ebp", "esp", "eip", "eflags"],
     "aarch64": [f"x{k}" for k in range(31)] + ["sp", "pc", "cpsr"],
     "arm": [f"r{k}" for k in range(13)] + ["sp", "lr", "pc", "cpsr"],
+    "mips": ["zero", "at", "v0", "v1", "a0", "a1", "a2", "a3", "t0", "t1", "t2", "t3", "t4", "t5", "t6", "t7",
+             "s0", "s1", "s2", "s3", "s4", "s5", "s6", "s7", "t8", "t9", "gp", "sp", "s8", "ra", "pc"],
+    "riscv": ["ra", "sp", "gp", "tp", "t0", "t1", "t2", "fp", "s1", "a0", "a1", "a2", "a3", "a4", "a5", "a6",
+              "a7", "s2", "s3", "s4", "s5", "s6", "s7", "s8", "s9", "s10", "s11", "t3", "t4", "t5", "t6", "pc"],
 }
-_PC = {"i386:x86-64": "rip", "i386": "eip", "aarch64": "pc", "arm": "pc"}
-_SP = {"i386:x86-64": "rsp", "i386": "esp", "aarch64": "sp", "arm": "sp"}
+_PC = {"i386:x86-64": "rip", "i386": "eip", "aarch64": "pc", "arm": "pc", "mips": "pc", "riscv": "pc"}
+_SP = {"i386:x86-64": "rsp", "i386": "esp", "aarch64": "sp", "arm": "sp", "mips": "sp", "riscv": "sp"}
+
+
+def _arch_key(arch: str) -> str:
+    """The register table for a gdb architecture name (`i386:x86-64`, `armv7`, `riscv:rv64`)."""
+    if arch in _GPRS:
+        return arch
+    return next((k for k in ("aarch64", "arm", "mips", "riscv", "i386") if arch.startswith(k)), arch)
+
+
+# qemu-user for a binary of Relic's arch name (and byte order), and where its libraries are
+_QEMU = {("x86", "little"): "qemu-i386", ("x64", "little"): "qemu-x86_64", ("arm", "little"): "qemu-arm",
+         ("arm", "big"): "qemu-armeb", ("arm64", "little"): "qemu-aarch64", ("mips", "little"): "qemu-mipsel",
+         ("mips", "big"): "qemu-mips", ("riscv64", "little"): "qemu-riscv64", ("ppc", "big"): "qemu-ppc"}
+_SYSROOT = {"arm": "/usr/arm-linux-gnueabihf", "arm64": "/usr/aarch64-linux-gnu", "mips": "/usr/mipsel-linux-gnu",
+            "riscv64": "/usr/riscv64-linux-gnu"}
+
+
+@dataclass
+class Target:
+    """Where and how the program runs.
+
+    kind: `local` (gdb runs it here), `qemu` (qemu-user runs it with its gdb stub: another
+    architecture's program on this machine), `remote` (a gdbserver at `address`, `host:port`,
+    already holding the program), `attach` (the process `pid`, already running here).
+    env / cwd / stdin (a file to read input from): for a program Relic starts (local, qemu).
+    sysroot: where the target's shared libraries are (qemu `-L`, gdb `set sysroot`)."""
+    kind: str = "local"
+    address: str = ""
+    pid: int = 0
+    env: dict = field(default_factory=dict)
+    cwd: str = ""
+    stdin: str = ""
+    sysroot: str = ""
+
+    @staticmethod
+    def for_binary(b) -> "Target":
+        """Local for a program this machine runs, qemu-user for one of another architecture."""
+        import platform
+        host = {"x86_64": "x64", "amd64": "x64", "aarch64": "arm64", "riscv64": "riscv64"}.get(platform.machine(), "")
+        native = b.arch == host or (host == "x64" and b.arch == "x86")
+        return Target() if native else Target("qemu")
+
+
+def qemu_for(b) -> str | None:
+    """The qemu-user that runs binary `b`, when installed."""
+    name = _QEMU.get((b.arch, getattr(b, "endian", "little")))
+    return shutil.which(name) if name else None
+
+
+def _free_port() -> int:
+    with socket.socket() as sk:
+        sk.bind(("127.0.0.1", 0))
+        return sk.getsockname()[1]
 
 
 def _mi_quote(text: str) -> str:
@@ -84,10 +149,13 @@ class Session:
     """Debug one program locally. Methods block until gdb answers (use a worker thread in a GUI)."""
 
     def __init__(self, path: str, args: list[str] | None = None, analysis=None, gdb: str | None = None,
-                 on_stop=None, on_output=None):
+                 on_stop=None, on_output=None, target: Target | None = None):
         self.path = os.path.abspath(path)
         self.args = list(args or [])
         self.an = analysis
+        self.target = target or Target()
+        self.qemu: subprocess.Popen | None = None
+        self.connected = False                      # (remote / qemu / attach: the program is there)
         self.on_stop = on_stop
         self.on_output = on_output
         self.mi = GdbMI(gdb, on_async=self._async)
@@ -118,12 +186,27 @@ class Session:
         except MIError as e:
             self.close()
             raise DebugError(str(e)) from None
-        self.mi.command(f"-inferior-tty-set {self.tty}")
         self.mi.console("set confirm off")
         self.mi.console("set pagination off")
         self.mi.console("set disassembly-flavor intel")
-        if self.args:
-            self.mi.command("-exec-arguments " + " ".join(_quote(a) for a in self.args))
+        t = self.target
+        if t.kind == "local":
+            self.mi.command(f"-inferior-tty-set {self.tty}")
+            for k, v in t.env.items():
+                self.mi.console(f"set environment {k}={v}")
+            if t.cwd:
+                self.mi.command(f'-environment-cd "{_mi_quote(t.cwd)}"')
+            args = " ".join(_quote(a) for a in self.args)
+            if t.stdin:
+                args += f" < {_quote(t.stdin)}"          # (gdb starts the program through a shell)
+            if args.strip():
+                self.mi.command("-exec-arguments " + args.strip())
+        else:
+            if t.kind == "qemu" and not t.sysroot and self.an is not None:
+                root = _SYSROOT.get(self.an.bin.arch, "")
+                t.sysroot = root if os.path.isdir(root) else ""
+            if t.sysroot:
+                self.mi.console(f"set sysroot {t.sysroot}")
 
     # ----------------------------------------------------------- program I/O
     def _read_tty(self):
@@ -189,10 +272,81 @@ class Session:
         return m.group(1) if m else ""
 
     def start(self, stop_at: str = "entry", timeout: float = 30.0) -> dict:
-        """Start the program, stopping at its first instruction (`entry`) or at `main`."""
+        """Start the program (or connect to it), stopping at its first instruction (`entry`)
+        or at `main`."""
+        if self.target.kind != "local":
+            stop = self._connect(timeout)
+            if stop_at == "main" and not stop.get("reason", "").startswith("exited"):
+                main = self.an.function_by_name("main") if self.an is not None else None
+                if main is not None:
+                    return self.run_to(self.to_live(main.addr), timeout)
+                self.mi.command("-break-insert -t main")
+                return self.cont(timeout)
+            return stop
         if stop_at == "main":
             return self._run_and_wait("-exec-run --start", timeout)
         return self._run_and_wait('-interpreter-exec console "starti"', timeout)
+
+    def _connect(self, timeout: float) -> dict:
+        """Connect gdb to the program: start it under qemu-user's gdb stub, reach a gdbserver,
+        or attach to the process. The stop it is found in."""
+        t = self.target
+        try:
+            if t.kind == "attach":
+                self.mi.command(f"-target-attach {int(t.pid)}", timeout)
+            else:
+                address = t.address
+                if t.kind == "qemu":
+                    address = self._start_qemu()
+                deadline = time.monotonic() + timeout
+                while True:                         # (qemu needs a moment before it listens)
+                    try:
+                        self.mi.command(f"-target-select remote {address}", timeout)
+                        break
+                    except MIError:
+                        if time.monotonic() > deadline or (self.qemu is not None and self.qemu.poll() is not None):
+                            raise
+                        time.sleep(0.1)
+        except MIError as e:
+            raise DebugError(f"cannot reach the program ({t.kind}): {e}") from None
+        self.connected = True
+        try:
+            frame = self.mi.command("-stack-info-frame").results.get("frame", {})
+        except MIError:
+            frame = {}
+        return self._after_stop({"reason": "connected" if t.kind != "attach" else "attached", "frame": frame})
+
+    def _start_qemu(self) -> str:
+        """Run the program under qemu-user with its gdb stub on a free local port, its input
+        and output on the session's terminal; the address to connect to."""
+        from ..loader import load
+        b = self.an.bin if self.an is not None else load(self.path)
+        exe = qemu_for(b)
+        if exe is None:
+            raise DebugError(f"no qemu-user for {b.arch} ({_QEMU.get((b.arch, b.endian), 'unsupported')})")
+        port = _free_port()
+        t = self.target
+        cmd = [exe, "-g", str(port)]
+        if t.sysroot:
+            cmd += ["-L", t.sysroot]
+        for k, v in t.env.items():
+            cmd += ["-E", f"{k}={v}"]
+        cmd += [self.path, *self.args]
+        stdin = open(t.stdin, "rb") if t.stdin else self._slave       # noqa: SIM115 - closed with qemu
+        self.qemu = subprocess.Popen(cmd, stdin=stdin, stdout=self._slave, stderr=self._slave,
+                                     cwd=t.cwd or None, start_new_session=True)
+        if t.stdin:
+            stdin.close()
+        return f"127.0.0.1:{port}"
+
+    def detach(self):
+        """Let the program run on without gdb (an attached process keeps running)."""
+        try:
+            self.mi.command("-target-detach")
+        except MIError as e:
+            raise DebugError(str(e)) from None
+        self.regs = {}
+        self.connected = False
 
     def cont(self, timeout: float = 30.0) -> dict:
         return self._run_and_wait("-exec-continue", timeout)
@@ -219,10 +373,20 @@ class Session:
         except MIError:
             pass
         self.regs = {}
+        self._stop_qemu()
+
+    def _stop_qemu(self):
+        if self.qemu is not None and self.qemu.poll() is None:
+            self.qemu.kill()
+            try:
+                self.qemu.wait(5)
+            except subprocess.TimeoutExpired:
+                pass
 
     def close(self):
         try:
             self.mi.close()
+            self._stop_qemu()
         finally:
             for fd in (self.master, self._slave):
                 try:
@@ -396,17 +560,17 @@ class Session:
 
     def gprs(self) -> list[tuple[str, int, bool]]:
         """(name, value, changed since the previous stop) of the general-purpose registers."""
-        names = _GPRS.get(self.arch) or [n for n in self._reg_names[:20] if n]
+        names = _GPRS.get(_arch_key(self.arch)) or [n for n in self._reg_names[:20] if n]
         return [(n, self.regs[n], n in self.prev_regs and self.prev_regs[n] != self.regs[n])
                 for n in names if n in self.regs]
 
     @property
     def pc(self) -> int | None:
-        return self.regs.get(_PC.get(self.arch, "pc"))
+        return self.regs.get(_PC.get(_arch_key(self.arch), "pc"))
 
     @property
     def sp(self) -> int | None:
-        return self.regs.get(_SP.get(self.arch, "sp"))
+        return self.regs.get(_SP.get(_arch_key(self.arch), "sp"))
 
     def read_memory(self, addr: int, size: int) -> bytes | None:
         try:
@@ -432,7 +596,10 @@ class Session:
         try:
             text = self.mi.console("info proc mappings")
         except MIError:
-            return []
+            text = ""
+        if "0x" not in text:                     # (a gdb stub that cannot list them: the binary's own)
+            self._maps = self._image_mappings()
+            return self._maps
         for line in text.splitlines():
             parts = line.split()
             if len(parts) < 4 or not parts[0].startswith("0x"):
@@ -448,6 +615,19 @@ class Session:
             except ValueError:
                 continue
         self._maps = out
+        return out
+
+    def _image_mappings(self) -> list[Mapping]:
+        """The main executable's segments where they are loaded (for a target that does not
+        list its mappings: qemu-user, some gdbservers)."""
+        if self.an is None:
+            return []
+        out = []
+        for sg in self.an.bin.segments:
+            if not sg.memsz:
+                continue
+            perms = ("r" if sg.r else "-") + ("w" if sg.w else "-") + ("x" if sg.x else "-") + "p"
+            out.append(Mapping(sg.addr + self.slide, sg.addr + sg.memsz + self.slide, perms, sg.offset, self.path))
         return out
 
     def mapping_at(self, addr: int) -> Mapping | None:
@@ -543,13 +723,28 @@ class Session:
         if getattr(b, "elf_type", "") != "ET_DYN":
             return
         exe = os.path.realpath(self.path)
-        maps = [m for m in self.mappings() if m.path and os.path.realpath(m.path) == exe]
+        maps = [m for m in self.mappings() if m.path and os.path.realpath(m.path) == exe] \
+            if self.target.kind in ("local", "attach") else []
         if not maps:
+            # where the program really starts (the auxiliary vector's AT_ENTRY) against its entry point
+            entry = self._auxv_entry()
+            if entry is not None and b.entry:
+                thumb = ~1 if b.arch == "arm" else ~0            # (a Thumb entry point has bit 0 set)
+                self.slide = (entry & thumb) - (b.entry & thumb)
+            self._maps = None
             return
         base_live = min(m.start - m.offset for m in maps)
         loads = [s.addr - s.offset for s in b.segments if getattr(s, "offset", None) is not None]
         base_static = min(loads) if loads else 0
         self.slide = base_live - base_static
+
+    def _auxv_entry(self) -> int | None:
+        try:
+            out = self.mi.console("info auxv")
+        except MIError:
+            return None
+        m = re.search(r"AT_ENTRY\s.*?(0x[0-9a-fA-F]+)", out)
+        return int(m.group(1), 16) if m else None
 
     def to_live(self, static_addr: int) -> int:
         return static_addr + self.slide
@@ -699,5 +894,5 @@ def _quote(a: str) -> str:
     return a if re.fullmatch(r"[\w./:=+-]+", a) else '"' + a.replace("\\", "\\\\").replace('"', '\\"') + '"'
 
 
-__all__ = ["DebugError", "Frame", "Mapping", "Session", "TeleRow", "describe_stop", "parse_bytes",
+__all__ = ["DebugError", "Frame", "Mapping", "Session", "Target", "TeleRow", "describe_stop", "parse_bytes", "qemu_for",
            "watch_key"]

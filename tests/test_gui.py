@@ -1311,3 +1311,22 @@ def _select(tree, label):
 
 def _tree_rows(tree):
     return [[tree.topLevelItem(r).text(c) for c in range(tree.columnCount())] for r in range(tree.topLevelItemCount())]
+
+
+def test_debugger_target_dialog(app, win, tmp_path):
+    """Debug > Target: automatic (here for a native program), or QEMU / a gdbserver / a process,
+    with environment, directory and input file kept."""
+    from relic.debugger import Target
+    from relic.gui.debugtarget import TargetDialog
+    assert win.debug_target().kind == "local"                     # (an x86-64 program: here)
+    d = TargetDialog(win, Target("remote", "10.0.0.2:1234", env={"A": "1", "B": "x=y"}, stdin="/tmp/in"))
+    t = d.target()
+    assert (t.kind, t.address, t.env, t.stdin) == ("remote", "10.0.0.2:1234", {"A": "1", "B": "x=y"}, "/tmp/in")
+    assert d.address.isEnabled() and not d.pid.isEnabled() and not d.env.isEnabled()
+    d.kind.setCurrentIndex(0)                                    # automatic, the environment kept
+    win.dbg_target = d.target()
+    got = win.debug_target()
+    assert got.kind == "local" and got.env == {"A": "1", "B": "x=y"}
+    d.kind.setCurrentIndex(4)
+    assert d.pid.isEnabled() and d.target().kind == "attach"
+    win.dbg_target = None
