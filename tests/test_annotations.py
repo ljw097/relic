@@ -38,3 +38,21 @@ def test_names_list(vuln64):
     assert names["notes"] == (notes, "data") and names["second_note"] == (notes + 8, "label")
     assert any(k == "import" for _, k in names.values())
     assert [a for a, _, _ in an.names()] == sorted(a for a, _, _ in an.names())
+
+
+def test_call_graph(vuln64):
+    from relic.analysis.callgraph import call_graph, callees, callers
+    an = analyze(vuln64)
+    main = an.function_by_name("main").addr
+    menu = an.function_by_name("menu").addr
+    vuln = an.function_by_name("vuln").addr
+    assert menu in callees(an, main) and vuln in callees(an, main) and main in callers(an, menu)
+    levels, edges, more = call_graph(an, main, 1)
+    assert levels[main] == 0 and levels[menu] == 1 and (main, menu) in edges and not more
+    levels, edges, _ = call_graph(an, menu, 2)
+    assert levels[main] == -1 and (main, menu) in edges
+    # two levels of callers: main -> add_note -> (what add_note calls)
+    add_note = an.function_by_name("add_note").addr
+    leaf = callees(an, add_note)[0]
+    levels, _, _ = call_graph(an, leaf, 2)
+    assert levels[add_note] == -1 and levels[main] == -2

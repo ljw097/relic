@@ -488,6 +488,7 @@ class MainWindow(QMainWindow):
         act(m, "&Python console", "Ctrl+Shift+P", self.show_python_console, False)
         act(m, "&Structures...", "Ctrl+Shift+S", self.show_structs)
         act(m, "C &types...", None, self.show_types)
+        act(m, "Call &graph...", "Ctrl+Shift+G", self.show_call_graph)
         self.light_act = act(m, "&Light theme", "Ctrl+Shift+L",
                              lambda on: self.set_appearance(theme="light" if on else "dark"), False)
         self.light_act.setCheckable(True)
@@ -1680,6 +1681,17 @@ class MainWindow(QMainWindow):
             self.graph.goto(keep)
 
     # ------------------------------------------------------------- scripting
+    def show_call_graph(self):
+        """The callers and callees of the function at the cursor."""
+        from .callgraph import CallGraphDialog
+        f = self.an.function_at(self.cur) if self.cur is not None else None
+        if f is None:
+            self.statusBar().showMessage("no function here", 3000)
+            return None
+        self.call_graph_dialog = CallGraphDialog(self, f.addr)
+        self.call_graph_dialog.show()
+        return self.call_graph_dialog
+
     def show_structs(self):
         """The structures window (one per main window, refreshed when shown)."""
         from .structs import StructsDialog

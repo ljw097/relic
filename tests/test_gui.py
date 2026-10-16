@@ -1107,3 +1107,20 @@ def test_names_window_and_repeatable_comment(win):
     an.rename(menu, "show_menu")
     win._after_edit()
     assert "show_menu" in rows()                     # (the names list follows renames)
+
+
+def test_call_graph_window(win):
+    an = win.an
+    main, menu = an.function_by_name("main").addr, an.function_by_name("menu").addr
+    win.goto(main)
+    d = win.show_call_graph()
+    assert main in d.nodes and menu in d.nodes and "callees" in d.note.text()
+    x, y, w, h = d.nodes[menu]
+    assert d.function_at(x + w / 2, y + h / 2) == menu
+    assert d.nodes[menu][0] > d.nodes[main][0]                     # callees to the right
+    d.depth.setValue(2)
+    assert len(d.nodes) >= 3
+    d.addr = menu
+    d.draw()
+    assert d.nodes[main][0] < d.nodes[menu][0]                     # callers to the left
+    d.close()
