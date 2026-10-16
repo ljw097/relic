@@ -149,7 +149,9 @@ class DebugController(QObject):
     def active(self) -> bool:
         return self.session is not None and bool(self.last.pc is not None and not self.last.exited)
 
-    def start(self, path: str, analysis=None, args: list[str] | None = None, stop_at: str = "entry"):
+    def start(self, path: str, analysis=None, args: list[str] | None = None, stop_at: str = "entry",
+              target=None):
+        """Debug `path` (where: `target`, a debugger.Target -- local by default)."""
         def go():
             from ..debugger import Session
             self._close()
@@ -165,7 +167,11 @@ class DebugController(QObject):
                 run = export(analysis.bin, os.path.join(self._tmpdir, os.path.basename(path)))
                 n = len(analysis.patches)
                 self.log.emit(f"[ debugging the patched image ({n} patch{'es' if n != 1 else ''}): {run} ]\n")
-            self.session = Session(run, self.args, analysis, on_output=self.output.emit)
+            self.session = Session(run, self.args, analysis, on_output=self.output.emit, target=target)
+            if target is not None and target.kind != "local":
+                where = {"qemu": "under QEMU", "remote": f"on {target.address}",
+                         "attach": f"attached to process {target.pid}"}.get(target.kind, target.kind)
+                self.log.emit(f"[ {where} ]\n")
             self.mem_addr = None
             self.session.start(stop_at)
             for bp in sorted(self.static_bps.values(), key=lambda b: b.addr):
@@ -221,6 +227,15 @@ class DebugController(QObject):
         # not through the queue: the worker is blocked waiting for the stop this causes
         if self.session is not None:
             threading.Thread(target=self.session.interrupt, daemon=True).start()
+
+    def detach(self):
+        """Leave the program running without the debugger."""
+        def go():
+            if self.session is not None:
+                self.session.detach()
+                self.log.emit("[ detached ]\n")
+            self._close()
+        self._submit(go)
 
     def stop(self):
         def go():
