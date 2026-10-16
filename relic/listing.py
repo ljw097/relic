@@ -52,6 +52,15 @@ def comment(an: Analysis, i: Insn) -> str:
     user = an.comments.get(i.addr)
     if user:
         parts.append(user)
+    rc = getattr(an, "rcomments", {})
+    if rc:
+        own = rc.get(i.addr)
+        if own:
+            parts.append(own)
+        # what it refers to carries a repeatable comment: shown here too
+        for r in dict.fromkeys(([i.target] if i.target is not None else []) + list(i.refs)):
+            if r != i.addr and r in rc:
+                parts.append(f"⇢ {rc[r]}")
     if i.kind == CALL and i.target is None and i.mem_target is not None:
         n = an.call_name(i)
         if n:

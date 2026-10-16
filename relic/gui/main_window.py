@@ -275,7 +275,16 @@ class MainWindow(QMainWindow):
         self.tabs.addTab(self.decomp, "Pseudocode")
         self.tabs.addTab(self.hex, "Hex")
         self.tabs.currentChanged.connect(self._tab_changed)
-        self.setCentralWidget(self.tabs)
+        from .navband import NavBand
+        self.navband = NavBand()
+        self.navband.navigate.connect(self.goto)
+        central = QWidget()
+        lay = QVBoxLayout(central)
+        lay.setContentsMargins(0, 0, 0, 0)
+        lay.setSpacing(0)
+        lay.addWidget(self.navband)
+        lay.addWidget(self.tabs)
+        self.setCentralWidget(central)
         for v in (self.disasm, self.graph, self.decomp):
             v.navigate.connect(self.goto)
             v.cursor_addr.connect(self._cursor_moved)
@@ -310,6 +319,8 @@ class MainWindow(QMainWindow):
         self.vulns = Table(["Severity", "Address", "Function", "Kind", "Message"])
         self.checksec = Table(["Property", "Value"])
         self.info = FilteredTable(["Name", "Address", "Size", "Offset", "Perm"], "Filter sections")
+        self.names = FilteredTable(["Address", "Name", "Kind"], "Filter names")
+        self.names.table.activated_addr.connect(self.goto)
         self.strings.table.activated_addr.connect(self.goto_xref_or_addr)
         self.imports.table.activated_addr.connect(self.goto)
         self.vulns.activated_addr.connect(self.goto)
@@ -319,7 +330,8 @@ class MainWindow(QMainWindow):
         self.pyconsole = PythonConsole()
         docks = [self._dock(t, w, bottom) for t, w in (("Strings", self.strings), ("Imports", self.imports),
                                                        ("Vulns", self.vulns), ("Checksec", self.checksec),
-                                                       ("Sections", self.info), ("Python", self.pyconsole))]
+                                                       ("Sections", self.info), ("Names", self.names),
+                                                       ("Python", self.pyconsole))]
         for d in docks[1:]:
             self.tabifyDockWidget(docks[0], d)
         docks[0].raise_()
@@ -441,6 +453,7 @@ class MainWindow(QMainWindow):
         m = mb.addMenu("&Edit")
         act(m, "&Rename...", "N", self.rename_dialog)
         act(m, "&Comment...", ";", self.comment_dialog)
+        act(m, "Re&peatable comment...", ":", self.repeatable_comment_dialog)
         act(m, "Set t&ype...", "Y", self.set_type_dialog)
         act(m, "&Xrefs to...", "X", self.show_xrefs_here)
         n = m.addMenu("&Number")
@@ -484,6 +497,7 @@ class MainWindow(QMainWindow):
         act(m, "&Python console", "Ctrl+Shift+P", self.show_python_console, False)
         act(m, "&Structures...", "Ctrl+Shift+S", self.show_structs)
         act(m, "C &types...", None, self.show_types)
+        act(m, "Call &graph...", "Ctrl+Shift+G", self.show_call_graph)
         self.light_act = act(m, "&Light theme", "Ctrl+Shift+L",
                              lambda on: self.set_appearance(theme="light" if on else "dark"), False)
         self.light_act.setCheckable(True)
@@ -763,6 +777,7 @@ class MainWindow(QMainWindow):
 
     def _fill_tables(self, checksec: dict):
         self._last_checksec = checksec
+        self.navband.set_analysis(self.an)
         an, b = self.an, self.an.bin
         t = self.strings.table
         t.setSortingEnabled(False)
@@ -787,6 +802,8 @@ class MainWindow(QMainWindow):
             self.checksec.add_row([k, v])
         self.checksec.fit()
 
+        self._fill_names()
+
         t = self.info.table
         t.setSortingEnabled(False)
         t.clear_rows()
@@ -808,6 +825,7 @@ class MainWindow(QMainWindow):
             del self.back[:-256]
             self.fwd.clear()
         self._show(addr)
+        self.navband.set_current(addr)
         return True
 
     def _show(self, addr: int):
@@ -1148,6 +1166,7 @@ class MainWindow(QMainWindow):
 
     def _cursor_moved(self, addr: int):
         self.cur = addr
+        self.navband.set_current(addr)
         self._show_status(addr)
         self._notify_cursor(addr)
 
@@ -1409,6 +1428,29 @@ class MainWindow(QMainWindow):
         self.an.comment(addr, text)
         self._after_edit()
 
+    def repeatable_comment_dialog(self):
+        """A comment shown here and wherever this address is referred to (calls, jumps, data
+        references)."""
+        a = self._subject()
+        if a is None:
+            return
+        text, ok = QInputDialog.getText(self, "Repeatable comment", f"Repeatable comment at {a:#x}:",
+                                        text=self.an.rcomments.get(a, ""))
+        if ok:
+            self.an.repeatable_comment(a, text.strip())
+            self._after_edit()
+
+    def _fill_names(self):
+        t = self.names.table
+        t.setSortingEnabled(False)
+        t.clear_rows()
+        colors = {"function": THEME["func"], "library": THEME["func"], "import": THEME["call"], "data": None,
+                  "label": None}
+        for a, name, kind in self.an.names():
+            t.add_row([a, name, kind], a, colors.get(kind))
+        t.setSortingEnabled(True)
+        t.fit()
+
     def export_dialog(self):
         """Write the pseudocode of every function to a C file, in the background."""
         if getattr(self, "export_thread", None) is not None and self.export_thread.isRunning():
@@ -1641,6 +1683,7 @@ class MainWindow(QMainWindow):
     def _after_edit(self):
         self.dirty = True
         self.setWindowTitle(self.windowTitle().rstrip(" *") + " *")
+        self._fill_names()
         keep = self.cur
         self.disasm.reload()
         self.graph.reload()
@@ -1650,6 +1693,17 @@ class MainWindow(QMainWindow):
             self.graph.goto(keep)
 
     # ------------------------------------------------------------- scripting
+    def show_call_graph(self):
+        """The callers and callees of the function at the cursor."""
+        from .callgraph import CallGraphDialog
+        f = self.an.function_at(self.cur) if self.cur is not None else None
+        if f is None:
+            self.statusBar().showMessage("no function here", 3000)
+            return None
+        self.call_graph_dialog = CallGraphDialog(self, f.addr)
+        self.call_graph_dialog.show()
+        return self.call_graph_dialog
+
     def show_structs(self):
         """The structures window (one per main window, refreshed when shown)."""
         from .structs import StructsDialog

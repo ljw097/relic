@@ -127,6 +127,16 @@ class Api:
         with open(path, "w") as fp:
             return export_c(self.an, fp)
 
+    def rcomment(self, addr, text: str):
+        """A repeatable comment: shown at `addr` and wherever it is referred to ("" removes it)."""
+        self.an.repeatable_comment(self.addr(addr), text)
+        if self.win is not None:
+            self.win._after_edit()
+
+    def names(self) -> list[tuple[int, str, str]]:
+        """Every named address: (address, name, kind)."""
+        return self.an.names()
+
     def op_format(self, addr, index: int, fmt: str):
         """Show operand `index` of the instruction at `addr` as hex / dec / char / bin / offset
         ("" resets)."""
@@ -276,7 +286,7 @@ def namespace(an: "Analysis", win=None) -> dict:
     ns = {"an": an, "bin": an.bin, "api": api, "win": win}
     for n in ("addr", "here", "goto", "name", "rename", "rename_struct", "rename_field", "set_type",
               "set_field_type", "add_field", "remove_field", "comment", "func", "import_header", "set_return_type",
-              "export", "snapshot", "restore_snapshot", "merge", "op_format", "number_format",
+              "export", "snapshot", "restore_snapshot", "merge", "op_format", "number_format", "rcomment", "names",
               "functions", "xrefs_to", "xrefs_from",
               "disasm", "decompile", "strings", "search", "patch", "nop", "invert", "assemble", "revert", "save"):
         ns[n] = getattr(api, n)

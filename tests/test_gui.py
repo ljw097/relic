@@ -1090,3 +1090,55 @@ def test_number_format_keys_in_listing_and_pseudocode(win):
     assert an.num_formats[f.addr] == {"16": "hex"}
     assert win.decomp.wait_idle()
     assert "malloc(0x10)" in win.decomp.toPlainText()
+
+
+def test_names_window_and_repeatable_comment(win):
+    from unittest import mock
+    an = win.an
+    rows = lambda: {win.names.table.model_.item(r, 1).text() for r in range(win.names.table.model_.rowCount())}
+    assert {"main", "vuln", "notes"} <= rows()
+    menu = an.function_by_name("menu").addr
+    win.goto(menu)
+    with mock.patch("relic.gui.main_window.QInputDialog.getText", return_value=("reads the choice", True)):
+        win.repeatable_comment_dialog()
+    assert an.rcomments[menu] == "reads the choice"
+    win.goto(an.function_by_name("main").addr)
+    assert "⇢ reads the choice" in win.disasm.toPlainText()
+    an.rename(menu, "show_menu")
+    win._after_edit()
+    assert "show_menu" in rows()                     # (the names list follows renames)
+
+
+def test_call_graph_window(win):
+    an = win.an
+    main, menu = an.function_by_name("main").addr, an.function_by_name("menu").addr
+    win.goto(main)
+    d = win.show_call_graph()
+    assert main in d.nodes and menu in d.nodes and "callees" in d.note.text()
+    x, y, w, h = d.nodes[menu]
+    assert d.function_at(x + w / 2, y + h / 2) == menu
+    assert d.nodes[menu][0] > d.nodes[main][0]                     # callees to the right
+    d.depth.setValue(2)
+    assert len(d.nodes) >= 3
+    d.addr = menu
+    d.draw()
+    assert d.nodes[main][0] < d.nodes[menu][0]                     # callers to the left
+    d.close()
+
+
+def test_navigation_band(win):
+    band = win.navband
+    win.resize(1200, 800)
+    band.resize(1000, band.height())
+    assert band.total and band.regions
+    main = win.an.function_by_name("main").addr
+    win.goto(main)
+    assert band.cur == main
+    x = band.x_of(main)
+    assert x is not None and abs(band.addr_at(x) - main) < band.total / band.width() * 2
+    got = []
+    band.navigate.connect(got.append)
+    from PySide6.QtCore import QPointF
+    band._go(type("E", (), {"position": lambda self: QPointF(x, 5)})())
+    assert got and abs(got[0] - main) < band.total / band.width() * 2
+    band.repaint()                                   # (paints without errors)
