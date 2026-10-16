@@ -40,7 +40,7 @@
 - [x] 플러그인: 메뉴 동작·단축키, 훅(리스팅 줄·분석·커서·편집·디버거 정지·의사 코드)
 - [x] SDK 대응 확장점: 플러그인 파일 로더·프로세서 모듈(명령 디코더)·의사 코드 훅, GUI와 CLI 모두. 리프터(디컴파일러 아키텍처)는 확장점 없음
 
-## P1 — 라이브러리 식별 100%까지 (README 90%)
+## 라이브러리 식별 100% — 완료 (README 진행률의 기준 항목)
 
 - [x] FLIRT 방식 시그니처: 정적 라이브러리에서 생성(`relic sigs build`), x86-64·ARM/Thumb·AArch64·MIPS·RISC-V, 별칭(공개 이름)·IFUNC 스텁
 - [x] Lumina 대응 함수 메타데이터 공유
@@ -51,7 +51,7 @@
 - [x] 컴파일러·런타임 식별(GCC/clang/MSVC(Rich 헤더)/MinGW/rustc/Go 버전, glibc(필요 버전)/musl/msvcrt/ucrt, 정적·동적, C/C++/Rust/Go)
 - [x] PE: COFF 정적 라이브러리(MinGW libmingwex·libmingw32·libmsvcrt·libgcc·시작 객체) 시그니처, x86-64·i686
 - [x] RISC-V 링커 완화(relaxation) 모델링: `call` → `jal`/`c.j`, 주소를 만드는 auipc/lui 삭제(쓰는 명령의 기준 레지스터는 gp/tp로), TLS add 삭제, 정렬 nop 삭제
-- [ ] GUI 시그니처 창: 불러온 세트, 세트별 이름 붙인 수, 적용·해제
+- [x] GUI 시그니처 창(File ▸ Library signatures, `Shift+F5`): 세트 목록(라이브러리·버전·아키텍처·형식·시그니처 수), 이 바이너리에 맞는 세트, 세트별 이름 붙인 수, 적용·이름 되돌리기·파일 추가·툴체인에서 생성
 
 ## P1 — 타입 시스템 100%까지 (README 85%)
 

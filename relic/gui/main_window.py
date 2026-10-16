@@ -428,6 +428,7 @@ class MainWindow(QMainWindow):
         self.recent_menu = m.addMenu("Open &Recent")
         self._fill_recent_menu()
         act(m, "&Save project", QKeySequence.StandardKey.Save, self.save_project)
+        act(m, "Library si&gnatures", "Shift+F5", self.signatures_window)
         act(m, "Apply library &signatures...", None, self.signatures_dialog)
         act(m, "Build signatures from installed toolchains", None, self.build_system_signatures)
         act(m, "Import C &header...", None, self.header_dialog)
@@ -1754,6 +1755,17 @@ class MainWindow(QMainWindow):
         self.statusBar().showMessage(f"{os.path.basename(path)}: {', '.join(parts) or 'nothing new'}", 6000)
         self._after_edit()
         return got
+
+    def signatures_window(self):
+        """The library signatures window: sets, which fit, how many each named; apply / take back."""
+        from .signatures import SignaturesDialog
+        if getattr(self, "signatures_win", None) is None:
+            self.signatures_win = SignaturesDialog(self)
+        else:
+            self.signatures_win.refresh()
+        self.signatures_win.show()
+        self.signatures_win.raise_()
+        return self.signatures_win
 
     def signatures_dialog(self):
         """Pick signature files (or static libraries, built into ~/.relic/sigs) and name the
