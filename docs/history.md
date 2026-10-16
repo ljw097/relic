@@ -58,6 +58,9 @@
 ## 파일 포맷
 
 - [x] ELF 재배치 객체(`relic/loader/elfobj.py`): 할당 섹션을 0x100000부터 정렬해 배치, 정의 안 된 심볼은 `.extern` 스텁(import), GOT 형태 재배치는 `.got` 슬롯, 공통 심볼은 `.common`; 재배치 적용 — x86-64(64/PC32/PLT32/32/32S/GOTPCREL(X)), x86(32/PC32/PLT32), AArch64(ABS·PREL·CALL26/JUMP26·ADR(_GOT)_PAGE·ADD/LDST lo12·CONDBR19·TSTBR14), ARM(ABS32·REL32·CALL/JUMP24·THM_CALL/JUMP24·MOVW/MOVT), MIPS o32(32·26·HI16/LO16·GOT16·CALL16·GOT_DISP), RISC-V(32/64·CALL·PCREL_HI20/LO12·HI20/LO12·JAL·BRANCH·RVC); COFF 객체(`coff.py`, AMD64·i386 재배치, `__imp_` 슬롯); 정적 라이브러리 멤버(`archive.py`, `lib.a:member.o`); Intel HEX·S-record(`firmware.py`, 체크섬 확인, 시작 주소 레코드 또는 Cortex-M 리셋 벡터); COFF도 Windows ABI·LLP64; 로드 오류는 CLI 메시지로
+- [x] ELF 코어 덤프(`core.py`): PT_LOAD를 매핑 파일 이름(`libc.so.6`·`[stack]`·`[anon]`) 섹션으로, NT_PRPSINFO(프로세스·명령), NT_PRSTATUS(시그널·pid·스레드별 레지스터, x64/x86/AArch64/ARM/MIPS/RISC-V), NT_FILE(매핑된 파일); 진입점 = 정지한 pc; 디스크에 남은 매핑 파일의 심볼을 PIE 바이어스로 얹음; 툴체인 식별은 덤프 속 라이브러리 문자열이 아니라 실행 파일로
+- [x] PE 부가 정보(`pe.py`): TLS 콜백(`tls_callback_N`), 리소스 종류·버전 문자열, CodeView RSDS의 PDB 경로·GUID·age, 지연 import(데이터 디렉터리 13 — GNU ld가 비워 두면 `__DELAY_IMPORT_DESCRIPTOR_*` 심볼에서), .NET CLR 헤더·메타데이터 런타임 버전
+- [x] RAW 적재 주소 추정(`rawbase.py`): 포인터 크기 워드가 문자열 시작에 가장 많이 떨어지는 정렬된 base(하위 비트로 묶어 후보 계산), Cortex-M 벡터 테이블(Thumb 핸들러가 이미지 안에); `--base auto`, `relic info`의 `Base?` 후보
 
 ## 테스트 / 인프라
 

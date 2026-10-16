@@ -44,7 +44,8 @@ def _parser() -> argparse.ArgumentParser:
         if where:
             s.add_argument("where", nargs=None if where_required else "?", help="address, symbol or symbol+off")
         s.add_argument("--arch", help="architecture for raw blobs (x86, x64, arm, arm64, mips, ...)")
-        s.add_argument("--base", type=lambda v: int(v, 0), default=0, help="load address for raw blobs")
+        s.add_argument("--base", type=_base_arg, default=0,
+                       help="load address for raw blobs (`auto`: guessed from the image)")
         s.add_argument("--sigs", action="append", metavar="FILE.sig",
                        help="library signature file to name functions with (repeatable)")
         s.add_argument("--no-sigs", action="store_true", help="name no functions by library signatures")
@@ -131,8 +132,13 @@ def _parser() -> argparse.ArgumentParser:
     g = sub.add_parser("gui", help="open the GUI")
     g.add_argument("file", nargs="?")
     g.add_argument("--arch", help="architecture for raw blobs (x86, x64, arm, arm64, mips, ...)")
-    g.add_argument("--base", type=lambda v: int(v, 0), default=0, help="load address for raw blobs")
+    g.add_argument("--base", type=_base_arg, default=0,
+                       help="load address for raw blobs (`auto`: guessed from the image)")
     return p
+
+
+def _base_arg(v: str):
+    return "auto" if v == "auto" else int(v, 0)
 
 
 def _analyze(args):
@@ -170,6 +176,10 @@ def cmd_info(args):
         print(f"Interp:    {b.interp}")
     for k, v in b.info.items():
         print(f"{k + ':':10} {v}")
+    if b.format == "RAW" and "base guess" not in b.info:
+        from .loader.rawbase import guess_base
+        for g in guess_base(b.data, b.bits, "big" if b.endian == "big" else "little", limit=3):
+            print(f"Base?      {g.base:#x}  ({g.reason}; load with --base {g.base:#x})")
     if b.libraries:
         print(f"Libraries: {', '.join(b.libraries)}")
     from .analysis.ident import identify
