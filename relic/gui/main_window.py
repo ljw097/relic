@@ -429,6 +429,7 @@ class MainWindow(QMainWindow):
         self._fill_recent_menu()
         act(m, "&Save project", QKeySequence.StandardKey.Save, self.save_project)
         act(m, "Apply library &signatures...", None, self.signatures_dialog)
+        act(m, "Build signatures from installed toolchains", None, self.build_system_signatures)
         act(m, "Import C &header...", None, self.header_dialog)
         act(m, "&Run script...", "Alt+F7", self.script_dialog)
         self.recent_scripts_menu = m.addMenu("Recent scrip&ts")
@@ -815,6 +816,11 @@ class MainWindow(QMainWindow):
         t.fit()
 
         self.checksec.clear_rows()
+        tc = an.toolchain
+        for k, v in (("Compiler", tc.compiler), ("C library", tc.libc and f"{tc.libc} ({tc.linking})"),
+                     ("Languages", ", ".join(tc.languages))):
+            if v:
+                self.checksec.add_row([k, v])
         for k, v in checksec.items():
             self.checksec.add_row([k, v])
         self.checksec.fit()
@@ -1759,6 +1765,26 @@ class MainWindow(QMainWindow):
         if paths:
             self.apply_signatures(paths)
 
+    def build_system_signatures(self, out_dir: str | None = None) -> int:
+        """Build a signature set for every static library of the installed toolchains (into
+        ~/.relic/sigs) and apply the ones for this binary; how many functions were named."""
+        from ..analysis import libsigs
+        out = out_dir or os.path.join(os.path.expanduser("~"), ".relic", "sigs")
+        QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
+        try:
+            done = libsigs.build_system(out, lambda text: (self.statusBar().showMessage(f"building {text}"),
+                                                           QApplication.processEvents()))
+        finally:
+            QApplication.restoreOverrideCursor()
+        if not done:
+            QMessageBox.information(self, "Library signatures", "No static libraries of an installed toolchain found.")
+            return 0
+        if self.an is None:
+            return 0
+        mine = libsigs.select([db for _, db in done if db.arch == self.an.bin.arch], self.an.toolchain,
+                              self.an.bin.format)
+        return self.apply_signature_dbs(mine, f"{len(done)} signature sets built; ")
+
     def apply_signatures(self, paths: list[str]) -> int:
         """Name functions by these signature files / static libraries; how many were named."""
         from ..analysis import libsigs
@@ -1779,14 +1805,23 @@ class MainWindow(QMainWindow):
                     continue
                 if db.arch == self.an.bin.arch:
                     dbs.append(db)
+        finally:
+            QApplication.restoreOverrideCursor()
+        return self.apply_signature_dbs(dbs)
+
+    def apply_signature_dbs(self, dbs: list, note: str = "") -> int:
+        """Name functions by these signature databases; how many were named."""
+        from ..analysis import libsigs
+        QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
+        try:
             named = libsigs.apply(self.an, dbs)
         finally:
             QApplication.restoreOverrideCursor()
         self.an.lib_names.update(named)
         if not dbs:
-            self.statusBar().showMessage(f"no signatures for {self.an.bin.arch}", 5000)
+            self.statusBar().showMessage(f"{note}no signatures for {self.an.bin.arch}", 5000)
         else:
-            self.statusBar().showMessage(f"{len(named)} functions named by library signatures", 5000)
+            self.statusBar().showMessage(f"{note}{len(named)} functions named by library signatures", 5000)
         if named:
             self._after_edit()
             self._fill_functions()

@@ -79,6 +79,7 @@ class Analysis:
         self.sig_paths: list[str] | None = None
         # functions named by a library signature: address -> name
         self.lib_names: dict[int, str] = {}
+        self._toolchain = None
 
     # ------------------------------------------------------------------ run
     def run(self, load_project: bool = True) -> "Analysis":
@@ -141,7 +142,7 @@ class Analysis:
         """Name functions without a symbol by library signatures (libsigs); the ones named as
         not returning that were not known to be so."""
         from .libsigs import apply, available
-        dbs = available(self.bin.arch, self.sig_paths)
+        dbs = available(self.bin.arch, self.sig_paths, self.toolchain, self.bin.format)
         make = None
         if finder is not None:
             def make(addr: int):                  # a virtual method found in a vtable
@@ -501,6 +502,14 @@ class Analysis:
     def checksec(self) -> dict[str, str]:
         from .checksec import checksec
         return checksec(self.bin)
+
+    @property
+    def toolchain(self):
+        """What built the binary (ident.Toolchain): compiler, C library, linking, languages."""
+        if self._toolchain is None:
+            from .ident import identify
+            self._toolchain = identify(self.bin)
+        return self._toolchain
 
     # ------------------------------------------------------- annotations
     @property

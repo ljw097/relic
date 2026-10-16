@@ -25,14 +25,14 @@
 진행률은 "IDA Pro가 그 영역에서 하는 일 중 Relic이 같은 수준으로 하는 비율"을 어림한 값입니다.
 전체 값은 영역 가중 평균(가중치는 리버싱 실무에서의 비중)입니다.
 
-**전체: 약 66%** — 분석·디컴파일 핵심 경로는 x86/ARM/MIPS/RISC-V 계열에서 실사용 가능, 파일 포맷(Mach-O)·타입 시스템(타입 자동 전파·라이브러리 타입)·디컴파일 품질(goto, SIMD)이 큰 격차.
+**전체: 약 67%** — 분석·디컴파일 핵심 경로는 x86/ARM/MIPS/RISC-V 계열에서 실사용 가능, 파일 포맷(Mach-O)·타입 시스템(타입 자동 전파·라이브러리 타입)·디컴파일 품질(goto, SIMD)이 큰 격차.
 
 | 영역 (가중치) | IDA Pro 기준 | Relic 현재 | 진행률 |
 |---|---|---|---|
 | 파일 포맷 (8) | ELF, PE, Mach-O, COFF/OMF, 펌웨어·raw 등 수십 종 | ELF, PE(import/export/COFF 심볼/.pdata), RAW | 35% |
 | 프로세서 (8) | 60여 개 CPU 계열 | 디스어셈블 7종(x86, x64, ARM/Thumb, AArch64, MIPS, RISC-V, PPC), 분석·리프팅·디컴파일은 x86/x64/ARM/AArch64/MIPS32/RV64 | 46% |
 | 자동 분석 (14) | 함수·CFG·xref·점프 테이블·noreturn·문자열·stripped 복구 | 재귀 하강 + 프롤로그 스캔, 점프 테이블(x86/ARM/AArch64/MIPS/RISC-V), 레지스터 상수 전파로 데이터 xref, stripped `main` 복구, ARM/Thumb 상호 운용 | 55% |
-| 라이브러리 식별 (8) | FLIRT 시그니처, Lumina | FLIRT 방식 시그니처(`relic sigs build`로 정적 라이브러리에서 생성, stripped 정적 바이너리의 libc 함수 이름 — x86-64·ARM/Thumb·AArch64·MIPS·RISC-V, 재배치는 명령의 즉치 비트만 가림, RISC-V는 링커 완화 전까지만), 정적 함수·C++ 런타임(libstdc++·libgcc, C1/C2 변형), 코드가 같은 함수를 참조 대상으로 함께 구분하고 이름 붙은 함수가 참조하는 함수에 이름 전파, vtable·함수 포인터 표의 슬롯으로 가상 메서드 이름(stripped 정적 C 바이너리에서 심볼 있는 함수의 83~94%, C++ 69%, 오식별 0), 심볼·import·PLT 이름 (기준 항목: [TODO.md](TODO.md)) | 55% |
+| 라이브러리 식별 (8) | FLIRT 시그니처, Lumina | FLIRT 방식 시그니처(`relic sigs build`로 정적 라이브러리에서 생성, stripped 정적 바이너리의 libc 함수 이름 — x86-64·ARM/Thumb·AArch64·MIPS·RISC-V, 재배치는 명령의 즉치 비트만 가림, RISC-V는 링커 완화 전까지만), 정적 함수·C++ 런타임(libstdc++·libgcc, C1/C2 변형), 코드가 같은 함수를 참조 대상으로 함께 구분하고 이름 붙은 함수가 참조하는 함수에 이름 전파, vtable·함수 포인터 표의 슬롯으로 가상 메서드 이름(stripped 정적 C 바이너리에서 심볼 있는 함수의 83~94%, C++ 69%, 오식별 0), 심볼·import·PLT 이름, 컴파일러·런타임 식별(GCC/clang/MSVC/MinGW/rustc/Go, glibc/musl/msvcrt)과 그에 맞는 시그니처 세트 선택, 설치된 툴체인에서 세트 자동 생성(`relic sigs build --system`) (기준 항목: [TODO.md](TODO.md)) | 70% |
 | 타입 시스템 (10) | 구조체·열거형·로컬 타입, 타입 라이브러리, 타입 전파 | int/포인터/unsigned 추론, libc 시그니처 일부, 구조체 자동 복원(필드 오프셋·폭·포인터 타입, 중첩·자기 참조, 전역을 통해 함수 간 공유, 이름 변경), 배열 필드(`l->vals[i]`), 호출을 통한 구조체 공유(전역·지역), 변수·필드·반환 타입 직접 지정(`Y`, 구조체를 다른 함수에 적용), 구조체 편집 창, C 헤더 가져오기(구조체·공용체·비트필드·열거형·typedef·`#define` 상수·함수 원형, 대상 ABI 레이아웃; 열거형 상수 이름·플래그 조합 `A, 타입 라이브러리(libc 구조체: `struct stat`·`tm`·`timeval`·`sockaddr_in`·`dirent` 등, 대상 ABI 레이아웃; Windows API: kernel32·advapi32·user32·ws2_32 원형과 `SYSTEM_INFO`·`STARTUPINFOA`·`WIN32_FIND_DATAA` 등 구조체, 32/64비트 레이아웃), 호출을 통한 타입 전파(프로토타입의 `struct tm *` 결과 → `tm->tm_year`, 주소를 넘긴 스택 지역 → `struct stat st; st.st_size`, 사용자가 타입을 준 함수의 매개변수 → 호출자의 인자 변수) | 85% | | 55% |
 | 디컴파일러 (20) | Hex-Rays: 다수 아키텍처, 타입·구조체 대화형 수정, 부동소수점 | x86-64/x86-32/AArch64/ARM32/MIPS32/RV64GC, 재컴파일 검증, 구조화(switch·for·&&), 상수 나눗셈, -fipa-ra 레지스터 보존, 구조체 복원·대화형 재타입(`Y`), x86-64 SSE·AArch64·ARM VFP(armhf)·RISC-V F/D 부동소수점(`float`/`double` 인자·반환값·리터럴·변환·비교·`fma`, 레지스터보다 많은 인자, 비트 단위 재컴파일 검증); x87 부동소수점, SIMD 없음 | 52% |
 | 대화형 UI (12) | 리스팅·그래프·xref·이름/주석·검색·패치·undo·북마크·구조체 창 | 리스팅·그래프(층별 레이아웃)·의사 코드·헥스, 함수 밖 메모리 리스팅(데이터 섹션·미분석 코드: 문자열·포인터·0 반복 자동 표시), 코드·데이터 정의(U/C/D/A/`*`)·함수 만들기·지우기(P/Ctrl+Delete), 이름·주석·반복 주석·변수 이름, xref, 이름 창, 호출 그래프, 내비게이션 밴드, 같은 단어 강조, 숫자 표시 형식(H/R/B/O), 이동 기록, 검색(바이트·텍스트·즉치값·명령어), 바이트 패치(NOP·분기 반전·어셈블, 패치된 파일 내보내기), 모든 편집의 undo/redo, 북마크, 구조체·C 타입 창, 테마·확대 (기준 항목: [TODO.md](TODO.md)의 대화형 UI 목록) | 100% |

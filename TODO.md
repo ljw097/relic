@@ -40,15 +40,15 @@
 - [x] 플러그인: 메뉴 동작·단축키, 훅(리스팅 줄·분석·커서·편집·디버거 정지·의사 코드)
 - [x] SDK 대응 확장점: 플러그인 파일 로더·프로세서 모듈(명령 디코더)·의사 코드 훅, GUI와 CLI 모두. 리프터(디컴파일러 아키텍처)는 확장점 없음
 
-## P1 — 라이브러리 식별 100%까지 (README 55%)
+## P1 — 라이브러리 식별 100%까지 (README 70%)
 
 - [x] FLIRT 방식 시그니처: 정적 라이브러리에서 생성(`relic sigs build`), x86-64·ARM/Thumb·AArch64·MIPS·RISC-V, 별칭(공개 이름)·IFUNC 스텁
 - [x] Lumina 대응 함수 메타데이터 공유
 - [x] C++ 런타임(libstdc++·libgcc) 시그니처, 정적(local) 함수, 생성자·소멸자 변형(C1/C2, D1/D2)을 한 이름으로
 - [x] 코드가 같은 함수 구분: 참조하는 대상으로 후보를 함께 좁힘, 이름 붙은 함수가 참조하는 함수(짧아서 혼자 못 맞추는 것)에 이름 전파
 - [x] 데이터 테이블(vtable·함수 포인터 표 — glibc `__io_vtables`): 시그니처 파일에 슬롯 저장, 참조로 위치를 찾아 슬롯의 함수(호출되지 않는 가상 메서드도 함수로 만들어) 이름 붙임
-- [ ] 설치된 툴체인에서 시그니처 자동 생성(`relic sigs build --system`), 식별한 라이브러리에 맞는 세트 선택
-- [ ] 컴파일러·런타임 식별(GCC/clang/MSVC/MinGW/Rust/Go 버전, glibc/musl)
+- [x] 설치된 툴체인에서 시그니처 자동 생성(`relic sigs build --system`, File 메뉴), 식별한 라이브러리·버전·파일 형식에 맞는 세트 선택
+- [x] 컴파일러·런타임 식별(GCC/clang/MSVC(Rich 헤더)/MinGW/rustc/Go 버전, glibc(필요 버전)/musl/msvcrt/ucrt, 정적·동적, C/C++/Rust/Go)
 - [ ] PE: COFF 정적 라이브러리(MinGW libgcc·libmingwex·CRT) 시그니처
 - [ ] RISC-V 링커 완화(relaxation) 모델링(현재 첫 완화 가능 호출에서 패턴이 끝남)
 - [ ] GUI 시그니처 창: 불러온 세트, 세트별 이름 붙인 수, 적용·해제

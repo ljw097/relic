@@ -197,6 +197,11 @@ class Api:
         f = self.func(where)
         return callees(self.an, f.addr) if f is not None else []
 
+    def toolchain(self) -> dict:
+        """What built the binary: {"compiler": "GCC 13.3.0", "libc": "glibc 2.39", "linking":
+        "static" / "dynamic", "languages": [...], "evidence": [...]} (unknown parts: None)."""
+        return self.an.toolchain.to_json()
+
     def load_type_library(self, name: str | None = None) -> dict:
         """Import a bundled type library (`libc`: struct stat, tm, timeval, sockaddr_in, ...;
         `win32`: HANDLE, DWORD, SYSTEM_INFO, STARTUPINFOA, ... -- the default for a PE)."""
@@ -393,7 +398,7 @@ def namespace(an: "Analysis", win=None) -> dict:
               "export", "snapshot", "restore_snapshot", "merge", "op_format", "number_format", "rcomment", "names",
               "lumina_pull", "lumina_push", "read", "read_int", "sections", "insn", "define", "undefine",
               "make_function", "delete_function", "bookmark", "callers", "callees", "load_type_library",
-              "functions", "xrefs_to", "xrefs_from",
+              "toolchain", "functions", "xrefs_to", "xrefs_from",
               "disasm", "decompile", "strings", "search", "patch", "nop", "invert", "assemble", "revert", "save"):
         ns[n] = getattr(api, n)
     return ns
