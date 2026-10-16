@@ -1,120 +1,123 @@
 # Relic
 
-리버싱과 포너블을 위한 디스어셈블러 / 디컴파일러 (WIP).
+리버싱하고 포너블 문제 풀 때 쓰려고 만들고 있는 디스어셈블러 겸 디컴파일러입니다.
+GUI는 PySide6, 디스어셈블은 capstone을 쓰고, 그 위의 분석·디컴파일·디버거는 직접 짰습니다.
 
-**목표: IDA Pro(+ Hex-Rays) 이상.** 아래 표는 IDA Pro를 기준선으로 한 현재 스펙과 진행률입니다.
-진행 상황 세부는 [TODO.md](TODO.md), 디컴파일러 설계는 [docs/decompiler-plan.md](docs/decompiler-plan.md)를 참고하세요.
+목표는 솔직히 크게 잡았습니다 — IDA Pro + Hex-Rays만큼, 할 수 있으면 그 이상.
+아직 갈 길이 멀지만 x86-64나 ARM 바이너리 하나 열어서 함수 보고, 이름 붙이고, 의사 코드 읽고,
+디버거로 오프셋 재는 정도는 이걸로 충분히 됩니다. 지금은 [0.1.0 베타](https://github.com/ljw097/relic/releases/tag/v0.1.0)입니다.
 
 ![Relic 디버거: vuln()에서 gets() 직후 멈춘 상태 — 레지스터·스택 telescope에 입력한 AAAA…가 보인다](docs/screenshots/debugger.png)
 
-## 스크린샷
-
-모두 테스트 샘플 [`tests/src/vuln.c`](tests/src/vuln.c)(`-O0 -no-pie -fno-stack-protector`)를 연 화면입니다.
-
-| | |
-|---|---|
-| ![리스팅](docs/screenshots/listing.png) | ![그래프](docs/screenshots/graph.png) |
-| **리스팅** — 주소·바이트·명령어, 문자열 참조는 주석으로(`; "name?"`), 호출 대상은 이름으로. 왼쪽 함수 목록(import는 흐리게), 오른쪽 xref 패널 | **CFG 그래프** — 층별 배치, 조건 분기의 분기함/안 함 간선은 초록/빨강, 무조건 이동은 파랑. 루프로 돌아가는 간선은 블록 옆을 돌아 위로 올라감 |
-| ![의사 코드](docs/screenshots/pseudocode.png) | ![취약점](docs/screenshots/vulns.png) |
-| **의사 코드** — 점프 테이블을 `switch`로 복원한 `classify()`. 변수 이름 변경(`N`)은 바로 반영 | **Vulns** — 비상수 포맷 스트링(`printf(notes[i]->data)`), `gets()`, ret2win 후보(`win`), `free()` 호출 위치 |
-| ![디버거 메모리](docs/screenshots/debugger-memory.png) | ![라이트 테마](docs/screenshots/light.png) |
-| **디버거 Memory / Stack** — `$rbp-0x40`(=`buf`)의 hexdump와 스택 telescope. 반환 주소 `main+0x3c`까지 거리를 바로 셀 수 있음 | **라이트 테마** (`Ctrl+Shift+L`), 코드 글꼴 크기 `Ctrl+=`/`Ctrl+-` |
-
-## 목표 대비 진행률 (기준: IDA Pro 9 + Hex-Rays)
-
-진행률은 "IDA Pro가 그 영역에서 하는 일 중 Relic이 같은 수준으로 하는 비율"을 어림한 값입니다.
-전체 값은 영역 가중 평균(가중치는 리버싱 실무에서의 비중)입니다.
-
-**전체: 약 76%** — 분석·디컴파일 핵심 경로는 x86/ARM/MIPS/RISC-V 계열에서 실사용 가능, 파일 포맷(Mach-O)·타입 시스템(타입 자동 전파·라이브러리 타입)·디컴파일 품질(goto, SIMD)이 큰 격차.
-
-| 영역 (가중치) | IDA Pro 기준 | Relic 현재 | 진행률 |
-|---|---|---|---|
-| 파일 포맷 (8) | ELF, PE, Mach-O, COFF/OMF, 펌웨어·raw 등 수십 종 | ELF(실행·공유·코어 덤프), PE(import/export/지연 import/COFF 심볼/.pdata/TLS 콜백/리소스·버전 정보/PDB 경로/.NET 감지), ELF 재배치 객체(6개 아키텍처 재배치 적용)·COFF 객체·정적 라이브러리 멤버, Intel HEX·S-record, RAW(적재 주소 추정) (기준 항목: [TODO.md](TODO.md)) | 70% |
-| 프로세서 (8) | 60여 개 CPU 계열 | 디스어셈블 7종(x86, x64, ARM/Thumb, AArch64, MIPS, RISC-V, PPC), 분석·리프팅·디컴파일은 x86/x64/ARM/AArch64/MIPS32/RV64 | 46% |
-| 자동 분석 (14) | 함수·CFG·xref·점프 테이블·noreturn·문자열·stripped 복구 | 재귀 하강 + 프롤로그 스캔, 점프 테이블(x86/ARM/AArch64/MIPS/RISC-V), 레지스터 상수 전파로 데이터 xref, stripped `main` 복구, ARM/Thumb 상호 운용 | 55% |
-| 라이브러리 식별 (8) | FLIRT 시그니처, Lumina | FLIRT 방식 시그니처(`relic sigs build`로 정적 라이브러리에서 생성, stripped 정적 바이너리의 libc 함수 이름 — x86-64·ARM/Thumb·AArch64·MIPS·RISC-V, 재배치는 명령의 즉치 비트만 가림, RISC-V 링커 완화 형태까지), 정적 함수·C++ 런타임(libstdc++·libgcc, C1/C2 변형), 코드가 같은 함수를 참조 대상으로 함께 구분하고 이름 붙은 함수가 참조하는 함수에 이름 전파, vtable·함수 포인터 표의 슬롯으로 가상 메서드 이름(stripped 정적 C 바이너리에서 심볼 있는 함수의 83~94%(RISC-V 84%), C++ 69%, 오식별 0), 심볼·import·PLT 이름, 컴파일러·런타임 식별(GCC/clang/MSVC/MinGW/rustc/Go, glibc/musl/msvcrt)과 그에 맞는 시그니처 세트 선택, 설치된 툴체인에서 세트 자동 생성(`relic sigs build --system`), MinGW(COFF) 런타임 시그니처(stripped 정적 PE에서 x86-64 85%, i686 77%) 시그니처 창(세트별 적용·되돌리기·이름 붙인 수) (기준 항목: [TODO.md](TODO.md)) | 100% |
-| 타입 시스템 (10) | 구조체·열거형·로컬 타입, 타입 라이브러리, 타입 전파 | int/포인터/unsigned 추론, libc 시그니처 일부, 구조체 자동 복원(필드 오프셋·폭·포인터 타입, 중첩·자기 참조, 전역을 통해 함수 간 공유, 이름 변경), 배열 필드(`l->vals[i]`), 호출을 통한 구조체 공유(전역·지역), 변수·필드·반환 타입 직접 지정(`Y`, 구조체를 다른 함수에 적용), 구조체 편집 창, C 헤더 가져오기(구조체·공용체·비트필드·열거형·typedef·`#define` 상수·함수 원형, 대상 ABI 레이아웃; 열거형 상수 이름·플래그 조합 `A, 타입 라이브러리(libc 구조체: `struct stat`·`tm`·`timeval`·`sockaddr_in`·`dirent` 등, 대상 ABI 레이아웃; Windows API: kernel32·advapi32·user32·ws2_32 원형과 `SYSTEM_INFO`·`STARTUPINFOA`·`WIN32_FIND_DATAA` 등 구조체, 32/64비트 레이아웃), 호출을 통한 타입 전파(프로토타입의 `struct tm *` 결과 → `tm->tm_year`, 주소를 넘긴 스택 지역 → `struct stat st; st.st_size`, 사용자가 타입을 준 함수의 매개변수 → 호출자의 인자 변수) | 85% | | 55% |
-| 디컴파일러 (20) | Hex-Rays: 다수 아키텍처, 타입·구조체 대화형 수정, 부동소수점 | x86-64/x86-32/AArch64/ARM32/MIPS32/RV64GC, 재컴파일 검증, 구조화(switch·for·&&), 상수 나눗셈, -fipa-ra 레지스터 보존, 구조체 복원·대화형 재타입(`Y`), x86-64 SSE·AArch64·ARM VFP(armhf)·RISC-V F/D 부동소수점(`float`/`double` 인자·반환값·리터럴·변환·비교·`fma`, 레지스터보다 많은 인자, 비트 단위 재컴파일 검증); x87 부동소수점, SIMD 없음 | 52% |
-| 대화형 UI (12) | 리스팅·그래프·xref·이름/주석·검색·패치·undo·북마크·구조체 창 | 리스팅·그래프(층별 레이아웃)·의사 코드·헥스, 함수 밖 메모리 리스팅(데이터 섹션·미분석 코드: 문자열·포인터·0 반복 자동 표시), 코드·데이터 정의(U/C/D/A/`*`)·함수 만들기·지우기(P/Ctrl+Delete), 이름·주석·반복 주석·변수 이름, xref, 이름 창, 호출 그래프, 내비게이션 밴드, 같은 단어 강조, 숫자 표시 형식(H/R/B/O), 이동 기록, 검색(바이트·텍스트·즉치값·명령어), 바이트 패치(NOP·분기 반전·어셈블, 패치된 파일 내보내기), 모든 편집의 undo/redo, 북마크, 구조체·C 타입 창, 테마·확대 (기준 항목: [TODO.md](TODO.md)의 대화형 UI 목록) | 100% |
-| 스크립팅·확장 (8) | IDAPython, IDC, SDK, 플러그인 | Python API(주석·타입·구조체·패치·데이터 정의·함수 만들기/지우기·메모리 읽기·명령 디코딩·xref·호출 그래프·Lumina·버전 기록 등 GUI에서 하는 모든 편집), GUI Python 콘솔, 스크립트 파일 실행(File ▸ Run script `Alt+F7`, 최근 목록)·`relic script` 배치 실행, 플러그인(`register(api)`: 메뉴 동작·단축키, 리스팅 줄·분석 완료·커서·편집·디버거 정지·의사 코드 훅), SDK 대응 확장점(플러그인 파일 로더·프로세서 모듈·의사 코드 훅 — GUI와 CLI 모두), 자동 생성 API 레퍼런스([docs/scripting.md](docs/scripting.md)) (기준 항목: [TODO.md](TODO.md)) | 100% |
-| 디버거 (7) | 로컬·원격(gdbserver 등) 디버깅 | GUI 디버거(GDB/MI) — 로컬, 원격 gdbserver, 다른 아키텍처(ARM·AArch64·MIPS·RISC-V)는 qemu-user gdb 스텁으로 자동, 실행 중인 프로세스에 붙기/떼기, 환경 변수·작업 디렉터리·입력 파일, 스레드 목록·전환, 공유 라이브러리 목록·적재 시 정지, 시그널 정지·전달 정책, 명령 추적(리스팅에 실행된 명령 표시): 실행·단계 실행·중단점(조건·활성화·적중 횟수, 라이브러리 함수 이름)·하드웨어 watchpoint·리스팅/의사 코드 동기화, pwndbg식 레지스터·스택 telescope·vmmap·메모리 hexdump·백트레이스·콘솔, 레지스터·메모리 편집, PIE 슬라이드 보정, glibc 힙 뷰(`[heap]` 청크 걷기 — 사용 중/해제/tcache/top, tcache 목록·safe-linking 자동 판별, libc 심볼 없이) (기준 항목: [TODO.md](TODO.md)) | 90% |
-| 프로젝트·협업 (5) | IDB, 스냅숏, Teams, Lumina | `<binary>.relic.json`(이름·주석·반복 주석·변수 이름·타입·구조체·패치·북마크·숫자 형식·데이터 정의·함수 편집, 바이너리 SHA-256), 이름 붙인 스냅숏, 버전 기록(commit·log·diff·checkout, 작성자·메시지 — Teams 대응), 다른 분석가의 프로젝트 파일 병합(충돌 보고), Lumina 대응 함수 메타데이터 공유(위치 독립 지문으로 이름·주석·변수 이름·타입 push/pull, JSON 파일 또는 `relic lumina serve` 서버) (기준 항목: [TODO.md](TODO.md)) | 100% |
-
-IDA Pro에 없는 Relic 쪽 기능: checksec(ELF/PE 보호 기법), 포너블 휴리스틱(위험 함수, 비상수 포맷 스트링, 폭 없는 `scanf("%s")`, ret2win 후보), 디컴파일 결과의 재컴파일 검증 하네스.
-
-### 다음 단계 (격차가 큰 순)
-
-1. ~~검색(텍스트·바이트 패턴·즉치값·명령어)~~, ~~바이트 패치·패치된 바이너리 저장~~ (완료)
-2. ~~GUI 안의 Python 콘솔과 플러그인 진입점 (IDAPython 대응)~~ (완료: `relic.scripting`)
-3. ~~정적 링크 라이브러리 함수 식별 (FLIRT 대응 시그니처)~~ (완료: x86/x64; 다른 아키텍처 남음)
-4. 구조체·타입 시스템과 디컴파일러 연동 (~~자동 복원·필드 접근·중첩·배열·이름 변경·타입 지정·편집 창, 열거형·공용체·C 헤더 가져오기~~ 완료)
-5. Mach-O 로더, PPC 리프터 (MIPS32·RISC-V RV64는 완료)
-6. ~~디버거 보강: watchpoint, 레지스터·메모리 값 편집~~ (완료)
-
-## 기능
-
-| 영역 | 상태 |
-|---|---|
-| 로더 | ELF / PE(import, export, COFF 심볼) / RAW(셸코드·펌웨어 blob) |
-| 디스어셈블 | capstone 기반: x86, x64, ARM, AArch64, MIPS, RISC-V, PPC |
-| 함수 탐색 / CFG | 재귀 하강, noreturn 처리, tail call, 점프 테이블 복원, MIPS 지연 슬롯, RISC-V pc 상대 분기·PLT |
-| stripped 바이너리 | `__libc_start_main` 인자로 `main` 복구, 프롤로그 스캔, `.init_array` 시드, 정적 링크된 라이브러리 함수 이름(시그니처: `relic sigs build libc.a`) |
-| 참조 | 코드/데이터 xref, 문자열(ASCII, PE는 UTF-16LE) |
-| C++ | Itanium 심볼 디맹글링 (`geo::Rect::area() const`), 짧은 이름으로 이동·디컴파일 (`relic decompile ./a.out geo::total`) |
-| checksec | ELF: RELRO / Canary / NX / PIE / FORTIFY / RPATH, PE: ASLR / DEP / CFG / SEH / GS |
-| 포너블 휴리스틱 | `gets`·`strcpy` 등 위험 함수, 비상수 포맷 스트링, 폭 없는 `scanf("%s")`, ret2win 후보 |
-| 프로젝트 | 이름 변경·주석·디컴파일러 변수 이름·바이트 패치를 `<binary>.relic.json`에 저장 (CLI 출력에도 반영, 패치는 열 때 다시 적용); 스냅숏(File ▸ Snapshots), 다른 프로젝트 파일 병합(File ▸ Merge project) |
-| 패치 | 바이트·NOP·조건 분기 반전(x86, ARM/Thumb, AArch64, MIPS)·어셈블(keystone), 패치 후 재분석, 패치된 파일 내보내기(`relic patch`, Edit 메뉴) |
-| GUI | 함수 목록, 디스어셈블리 / CFG 그래프 / 의사 코드 / 헥스, xref·문자열·import·vulns·checksec 패널 |
-| 디컴파일러 (x86-64, x86-32, AArch64, ARM32, MIPS32, RISC-V RV64GC) | 리프팅 → SSA·최적화 → 호출 인자·스택 버퍼·카나리 → out-of-SSA → 구조화 → C 출력(`relic decompile`) |
-
-> 인자 추적 기반 탐지(포맷 스트링, ret2win)와 점프 테이블 복원은 **x86-64·x86-32·AArch64·ARM32·MIPS32·RV64**에서 동작합니다.
-
 ## 설치
 
+릴리스 페이지의 wheel을 받아서 깔면 됩니다.
+
 ```sh
+python3 -m venv .venv
+.venv/bin/pip install https://github.com/ljw097/relic/releases/download/v0.1.0/relic_re-0.1.0-py3-none-any.whl
+.venv/bin/relic ./chall
+```
+
+소스에서 돌리려면:
+
+```sh
+git clone https://github.com/ljw097/relic && cd relic
 python3 -m venv .venv
 .venv/bin/pip install -e '.[dev]'
 ```
 
-Python 3.10 이상, 의존성: capstone, pyelftools, pefile, PySide6. 디버거를 쓰려면 `gdb`(또는 `gdb-multiarch`)가 PATH에 있어야 합니다(`sudo apt install gdb`).
+Python 3.10 이상, 리눅스에서 씁니다. 디버거는 `gdb`가 필요하고(`sudo apt install gdb`), ARM·MIPS 같은
+다른 아키텍처 바이너리를 디버깅하려면 `gdb-multiarch`와 `qemu-user`도 깔아 두세요.
+`Ctrl+Alt+A`(어셈블해서 패치)는 keystone이 있어야 해서 `pip install 'relic-re[asm]'`로 따로 받습니다.
 
-## 사용법
+## 뭘 할 수 있나
+
+| | |
+|---|---|
+| ![리스팅](docs/screenshots/listing.png) | ![그래프](docs/screenshots/graph.png) |
+| 리스팅. 문자열 참조는 주석으로, 호출 대상은 이름으로 보입니다 | CFG 그래프. 분기함/안 함은 초록/빨강, 루프는 옆으로 돌아 올라갑니다 |
+| ![의사 코드](docs/screenshots/pseudocode.png) | ![취약점](docs/screenshots/vulns.png) |
+| 의사 코드. 점프 테이블이 `switch`로 돌아옵니다 | Vulns 탭. 포맷 스트링, `gets()`, ret2win 후보 |
+
+(스크린샷은 전부 [`tests/src/vuln.c`](tests/src/vuln.c)를 연 화면입니다.)
+
+대충 이런 것들이 됩니다.
+
+- **여는 파일**: ELF(실행 파일, 공유 라이브러리, `.o`, 코어 덤프), PE, COFF 객체, `.a` 안의 멤버,
+  Intel HEX / S-record, 그냥 raw 덤프. raw 펌웨어는 적재 주소도 추측해 줍니다(`--base auto`).
+- **아키텍처**: 디컴파일까지 되는 건 x86, x86-64, ARM/Thumb, AArch64, MIPS32, RISC-V(RV64GC).
+  PPC는 디스어셈블만 됩니다.
+- **분석**: 함수·CFG·xref·문자열, 점프 테이블, stripped 바이너리에서 `main` 찾기, 어떤 컴파일러와
+  libc로 빌드했는지 알아내기.
+- **라이브러리 함수 이름**: 정적 링크된 stripped 바이너리에서 libc 함수를 시그니처로 찾아 이름을 붙입니다.
+  설치된 툴체인에서 시그니처를 알아서 만들 수도 있습니다(`relic sigs build --system`).
+- **디컴파일러**: 구조체를 알아서 복원하고, 타입을 직접 줄 수도 있습니다(`Y`). 부동소수점, libc·Windows API
+  원형, C 헤더 가져오기도 됩니다. 결과를 다시 컴파일해서 원본과 같게 도는지 확인하는 테스트도 있습니다.
+- **GUI**: 이름·주석·xref·검색·북마크·바이트 패치·undo처럼 IDA에서 손에 익은 것들은 대부분 있고,
+  단축키도 웬만하면 IDA랑 같게 맞췄습니다.
+- **디버거**: gdb를 뒤에 두고 pwndbg 느낌으로 만들었습니다. 로컬, gdbserver, qemu-user, 실행 중인 프로세스에
+  붙기까지 되고, 레지스터·스택 telescope·vmmap·힙 청크도 볼 수 있습니다.
+- **스크립팅**: GUI 안 Python 콘솔, `relic script`, 플러그인.
+- **포너블용**: checksec, 위험 함수, 비상수 포맷 스트링, 폭 없는 `scanf("%s")`, ret2win 후보.
+  이건 IDA에 없어서 따로 만든 것들입니다.
+
+### IDA랑 비교하면 지금 어디쯤인가
+
+어림잡아 매긴 숫자입니다. "IDA가 그 영역에서 해 주는 것 중 Relic이 비슷한 수준으로 하는 비율" 정도로 봐 주세요.
+전체는 영역별 가중 평균인데, 가중치는 제가 실제로 리버싱할 때 체감하는 비중으로 정했습니다. 지금 **대략 75%**입니다.
+
+| 영역 (가중치) | 진행률 | 메모 |
+|---|---|---|
+| 파일 포맷 (8) | 70% | Mach-O가 없습니다 |
+| 프로세서 (8) | 46% | IDA는 60종 넘게 지원하니 여기가 제일 멀어요 |
+| 자동 분석 (14) | 55% | 큰 바이너리에서 아직 놓치는 함수·점프가 있습니다 |
+| 라이브러리 식별 (8) | 100% | stripped 정적 C 바이너리에서 83~94%, 오식별 0 |
+| 타입 시스템 (10) | 85% | |
+| 디컴파일러 (20) | 52% | goto가 많이 남고 x87·SIMD가 없습니다 |
+| 대화형 UI (12) | 100% | |
+| 스크립팅·확장 (8) | 100% | |
+| 디버거 (7) | 90% | |
+| 프로젝트·협업 (5) | 100% | 스냅숏, 버전 기록, 병합, Lumina 비슷한 이름 공유 |
+
+영역마다 무엇을 기준으로 100%라고 했는지, 뭐가 남았는지는 [TODO.md](TODO.md)에 적어 뒀습니다.
+끝난 일의 기록은 [docs/history.md](docs/history.md)에 있습니다.
+
+## CLI
+
+GUI 없이도 대부분 됩니다. 자주 쓰는 것만 추리면:
 
 ```sh
-relic info      ./chall              # 헤더, 섹션, 라이브러리
-relic checksec  ./chall              # 보호 기법
-relic funcs     ./chall [-a]         # 함수 목록 (-a: import 스텁 포함)
-relic disasm    ./chall [main]       # 함수/주소 디스어셈블 (기본: main 또는 entry)
-relic disasm    ./chall 0x401000 -n 20   # 선형 스윕
-relic cfg       ./chall classify | dot -Tsvg > cfg.svg
-relic strings   ./chall
-relic imports   ./chall
+relic info      ./chall              # 헤더, 섹션, 라이브러리, 컴파일러
+relic checksec  ./chall
+relic funcs     ./chall
+relic disasm    ./chall main
+relic decompile ./chall main
+relic vulns     ./chall
+relic strings   ./chall -g bin/sh
 relic xrefs     ./chall menu
-relic strings   ./chall -g bin/sh    # 부분 문자열 검색
-relic vulns     ./chall              # 포너블 휴리스틱
-relic ir        ./chall vuln         # 디컴파일러 IR (리프팅 직후, 디버깅용)
-relic opt       ./chall checksum --xrefs  # SSA + 최적화 IR, 문자열·교차참조, 스택 프레임
-relic decompile ./chall main         # C 유사 의사 코드 (--addrs: 줄마다 명령어 주소, -a: 모든 함수)
-relic decompile ./chall main --header chall.h   # C 선언(구조체·열거형·typedef·원형)을 써서 디컴파일
-relic types     ./chall chall.h      # C 헤더를 프로젝트에 가져오기 (인자 없이: 가져온 타입 목록)
-relic decompile ./chall -a -o chall.c   # 바이너리 전체 의사 코드를 C 파일 하나로 (구조체 선언은 한 번)
-relic project   ./chall snapshot before  # 지금의 이름·주석·타입을 스냅숏으로 (snapshots / restore / delete)
-relic project   ./chall merge bob/chall.relic.json   # 다른 분석가의 작업 병합 (--theirs: 충돌 시 그쪽 값)
-relic project   ./chall commit -m "named the parser"   # 버전 기록 (log / diff [A [B]] / checkout N)
-relic lumina    push ./chall --store team.json   # 함수 이름·주석·타입 공유 (pull: 같은 함수가 있는 다른 바이너리에 적용, serve: 팀 서버)
-relic search    ./chall --bytes '48 8b ?? 05'   # 바이트 패턴 (--text, --imm 0x186a0, --insn 'call.*system')
-relic script    ./chall rename_all.py arg1      # 스크립팅 API로 Python 실행 (--save: 프로젝트 저장, 옵션은 스크립트 앞에)
-relic sigs build /usr/lib/x86_64-linux-gnu/libc.a -o ~/.relic/sigs/glibc-x64.sig   # 라이브러리 시그니처
-relic funcs     ./static_stripped               # 시그니처로 이름 붙인 함수는 [lib] (--sigs F.sig, --no-sigs)
-relic patch     ./chall main+0x2f --invert      # 조건 분기 반전 → ./chall.patched (--nop, --bytes '90 90',
-                                                #   --asm 'xor eax, eax; ret', --revert, --list, -o 출력 파일)
-relic disasm    sc.bin --arch x64 --base 0x1000 -n 30   # RAW blob
 ```
 
-주소 인자는 `0x401000`, `401000`, `main`, `main+0x10` 형식을 받습니다.
+조금 덜 자주 쓰지만 알아 두면 편한 것들:
 
-예시 (`tests/src/vuln.c`, `-no-pie -fno-stack-protector`):
+```sh
+relic decompile ./chall -a -o chall.c            # 전체를 C 파일 하나로
+relic decompile ./chall main --header chall.h    # 내가 쓴 구조체 선언을 써서
+relic cfg       ./chall classify | dot -Tsvg > cfg.svg
+relic search    ./chall --bytes '48 8b ?? 05'    # --text, --imm 0x186a0, --insn 'call.*system'
+relic patch     ./chall main+0x2f --invert       # 분기 뒤집어서 ./chall.patched로
+relic script    ./chall rename_all.py
+relic sigs build /usr/lib/x86_64-linux-gnu/libc.a -o ~/.relic/sigs/glibc-x64.sig
+relic project   ./chall commit -m "named the parser"
+relic disasm    sc.bin --arch x64 --base 0x1000 -n 30   # 셸코드 같은 raw blob
+```
+
+주소는 `0x401000`, `401000`, `main`, `main+0x10` 어느 쪽으로 써도 됩니다.
+`relic <명령> -h`로 옵션을 볼 수 있습니다.
+
+### 예시
+
+`tests/src/vuln.c`를 `-no-pie -fno-stack-protector`로 빌드해서 돌려 보면:
 
 ```
 $ relic vulns vuln64.out
@@ -123,7 +126,7 @@ $ relic vulns vuln64.out
 [info  ] 0x401296 win                  win-function    win runs system("/bin/sh") - ret2win target?
 ```
 
-디컴파일 예시 (`-fstack-protector-strong -pie -O1`):
+같은 소스를 `-fstack-protector-strong -pie -O1`로 빌드하고 디컴파일하면:
 
 ```
 $ relic decompile vuln64_pie.out vuln
@@ -138,9 +141,10 @@ void vuln(void)
 }
 ```
 
-지역 변수 이름은 진입 시 스택 포인터(반환 주소 위치) 기준 오프셋입니다. `buf_58`은 반환 주소에서 0x58 아래에 있고, 크기 72는 다음 슬롯(카나리)까지의 거리입니다 — 오버플로 페이로드 계산에 그대로 쓸 수 있습니다.
+지역 변수 이름의 숫자는 반환 주소에서 얼마나 떨어져 있는지입니다. `buf_58`은 반환 주소 0x58 아래에 있으니,
+페이로드는 0x58바이트 채우고 바로 반환 주소를 덮으면 됩니다(카나리가 없다면요). 포너블 하다 보면 이게 제일 편합니다.
 
-구조체는 고정 오프셋 접근에서 자동으로 복원됩니다. 전역 배열 `notes`의 원소가 가리키는 구조체는 그 배열을 쓰는 모든 함수에서 같은 정의를 씁니다:
+구조체도 알아서 잡아 줍니다. 전역 배열 `notes`가 가리키는 구조체는 그 배열을 쓰는 함수들끼리 같은 정의를 공유합니다.
 
 ```
 $ relic decompile vuln64.out add_note
@@ -154,156 +158,135 @@ struct s_notes {  // recovered, 12 bytes
         notes[var_1c]->f_8 = var_20;
 ```
 
-의사 코드에서 구조체·필드 이름에 `N`을 누르면 이름을 바꿀 수 있고(`struct note { char *data; int size; }`), `Y`로 변수나 필드에 타입을 줄 수 있습니다. 한 함수에서 복원된 구조체를 다른 함수의 매개변수에 `struct note *`로 적용하면 그 함수의 접근도 같은 구조체의 필드가 되고, 필드에 `struct item *`을 주면 그 필드를 거친 접근이 `->count`처럼 나옵니다. 모두 프로젝트 파일에 저장됩니다.
+GUI에서 `N`으로 `struct note { char *data; int size; }`처럼 이름을 바꾸면 다른 함수에서도 다 바뀌어 보입니다.
 
 ## GUI
 
 ```sh
-relic ./chall                        # 또는 relic gui ./chall
-relic sc.bin --arch x64 --base 0x1000
+relic ./chall          # = relic gui ./chall
 ```
 
-### 기본 흐름
+처음 열면 이렇게 쓰면 됩니다.
 
-1. **열기** — `relic ./chall` 또는 File → Open(`Ctrl+O`). 분석은 백그라운드에서 돌고 상태 표시줄에 진행률이 나옵니다(`Ctrl+.`로 취소). 끝나면 `main`(stripped면 복구한 `main`, 없으면 entry)으로 이동합니다.
-2. **둘러보기** — 왼쪽 Functions에서 함수를 더블클릭(`Ctrl+F`로 이름 필터). 리스팅에서 `call`/`jmp` 대상이나 심볼을 더블클릭하면 따라가고 `Esc`로 돌아옵니다. `Space`는 그래프, `Tab`은 의사 코드(커서 위치를 서로 맞춰 줌), `Ctrl+H`는 헥스.
-3. **참조 찾기** — `X`로 커서 위치를 가리키는 xref 목록. Strings 탭의 문자열을 더블클릭하면 그 문자열을 쓰는 코드로 갑니다.
-4. **정리하기** — `N`으로 함수·라벨 이름(의사 코드에서는 지역 변수·매개변수 이름), `;`로 주석. `Ctrl+S`로 `<binary>.relic.json`에 저장되고 다시 열면 그대로 복원됩니다.
-5. **찾기** — Search 메뉴: 바이트 패턴 `48 8b ?? 05`(`Alt+B`), 텍스트(`Alt+T`, UTF-8/UTF-16), 즉치값(`Alt+I`), 명령어 정규식 `call.*(gets|system)`(`Ctrl+Alt+I`). 결과는 Search 패널에서 더블클릭으로 이동.
-6. **취약점 훑기** — 아래 Vulns 탭(위험 함수·포맷 스트링·ret2win 후보)과 Checksec 탭(NX·PIE·canary·RELRO).
+1. 분석은 백그라운드에서 돌고, 끝나면 `main`으로 갑니다. stripped여도 `main`을 찾아 줍니다.
+2. 왼쪽 함수 목록에서 더블클릭해 들어가고, `call` 대상도 더블클릭하면 따라갑니다. `Esc`로 돌아옵니다.
+3. `Space`는 그래프, `Tab`은 의사 코드, `Ctrl+H`는 헥스입니다. 뷰를 바꿔도 커서 위치는 따라옵니다.
+4. 읽으면서 `N`으로 이름 붙이고 `;`로 주석 달고, `Ctrl+S`로 저장합니다. 저장은 바이너리 옆 `<binary>.relic.json`에 됩니다.
+5. 아래 Vulns, Checksec 탭은 포너블 할 때 먼저 한 번 훑어보면 좋습니다.
 
 ### 단축키
+
+IDA를 써 봤으면 거의 그대로입니다.
 
 | 키 | 동작 |
 |---|---|
 | `G` | 주소 / 심볼로 이동 |
-| `Esc`, `Alt+←` / `Ctrl+Enter`, `Alt+→` | 뒤로 / 앞으로 |
-| `Space` | 리스팅 ↔ 그래프 전환 |
-| `-` / `L` / `+` | 그래프에서 선택 블록 접기 / 그 블록을 감싼 루프 접기 / 펼치기 (더블클릭으로도 펼침) |
-| `Tab`, `F5` | 리스팅 ↔ 의사 코드 전환 (커서 위치 동기화) |
-| `Ctrl+H` | 헥스 뷰 |
-| `Ctrl+F` | 함수 필터 |
-| `N` | 이름 변경 (함수·라벨, 커서 줄의 호출 대상; 의사 코드에서는 커서 아래 지역 변수·매개변수·구조체·필드) |
+| `Esc` / `Ctrl+Enter` | 뒤로 / 앞으로 |
+| `Space` | 리스팅 ↔ 그래프 |
+| `Tab`, `F5` | 리스팅 ↔ 의사 코드 |
+| `Ctrl+H` | 헥스 |
+| `N` | 이름 바꾸기 (의사 코드에서는 변수·구조체·필드도) |
 | `;` | 주석 |
-| `Y` | 의사 코드에서 변수·매개변수·구조체 필드의 타입 지정 (`char *`, `unsigned int`, `struct note *`; 비우면 복원된 타입) |
-| `X` | xref 패널 |
-| `Ctrl+S` | 프로젝트 저장 (`<binary>.relic.json`) |
-| `Alt+B` / `Alt+T` / `Alt+I` / `Ctrl+Alt+I` | 바이트 패턴(`48 8b ?? 05`) / 텍스트 / 즉치값 / 명령어 정규식 검색 (결과는 Search 패널) |
-| `F9` / `Shift+F9` | 디버거 시작·계속 / `main`에서 멈추게 시작 |
-| `F7` / `F8` / `Ctrl+F7` | 한 명령 단계 실행(들어감) / 건너뜀 / 함수 끝까지 |
-| `F4` / `F2` | 커서까지 실행 / 중단점 토글 |
-| `Ctrl+Alt+B` / `Ctrl+Alt+W` | 이름으로 중단점(`vuln`, `puts@plt`, libc의 `puts`) / watchpoint 추가 |
-| `Ctrl+Alt+Pause` / `Ctrl+F2` | 일시 정지 / 종료 |
-| `Ctrl+Alt+P` / `Ctrl+Alt+A` | 바이트 패치 / 어셈블해서 패치 (`pip install .[asm]`: keystone) |
-| `Ctrl+Alt+N` / `Ctrl+Alt+J` | 명령어를 NOP으로 / 조건 분기 반전 (Edit ▸ Revert patch, Export patched file) |
-| `Ctrl+Z` / `Ctrl+Shift+Z` | 마지막 편집 되돌리기 / 다시 하기 (이름·주석·타입·구조체·북마크·패치를 순서대로, 커서는 그 위치로) |
-| `Alt+M` / `Ctrl+M` | 커서 위치 북마크(설명 입력, 비우면 삭제) / Bookmarks 패널 (더블클릭 이동, `Delete`로 삭제) |
-| `Ctrl+Shift+S` | 구조체 창: 복원된 구조체의 필드 이름·타입 수정, 필드 추가(`0x10 char[8] tag`)·삭제 |
-| `Ctrl+Shift+P` | Python 콘솔 (`an`, `here()`, `goto()`, `rename()`, `decompile()`, `patch()` …, ↑/↓ 기록) |
-| `Ctrl+.` | 실행 중인 분석 / 취약점 스캔 / 검색 취소 |
-| `Ctrl+Shift+L` | 라이트 / 다크 테마 전환 |
-| `Ctrl+=` / `Ctrl+-` / `Ctrl+0` | 코드 글꼴 크게 / 작게 / 기본 (테마·크기는 저장됨) |
+| `Y` | 타입 지정 (`char *`, `struct note *` …) |
+| `X` | xref |
+| `U` / `C` / `D` / `A` / `P` | 정의 해제 / 코드 / 데이터 / 문자열 / 함수 만들기 |
+| `H` / `R` / `B` | 숫자를 16진↔10진 / 문자 / 2진으로 |
+| `Alt+B` / `Alt+T` / `Alt+I` | 바이트 패턴 / 텍스트 / 즉치값 검색 |
+| `Ctrl+Z` / `Ctrl+Shift+Z` | 되돌리기 / 다시 하기 |
+| `Alt+M` / `Ctrl+M` | 북마크 추가 / 북마크 목록 |
+| `Ctrl+Shift+S` | 구조체 창 |
+| `Ctrl+Shift+P` | Python 콘솔 |
+| `Shift+F5` | 시그니처 창 |
+| `Ctrl+Alt+N` / `Ctrl+Alt+J` / `Ctrl+Alt+A` | NOP으로 / 분기 뒤집기 / 어셈블해서 패치 |
+| `F9` / `F7` / `F8` / `F4` / `F2` | 디버거 실행·계속 / 들어가기 / 건너뛰기 / 커서까지 / 중단점 |
+| `Ctrl+Shift+L` | 라이트 / 다크 테마 |
+| `Ctrl+=` / `Ctrl+-` | 글꼴 크게 / 작게 |
+| `Ctrl+.` | 돌고 있는 분석·검색 취소 |
 
-더블클릭으로 분기 대상·심볼(의사 코드에서는 함수·전역 이름, `loc_` 레이블)을 따라갑니다. 의사 코드는 탭을 열 때 함수 단위로 백그라운드에서 디컴파일하고(그동안 GUI는 멈추지 않음) 캐시하며, 이름 변경은 바로 반영됩니다. 문자열 테이블에서 더블클릭하면 그 문자열을 참조하는 코드로 이동합니다.
+### 디버거
 
-분석과 취약점 스캔은 백그라운드에서 돌며 상태 표시줄에 진행 상황과 Cancel 버튼이 나옵니다. 창을 닫으면 실행 중인 작업을 기다리지 않고 취소합니다. 스캔이 실패하면 Vulns 표에 빈 결과 대신 오류가 표시됩니다. CFG 그래프는 층별 배치(루프는 위로 돌아가는 간선, 긴 간선은 블록 사이로 우회, 교차 최소화)로 그립니다.
+Debug 메뉴(`F9`)로 지금 열린 바이너리를 gdb 밑에서 실행합니다. 원격 gdbserver에 붙거나, 다른 아키텍처 바이너리를
+qemu-user로 돌리거나, 이미 떠 있는 프로세스에 붙는 건 Debug ▸ Debugger target에서 고릅니다. 프로그램 입출력은 Console 패널에서 주고받습니다.
 
-### 디버거 (로컬, pwndbg 스타일 GUI)
+패널은 pwndbg를 써 봤다면 익숙할 겁니다. Registers에서는 바뀐 값이 강조되고 포인터가 가리키는 곳이 같이 보입니다.
+Stack은 telescope, 그 밖에 Backtrace, Vmmap, Memory, Breakpoints, Threads, Modules 패널이 있습니다.
+값을 더블클릭하면 코드는 리스팅으로, 나머지는 Memory로 따라갑니다. 바이너리를 패치해 뒀다면 디버거는 패치된 쪽을 실행합니다.
 
-Debug 메뉴(`F9`)가 열린 바이너리를 로컬 `gdb`(GDB/MI)로 실행합니다. 모든 디버깅은 이 컴퓨터에서 돌며 원격 연결은 없습니다. 프로그램 인자는 Debug → Program arguments에서 지정하고, 표준 입출력은 Console 패널(pty)로 주고받습니다(아래 줄은 gdb 명령).
+#### 해 보기: `vuln()` 오버플로 오프셋 재기
 
-- **Registers**: 범용 레지스터, 바뀐 값 강조, 포인터는 pwndbg처럼 가리키는 곳(코드 심볼·문자열·스택/힙 체인)을 표시
-- **Stack**: `telescope` — 스택 워드와 포인터 체인, 매핑 종류(code/stack/heap/data)별 색
-- **Backtrace** / **Code**: 호출 스택(클릭하면 해당 위치로 이동), 현재 pc 주변 디스어셈블
-- **Breakpoints**: 중단점·watchpoint 목록(체크로 활성/비활성, 조건 `$rdi == 5` 편집, 적중 횟수, `Delete`로 삭제), 실행을 다시 시작해도 유지
-  - 이름으로 중단점: 바이너리 함수나 `puts@plt`는 그 주소에, `puts`처럼 import한 라이브러리 함수는 libc 안의 함수 본체에서 멈춤(라이브러리가 아직 로드되지 않았으면 로드될 때 설정)
-  - watchpoint: 쓰기/읽기/접근, 대상은 바이너리 전역·주소(`notes`, `notes+8`, `0x404040`; PIE 슬라이드 보정, 크기 1/2/4/8바이트)나 gdb 식(`*(int *)($rbp-4)`). 커서 줄이 참조하는 전역이 기본값. 멈추면 이전 값 → 새 값을 Console과 상태 표시줄에 표시
-- **Vmmap** / **Memory**: 프로세스 메모리 맵(종류별 색), 주소·식(`$rsp+8`, `main`, `0x7ffd...`)의 hexdump. 레지스터·스택 값이나 매핑을 더블클릭하면 분석한 바이너리의 코드는 리스팅으로, 그 밖은 Memory 뷰로 따라갑니다
-- 패치가 있으면 디버거는 패치된 이미지(임시 사본)를 실행합니다 — 리스팅에 보이는 코드가 실제로 돕니다
-- 리스팅과 의사 코드에서 현재 pc 줄(의사 코드는 그 명령이 속한 문장)은 초록, 중단점은 빨강으로 표시하며 멈출 때마다 정적 주소로 따라갑니다(PIE 슬라이드는 자동 보정)
-- 값 바꾸기: Registers 패널에서 `E`(또는 우클릭 ▸ Set)로 레지스터를 숫자나 gdb 식(`$rsp+8`)으로, Debug ▸ Write memory로 메모리에 hex 바이트(`41 42 ff`)·문자열(`"AAAA\n"`)·워드(`0x401136`)를 씁니다
+맨 위 스크린샷이 이 순서로 찍은 겁니다. `tests/bins/vuln64.out`은 테스트를 한 번 돌리면 생깁니다.
 
-#### 따라 해 보기: `vuln()`의 스택 오버플로 오프셋 구하기
+1. `relic tests/bins/vuln64.out`으로 열고, Debug ▸ Program arguments에 `5`를 넣습니다. 인자가 있으면 `main`이 `vuln()`을 부릅니다.
+2. `vuln`으로 가서 `F2`로 중단점을 겁니다.
+3. `F9`를 두 번 누르면 entry에서 한 번 서고, 그다음 `vuln`에서 섭니다.
+4. `call gets` 바로 다음 줄에 커서를 두고 `F4`. 입력을 기다리면 Console의 stdin 줄에 `AAAAAAAABBBBBBBB`를 넣습니다.
+5. Stack 패널에서 `0x4141414141414141`이 보이고, 몇 줄 아래에 반환 주소 `main+0x3c`가 보입니다.
+6. Memory 탭에 `$rbp-0x40`을 넣으면 버퍼부터 덤프가 나옵니다. 의사 코드의 `char buf_48[64]; // ret-0x48`처럼 반환 주소까지는 0x48바이트입니다.
 
-맨 위 스크린샷을 만드는 순서입니다(`tests/bins/vuln64.out`, 테스트를 한 번 돌리면 생깁니다).
+Console의 `gdb>` 줄에는 `x/8gx $rsp` 같은 gdb 명령을 그대로 쳐도 됩니다.
+도커 안이라면 ptrace 권한(`--cap-add=SYS_PTRACE`)이 있어야 gdb가 제대로 돕니다.
 
-1. `relic tests/bins/vuln64.out`으로 열고 Debug → Program arguments에 `5`를 넣습니다(인자가 있으면 `main`이 메뉴 대신 `vuln()`을 부름).
-2. 함수 목록에서 `vuln`으로 가서 `F2` — 첫 줄이 빨갛게 바뀝니다(중단점은 실행 전에 걸어 둬도 됨).
-3. `F9`로 시작(entry에서 멈춤), 한 번 더 `F9`로 `vuln`의 중단점까지 갑니다. 리스팅의 초록 줄이 현재 위치이고, Registers/Stack/Code/Backtrace가 채워집니다.
-4. `call gets` 다음 줄(`lea rax, [rbp - 0x40]`)에 커서를 두고 `F4`(커서까지 실행). 프로그램이 입력을 기다리면 Console의 **stdin** 줄에 `AAAAAAAABBBBBBBB`를 입력하고 Enter.
-5. 멈추면 Registers의 `rax`가 버퍼를 가리키며 `'AAAAAAAABBBBBBBB'`를 보여 주고, Stack 패널에서는 `0x4141414141414141` 다음 몇 줄 아래에 반환 주소 `main+0x3c`가 보입니다.
-6. Memory 탭의 주소 칸에 `$rbp-0x40`을 입력하면 버퍼부터 hexdump가 나옵니다. 의사 코드의 `char buf_48[64]; // ret-0x48`과 같이, 버퍼 시작에서 반환 주소까지는 0x48바이트입니다.
-7. 값 위를 더블클릭하면 따라갑니다: 코드 주소는 리스팅으로, 그 밖은 Memory로. `F8`/`F7`로 계속 단계 실행하거나 `Ctrl+F2`로 종료합니다.
+## 스크립팅
 
-Console의 **gdb>** 줄에는 일반 gdb 명령(`x/8gx $rsp`, `info proc mappings`, `p $rdi`)을 그대로 쓸 수 있습니다. 컨테이너 안에서는 gdb가 자식 프로세스를 추적할 수 있도록 ptrace 권한(`--cap-add=SYS_PTRACE`)이 필요할 수 있습니다.
+GUI의 Python 콘솔(`Ctrl+Shift+P`), 플러그인, `relic script` 전부 같은 함수들을 씁니다.
+`here()`, `goto()`, `rename()`, `comment()`, `functions()`, `xrefs_to()`, `decompile()`, `search()`, `patch()` 같은 것들이고,
+전체 목록은 [docs/scripting.md](docs/scripting.md)에 있습니다.
 
-
-## 스크립팅과 플러그인
-
-GUI의 Python 콘솔(`Ctrl+Shift+P`), 플러그인, `relic script`는 같은 이름들을 씁니다(`relic/scripting.py`):
-`an`, `bin`, `here()`, `goto(x)`, `addr(x)`, `name(a)`, `rename(a, n)`, `comment(a, t)`, `func(x)`, `functions()`,
-`xrefs_to(a)`, `xrefs_from(a)`, `disasm(x, n)`, `decompile(x)`, `strings()`, `search('48 8b ?? 05')`,
-`patch(a, b'..')`, `nop(a)`, `invert(a)`, `assemble(a, 'ret')`, `revert(a)`, `save()`.
+플러그인은 `~/.relic/plugins/`에 파이썬 파일을 넣고 `register(api)`만 만들면 됩니다.
 
 ```python
-# ~/.relic/plugins/mark_gets.py  (또는 RELIC_PLUGINS 환경 변수의 디렉터리)
+# ~/.relic/plugins/mark_gets.py
 def register(api):
     def run(ns):
         for f in ns["functions"]():
             if "gets(" in ns["decompile"](f):
                 ns["comment"](f.addr, "calls gets")
-    api.add_action("Mark gets() callers", run, "Ctrl+Alt+G")     # Plugins 메뉴에 추가
+    api.add_action("Mark gets() callers", run, "Ctrl+Alt+G")     # Plugins 메뉴에 들어갑니다
 
-    # 리스팅 줄 꾸미기: 주석 덧붙이기, 배경색
-    def deco(an, line):
+    def deco(an, line):                                           # 리스팅 줄에 주석·색 입히기
         if line.mnemonic == "call" and "gets" in line.operands:
             return {"comment": "unbounded read", "color": "#5a1e1e"}
     api.add_line_decorator(deco)
-
-    api.on_analysis(lambda ns: print(len(ns["functions"]()), "functions"))   # 분석이 끝날 때마다 (패치 후 재분석 포함)
-    api.on_cursor(lambda ns, a: None)                                        # 커서가 다른 주소로 갈 때
 ```
 
-플러그인을 불러오다 난 오류나 훅 안의 예외는 GUI를 막지 않고 Python 콘솔에 (훅마다 한 번) 표시됩니다.
+플러그인에서 예외가 나도 GUI는 멀쩡하고, 에러는 Python 콘솔에 찍힙니다.
 
-## 라이브러리로 사용
+라이브러리처럼 가져다 써도 됩니다.
 
 ```python
 from relic.analysis import analyze
 
 an = analyze("./chall")
-main = an.function_by_name("main")
-for blk in main.blocks.values():
-    print(hex(blk.addr), [hex(s) for s in blk.succs])
 print(an.checksec())
 for v in an.vulns():
     print(v.severity, hex(v.addr), v.message)
 ```
 
-## 구조
+## 코드 구조
 
 ```
 relic/
-  loader/      ELF / PE / RAW → 공통 Binary 모델 (섹션, 세그먼트, 심볼, import, 재배치)
-  disasm.py    capstone 래퍼, 명령어 분류(call/jmp/cjmp/ret/halt), 분기 대상·데이터 참조 추출
-  analysis/    함수 탐색·CFG(functions), 문자열, checksec, 취약점 휴리스틱, xref, 프로젝트 저장
-  decompiler/  IR, 리프터(x86/x64, AArch64, ARM32, MIPS32, RV64), SSA·최적화, 호출/스택 복원, 구조화, C 출력 (docs/decompiler-plan.md)
-  listing.py   심볼/문자열 주석이 붙은 디스어셈블리 리스팅 (CLI·GUI 공용)
-  gui/         PySide6 메인 윈도우와 뷰 위젯, CFG 층별 레이아웃(layout.py)
-  progress.py  백그라운드 작업 취소 토큰·진행 보고
+  loader/      ELF / PE / COFF / 코어 덤프 / 펌웨어 → 공통 Binary 모델
+  disasm.py    capstone 래퍼
+  analysis/    함수·CFG, xref, 문자열, 시그니처, 컴파일러 식별, checksec, 취약점, 프로젝트 저장
+  decompiler/  리프터 → SSA·최적화 → 구조화 → C 출력 (설계는 docs/decompiler-plan.md)
+  debugger/    gdb/MI 세션
+  gui/         PySide6 창과 뷰
+  scripting.py 콘솔·플러그인·relic script가 같이 쓰는 API
   __main__.py  CLI
-tests/
-  src/vuln.c   테스트용 포너블 샘플 (테스트 실행 시 tests/bins/에 빌드)
 ```
 
 ## 테스트
 
 ```sh
 .venv/bin/pytest -q
-.venv/bin/ruff check .      # 린트 (pip install -e ".[dev]"에 포함)
+.venv/bin/ruff check .
 ```
 
-gcc가 있으면 `tests/src/vuln.c`를 여러 변형(no-PIE, PIE+보호기법, strip)으로 빌드해 검증합니다. 디컴파일러는 IR 인터프리터로 각 변환 단계의 의미 보존을 확인하고, `checksum`·`classify`의 디컴파일 결과를 다시 컴파일해 원본 소스와 같은 결과를 내는지 비교합니다. 컴파일러가 없으면 해당 테스트는 skip됩니다. GUI 테스트는 `QT_QPA_PLATFORM=offscreen`으로 실행되며, Qt 시스템 라이브러리(libEGL 등)가 없으면 skip됩니다.
+테스트는 gcc나 크로스 컴파일러로 샘플을 그 자리에서 빌드해서 돌립니다. 디컴파일 결과를 다시 컴파일해서
+원본과 같은 값을 내는지까지 봅니다. 컴파일러가 없으면 그 테스트는 skip되고, GUI 테스트는 `QT_QPA_PLATFORM=offscreen`으로 돕니다.
+
+버그나 이상한 디컴파일 결과를 보면 이슈로 바이너리와 같이 남겨 주시면 고맙겠습니다.
 
 ## 라이선스
 
