@@ -148,11 +148,16 @@ class SigDB:
     # data objects holding pointers (vtables, tables of function pointers): name -> [its size,
     # the pointers it holds: [offset, name pointed to, 1 when that is a function], ...]
     tables: dict[str, list] = field(default_factory=dict)
+    # what the signatures are of: the library ("glibc", "libstdc++", "libgcc", "libm", ... or
+    # the archive's name), its version when known, and the object format of its code
+    library: str = ""
+    version: str = ""
+    format: str = "ELF"
 
     def save(self, path: str) -> None:
         os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
-        data = {"arch": self.arch, "source": self.source,
-                "sigs": [_entry(s) for s in self.sigs]}
+        data = {"arch": self.arch, "source": self.source, "library": self.library, "version": self.version,
+                "format": self.format, "sigs": [_entry(s) for s in self.sigs]}
         if self.tables:
             data["tables"] = self.tables
         with gzip.open(path, "wt") as fp:
@@ -162,7 +167,8 @@ class SigDB:
     def load(cls, path: str) -> "SigDB":
         with gzip.open(path, "rt") as fp:
             data = json.load(fp)
-        db = cls(data["arch"], source=data.get("source", path), tables=data.get("tables", {}))
+        db = cls(data["arch"], source=data.get("source", path), tables=data.get("tables", {}),
+                 library=data.get("library", ""), version=data.get("version", ""), format=data.get("format", "ELF"))
         for groups, text, *rest in data["sigs"]:
             pattern, mask = _decode(text)
             if len(rest) > 1 and rest[1]:        # some bytes only partly known
@@ -361,13 +367,71 @@ def _data_tables(elf, arch: str, symtab, tables: dict) -> None:
                     tables.setdefault(oname, [end - start, []])[1].append([off - start, name, int(is_func)])
 
 
+_GLIBC_BANNER = re.compile(rb"GNU C Library [^\n]*?release version (\d+\.\d+)")
+_GCC_COMMENT = re.compile(rb"GCC: \([^)]*\) (\d+)(?:\.\d+)*")
+
+
+def library_of(paths: list[str], data: bytes) -> tuple[str, str]:
+    """Which library these archives are (from the first one's name and contents) and its
+    version: glibc's from its banner, GCC's runtime libraries' from the compiler that built
+    them (major version)."""
+    base = os.path.basename(paths[0]) if paths else ""
+    stem = base[3:] if base.startswith("lib") else base
+    stem = stem.split(".")[0] if stem else ""
+    m = _GLIBC_BANNER.search(data)
+    if base == "libc.a" and m:
+        return "glibc", m.group(1).decode()
+    if base == "libc.a" and b"musl" in data:
+        return "musl", ""
+    gcc = _GCC_COMMENT.findall(data)
+    gcc_major = max(gcc, key=int).decode() if gcc else ""
+    if not gcc_major:                        # (in GCC's own directory: /usr/lib/gcc/<triple>/<version>/)
+        d = re.search(r"/gcc(?:-cross)?/[^/]+/(\d+)", os.path.abspath(paths[0]) if paths else "")
+        gcc_major = d.group(1) if d else ""
+    if stem in ("stdc++", "gcc", "gcc_eh", "supc++", "atomic", "quadmath", "gfortran"):
+        return ("libstdc++" if stem in ("stdc++", "supc++") else "lib" + stem.removesuffix("_eh")), gcc_major
+    if stem in ("m", "pthread", "dl", "rt", "resolv", "crypt", "util") and m:
+        return "lib" + stem, m.group(1).decode()
+    return ("lib" + stem if stem and base.startswith("lib") else stem), ""
+
+
+_LD_SCRIPT_FILES = re.compile(r"(?:GROUP|INPUT)\s*\(([^)]*)\)")
+
+
+def _expand_scripts(paths: list[str]) -> list[str]:
+    """Archives named by GNU ld scripts standing in for a library (`libm.a`: GROUP(libm-2.39.a
+    libmvec.a)), in their place."""
+    out = []
+    for p in paths:
+        try:
+            with open(p, "rb") as fp:
+                head = fp.read(4096)
+        except OSError:
+            out.append(p)
+            continue
+        if head.startswith(b"!<arch>") or head.startswith(b"\x7fELF") or b"GNU ld script" not in head:
+            out.append(p)
+            continue
+        for group in _LD_SCRIPT_FILES.findall(head.decode("latin-1")):
+            for f in group.replace(",", " ").split():
+                if f in ("AS_NEEDED", "(", ")") or f.startswith("-l"):
+                    continue
+                out.append(f if os.path.isabs(f) else os.path.join(os.path.dirname(p), f))
+    return out
+
+
 def build(paths: list[str]) -> SigDB:
-    """Signatures of every function in the given static libraries / object files."""
+    """Signatures of every function in the given static libraries / object files (a GNU ld
+    script naming archives stands for them)."""
     db: SigDB | None = None
     seen: dict[tuple, Signature] = {}
+    first_data = b""
+    named, paths = paths, _expand_scripts(paths)
     for path in paths:
         with open(path, "rb") as fp:
             data = fp.read()
+        if not first_data:
+            first_data = data
         members = ar_members(data) if data.startswith(b"!<arch>\n") else [(os.path.basename(path), data)]
         for _name, body in members:
             if not body.startswith(b"\x7fELF"):
@@ -398,6 +462,14 @@ def build(paths: list[str]) -> SigDB:
     if db is None:
         raise ValueError("no ELF objects found")
     db.tables = {n: t for n, t in db.tables.items() if t and any(f for _, _, f in t[1])}
+    db.library, db.version = library_of(named, first_data)
+    db.source = ", ".join(os.path.basename(p) for p in named)
+    if db.library == "libm" and not db.version:     # (libm.a has no banner: glibc's own beside it)
+        libc = os.path.join(os.path.dirname(named[0]), "libc.a")
+        if os.path.exists(libc):
+            with open(libc, "rb") as fp:
+                m = _GLIBC_BANNER.search(fp.read())
+            db.version = m.group(1).decode() if m else ""
     return db
 
 
@@ -509,8 +581,21 @@ def sig_dirs() -> list[str]:
     return [d for d in dict.fromkeys(dirs) if os.path.isdir(d)]
 
 
-def available(arch: str, paths: list[str] | None = None) -> list[SigDB]:
-    """The signature databases for `arch`: the given files, else those in sig_dirs()."""
+def _ver_key(v: str) -> tuple:
+    return tuple(int(x) for x in re.findall(r"\d+", v))
+
+
+# C libraries and the runtime libraries that go with them
+_LIBC_FAMILY = {"glibc": "glibc", "libm": "glibc", "libpthread": "glibc", "libdl": "glibc", "librt": "glibc",
+                "libresolv": "glibc", "libcrypt": "glibc", "libutil": "glibc", "musl": "musl"}
+
+
+def available(arch: str, paths: list[str] | None = None, toolchain=None, fmt: str | None = None) -> list[SigDB]:
+    """The signature databases for `arch`: the given files, else those in sig_dirs(). With
+    the binary's `toolchain` (ident.Toolchain) and object format, a set made for another C
+    library or object format is left out (glibc's for a musl or Windows binary), and of several
+    versions of one library the one the binary was built with -- else the newest -- is kept."""
+    explicit = paths is not None
     if paths is None:
         paths = [os.path.join(d, f) for d in sig_dirs() for f in sorted(os.listdir(d)) if f.endswith(".sig")]
     out = []
@@ -524,7 +609,89 @@ def available(arch: str, paths: list[str] | None = None) -> list[SigDB]:
             continue
         if db.arch == arch:
             out.append(db)
+    if explicit:                               # (the files asked for: all of them)
+        return out
+    return select(out, toolchain, fmt)
+
+
+def select(dbs: list[SigDB], toolchain=None, fmt: str | None = None) -> list[SigDB]:
+    """Of these signature databases, the ones for a binary of this toolchain and object format
+    (see available)."""
+    out = list(dbs)
+    if fmt in ("ELF", "PE"):                     # (a raw image may hold any library's code)
+        out = [db for db in out if not db.format or db.format == fmt]
+    family = toolchain.libc_family if toolchain is not None else None
+    if family:
+        out = [db for db in out if _LIBC_FAMILY.get(db.library, family) == family]
+    want = {}
+    if toolchain is not None and toolchain.libc_version:
+        want["glibc"] = toolchain.libc_version
+    by_lib: dict[str, list[SigDB]] = {}
+    for db in out:
+        by_lib.setdefault(db.library or db.source, []).append(db)
+    keep = []
+    for lib, group in by_lib.items():
+        if len(group) == 1:
+            keep += group
+            continue
+        v = want.get(_LIBC_FAMILY.get(lib, lib))
+        exact = [db for db in group if v and db.version == v]
+        keep.append(exact[0] if exact else max(group, key=lambda db: _ver_key(db.version)))
+    return keep
+
+
+# ------------------------------------------------------- installed toolchains
+def system_libraries() -> list[tuple[str, list[str]]]:
+    """The static libraries of the toolchains installed here, one signature set each:
+    (file name, the archives it is built from) -- glibc's libc.a and libm.a and GCC's
+    libstdc++.a and libgcc.a (+ libgcc_eh.a), for the native and every cross compiler."""
+    import glob
+    out = []
+    triples: dict[str, str] = {}               # target triple -> its newest GCC directory
+    for root in ("/usr/lib/gcc", "/usr/lib/gcc-cross", "/usr/local/lib/gcc"):
+        for d in glob.glob(os.path.join(root, "*", "*")):
+            triple, ver = d.split(os.sep)[-2:]
+            if "mingw" in triple or not os.path.exists(os.path.join(d, "libgcc.a")):
+                continue                        # (Windows runtime objects are COFF)
+            old = triples.get(triple)
+            if old is None or _ver_key(ver) > _ver_key(os.path.basename(old)):
+                triples[triple] = d
+    for triple, gcc in sorted(triples.items()):
+        libdirs = [f"/usr/lib/{triple}", f"/usr/{triple}/lib", f"/usr/local/{triple}/lib"]
+        for name in ("libc.a", "libm.a"):
+            lib = next((os.path.join(d, name) for d in libdirs if os.path.exists(os.path.join(d, name))), None)
+            if lib is not None:
+                out.append((triple, [lib]))
+        for name in ("libstdc++.a",):
+            lib = os.path.join(gcc, name)
+            if os.path.exists(lib):
+                out.append((triple, [lib]))
+        gcc_libs = [os.path.join(gcc, n) for n in ("libgcc.a", "libgcc_eh.a") if os.path.exists(os.path.join(gcc, n))]
+        out.append((triple, gcc_libs))
     return out
+
+
+def set_name(db: SigDB) -> str:
+    """`glibc-2.39-x64.sig`, `libstdc++-13-arm64.sig`."""
+    lib = (db.library or "lib").replace("+", "x")
+    return f"{lib}-{db.version + '-' if db.version else ''}{db.arch}.sig"
+
+
+def build_system(out_dir: str, progress=None) -> list[tuple[str, SigDB]]:
+    """Build a signature set for every static library of the installed toolchains into
+    `out_dir`: [(file written, database)]. `progress(text)`: called before each."""
+    done = []
+    for triple, libs in system_libraries():
+        if progress is not None:
+            progress(f"{triple}: {', '.join(os.path.basename(p) for p in libs)}")
+        try:
+            db = build(libs)
+        except (OSError, ValueError):
+            continue
+        path = os.path.join(out_dir, set_name(db))
+        db.save(path)
+        done.append((path, db))
+    return done
 
 
 _LOADED: dict[tuple[str, float], SigDB] = {}       # loaded databases, by path and modification time
@@ -821,5 +988,5 @@ def _refs_fit(an: "Analysis", addr: int, sig: Signature, aliases: dict[int, set]
     return True if checked else None
 
 
-__all__ = ["Matcher", "SigDB", "Signature", "apply", "ar_members", "available", "build", "object_signatures",
-           "sig_dirs"]
+__all__ = ["Matcher", "SigDB", "Signature", "apply", "ar_members", "available", "build", "build_system",
+           "library_of", "object_signatures", "select", "set_name", "sig_dirs", "system_libraries"]

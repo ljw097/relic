@@ -1240,3 +1240,27 @@ def test_address_signals_carry_64_bit_addresses(win):
     p.edit_requested.connect(lambda name, v: got.append(v))
     p.edit_requested.emit("rsp", 0x7FFD12345678)
     assert got == [big] * 5 + [0x7FFD12345678]
+
+
+def test_toolchain_rows_and_building_signatures_from_toolchains(app, vuln64_stripped, tmp_path, monkeypatch):
+    """The Checksec table starts with the compiler and C library; File > Build signatures from
+    installed toolchains builds the sets and applies the ones for the binary."""
+    import subprocess
+    from relic.analysis import libsigs
+    obj = str(tmp_path / "vuln.o")
+    subprocess.run(["gcc", "-O0", "-fno-stack-protector", "-w", "-c", "-o", obj,
+                    os.path.join(os.path.dirname(__file__), "src", "vuln.c")], check=True)
+    monkeypatch.setattr(libsigs, "system_libraries", lambda: [("x86_64-linux-gnu", [obj])])
+    path = tmp_path / "stripped"
+    shutil.copy(vuln64_stripped, path)
+    w = MainWindow()
+    w.open_file(str(path))
+    assert w.wait()
+    rows = {r[0]: r[1] for r in _rows(w.checksec)}
+    assert rows["Compiler"].startswith("GCC ") and rows["C library"].startswith("glibc")
+    out = tmp_path / "sigs"
+    assert w.build_system_signatures(str(out)) >= 8
+    assert (out / "vuln-x64.sig").exists()
+    assert w.an.function_by_name("checksum").library
+    w.dirty = False
+    w.close()

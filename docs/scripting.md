@@ -56,6 +56,7 @@ script) and in plugin callbacks. Besides these: `an` (the Analysis), `bin` (its 
 - `set_type(func, var: str, ctype: str)` -- Give a variable / parameter (`a1`, `v3`, `var_10`) of a function a C type.
 - `snapshot(name: str) -> dict` -- Keep a named copy of every annotation (saved with the project).
 - `strings() -> list` -- The strings found in the binary (`.addr`, `.value`, `.encoding`, `.section`).
+- `toolchain() -> dict` -- What built the binary: {"compiler": "GCC 13.3.0", "libc": "glibc 2.39", "linking": "static" / "dynamic", "languages": [...], "evidence": [...]} (unknown parts: None).
 - `undefine(where)` -- Forget what was said about an address (U).
 - `xrefs_from(where) -> list` -- The cross references from an address (`.frm`, `.to`, `.kind`).
 - `xrefs_to(where) -> list` -- The cross references to an address (`.frm`, `.to`, `.kind`).

@@ -124,7 +124,10 @@ def _parser() -> argparse.ArgumentParser:
     s = sub.add_parser("sigs", help="library signatures: build from static libraries, list")
     s.add_argument("action", choices=("build", "list"))
     s.add_argument("libs", nargs="*", help="static libraries (.a) / object files to build from")
-    s.add_argument("-o", "--output", help="signature file to write (build)")
+    s.add_argument("-o", "--output", help="signature file to write (build; with --system: the directory)")
+    s.add_argument("--system", action="store_true",
+                   help="build: a set for every static library of the installed toolchains (glibc, libm, "
+                        "libstdc++, libgcc; native and cross) into ~/.relic/sigs")
     g = sub.add_parser("gui", help="open the GUI")
     g.add_argument("file", nargs="?")
     g.add_argument("--arch", help="architecture for raw blobs (x86, x64, arm, arm64, mips, ...)")
@@ -162,6 +165,12 @@ def cmd_info(args):
         print(f"{k + ':':10} {v}")
     if b.libraries:
         print(f"Libraries: {', '.join(b.libraries)}")
+    from .analysis.ident import identify
+    tc = identify(b)
+    print(f"Compiler:  {tc.compiler or 'unknown'}")
+    print(f"C library: {tc.libc or 'unknown'}{f' ({tc.linking})' if tc.linking else ''}")
+    if tc.languages:
+        print(f"Languages: {', '.join(tc.languages)}")
     print("\nSections:")
     print(f"  {'name':20} {'addr':>18} {'size':>10} {'offset':>10}  perm")
     for s in b.sections:
@@ -188,9 +197,17 @@ def cmd_funcs(args):
 
 def cmd_sigs(args):
     from .analysis import libsigs
+    if args.action == "build" and args.system:
+        out = args.output or os.path.join(os.path.expanduser("~"), ".relic", "sigs")
+        done = libsigs.build_system(out, lambda text: print(f"building {text}", flush=True))
+        for path, db in done:
+            print(f"{path}: {len(db.sigs)} signatures ({db.arch})")
+        if not done:
+            sys.exit("relic: no static libraries of an installed toolchain found")
+        return 0
     if args.action == "build":
         if not args.libs or not args.output:
-            sys.exit("relic: sigs build LIB.a... -o OUT.sig")
+            sys.exit("relic: sigs build LIB.a... -o OUT.sig  (or: sigs build --system)")
         db = libsigs.build(args.libs)
         db.save(args.output)
         print(f"{args.output}: {len(db.sigs)} signatures ({db.arch}) from {db.source}")
@@ -202,7 +219,8 @@ def cmd_sigs(args):
         for f in sorted(os.listdir(d)):
             if f.endswith(".sig"):
                 db = libsigs.SigDB.load(os.path.join(d, f))
-                print(f"{os.path.join(d, f)}: {db.arch}, {len(db.sigs)} signatures from {db.source}")
+                what = " ".join(x for x in (db.library, db.version) if x) or db.source
+                print(f"{os.path.join(d, f)}: {what} ({db.arch}), {len(db.sigs)} signatures from {db.source}")
     return 0
 
 
