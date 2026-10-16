@@ -48,6 +48,11 @@ def load_elf(path: str, data: bytes) -> Binary:
         # EF_ARM_ABI_FLOAT_HARD: floating-point arguments and results in VFP registers (armhf)
         b.arm_hard_float = bool(elf["e_flags"] & 0x400)
     b.elf_type = elf["e_type"]
+    if b.elf_type == "ET_REL":                # a relocatable object: lay it out and link it alone
+        from .elfobj import load_elf_object
+        load_elf_object(b, elf)
+        b._finalize()
+        return b
 
     b.program_headers = []
     for seg in elf.iter_segments():

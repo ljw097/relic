@@ -5,8 +5,19 @@ from .base import Binary, Import, Section, Segment, Symbol
 
 
 def load(path: str, arch: str | None = None, base: int = 0) -> Binary:
+    """Load a file -- or one member of a static library, `lib.a:member.o`."""
+    import os
+    member = None
+    if not os.path.exists(path) and ":" in path and os.path.exists(path.rsplit(":", 1)[0]):
+        path, member = path.rsplit(":", 1)
     with open(path, "rb") as f:
         data = f.read()
+    if member is not None or data.startswith(b"!<arch>\n"):
+        from .archive import member as pick
+        name, body = pick(data, member)
+        b = load_bytes(body, f"{path}:{name}", arch, base)
+        b.info["archive"] = f"{os.path.basename(path)} member {name}"
+        return b
     return load_bytes(data, path, arch, base)
 
 
@@ -24,11 +35,27 @@ def load_bytes(data: bytes, path: str = "<memory>", arch: str | None = None, bas
     elif data[:2] == b"MZ":
         from .pe import load_pe
         b = load_pe(path, data)
+    elif _is_coff(data):
+        from .coff import load_coff
+        b = load_coff(path, data)
+    elif _is_text_firmware(data):
+        from .firmware import load_firmware
+        return load_firmware(path, data, arch)
     else:
         b = load_raw(path, data, arch or "x64", base)
     if arch and b.format != "RAW":
         b.arch = arch
     return b
+
+
+def _is_coff(data: bytes) -> bool:
+    from .coff import is_coff
+    return is_coff(data)
+
+
+def _is_text_firmware(data: bytes) -> bool:
+    from .firmware import is_ihex, is_srec
+    return is_ihex(data) or is_srec(data)
 
 
 def load_raw(path: str, data: bytes, arch: str = "x64", base: int = 0) -> Binary:

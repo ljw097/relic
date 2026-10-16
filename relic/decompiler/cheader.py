@@ -35,10 +35,9 @@ class Model:
     @staticmethod
     def for_binary(b) -> "Model":
         if b.bits == 32:
-            x86 = b.arch == "x86"
-            return Model(4, 4, 2 if b.format == "PE" else 4, 4 if x86 and b.format != "PE" else 8,
-                         12 if x86 and b.format != "PE" else 8)
-        if b.format == "PE":
+            x86, win = b.arch == "x86", b.format in ("PE", "COFF")
+            return Model(4, 4, 2 if win else 4, 4 if x86 and not win else 8, 12 if x86 and not win else 8)
+        if b.format in ("PE", "COFF"):
             return Model(8, 4, 2, 8, 8)
         return Model()
 

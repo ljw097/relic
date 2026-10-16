@@ -53,6 +53,18 @@
 - [x] RISC-V 링커 완화(relaxation) 모델링: `call` → `jal`/`c.j`, 주소를 만드는 auipc/lui 삭제(쓰는 명령의 기준 레지스터는 gp/tp로), TLS add 삭제, 정렬 nop 삭제
 - [x] GUI 시그니처 창(File ▸ Library signatures, `Shift+F5`): 세트 목록(라이브러리·버전·아키텍처·형식·시그니처 수), 이 바이너리에 맞는 세트, 세트별 이름 붙인 수, 적용·이름 되돌리기·파일 추가·툴체인에서 생성
 
+## P1 — 파일 포맷 100%까지 (README 55%)
+
+- [x] ELF(실행·공유·정적), PE(import/export/COFF 심볼/.pdata), RAW
+- [x] ELF 재배치 객체(`.o`): 섹션 배치, 재배치 적용(x86-64·x86·AArch64·ARM/Thumb·MIPS·RISC-V), 외부 심볼은 import 스텁, GOT 슬롯
+- [x] COFF 객체(`.obj`/MinGW `.o`, x64·x86)
+- [x] 정적 라이브러리 멤버(`lib.a:member.o`, 지정 없으면 첫 객체)
+- [x] Intel HEX·Motorola S-record(시작 주소 레코드, Cortex-M 벡터 테이블의 리셋 핸들러)
+- [ ] ELF 코어 덤프(메모리·레지스터·매핑된 파일)
+- [ ] PE: TLS 콜백, 리소스, 지연 import, .NET 감지, 디버그 디렉터리(PDB 경로)
+- [ ] RAW 펌웨어의 적재 주소 추정
+- [ ] Mach-O
+
 ## P1 — 디버거 100%까지 (README 90%)
 
 - [x] 로컬: 실행·단계 실행·중단점(조건·활성화·적중 횟수·라이브러리 함수)·하드웨어 watchpoint·레지스터/메모리 보기·편집·telescope·vmmap·백트레이스·콘솔·힙 뷰·PIE 슬라이드
