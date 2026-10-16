@@ -30,7 +30,7 @@ import sys
 from . import __version__
 
 COMMANDS = ("info", "checksec", "funcs", "disasm", "cfg", "strings", "imports", "xrefs", "vulns", "ir", "opt",
-            "decompile", "search", "patch", "script", "sigs", "types", "project", "gui")
+            "decompile", "search", "patch", "script", "sigs", "types", "project", "lumina", "gui")
 
 
 def _parser() -> argparse.ArgumentParser:
@@ -79,9 +79,14 @@ def _parser() -> argparse.ArgumentParser:
     s.add_argument("headers", nargs="*", metavar="FILE.h", help="headers to import (none: list what is imported)")
     s.add_argument("--no-save", action="store_true", help="check the headers without saving the project")
     s = add("project", "snapshots of the annotations; merge another analyst's project file")
-    s.add_argument("action", choices=("snapshots", "snapshot", "restore", "delete", "merge"),
-                   help="snapshots: list; snapshot/restore/delete NAME; merge OTHER.relic.json")
-    s.add_argument("arg", nargs="?", metavar="NAME|FILE")
+    s.add_argument("action", choices=("snapshots", "snapshot", "restore", "delete", "merge", "commit", "log", "diff",
+                                      "checkout"),
+                   help="snapshots: list; snapshot/restore/delete NAME; merge OTHER.relic.json; commit -m MSG; log; "
+                        "diff [A [B]] (versions, default: latest -> now); checkout N")
+    s.add_argument("arg", nargs="?", metavar="NAME|FILE|N")
+    s.add_argument("arg2", nargs="?", metavar="N")
+    s.add_argument("-m", "--message", help="commit: what this version is")
+    s.add_argument("--author", help="commit: who (default: the login name)")
     s.add_argument("--theirs", action="store_true", help="merge: where both differ, take the other file's value")
     s.add_argument("--force", action="store_true", help="merge: even if the project is for another binary")
     s = add("search", "search bytes, text, immediates or instructions")
@@ -107,6 +112,14 @@ def _parser() -> argparse.ArgumentParser:
     s.add_argument("args", nargs=argparse.REMAINDER, help="arguments for the script (sys.argv[1:]); "
                    "relic's own options go before the script")
     s.add_argument("--save", action="store_true", help="save the project file afterwards")
+    s = sub.add_parser("lumina", help="share function names / comments / types through a store (push, pull, serve)")
+    s.add_argument("action", choices=("push", "pull", "serve"))
+    s.add_argument("target", help="the binary (push / pull), or the store file to serve")
+    s.add_argument("--store", help="JSON file or http:// server (default: ~/.relic/lumina.json, $RELIC_LUMINA)")
+    s.add_argument("--overwrite", action="store_true", help="pull: replace names the project already has")
+    s.add_argument("--host", default="127.0.0.1", help="serve: address to listen on (default: localhost only)")
+    s.add_argument("--port", type=int, default=8765, help="serve: port")
+    s.add_argument("--no-save", action="store_true", help="pull: do not save the project")
     s = sub.add_parser("sigs", help="library signatures: build from static libraries, list")
     s.add_argument("action", choices=("build", "list"))
     s.add_argument("libs", nargs="*", help="static libraries (.a) / object files to build from")
@@ -409,6 +422,8 @@ def cmd_decompile(args):
 def cmd_project(args):
     from .analysis.project import ProjectMismatch, summary
     an = _analyze(args)
+    if args.action in ("commit", "log", "diff", "checkout"):
+        return _project_history(an, args)
     if args.action == "snapshots":
         for name, snap in an.snapshots.items():
             print(f"{name:24} {snap['time']}  {summary(snap['notes'])}")
@@ -440,6 +455,68 @@ def cmd_project(args):
             key = f"{key:#x}" if isinstance(key, int) else (f"{key[0]:#x} {key[1]}" if isinstance(key, tuple) else key)
             print(f"conflict {section} {key}: ours {ours!r}, theirs {theirs!r} (kept {got['kept']})")
     an.save_project()
+
+
+def _project_history(an, args):
+    from .analysis.project import summary, summary_of_diff
+    if args.action == "log":
+        for v in reversed(an.history):
+            print(f"{v['id']:>4}  {v['time']}  {v['author']:<12} {v['message']}  ({summary(v['notes'])})")
+        if not an.history:
+            print("no versions")
+        return
+    if args.action == "commit":
+        if not args.message:
+            sys.exit("relic: project commit needs -m MESSAGE")
+        v = an.commit(args.message, args.author)
+        print(f"version {v['id']}: {v['message']} ({summary(v['notes'])})")
+    elif args.action == "diff":
+        try:
+            a = int(args.arg) if args.arg else None
+            b = int(args.arg2) if args.arg2 else None
+            changes = an.diff_versions(a, b)
+        except (KeyError, ValueError) as e:
+            sys.exit(f"relic: {e}")
+        for sec, key, old, new in changes:
+            sign = "+" if old is None else "-" if new is None else "~"
+            print(f"{sign} {sec:<10} {key}: " + (repr(new) if old is None else repr(old) if new is None
+                                                  else f"{old!r} -> {new!r}"))
+        print(summary_of_diff(changes))
+        return
+    else:
+        try:
+            an.checkout(int(args.arg))
+        except (KeyError, TypeError, ValueError) as e:
+            sys.exit(f"relic: no such version ({e})")
+        print(f"checked out version {args.arg}")
+    an.save_project()
+
+
+def cmd_lumina(args):
+    from .analysis import Analysis
+    from .loader import load
+    if args.action == "serve":
+        from .analysis.lumina import serve
+        print(f"serving {args.target} on http://{args.host}:{args.port}", flush=True)
+        try:
+            serve(args.target, args.host, args.port)
+        except KeyboardInterrupt:
+            pass
+        return
+    an = Analysis(load(args.target)).run()
+    try:
+        if args.action == "push":
+            got = an.lumina_push(args.store)
+            print(f"pushed {got['pushed']} function(s)" + (f" ({got['skipped']} too short)" if got["skipped"] else ""))
+            return
+        got = an.lumina_pull(args.store, args.overwrite)
+    except (OSError, ValueError) as e:
+        sys.exit(f"relic: {e}")
+    for a, name in got["applied"]:
+        print(f"{a:#x}  {name}")
+    print(f"{len(got['applied'])} function(s) from {got['matched']} match(es)")
+    if got["applied"] and not args.no_save:
+        an.save_project()
 
 
 def cmd_search(args):

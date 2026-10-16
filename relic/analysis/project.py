@@ -78,6 +78,55 @@ def summary(notes: dict) -> str:
     return ", ".join(parts) or "no annotations"
 
 
+# -------------------------------------------------------------------- history
+def commit(an: "Analysis", message: str, author: str | None = None) -> dict:
+    """A new version of the annotations (IDA Teams' check-in): number, time, author, message."""
+    import getpass
+    if not message.strip():
+        raise ValueError("a version needs a message")
+    try:
+        who = author or getpass.getuser()
+    except Exception:  # noqa: BLE001 - no user name in this environment
+        who = author or "unknown"
+    v = {"id": (an.history[-1]["id"] + 1) if an.history else 1, "time": time.strftime("%Y-%m-%d %H:%M:%S"),
+         "author": who, "message": message.strip(), "notes": notes_to_json(an)}
+    an.history.append(v)
+    return v
+
+
+def version(an: "Analysis", vid: int) -> dict:
+    v = next((v for v in an.history if v["id"] == vid), None)
+    if v is None:
+        raise KeyError(f"no version {vid}")
+    return v
+
+
+def diff(old: dict, new: dict) -> list[tuple[str, str, object, object]]:
+    """What changed from one set of annotations (project-file sections) to another:
+    (section, key, before or None, after or None), in section order."""
+    out = []
+    sections = list(FLAT) + list(NESTED) + ["structs", "c_types"]
+    for sec in sections:
+        a, b = old.get(sec, {}) or {}, new.get(sec, {}) or {}
+        if sec in NESTED:                       # {function: {name: value}}: one row per name
+            for fn in sorted(set(a) | set(b)):
+                ia, ib = a.get(fn, {}), b.get(fn, {})
+                for k in sorted(set(ia) | set(ib)):
+                    if ia.get(k) != ib.get(k):
+                        out.append((sec, f"{fn} {k}", ia.get(k), ib.get(k)))
+            continue
+        for k in sorted(set(a) | set(b)):
+            if a.get(k) != b.get(k):
+                out.append((sec, k, a.get(k), b.get(k)))
+    return out
+
+
+def summary_of_diff(changes: list) -> str:
+    added = sum(1 for c in changes if c[2] is None)
+    removed = sum(1 for c in changes if c[3] is None)
+    return f"{added} added, {removed} removed, {len(changes) - added - removed} changed"
+
+
 # ---------------------------------------------------------------------- merge
 class ProjectMismatch(ValueError):
     """The other project file belongs to a different binary."""
@@ -137,4 +186,5 @@ def merge(an: "Analysis", data: dict, theirs: bool = False, force: bool = False)
     return {"added": added, "conflicts": conflicts, "kept": "theirs" if theirs else "ours"}
 
 
-__all__ = ["ProjectMismatch", "merge", "notes_from_json", "notes_to_json", "sha256", "summary", "take"]
+__all__ = ["ProjectMismatch", "commit", "diff", "merge", "notes_from_json", "notes_to_json", "sha256", "summary",
+           "summary_of_diff", "take", "version"]

@@ -433,7 +433,12 @@ class MainWindow(QMainWindow):
         act(m, "&Export pseudocode...", None, self.export_dialog)
         m.addSeparator()
         act(m, "Sna&pshots...", None, self.show_snapshots)
+        act(m, "&History...", None, self.show_history)
         act(m, "&Merge project...", None, self.merge_dialog)
+        lm = m.addMenu("&Lumina")
+        act(lm, "&Pull function names", None, self.lumina_pull)
+        act(lm, "Pu&sh function names", None, self.lumina_push)
+        act(lm, "&Choose store...", None, self.lumina_store_dialog, False)
         m.addSeparator()
         act(m, "&Cancel background work", "Ctrl+.", self.cancel_work, False)
         m.addSeparator()
@@ -1581,6 +1586,55 @@ class MainWindow(QMainWindow):
         self.snapshots_dialog.show()
         self.snapshots_dialog.raise_()
         return self.snapshots_dialog
+
+    # ------------------------------------------------------------- lumina
+    def lumina_store(self) -> str:
+        from ..analysis.lumina import default_store
+        return str(self.settings().value("lumina/store", "") or default_store())
+
+    def lumina_store_dialog(self):
+        text, ok = QInputDialog.getText(self, "Lumina store", "JSON file or http://host:port of a "
+                                        "`relic lumina serve`:", text=self.lumina_store())
+        if ok and text.strip():
+            self.settings().setValue("lumina/store", text.strip())
+
+    def lumina_pull(self) -> dict | None:
+        """Names, comments and variable names of the functions the store knows (one undo step)."""
+        if self.an is None:
+            return None
+        try:
+            got = self.an.lumina_pull(self.lumina_store())
+        except (OSError, ValueError) as e:
+            QMessageBox.warning(self, "Lumina", f"{self.lumina_store()}: {e}")
+            return None
+        self.statusBar().showMessage(f"lumina: {len(got['applied'])} function(s) named from "
+                                     f"{got['matched']} match(es)", 6000)
+        if got["applied"]:
+            self._after_edit()
+            self._fill_functions()
+        return got
+
+    def lumina_push(self) -> dict | None:
+        if self.an is None:
+            return None
+        try:
+            got = self.an.lumina_push(self.lumina_store())
+        except (OSError, ValueError) as e:
+            QMessageBox.warning(self, "Lumina", f"{self.lumina_store()}: {e}")
+            return None
+        self.statusBar().showMessage(f"lumina: pushed {got['pushed']} function(s)", 6000)
+        return got
+
+    def show_history(self):
+        """The version history window."""
+        from .history import HistoryDialog
+        if getattr(self, "history_dialog", None) is None:
+            self.history_dialog = HistoryDialog(self)
+        else:
+            self.history_dialog.refresh()
+        self.history_dialog.show()
+        self.history_dialog.raise_()
+        return self.history_dialog
 
     def merge_dialog(self):
         """Pick another analyst's project file of this binary and merge its annotations."""
