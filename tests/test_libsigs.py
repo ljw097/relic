@@ -56,15 +56,16 @@ def test_static_stripped_binary_gets_library_names(static_bins):
 
 
 # arch -> (toolchain, libc.a, functions to be named, share of all functions named at least)
-# (Thumb `fopen` is `movs r2, #1; b.n __fopen_internal`: 4 bytes, too few to tell; RISC-V
-# signatures stop where the linker may relax a call, so they name fewer)
+# (Thumb `fopen` is `movs r2, #1; b.n __fopen_internal`: 4 bytes, too few to tell -- on RISC-V
+# `li a2, 1; tail __fopen_internal`, the tail call relaxed)
 CROSS = {"arm": ("arm-linux-gnueabihf", "/usr/arm-linux-gnueabihf/lib/libc.a",
                  {"malloc", "free", "fgetc", "fclose"}, 0.75),
          "arm64": ("aarch64-linux-gnu", "/usr/aarch64-linux-gnu/lib/libc.a",
                    {"malloc", "free", "fgetc", "fclose", "fopen"}, 0.65),
          "mips": ("mipsel-linux-gnu", "/usr/mipsel-linux-gnu/lib/libc.a",
                   {"malloc", "free", "fgetc", "fclose", "fopen", "strlen"}, 0.8),
-         "riscv64": ("riscv64-linux-gnu", "/usr/riscv64-linux-gnu/lib/libc.a", {"fgetc", "fclose", "strlen"}, 0.3)}
+         "riscv64": ("riscv64-linux-gnu", "/usr/riscv64-linux-gnu/lib/libc.a",
+                     {"malloc", "free", "fgetc", "fclose", "strlen"}, 0.7)}
 
 
 @pytest.mark.parametrize("arch", sorted(CROSS))
@@ -102,8 +103,10 @@ def test_cross_static_binaries_get_library_names(arch, tmp_path):
         assert main is not None and main.addr & ~1 == next(a for a, n in truth.items() if n == "main")
 
 
-def test_cross_riscv_signatures_stop_where_calls_may_be_relaxed(tmp_path):
-    """`call f` (auipc + jalr) may become `jal f`: the code after it moves."""
+def test_cross_riscv_signatures_model_linker_relaxation(tmp_path):
+    """`call g` (auipc + jalr) may become `jal g`, an auipc building an address may go (the
+    instruction using it then adds to gp): the signature keeps the whole function and the
+    places that may change, and matches each form."""
     gcc = shutil.which("riscv64-linux-gnu-gcc")
     if gcc is None:
         pytest.skip("needs riscv64-linux-gnu-gcc")
@@ -113,10 +116,52 @@ def test_cross_riscv_signatures_stop_where_calls_may_be_relaxed(tmp_path):
     subprocess.run([gcc, "-O2", "-c", "-o", str(obj), str(src)], check=True)
     arch, sigs = libsigs.object_signatures(obj.read_bytes())
     s = next(s for s in sigs if "f" in s.names)
-    assert arch == "riscv64" and s.prefix and not s.refs        # cut before the call to g
+    assert arch == "riscv64" and not s.prefix and ("g" in [n for _, n in s.refs])
+    call = next(r for r in s.relax if r[1] == "call")
+    assert call[2] == 8 and call[3] == 1                         # auipc ra + jalr ra: 8 bytes, rd = ra
     db = libsigs.SigDB(arch, [s])
     db.save(str(tmp_path / "f.sig"))
-    assert libsigs.SigDB.load(str(tmp_path / "f.sig")).sigs[0].prefix
+    back = libsigs.SigDB.load(str(tmp_path / "f.sig")).sigs[0]
+    assert back.relax == s.relax and back.fixed == s.fixed
+    # as linked unrelaxed: the pattern itself; relaxed: `jal ra, g` in place of the 8 bytes
+    off = call[0]
+    assert libsigs.match_relaxed(s.pattern, s)[0] == len(s.pattern)
+    jal = (0x000000EF).to_bytes(4, "little")                     # jal ra, 0
+    relaxed = s.pattern[:off] + jal + s.pattern[off + 8:]
+    size, pieces = libsigs.match_relaxed(relaxed, s)
+    assert size == len(s.pattern) - 4 and libsigs._code_offset(pieces, len(s.pattern) - 2) == size - 2
+    assert libsigs.match_relaxed(s.pattern[:off] + (0x000000EF ^ 0x80).to_bytes(4, "little") +
+                                 s.pattern[off + 8:], s) is None   # (jal with another rd: not it)
+
+
+def test_relaxed_matcher_forms():
+    """A synthetic pattern: a deletable auipc (kept or gone), a tail call (auipc t1 + jr t1, or
+    `j`, or `c.j`), and alignment nops the linker may drop."""
+    auipc = (0x00000297).to_bytes(4, "little")                   # auipc t0, 0
+    use = (0x0002B503).to_bytes(4, "little")                      # ld a0, 0(t0)
+    tail = (0x00000317).to_bytes(4, "little") + (0x00030067).to_bytes(4, "little")   # auipc t1; jr t1
+    nops = b"\x01\x00" * 2
+    body = bytes.fromhex("1305a500") * 4                          # addi a0, a0, 10 (x4): known bytes
+    pat = auipc + use + body + nops + tail
+    mask = bytearray(b"\xff" * len(pat))
+    for k in range(4, 8):                                        # rs1 of the `ld` may become gp
+        mask[k] = 0x07 if k == 6 else (0x7F if k == 5 else mask[k])
+    for k in list(range(1, 4)) + list(range(len(pat) - 7, len(pat) - 4)) + list(range(len(pat) - 2, len(pat))):
+        mask[k] = 0
+    s = libsigs.Signature([["f"]], pat, bytes(mask), [],
+                          relax=[[0, "del", 4, 0], [24, "align", 4, 0], [28, "call", 8, 0]])
+    m = libsigs.match_relaxed
+    assert m(pat, s)[0] == len(pat)
+    no_auipc = pat[4:]
+    assert m(no_auipc, s)[0] == len(pat) - 4
+    j = (0x0000006F).to_bytes(4, "little")                       # j (jal x0)
+    assert m(pat[:28] + j, s)[0] == len(pat) - 4
+    assert m(pat[:28] + b"\x01\xa0", s)[0] == len(pat) - 6       # c.j
+    assert m(pat[:24] + j, s)[0] == len(pat) - 8                  # (nops dropped too)
+    assert m(pat[:8] + bytes.fromhex("1305b500") + pat[12:], s) is None   # a known byte differs
+    db = libsigs.SigDB("riscv64", [s])
+    mt = libsigs.Matcher([db])
+    assert not mt.unindexed and mt.candidates(no_auipc)[0] is s and mt.candidates(pat)[0] is s
 
 
 def test_ctor_dtor_variants_are_one_name():
