@@ -64,7 +64,7 @@ def test_struct_results_and_stack_structs(built):
 
 def test_user_types_reach_callers(built):
     an = analyze(built)
-    p, u = an.function_by_name("parse"), an.function_by_name("use")
+    p = an.function_by_name("parse")
     an.set_var_type(p.addr, "a1", "char *")
     code = _c(an, "use")
     if "var_" in code:                                     # -O0: the argument's variable
