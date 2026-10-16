@@ -58,12 +58,12 @@ def test_static_stripped_binary_gets_library_names(static_bins):
 # (Thumb `fopen` is `movs r2, #1; b.n __fopen_internal`: 4 bytes, too few to tell; RISC-V
 # signatures stop where the linker may relax a call, so they name fewer)
 CROSS = {"arm": ("arm-linux-gnueabihf", "/usr/arm-linux-gnueabihf/lib/libc.a",
-                 {"malloc", "free", "fgetc", "fclose"}, 0.5),
+                 {"malloc", "free", "fgetc", "fclose"}, 0.75),
          "arm64": ("aarch64-linux-gnu", "/usr/aarch64-linux-gnu/lib/libc.a",
-                   {"malloc", "free", "fgetc", "fclose", "fopen"}, 0.5),
+                   {"malloc", "free", "fgetc", "fclose", "fopen"}, 0.65),
          "mips": ("mipsel-linux-gnu", "/usr/mipsel-linux-gnu/lib/libc.a",
-                  {"malloc", "free", "fgetc", "fclose", "fopen", "strlen"}, 0.5),
-         "riscv64": ("riscv64-linux-gnu", "/usr/riscv64-linux-gnu/lib/libc.a", {"fgetc", "fclose", "strlen"}, 0.2)}
+                  {"malloc", "free", "fgetc", "fclose", "fopen", "strlen"}, 0.8),
+         "riscv64": ("riscv64-linux-gnu", "/usr/riscv64-linux-gnu/lib/libc.a", {"fgetc", "fclose", "strlen"}, 0.3)}
 
 
 @pytest.mark.parametrize("arch", sorted(CROSS))
@@ -116,6 +116,87 @@ def test_cross_riscv_signatures_stop_where_calls_may_be_relaxed(tmp_path):
     db = libsigs.SigDB(arch, [s])
     db.save(str(tmp_path / "f.sig"))
     assert libsigs.SigDB.load(str(tmp_path / "f.sig")).sigs[0].prefix
+
+
+def test_ctor_dtor_variants_are_one_name():
+    """The base-object constructor / destructor (C2 / D2) is the complete-object one's code."""
+    p = libsigs._plain
+    assert p("_ZNSt12length_errorC2EPKc") == p("_ZNSt12length_errorC1EPKc")
+    assert p("_ZNSt12length_errorD2Ev") == p("_ZNSt12length_errorD1Ev")
+    assert p("_ZNSt12length_errorD0Ev") != p("_ZNSt12length_errorD1Ev")       # (deleting: other code)
+    assert p("__libc_malloc") == "malloc" and p("D2Ex") == "D2Ex"             # (not mangled: as it is)
+
+
+def _all_symbols(path):
+    """Every function symbol of an ELF file: address -> names (aliases share one)."""
+    from elftools.elf.elffile import ELFFile
+    from elftools.elf.sections import SymbolTableSection
+    out = {}
+    with open(path, "rb") as fp:
+        for sec in ELFFile(fp).iter_sections():
+            if isinstance(sec, SymbolTableSection):
+                for sym in sec.iter_symbols():
+                    if sym["st_info"]["type"] in ("STT_FUNC", "STT_GNU_IFUNC") and sym.name:
+                        out.setdefault(sym["st_value"], set()).add(sym.name)
+    return out
+
+
+LIBSTDCXX_A = "/usr/lib/gcc/x86_64-linux-gnu/13/libstdc++.a"
+LIBGCC_A = ["/usr/lib/gcc/x86_64-linux-gnu/13/libgcc.a", "/usr/lib/gcc/x86_64-linux-gnu/13/libgcc_eh.a"]
+
+
+@pytest.fixture(scope="module")
+def static_cxx(tmp_path_factory):
+    libs = [LIBC_A, LIBSTDCXX_A, *LIBGCC_A]
+    if not all(os.path.exists(p) for p in libs) or shutil.which("g++") is None or shutil.which("strip") is None:
+        pytest.skip("needs g++, strip and static libc / libstdc++ / libgcc")
+    d = tmp_path_factory.mktemp("static_cxx")
+    full, stripped = str(d / "cxx"), str(d / "cxx_stripped")
+    r = subprocess.run(["g++", "-O2", "-static", "-o", full, os.path.join(HERE, "src", "libsigs_cxx.cpp")],
+                       capture_output=True)
+    if r.returncode:
+        pytest.skip("static linking is not available")
+    subprocess.run(["strip", "-o", stripped, full], check=True)
+    sigs = []
+    for name, paths in (("libc", [LIBC_A]), ("libstdcxx", [LIBSTDCXX_A]), ("libgcc", LIBGCC_A)):
+        sigs.append(str(d / f"{name}.sig"))
+        libsigs.build(paths).save(sigs[-1])
+    return _all_symbols(full), analyze(stripped, sigs=sigs), sigs
+
+
+def test_static_cxx_names_through_references_and_tables(static_cxx):
+    """Code several signatures fit (nine `__throw_*` functions alike but for what they call),
+    functions too short to match, and virtual methods found through the vtables and function
+    tables named functions refer to -- and none named wrongly."""
+    truth, an, _ = static_cxx
+    names = set(an.lib_names.values())
+    # told apart by what they call: length_error's constructor (named itself as C1 from a C2 symbol)
+    assert {"_ZSt20__throw_length_errorPKc", "_ZSt19__throw_logic_errorPKc",
+            "_ZSt21__throw_runtime_errorPKc"} <= names
+    # in vtables: deleting destructors and what()
+    assert {"_ZNSt13runtime_errorD0Ev", "_ZNKSt11logic_error4whatEv", "_ZNSt9exceptionD0Ev"} <= names
+    # in libc's stdio jump tables
+    assert {"_IO_file_seek", "_IO_file_stat", "_IO_default_imbue"} <= names
+    p = libsigs._plain
+    for a, n in an.lib_names.items():
+        t = truth.get(a)
+        if t:
+            assert p(n) in {p(x) for x in t}, (hex(a), n, sorted(t))
+    with_symbols = [f for f in an.functions.values() if not f.is_import and f.addr in truth]
+    assert sum(1 for f in with_symbols if f.library) > 0.7 * len(with_symbols)
+
+
+def test_tables_are_kept_in_the_signature_file(static_cxx, tmp_path):
+    _, _, sigs = static_cxx
+    libc = libsigs.SigDB.load(sigs[0])
+    size, slots = libc.tables["_IO_file_jumps"]
+    assert size > 0 and ["_IO_file_seek", 1] in [s[1:] for s in slots]
+    assert all(off % 8 == 0 and 0 <= off < size for off, _, _ in slots)
+    cxx = libsigs.SigDB.load(sigs[1])
+    vt = dict((n, off) for off, n, _ in cxx.tables["_ZTVSt13runtime_error"][1])
+    assert vt["_ZTISt13runtime_error"] == 8 and "_ZNSt13runtime_errorD0Ev" in vt     # typeinfo, then methods
+    libc.save(str(tmp_path / "again.sig"))
+    assert libsigs.SigDB.load(str(tmp_path / "again.sig")).tables == libc.tables
 
 
 def test_signature_file_round_trip(tmp_path):
