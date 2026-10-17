@@ -33,9 +33,9 @@
 - [x] 하드웨어 watchpoint(쓰기/읽기/접근, 바이너리 전역·주소는 PIE 보정한 `*(T *)live`로, 크기 1/2/4/8, 그 밖은 gdb 식), 이름으로 중단점(바이너리 함수·`puts@plt`는 정적 주소, `puts` 같은 라이브러리 함수는 gdb pending 중단점으로 libc 안에서 멈춤), 중단점 패널에 종류 열·`Delete`로 삭제, 멈춘 이유(`watchpoint 3 …: 0 -> 0x4052a0`) 표시
 - [x] 의사 코드 뷰에서 현재 문장(pc)·중단점 줄 표시
 - [x] 레지스터·메모리 값 편집(Registers 패널 `E`/우클릭, Debug ▸ Set register / Write memory: hex·`"문자열\n"`·`0x…` 워드)
-
 - [x] 디버그 대상(`debugger.Target`, Debug ▸ Debugger target): 원격 gdbserver(`host:port`), qemu-user gdb 스텁(다른 아키텍처면 자동 — 프로그램 입출력은 세션의 터미널, `-E` 환경 변수, 크로스 툴체인 sysroot를 qemu `-L`·gdb `set sysroot`로), 실행 중인 프로세스에 붙기·떼기(Debug ▸ Detach), 로컬 실행의 환경 변수·작업 디렉터리·입력 파일; 매핑을 못 주는 스텁은 보조 벡터의 AT_ENTRY로 슬라이드(Thumb 비트 제외), vmmap은 바이너리 세그먼트로; MIPS·RISC-V 레지스터 표, gdb 아키텍처 이름 접두사(`riscv:rv64`, `armv7`)로 표 선택. CI에 gdbserver·gdb-multiarch
 - [x] 스레드(`Session.threads`·`select_thread`, Threads 창 — 더블클릭으로 전환), 공유 라이브러리(`modules`, Modules 창; Debug ▸ Stop on library load), 시그널 정책(`set_signal`·`signal`, Debug ▸ Signals — 다음 세션에도), 명령 추적(`trace`: 한 명령씩 실행하며 주소 기록, 브레이크·시그널·종료에서 멈춤; Debug ▸ Trace instructions — 바이너리의 실행된 명령을 리스팅에 표시, Clear trace)
+
 ## 아키텍처별 분석 보강
 
 - [x] **P0** 함수 단위 레지스터 상수 전파 패스(`analysis/constprop.py`): CFG 위 전방 데이터 흐름(합류점은 모든 선행자가 같은 값일 때만, 호출은 caller-saved 소멸), "주소" 플래그(pc 유래 값, 비-PIE 절대 리터럴)가 붙은 값만 데이터 참조로 기록 → 문자열·전역·GOT 슬롯 xref와 리스팅 주석
