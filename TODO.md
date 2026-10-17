@@ -101,7 +101,6 @@
 ## P2
 
 - [ ] 부동소수점: x87(`fld`/`fstp`, 32비트 cdecl의 `double` 반환), `unsigned` ↔ `double` 변환 관용구(`cvtsi2sd` + 보정 분기)
-
 - [ ] C 헤더: 매크로 상수(`#define`) 이름으로 상수 출력(어느 인자에 쓰이는지 알아야 함), 구조체 by-value 인자, MS ABI 비트필드 레이아웃
 - [ ] PPC 리프터(호출 인자 추출은 같은 경로로), PPC64 ELFv1 함수 디스크립터; RV32(ILP32) 리프터
 - [ ] ARM 데이터 영역을 코드로 잘못 읽은 경우(coprocessor 명령 등) 감지

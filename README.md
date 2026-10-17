@@ -52,14 +52,15 @@ Roughly, here's what works:
   PPC is disassembly only.
 - **Analysis**: functions, CFGs, xrefs, strings, jump tables, finding `main` in stripped binaries, and working out
   which compiler and libc built the binary.
-- **Library function names**: in statically linked, stripped binaries it finds libc functions by signature and names them.
-  It can also build the signature sets from the toolchains you have installed (`relic sigs build --system`).
-- **Decompiler**: recovers structs on its own, and you can assign types yourself (`Y`). Floating point, libc and Windows API
+- **Library function names**: in statically linked, stripped binaries it finds libc and other library functions by
+  FLIRT-style byte signatures and names them. It can build the signature files from the static libraries of the
+  toolchains you have installed (`relic sigs build --system`).
+- **Decompiler**: recovers structs from memory access patterns, and you can assign types yourself (`Y`). Floating point, libc and Windows API
   prototypes, and C header import are in. There are tests that recompile the output and check it behaves like the original.
 - **GUI**: most of what your hands know from IDA is there (names, comments, xrefs, search, bookmarks, byte patching, undo),
   and the shortcuts match IDA's wherever I could make them.
-- **Debugger**: gdb underneath, with a pwndbg feel on top. Local, gdbserver, qemu-user and attaching to a running process
-  all work, and you get registers, a stack telescope, vmmap and heap chunks.
+- **Debugger**: gdb (via GDB/MI) underneath, with a pwndbg feel on top. Local, gdbserver, qemu-user and attaching to a running process
+  all work, and you get registers, a stack telescope, vmmap and glibc heap chunks.
 - **Scripting**: a Python console inside the GUI, `relic script`, and plugins.
 - **For pwn**: checksec, dangerous calls, non-constant format strings, width-less `scanf("%s")`, ret2win candidates.
   IDA doesn't do these, so I added them.
@@ -73,13 +74,13 @@ The total is a weighted average, with weights from how much each area matters to
 |---|---|---|
 | File formats (8) | 70% | No Mach-O |
 | Processors (8) | 46% | IDA handles 60+ CPU families, so this is the furthest behind |
-| Auto-analysis (14) | 55% | Still misses some functions and jumps in big binaries |
-| Library identification (8) | 100% | 83–94% of functions named in stripped static C binaries, no wrong names |
-| Type system (10) | 85% | |
-| Decompiler (20) | 52% | Too many gotos left, no x87 or SIMD |
+| Auto-analysis (14) | 55% | Still misses some functions and indirect jumps in big binaries |
+| Library identification (8) | 100% | On the stripped static C test binaries, 83–94% of the functions that had symbols get named, with no wrong names |
+| Type system (10) | 85% | No by-value struct arguments or returns |
+| Decompiler (20) | 52% | Too many gotos left, no x87 floating point or SIMD |
 | Interactive UI (12) | 100% | |
 | Scripting & extensions (8) | 100% | |
-| Debugger (7) | 90% | |
+| Debugger (7) | 90% | No Windows (PE) targets |
 | Projects & collaboration (5) | 100% | Snapshots, version history, merging, Lumina-style name sharing |
 
 What "100%" means for each area, and what's left, is written down in [TODO.md](TODO.md).
@@ -91,13 +92,13 @@ Most things work without the GUI. The ones I use all the time:
 
 ```sh
 relic info      ./chall              # headers, sections, libraries, compiler
-relic checksec  ./chall
-relic funcs     ./chall
+relic checksec  ./chall              # NX, PIE, canary, RELRO
+relic funcs     ./chall              # function list
 relic disasm    ./chall main
 relic decompile ./chall main
-relic vulns     ./chall
-relic strings   ./chall -g bin/sh
-relic xrefs     ./chall menu
+relic vulns     ./chall              # likely bugs
+relic strings   ./chall -g bin/sh    # filter by substring, case-insensitive
+relic xrefs     ./chall menu         # what references this address
 ```
 
 Less frequent, but handy to know about:
@@ -143,10 +144,12 @@ void vuln(void)
 }
 ```
 
-The number in a local's name is its distance below the return address. `buf_58` sits 0x58 below it, so the payload is
-0x58 bytes of filler and then the return address (if there's no canary, anyway). For pwn, this is the bit I find most useful.
+The number in a local's name is how far below the return address slot it starts. `buf_58` starts 0x58 bytes below it,
+so 0x58 bytes of filler from the start of the buffer reach the return address. This build has a canary, though: it sits at
+`ret-0x10`, right above the 72-byte (0x58 − 0x10) buffer, so a straight overwrite fails the canary check before `vuln` returns.
+You'd need to leak the canary and write it back, or a build without one. For pwn, this offset is the bit I find most useful.
 
-Structs get picked up automatically too. The struct that the global array `notes` points to is shared by every function that uses the array:
+Structs are recovered from how memory is accessed. Below is the struct the elements of the global array `notes` point to; every function that uses the array shares the same definition:
 
 ```
 $ relic decompile vuln64.out add_note
@@ -174,6 +177,7 @@ The first time you open something:
 2. Double-click a function in the list on the left to go there; double-clicking a `call` target follows it. `Esc` goes back.
 3. `Space` is the graph, `Tab` is pseudocode, `Ctrl+H` is hex. The cursor follows you between views.
 4. Name things with `N` and comment with `;` as you read, then `Ctrl+S`. It saves to `<binary>.relic.json` next to the binary.
+   Only your edits (names, comments, types, patches) are saved; the analysis itself is redone each time you open the file.
 5. For pwn, take a quick look at the Vulns and Checksec tabs at the bottom first.
 
 ### Shortcuts
@@ -210,20 +214,22 @@ If you've used IDA, these will feel familiar.
 The Debug menu (`F9`) runs the open binary under gdb. Connecting to a remote gdbserver, running a foreign-architecture binary
 under qemu-user, or attaching to a process that's already running are all picked in Debug ▸ Debugger target. The program's input and output go through the Console panel.
 
-The panels will feel familiar if you've used pwndbg. Registers highlights what changed and shows where pointers lead;
+The panels will feel familiar if you've used pwndbg. Registers highlights what changed since the last stop and shows where pointers lead;
 Stack is a telescope; there are also Backtrace, Vmmap, Memory, Breakpoints, Threads and Modules panels.
-Double-click a value to follow it: code opens in the listing, anything else in Memory. If you've patched the binary, the debugger runs the patched copy.
+Double-click a value to follow it: code opens in the listing, anything else in Memory. If you've patched the binary, the debugger runs a temporary patched copy.
 
 #### Try it: measuring the overflow offset in `vuln()`
 
-This is how the screenshot at the top was taken. `tests/bins/vuln64.out` appears after you run the tests once.
+This is how the screenshot at the top was taken. `tests/bins/vuln64.out` appears after you run the tests once
+(it is built with `-no-pie -fno-stack-protector`, so there's no canary).
 
 1. Open it with `relic tests/bins/vuln64.out` and put `5` in Debug ▸ Program arguments. With an argument, `main` calls `vuln()`.
 2. Go to `vuln` and set a breakpoint with `F2`.
 3. Press `F9` twice: it stops at the entry point first, then in `vuln`.
 4. Put the cursor on the line right after `call gets` and press `F4`. When it waits for input, type `AAAAAAAABBBBBBBB` on the Console's stdin line.
 5. The Stack panel shows `0x4141414141414141`, and a few lines below it the return address `main+0x3c`.
-6. Type `$rbp-0x40` into the Memory tab to dump from the start of the buffer. As the pseudocode's `char buf_48[64]; // ret-0x48` says, it's 0x48 bytes to the return address.
+6. Type `$rbp-0x40` into the Memory tab to dump from the start of the buffer. The buffer starts at `rbp-0x40` and the return
+   address sits right above the saved `rbp` (8 bytes), so the offset is 0x40 + 8 = 0x48, matching the pseudocode's `char buf_48[64]; // ret-0x48`.
 
 The Console's `gdb>` line takes ordinary gdb commands like `x/8gx $rsp`.
 Inside Docker, gdb needs the ptrace capability (`--cap-add=SYS_PTRACE`) to work properly.
@@ -234,7 +240,7 @@ The GUI's Python console (`Ctrl+Shift+P`), plugins and `relic script` all share 
 `here()`, `goto()`, `rename()`, `comment()`, `functions()`, `xrefs_to()`, `decompile()`, `search()`, `patch()` and so on.
 The full list is in [docs/scripting.md](docs/scripting.md).
 
-A plugin is just a Python file in `~/.relic/plugins/` with a `register(api)` function:
+A plugin is just a Python file with a `register(api)` function, placed in `~/.relic/plugins/` (or a directory listed in `RELIC_PLUGINS`):
 
 ```python
 # ~/.relic/plugins/mark_gets.py

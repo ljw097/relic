@@ -1,6 +1,6 @@
 # 디컴파일러 계획
 
-상태: 단계 5 완료 — x86-64에서 `relic decompile`이 C 유사 코드를 출력한다(out-of-SSA, 타입, 출력 정리). GUI Pseudocode 탭(단계 6 일부)도 동작한다. 남은 단계 6 작업은 x86-32 리프터 검증과 GUI 백그라운드 디컴파일. 이 문서는 구현 순서와 모듈 경계를 정한다.
+상태: 아래 일정의 단계 1–6 완료. x86/x86-64, ARM/Thumb, AArch64, MIPS32, RISC-V(RV64GC) 리프터가 있고, GUI Pseudocode 탭은 백그라운드에서 디컴파일한다(다른 함수로 이동하면 취소). 남은 작업(goto 줄이기, x87·SIMD, 속도)은 [TODO.md](../TODO.md)에 있다. 이 문서는 파이프라인의 단계와 모듈 경계를 설명한다. 아래 "구현 메모"와 일정은 처음 x86-64로 구현할 때의 기록이다.
 
 ## 목표
 
@@ -48,6 +48,8 @@ relic/decompiler/
     x86.py        x86 / x64
     arm64.py      AArch64
     arm.py        ARM32 (A32 / Thumb-2): 조건 실행은 Ite, 조건부 호출·리턴은 합성 블록(extra_blocks)
+    mips.py       MIPS32 (o32)
+    riscv.py      RISC-V (RV64GC, LP64D)
   arch.py         호출 규약 표
   ssa.py          지배자, phi 삽입, 이름 부여
   passes.py       상수/복사 전파, load 전달, 조건식 복원, DCE
@@ -61,10 +63,19 @@ relic/decompiler/
   cleanup.py      출력용 정리: 카나리 숨김, void/반환 폭, 스택 지역 변수, 빈 블록 우회, 임시 변수 인라인
   outssa.py       phi → 복사, 간섭 그래프 기반 변수 병합
   vartypes.py     폭 축소, C 타입 추론
+  structs.py      구조체 복원: 같은 기준 주소에서 고정 오프셋으로 접근하는 메모리 → 필드
+  fp.py           부동소수점 IR 연산자·의미·비교 접기
+  fpabi.py        x86-64 호출 규약의 부동소수점 인자·반환
+  fpconst.py      읽기 전용 데이터에서 읽는 부동소수점 상수 → 리터럴
+  cheader.py      C 선언(struct/union/enum/typedef/함수 원형) 파서
+  libc_h.py       libc·POSIX 함수 원형 헤더
+  win32_h.py      Windows API 타입·구조체·함수 원형 헤더
+  typelibs.py     타입 라이브러리(libc, win32): 대상 ABI 레이아웃으로 프로젝트에 가져오기
   arith.py        상수 나눗셈·나머지 복원 (평가로 검증)
   structure.py    제어 흐름 구조화: if/while/do-while/switch, break/continue, goto 폴백
   pipeline.py     위 단계를 순서대로 실행 (prepare)
   emit.py         C 출력, 줄 ↔ 주소 매핑 (decompile)
+  export.py       바이너리 전체의 의사 코드를 C 파일 하나로 (`relic decompile -a -o`)
 ```
 
 `relic.analysis`는 디컴파일러를 몰라도 동작해야 한다. 의존 방향은 `decompiler → analysis → disasm → loader`.
@@ -145,7 +156,7 @@ relic/decompiler/
 | 3 | 호출·스택 | `vuln`에서 `gets(buf)`와 `char buf[0x40]`(PIE 0x48) 크기, 카나리 식별, `printf("hello %s (%d)\n", buf, checksum(buf))` 복원 ✅ |
 | 4 | 구조화 | `main`의 `while(1)` 메뉴 루프, `classify`의 `switch`가 goto 없이 출력 ✅ |
 | 5 | 타입·출력 정리 | `-O0`/`-O1`/PIE 변형 모두에서 위 결과 유지, 재컴파일 결과가 원본과 일치 ✅ |
-| 6 | GUI 디컴파일 탭 ✅, x86-32 리프터 (CLI `relic decompile`은 단계 5에서 완료) | GUI 스모크 테스트 통과 ✅, x86-32 샘플 재컴파일 테스트 |
+| 6 | GUI 디컴파일 탭, x86-32 리프터 (CLI `relic decompile`은 단계 5에서 완료) | GUI 스모크 테스트 통과, x86-32 샘플(`flow32_O0`/`flow32_O2`) 재컴파일 테스트 ✅ |
 
 각 단계는 `tests/src/vuln.c` 기반의 골든 테스트를 추가한다. 출력 문자열 전체 비교 대신 핵심 구문(호출, 조건, 루프 형태)의 포함 여부로 검증해 출력 형식 변경에 덜 민감하게 한다.
 
