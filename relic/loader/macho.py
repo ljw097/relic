@@ -33,6 +33,7 @@ LC_LOAD_WEAK_DYLIB, LC_REEXPORT_DYLIB, LC_LAZY_LOAD_DYLIB = 0x80000018, 0x800000
 LC_FUNCTION_STARTS, LC_VERSION_MIN_MACOSX, LC_VERSION_MIN_IPHONEOS = 0x26, 0x24, 0x25
 LC_MAIN, LC_SOURCE_VERSION, LC_BUILD_VERSION, LC_ENCRYPTION_INFO_64 = 0x80000028, 0x2A, 0x32, 0x2C
 LC_ENCRYPTION_INFO = 0x21
+LC_DYLD_CHAINED_FIXUPS = 0x80000034
 _DYLIBS = (LC_LOAD_DYLIB, LC_LOAD_WEAK_DYLIB, LC_REEXPORT_DYLIB, LC_LAZY_LOAD_DYLIB)
 
 # section types (flags & 0xff) and attributes
@@ -116,7 +117,7 @@ def _load_thin(path: str, data: bytes) -> Binary:
     secs_by_index: list[tuple[Section, int, int, int]] = []    # (section, flags, reserved1, reserved2)
     symtab = dysymtab = None
     entryoff = thread_pc = None
-    starts_cmd = None
+    starts_cmd = chained_cmd = None
     text_vmaddr = None
     b.macho_segments = []
     for _ in range(ncmds):
@@ -144,11 +145,11 @@ def _load_thin(path: str, data: bytes) -> Binary:
                                           bool(initprot & 2), bool(initprot & 4)))
             for _k in range(nsects):
                 if cmd == LC_SEGMENT_64:
-                    sectname, sseg, addr, ssize, off, _al, _reloff, _nrel, sflags, r1, r2, _r3 = \
+                    sectname, sseg, addr, ssize, off, _al, reloff, nrel, sflags, r1, r2, _r3 = \
                         struct.unpack_from(end + "16s16sQQIIIIIIII", data, spos)
                     spos += 80
                 else:
-                    sectname, sseg, addr, ssize, off, _al, _reloff, _nrel, sflags, r1, r2 = \
+                    sectname, sseg, addr, ssize, off, _al, reloff, nrel, sflags, r1, r2 = \
                         struct.unpack_from(end + "16s16sIIIIIIIII", data, spos)
                     spos += 68
                 name = sectname.rstrip(b"\0").decode(errors="replace")
@@ -159,6 +160,7 @@ def _load_thin(path: str, data: bytes) -> Binary:
                               name in ("__text", "__stubs", "__stub_helper", "__auth_stubs"),
                               stype not in _ZEROFILL)
                 sec.segment = sseg.rstrip(b"\0").decode(errors="replace")
+                sec.relocs = (reloff, nrel)
                 b.sections.append(sec)
                 secs_by_index.append((sec, sflags, r1, r2))
         elif cmd == LC_SYMTAB:
@@ -192,6 +194,8 @@ def _load_thin(path: str, data: bytes) -> Binary:
             b.info["platform"] = f"{'macOS' if cmd == LC_VERSION_MIN_MACOSX else 'iOS'} {_ver(ver)} (SDK {_ver(sdk)})"
         elif cmd == LC_FUNCTION_STARTS:
             starts_cmd = struct.unpack_from(end + "II", data, body)
+        elif cmd == LC_DYLD_CHAINED_FIXUPS:
+            chained_cmd = struct.unpack_from(end + "II", data, body)
         elif cmd == LC_CODE_SIGNATURE:
             b.info["code signature"] = "yes"
         elif cmd in (LC_ENCRYPTION_INFO, LC_ENCRYPTION_INFO_64):
@@ -199,6 +203,10 @@ def _load_thin(path: str, data: bytes) -> Binary:
                 b.info["encrypted"] = "yes (FairPlay): the encrypted range reads as ciphertext"
         pos += size
 
+    if ftype == 1:                              # MH_OBJECT: laid out and relocated like an ELF .o
+        from .machoobj import load_macho_object
+        load_macho_object(b, data, end, is64, secs_by_index, symtab)
+        return b
     b.base = text_vmaddr or 0
     if entryoff is not None:
         b.entry = (text_vmaddr or 0) + entryoff
@@ -207,6 +215,9 @@ def _load_thin(path: str, data: bytes) -> Binary:
 
     names = _symbols(b, data, end, is64, symtab, secs_by_index)
     _imports(b, data, end, ptr, names, symtab, dysymtab, secs_by_index)
+    if chained_cmd is not None:
+        b._finalize()                   # (address -> file offset for the chains)
+        _chained_fixups(b, data, *chained_cmd)
     if starts_cmd is not None and text_vmaddr is not None:
         b.function_starts = _function_starts(data, *starts_cmd, text_vmaddr)
     if b.entry and b.entry not in b.symbols:
@@ -342,6 +353,106 @@ def _library_ordinals(b: Binary, data: bytes, end: str, is64: bool, symtab) -> d
         if 0 < ordinal <= len(b.libraries):
             out[name] = b.libraries[ordinal - 1].rsplit("/", 1)[-1]
     return out
+
+
+# chained-fixup pointer formats: (stride, 64-bit, kind)
+_PTR_FORMATS = {1: (8, True, "arm64e"), 2: (4, True, "64"), 3: (4, False, "32"), 6: (4, True, "64_offset"),
+                9: (8, True, "arm64e_offset"), 12: (8, True, "arm64e_offset24")}
+
+
+def _chained_fixups(b: Binary, data: bytes, off: int, size: int):
+    """LC_DYLD_CHAINED_FIXUPS (macOS 12+, iOS 15+): every pointer dyld fixes is a link in a chain
+    through its page, holding either a rebase (the target, read here as the address it becomes)
+    or a bind (an index into the imports table). Rebases fill the pointer's value for reads; a
+    bind names its slot after the import."""
+    if size < 28 or off + size > len(data):
+        return
+    _ver, starts_off, imports_off, symbols_off, nimports, imports_fmt, _symfmt = \
+        struct.unpack_from("<7I", data, off)
+    names: list[tuple[str, int]] = []           # (name, library ordinal)
+    pos = off + imports_off
+    for _ in range(nimports):
+        if imports_fmt == 1:
+            v = struct.unpack_from("<I", data, pos)[0]
+            ordinal, name_off = v & 0xFF, v >> 9
+            pos += 4
+        elif imports_fmt == 2:
+            v = struct.unpack_from("<I", data, pos)[0]
+            ordinal, name_off = v & 0xFF, v >> 9
+            pos += 8
+        elif imports_fmt == 3:
+            v = struct.unpack_from("<Q", data, pos)[0]
+            ordinal, name_off = v & 0xFFFF, v >> 32
+            pos += 16
+        else:
+            return
+        raw = _cstr(data, off + symbols_off + name_off)
+        names.append((raw[1:] if raw.startswith("_") else raw, ordinal))
+    base = b.base
+    seg_count = struct.unpack_from("<I", data, off + starts_off)[0]
+    got_names = getattr(b, "got_names", {})
+    known = {i.name for i in b.imports}
+    for k in range(seg_count):
+        seg_info = struct.unpack_from("<I", data, off + starts_off + 4 + 4 * k)[0]
+        if not seg_info:
+            continue
+        sp = off + starts_off + seg_info
+        _sz, page_size, fmt, seg_off, _maxp, page_count = struct.unpack_from("<IHHQIH", data, sp)
+        if fmt not in _PTR_FORMATS:
+            continue
+        stride, wide, kind = _PTR_FORMATS[fmt]
+        for p in range(page_count):
+            start = struct.unpack_from("<H", data, sp + 22 + 2 * p)[0]
+            if start == 0xFFFF or start & 0x8000:      # no fixups / (32-bit multi-start pages)
+                continue
+            addr = base + seg_off + p * page_size + start
+            for _guard in range(page_size // stride + 1):
+                fo = b.addr_to_offset(addr)
+                if fo is None or fo + (8 if wide else 4) > len(data):
+                    break
+                v = struct.unpack_from("<Q" if wide else "<I", data, fo)[0]
+                bind, value, nxt = _decode_chained(v, kind, base)
+                if bind is not None:
+                    if bind < len(names):
+                        name, ordinal = names[bind]
+                        got_names[addr] = name
+                        b.reloc_fill[addr] = bytes(8 if wide else 4)
+                        if name not in known:
+                            lib = b.libraries[ordinal - 1].rsplit("/", 1)[-1] if 0 < ordinal <= len(b.libraries) \
+                                else ""
+                            b.imports.append(Import(name, 0, addr, lib))
+                            known.add(name)
+                elif value is not None:
+                    b.reloc_fill[addr] = value.to_bytes(8 if wide else 4, "little")
+                if not nxt:
+                    break
+                addr += nxt * stride
+    b.got_names = got_names
+    b._fill_addrs = sorted(b.reloc_fill)
+
+
+def _decode_chained(v: int, kind: str, base: int) -> tuple[int | None, int | None, int]:
+    """One chained pointer: (bind import index or None, rebased value or None, next delta)."""
+    if kind in ("64", "64_offset"):
+        nxt = (v >> 51) & 0xFFF
+        if v >> 63:
+            return v & 0xFFFFFF, None, nxt
+        target, high8 = v & 0xFFFFFFFFF, (v >> 36) & 0xFF
+        return None, (high8 << 56) | (target + (base if kind == "64_offset" else 0)), nxt
+    if kind == "32":
+        nxt = (v >> 26) & 0x1F
+        if v >> 31:
+            return v & 0xFFFFF, None, nxt
+        return None, v & 0x3FFFFFF, nxt
+    # arm64e: auth (bit 63), bind (bit 62), next in 11 bits
+    nxt = (v >> 51) & 0x7FF
+    auth, bind = v >> 63, (v >> 62) & 1
+    if bind:
+        return v & (0xFFFFFF if kind == "arm64e_offset24" else 0xFFFF), None, nxt
+    if auth:                                    # the target is an offset from the image base
+        return None, base + (v & 0xFFFFFFFF), nxt
+    target, high8 = v & 0x7FFFFFFFFFF, (v >> 43) & 0xFF
+    return None, (high8 << 56) | (target + (base if kind != "arm64e" else 0)), nxt
 
 
 def _function_starts(data: bytes, off: int, size: int, base: int) -> list[int]:

@@ -152,3 +152,48 @@ def test_checksec(exe):
     cs = analyze(path).checksec()
     assert cs["PIE"] == "Yes" and cs["NX stack"] == "Yes" and cs["NX heap"] == "Yes" and cs["Canary"] == "Yes"
     assert cs["Code signature"] == ("Yes" if name.startswith("a64") else "No")    # (ld64 signs arm64 ad hoc)
+
+
+@pytest.mark.parametrize("arch", ["x64", "a64"])
+def test_chained_fixups(arch):
+    """macOS 13 targets: pointers fixed through LC_DYLD_CHAINED_FIXUPS. A rebased pointer in data
+    reads as its target, a bound one is named after its import."""
+    path = _build(f"{arch}_O0", "-Wl,-platform_version,macos,13.0,13.0", "-Wl,-fixup_chains",
+                  out_name=f"{arch}_O0_chained")
+    with open(path, "rb") as f:
+        assert (0x80000034).to_bytes(4, "little") in f.read(0x1000)        # (built with chained fixups)
+    an = analyze(path)
+    b = an.bin
+    names = b.name_to_addr["names"]
+    assert [b.read_cstring(b.read_ptr(names + 8 * k)) for k in range(3)] == ["zero", "one", "two"]
+    assert {"printf", "gets", "__stack_chk_guard"} <= set(b.got_names.values())
+    code = decompile(an, an.function_by_name("main")).text
+    assert 'printf("%s %d\\n", names[' in code, code
+
+
+@pytest.mark.parametrize("arch", ["x64", "a64"])
+def test_relocatable_object(arch):
+    """clang's .o: sections placed from a base, undefined symbols as import stubs with GOT slots,
+    relocations applied (x86-64 branch / signed / GOT load; arm64 branch26 / page21 / pageoff12)."""
+    clang = _tool("clang")
+    if clang is None:
+        pytest.skip("needs clang")
+    out = os.path.join(BINS, f"macho_{arch}.o")
+    if not os.path.exists(out) or os.path.getmtime(out) < os.path.getmtime(SRC):
+        subprocess.run([clang, "-target", f"{TARGET[arch]}-apple-macos11", "-O0", "-w", "-c", "-o", out, SRC],
+                       check=True)
+    an = analyze(out)
+    b = an.bin
+    assert b.info["type"] == "object" and b.base == 0x100000
+    assert {"classify", "checksum", "vuln", "main", "counter", "names"} <= set(b.name_to_addr)
+    assert not any(n.startswith(("ltmp", "l_.str")) for n in b.name_to_addr)
+    imps = {i.name: i for i in b.imports}
+    assert {"printf", "puts", "gets", "malloc", "system"} <= set(imps)
+    assert b.got_names[imps["__stack_chk_guard"].got] == "__stack_chk_guard"
+    names = b.name_to_addr["names"]
+    assert [b.read_cstring(b.read_ptr(names + 8 * k)) for k in range(3)] == ["zero", "one", "two"]
+    code = decompile(an, an.function_by_name("vuln")).text
+    assert 'puts("name?");' in code and 'printf("hello %s (%d)\\n", ' in code and "checksum(" in code, code
+    code = decompile(an, an.function_by_name("main")).text
+    assert "malloc(32)" in code and 'printf("%s %d\\n", names[' in code and "% 3]" in code, code
+    assert "counter = " in code and "exit(1);" in code, code
