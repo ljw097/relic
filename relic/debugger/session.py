@@ -434,7 +434,7 @@ class Session:
         else:
             stdin, self._pipe_in = os.pipe()
         out_r, out_w = os.pipe()
-        self.qemu = subprocess.Popen([wine, server, f"localhost:{port}", self.path, *self.args], stdin=stdin,
+        self.qemu = subprocess.Popen([wine, server, f"127.0.0.1:{port}", self.path, *self.args], stdin=stdin,
                                      stdout=out_w, stderr=subprocess.DEVNULL, cwd=t.cwd or None, env=env,
                                      start_new_session=True)
         os.close(out_w)

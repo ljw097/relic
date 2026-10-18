@@ -226,7 +226,7 @@ def wine_env(tmp_path_factory):
     if wine is None:
         pytest.skip("needs wine")
     prefix = tmp_path_factory.mktemp("wineprefix")
-    env = dict(os.environ, WINEDEBUG="-all", WINEPREFIX=str(prefix), DISPLAY="")
+    env = dict(os.environ, WINEDEBUG="err+all", WINEPREFIX=str(prefix), DISPLAY="")
     r = subprocess.run([wine, "wineboot", "-i"], env=env, capture_output=True, timeout=300)
     if r.returncode:
         pytest.skip("wine cannot make a prefix here")
@@ -245,7 +245,7 @@ def test_windows_gdbserver_under_wine(kind, tmp_path, wine_env):
     path = _build(tmp_path, cc, f"t_{kind}.exe")
     an = analyze(path)
     port = _free_port()
-    srv = subprocess.Popen([wine, server, f"localhost:{port}", path, "a"], cwd=str(tmp_path), env=env,
+    srv = subprocess.Popen([wine, server, f"127.0.0.1:{port}", path, "a"], cwd=str(tmp_path), env=env,
                            stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
     try:
         s = None
@@ -259,7 +259,11 @@ def test_windows_gdbserver_under_wine(kind, tmp_path, wine_env):
                 time.sleep(1)
         assert s is not None, "could not connect to gdbserver.exe"
         try:
-            st = s.start("main", 120)
+            try:
+                st = s.start("main", 120)
+            except DebugError as e:
+                srv.kill()
+                pytest.fail(f"{e}\nwine/gdbserver.exe said:\n{srv.stdout.read().decode(errors='replace')}")
             assert s.symbolize(s.pc).startswith("main"), describe_stop(st)
             s.add_breakpoint(s.to_live(an.function_by_name("work").addr))
             srv.stdin.write(b"line1\n")
