@@ -1,6 +1,7 @@
 """Auto-analysis on gcc -O2 x86-64 code: switch tables whose base register is set out of sight of
 the dispatch, a switch over negative cases, a tail call through a function pointer after the
-epilogue, and `.eh_frame` as the list of functions (with `.cold` fragments kept out of it)."""
+epilogue, `.eh_frame` as the list of functions (with `.cold` fragments kept out of it), and
+functions found without it (noreturn functions, tail calls, pointers in data)."""
 import io
 import os
 import shutil
@@ -98,3 +99,42 @@ def test_eh_frame_functions(jumps):
     assert entries <= set(an.functions)
     cold = {a for a in cold if an.bin.section_at(a).name == ".text"}
     assert cold and not cold & set(an.functions)                # (neg.cold, loop.cold, ...)
+
+
+@pytest.fixture(scope="module")
+def noeh(tmp_path_factory):
+    """tests/src/noret.c without unwind info: (symbols of the plain build, stripped build)."""
+    from elftools.elf.elffile import ELFFile
+    cc = shutil.which("gcc")
+    if cc is None or shutil.which("objcopy") is None:
+        pytest.skip("needs gcc and objcopy")
+    d = tmp_path_factory.mktemp("noret")
+    plain, stripped = str(d / "noret"), str(d / "noret.stripped")
+    subprocess.run([cc, "-O2", "-w", "-fno-asynchronous-unwind-tables", "-fcf-protection", "-o", plain,
+                    os.path.join(HERE, "src", "noret.c")], check=True)
+    subprocess.run(["objcopy", "--remove-section", ".eh_frame", "--remove-section", ".eh_frame_hdr",
+                    "--strip-all", plain, stripped], check=True)
+    with open(plain, "rb") as f:
+        elf = ELFFile(io.BytesIO(f.read()))
+        text = elf.get_section_by_name(".text")
+        lo, hi = text["sh_addr"], text["sh_addr"] + text["sh_size"]
+        syms = {s.name: s["st_value"] for s in elf.get_section_by_name(".symtab").iter_symbols()
+                if s["st_info"]["type"] == "STT_FUNC" and lo <= s["st_value"] < hi}
+    return syms, stripped
+
+
+def test_functions_without_unwind_info(noeh):
+    """Every function is found and none runs on into the next: past calls of functions that do not
+    return (found from their code), tail calls of a function nothing else reaches, functions only
+    in a table of pointers."""
+    syms, path = noeh
+    an = analyze(path)
+    assert set(syms.values()) <= set(an.functions)
+    starts = set(syms.values())
+    for f in an.functions.values():
+        for blk in f.blocks.values():
+            for i in blk.insns:
+                assert i.addr == f.addr or i.addr not in starts, f"{f.name} runs into {i.addr:#x}"
+    assert an.functions[syms["fatal"]].noreturn and an.functions[syms["usage"]].noreturn
+    assert not an.functions[syms["parse"]].noreturn and not an.functions[syms["main"]].noreturn
+    assert syms["change_case"] in an.functions[syms["upcase"]].tail_calls
