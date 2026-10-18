@@ -11,6 +11,7 @@ from ..progress import checkpoint, report
 NORETURN = {
     "exit", "_exit", "_Exit", "abort", "__stack_chk_fail", "__assert_fail", "__fortify_fail",
     "__chk_fail", "err", "errx", "verr", "verrx", "pthread_exit", "longjmp", "siglongjmp",
+    "_longjmp", "__longjmp_chk",
     "__libc_start_main", "__cxa_throw", "__cxa_rethrow", "_Unwind_Resume", "quick_exit",
     "ExitProcess", "ExitThread", "TerminateProcess", "__report_gsfailure", "_invalid_parameter_noinfo_noreturn",
 }
@@ -112,6 +113,9 @@ class Function:
         return None
 
 
+_ENDBR = (b"\xf3\x0f\x1e\xfa", b"\xf3\x0f\x1e\xfb")
+
+
 class FunctionAnalyzer:
     MAX_INSNS = 200_000
 
@@ -143,7 +147,10 @@ class FunctionAnalyzer:
             self._queue.append(main)
             self._drain()
         self._eh_frame_seeds()
+        self._data_pointer_seeds()
+        self._infer_noreturn()
         self._scan_gaps()
+        self._infer_noreturn()
         self._link()
         return self.funcs
 
@@ -178,6 +185,69 @@ class FunctionAnalyzer:
             return set()
         return out
 
+    def _infer_noreturn(self):
+        """Functions that never return, from their code: no way out of them but calls of (or jumps
+        to) functions that do not return -- `exit`, `abort`, others found here -- or no way out at
+        all. Their callers, analyzed before this was known, ran on past such calls into whatever
+        follows (often the next function); they are analyzed again, until nothing changes."""
+        while True:
+            new: set[int] = set()
+            changed = True
+            while changed:
+                changed = False
+                for f in self.funcs.values():
+                    if not f.is_import and not f.noreturn and f.blocks and not self._returns(f):
+                        f.noreturn = True
+                        new.add(f.addr)
+                        changed = True
+            if not new:
+                return
+            redo = [f for f in self.funcs.values() if not f.is_import and (f.calls | f.tail_calls) & new]
+            for f in redo:
+                for blk in f.blocks.values():
+                    for i in blk.insns:
+                        self.prev.pop(i.end, None)
+                del self.funcs[f.addr]
+                if self.dis.md_thumb is not None and f.addr in f.blocks:
+                    self.dis.hint(f.addr, f.blocks[f.addr].insns[0].thumb)
+                self._analyze(f.addr)
+                g = self.funcs[f.addr]
+                g.name, g.noreturn, g.library = f.name, f.noreturn, f.library
+            self._drain()
+
+    def _calls_noreturn(self, i: Insn) -> bool:
+        if i.kind == CALL:
+            return self._is_noreturn_call(i)
+        if i.kind == JMP and i.target is not None:      # (a tail call)
+            fn = self.funcs.get(i.target)
+            return fn is not None and fn.noreturn or i.target in self.noreturn
+        return False
+
+    def _returns(self, f: Function) -> bool:
+        """Whether some path from `f`'s entry leaves it other than by a call that does not return.
+        A way out that cannot be followed (an unresolved jump, undecodable bytes) counts as one."""
+        seen, work = set(), [f.addr]
+        while work:
+            a = work.pop()
+            if a in seen or a not in f.blocks:
+                continue
+            seen.add(a)
+            blk = f.blocks[a]
+            if any(self._calls_noreturn(i) for i in blk.insns if i.kind in (CALL, JMP)):
+                continue
+            if blk.succs:
+                work.extend(blk.succs)
+                continue
+            last = blk.last
+            if last.kind == HALT or last.kind == CALL:      # (a call cut short: does not return)
+                continue
+            if last.kind not in (RET, JMP, CJMP):
+                nxt = self.funcs.get(blk.end)           # (runs into the next function)
+                if nxt is not None and nxt.noreturn:
+                    continue
+            return True
+        return False
+
     def _eh_frame_seeds(self):
         """The functions `.eh_frame` describes that nothing reached. After the others are found,
         so that the separate FDE of a `.cold` fragment -- code of a function already found --
@@ -186,17 +256,44 @@ class FunctionAnalyzer:
         starts = sorted(self._fde)
         if not starts:
             return
+        inside = self._covered()
+        for a in starts:
+            if a in self.funcs or not b.is_exec(a) or inside(a):    # (inside a function found already)
+                continue
+            self._queue.append(a)
+        self._drain()
+
+    def _covered(self):
+        """Predicate: whether an address lies in a block of a function found so far."""
         covered = sorted((blk.addr, blk.end) for f in self.funcs.values() if not f.is_import
                          for blk in f.blocks.values())
         firsts = [c[0] for c in covered]
-        import bisect
-        for a in starts:
-            if a in self.funcs or not b.is_exec(a):
-                continue
+
+        def inside(a: int) -> bool:
             k = bisect.bisect_right(firsts, a) - 1
-            if k >= 0 and covered[k][0] <= a < covered[k][1]:
-                continue                        # (inside a function found already)
-            self._queue.append(a)
+            return k >= 0 and covered[k][0] <= a < covered[k][1]
+        return inside
+
+    def _data_pointer_seeds(self):
+        """Functions only called through pointers stored in data (callback tables, vtables,
+        `struct` initializers): the code addresses that position-independent data relocates.
+        x86 code built for CET starts every such function with `endbr64`."""
+        b = self.bin
+        x86 = self.dis.arch in ("x64", "x86")
+        cet = x86 and b.entry is not None and b.read(b.entry, 4) in _ENDBR
+        inside = self._covered()
+        for r in getattr(b, "relocs", ()):
+            if "RELATIVE" not in r.kind or b.is_exec(r.addr):
+                continue
+            a = r.addend or b.read_ptr(r.addr)
+            if not a or a in self.funcs or not b.is_exec(a & ~1) or inside(a & ~1):
+                continue
+            if x86 and not (b.read(a, 4) in _ENDBR if cet else a % 16 == 0):
+                continue
+            if self.dis.md_thumb is not None:
+                self.dis.hint(a & ~1, bool(a & 1))      # (before decoding it: the mode sticks)
+            if self._looks_like_code(a & ~1):
+                self._queue.append(a)
         self._drain()
 
     def _drain(self):
@@ -247,6 +344,7 @@ class FunctionAnalyzer:
         leaders = {start}
         edges: dict[int, list[int]] = {}  # terminator addr -> successors
         work = [start]
+        pic = self.dis.arch == "x64" and getattr(self.bin, "elf_type", None) == "ET_DYN"
         while work and len(insns) < self.MAX_INSNS:
             a = work.pop()
             while a not in insns:
@@ -293,7 +391,7 @@ class FunctionAnalyzer:
                     tgt = i.target
                     succ = []
                     if tgt is not None:
-                        if self._is_tail_call(f, tgt):
+                        if self._is_tail_call(f, tgt) or tgt not in insns and self._x86_frame_gone(i, start):
                             f.tail_calls.add(tgt)
                             if tgt not in self.funcs:
                                 self._queue.append(tgt)
@@ -333,7 +431,9 @@ class FunctionAnalyzer:
                 # function pointers taken by address -- not on ARM (its immediates are offsets and
                 # masks, addresses come from literal pools) nor from AArch64 `adr` (local labels
                 # such as a jump table's base; function pointers come from `adrp` + `add`)
-                for r in (i.refs if self.dis.md_thumb is None and i.mnemonic != "adr" else ()):
+                # (x86-64 PIC takes addresses `rip`-relative: its immediates are numbers, not addresses)
+                for r in (i.refs if self.dis.md_thumb is None and i.mnemonic != "adr" and
+                          not (pic and not (i.mnemonic == "lea" and "rip" in i.op_str)) else ()):
                     if r not in self.funcs and self.bin.is_exec(r) and r != start and self._looks_like_code(r):
                         self._queue.append(r)
                 self.prev[nxt] = a
@@ -405,7 +505,18 @@ class FunctionAnalyzer:
         elif i.mem_target is not None:
             imp = self.bin.imports_by_got.get(i.mem_target)
             name = imp.name if imp else None
+        if name in ("error", "error_at_line"):          # (exits when its status is not 0)
+            return self._nonzero_first_arg(i)
         return name in NORETURN
+
+    def _nonzero_first_arg(self, i: Insn) -> bool:
+        reg = {"x64": "edi", "arm64": "w0"}.get(self.dis.arch)
+        for p in self._back(i.addr, 4) if reg else ():
+            ops = [o.strip() for o in p.op_str.split(",")]
+            if ops and ops[0] in (reg, "r" + reg[1:], "x0"):
+                return p.mnemonic == "mov" and len(ops) == 2 and ops[1].lstrip("#").isdigit() and \
+                    int(ops[1].lstrip("#")) != 0
+        return False
 
     def _is_tail_call(self, f: Function, tgt: int) -> bool:
         if tgt == f.addr:
@@ -415,7 +526,36 @@ class FunctionAnalyzer:
         if tgt in self._fde:
             return True                         # a function's entry by its unwind info
         s = self.bin.symbols.get(tgt)
-        return bool(s and s.kind == "func" and not _fragment(s.name))
+        if s is not None:
+            return s.kind == "func" and not _fragment(s.name)
+        # CET: indirect-branch targets start with `endbr64` -- functions, never a block of this one
+        # (gcc reaches switch cases by `notrack jmp`)
+        return self.dis.arch in ("x64", "x86") and self.bin.read(tgt, 4) in _ENDBR
+
+    _EPILOGUE = ("pop", "leave")
+
+    def _x86_frame_gone(self, jmp: Insn, start: int) -> bool:
+        """x86: a `jmp` to a function's alignment (16) with the caller's frame gone -- right after
+        an epilogue (`pop`s, `leave`, `add rsp`), or (backwards, before this function) from a
+        wrapper that never set one up: a tail call of a function nothing else reaches."""
+        if self.dis.arch not in ("x64", "x86") or jmp.target % 16:
+            return False
+        sp = "rsp" if self.dis.arch == "x64" else "esp"
+        a = self.prev.get(jmp.addr)
+        for k in range(64):
+            if a is None:
+                return False
+            i = self.dis.decode(a)
+            if i is None:
+                return False
+            if k < 8 and (i.mnemonic in self._EPILOGUE or i.mnemonic == "add" and i.op_str.startswith(sp + ",")):
+                return True
+            if i.mnemonic in ("push", "call", "enter") or sp in i.op_str:
+                return False
+            if a == start:
+                return jmp.target < start
+            a = self.prev.get(a)
+        return False
 
     def _looks_like_code(self, addr: int) -> bool:
         i = self.dis.decode(addr)
@@ -1299,10 +1439,3 @@ class FunctionAnalyzer:
                 for i in b.insns:
                     if i.kind == CALL and i.target in self.funcs:
                         self.funcs[i.target].callers.add(i.addr)
-        # propagate noreturn: a function whose every path ends in a noreturn call
-        for f in self.funcs.values():
-            if f.is_import or not f.blocks:
-                continue
-            exits = [b for b in f.blocks.values() if not b.succs]
-            if exits and all(b.last.kind == CALL for b in exits):
-                f.noreturn = True
