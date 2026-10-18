@@ -13,12 +13,23 @@ and measuring an overflow offset in the debugger all work fine today. The curren
 
 ## Installing
 
-Grab the wheel from the release page:
+Download the executable for your system from the [release page](https://github.com/ljw097/relic/releases/latest)
+and start it; there is nothing to install:
+
+- **Windows**: `relic-<version>-windows-x86_64.exe`
+- **Linux**: `relic-<version>-linux-x86_64.tar.gz` (one file, `relic`)
+- **macOS**: `relic-<version>-macos-arm64.zip` (Apple silicon) or `-macos-x86_64.zip` (Intel), a `Relic.app`.
+  It is not signed: the first time, right-click it and choose Open.
+
+It opens with no file; open one with File > Open (`Ctrl+O`), File > Open Recent, or by dropping it on the window.
+The same executable runs the commands below too (`relic info FILE`, `Relic.exe decompile FILE`, ...).
+
+With Python 3.10+, the wheel on the release page installs the same thing as a package:
 
 ```sh
 python3 -m venv .venv
-.venv/bin/pip install https://github.com/ljw097/relic/releases/download/v0.1.0/relic_re-0.1.0-py3-none-any.whl
-.venv/bin/relic ./chall
+.venv/bin/pip install https://github.com/ljw097/relic/releases/download/v0.2.0/relic_re-0.2.0-py3-none-any.whl
+.venv/bin/relic
 ```
 
 Or run it from source:
@@ -29,7 +40,7 @@ python3 -m venv .venv
 .venv/bin/pip install -e '.[dev]'
 ```
 
-You need Python 3.10+ on Linux. The debugger needs `gdb` (`sudo apt install gdb`); to debug ARM, MIPS and other
+Analysis and decompilation work the same on every system. The debugger needs `gdb` (`sudo apt install gdb`); to debug ARM, MIPS and other
 foreign binaries, install `gdb-multiarch` and `qemu-user` as well.
 `Ctrl+Alt+A` (patch by assembling) needs keystone, which is a separate extra: `pip install 'relic-re[asm]'`.
 

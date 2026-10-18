@@ -17,6 +17,8 @@ def run(path: str | None = None, arch: str | None = None, base: int = 0) -> int:
     win.show()
     if path:
         win.open_file(path, arch, base)
+    else:
+        win.statusBar().showMessage("Open a binary: File > Open (Ctrl+O), File > Open Recent, or drop it on the window")
     return app.exec()
 
 

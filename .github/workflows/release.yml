@@ -1,15 +1,16 @@
 name: Release
 
-# Run by hand (Actions ▸ Release ▸ Run workflow) on main: checks that the version matches the
-# package, builds the sdist and wheel, smoke-tests the wheel, tags v<version> and publishes a
-# GitHub release with docs/releases/<version>.md as its notes.
+# Run by hand (Actions > Release > Run workflow) on main: checks that the version matches the
+# package, builds stand-alone executables for Windows, Linux and macOS (PyInstaller) plus the
+# sdist and wheel, smoke-tests them, tags v<version> and publishes a GitHub release with
+# docs/releases/<version>.md as its notes.
 on:
   workflow_dispatch:
     inputs:
       version:
         description: "Version (must equal pyproject.toml's)"
         required: true
-        default: "0.1.0"
+        default: "0.2.0"
       prerelease:
         description: "Mark as a pre-release (beta)"
         type: boolean
@@ -19,7 +20,7 @@ permissions:
   contents: write
 
 jobs:
-  release:
+  check:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -33,7 +34,7 @@ jobs:
           grep -q "__version__ = \"$v\"" relic/__init__.py
           test -f "docs/releases/$v.md"
           ! git ls-remote --exit-code --tags origin "v$v"
-      - name: Build
+      - name: Build the sdist and wheel
         run: |
           pip install build
           python -m build
@@ -43,12 +44,86 @@ jobs:
           /tmp/v/bin/pip install dist/*.whl
           /tmp/v/bin/relic info /bin/ls
           /tmp/v/bin/relic decompile /bin/true > /dev/null
+      - uses: actions/upload-artifact@v4
+        with:
+          name: python
+          path: dist/*
+
+  executable:
+    needs: check
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-22.04            # (an older glibc: runs on more distributions)
+            asset: relic-${{ inputs.version }}-linux-x86_64
+          - os: windows-latest
+            asset: relic-${{ inputs.version }}-windows-x86_64
+          - os: macos-14
+            asset: relic-${{ inputs.version }}-macos-arm64
+          - os: macos-15-intel
+            asset: relic-${{ inputs.version }}-macos-x86_64
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install
+        run: pip install . pyinstaller
+      - name: Qt's runtime libraries (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y -q libegl1 libgl1 libxkbcommon0 libxkbcommon-x11-0 libfontconfig1 libdbus-1-3 \
+            libxcb-cursor0 libxcb-icccm4 libxcb-image0 libxcb-keysyms1 libxcb-randr0 libxcb-render-util0 \
+            libxcb-shape0 libxcb-xinerama0 libxcb-xkb1
+      - name: Build (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          pyinstaller --noconfirm --onefile --name relic --collect-submodules relic packaging/relic_app.py
+          ./dist/relic info ./dist/relic | head -3
+          ./dist/relic decompile /bin/true > /dev/null
+          QT_QPA_PLATFORM=offscreen timeout 20 ./dist/relic || test $? -eq 124      # the GUI stays up
+          mkdir out && tar -C dist -czf "out/${{ matrix.asset }}.tar.gz" relic
+      - name: Build (Windows)
+        if: runner.os == 'Windows'
+        shell: bash
+        run: |
+          pyinstaller --noconfirm --onefile --windowed --name Relic --collect-submodules relic packaging/relic_app.py
+          python -m relic info dist/Relic.exe | head -3
+          mkdir out && cp dist/Relic.exe "out/${{ matrix.asset }}.exe"
+      - name: Build (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          pyinstaller --noconfirm --windowed --name Relic --collect-submodules relic \
+            --osx-bundle-identifier io.github.ljw097.relic packaging/relic_app.py
+          ./dist/Relic.app/Contents/MacOS/Relic info ./dist/Relic.app/Contents/MacOS/Relic | head -3
+          mkdir out && ditto -c -k --keepParent dist/Relic.app "out/${{ matrix.asset }}.zip"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.asset }}
+          path: out/*
+
+  publish:
+    needs: [check, executable]
+    # (publish with what was built: a missing runner image must not hold the others back)
+    if: ${{ !cancelled() && needs.check.result == 'success' }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          path: assets
+          merge-multiple: true
       - name: Publish
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           v=${{ inputs.version }}
+          ls -la assets
+          ls assets | grep -q linux-x86_64 && ls assets | grep -q windows-x86_64 || { echo "Linux / Windows builds missing"; exit 1; }
           flags=""
           if [ "${{ inputs.prerelease }}" = "true" ]; then flags="--prerelease"; title="Relic $v (beta)"; else title="Relic $v"; fi
-          gh release create "v$v" dist/* --target "$GITHUB_SHA" --title "$title" \
+          gh release create "v$v" assets/* --target "$GITHUB_SHA" --title "$title" \
             --notes-file "docs/releases/$v.md" $flags

@@ -13,12 +13,23 @@ GUI는 PySide6, 명령어 디코딩은 capstone을 쓰고, 그 위의 분석·�
 
 ## 설치
 
-릴리스 페이지의 wheel로 설치합니다.
+[릴리스 페이지](https://github.com/ljw097/relic/releases/latest)에서 자기 운영체제에 맞는 실행 파일을 받아
+실행하면 됩니다. 따로 설치할 것은 없습니다.
+
+- **Windows**: `relic-<버전>-windows-x86_64.exe`
+- **Linux**: `relic-<버전>-linux-x86_64.tar.gz` (파일 하나, `relic`)
+- **macOS**: `relic-<버전>-macos-arm64.zip`(Apple 실리콘) 또는 `-macos-x86_64.zip`(Intel), 안에 `Relic.app`.
+  서명되지 않았으므로 처음에는 오른쪽 클릭 후 열기를 선택합니다.
+
+파일 없이 열리고, File > Open(`Ctrl+O`), File > Open Recent, 또는 창에 파일을 끌어다 놓아서 엽니다.
+같은 실행 파일로 아래 명령도 쓸 수 있습니다(`relic info FILE`, `Relic.exe decompile FILE` 등).
+
+Python 3.10 이상이 있다면 릴리스 페이지의 wheel로 패키지로 설치할 수도 있습니다.
 
 ```sh
 python3 -m venv .venv
-.venv/bin/pip install https://github.com/ljw097/relic/releases/download/v0.1.0/relic_re-0.1.0-py3-none-any.whl
-.venv/bin/relic ./chall
+.venv/bin/pip install https://github.com/ljw097/relic/releases/download/v0.2.0/relic_re-0.2.0-py3-none-any.whl
+.venv/bin/relic
 ```
 
 소스에서 실행하려면:
@@ -29,7 +40,7 @@ python3 -m venv .venv
 .venv/bin/pip install -e '.[dev]'
 ```
 
-요구 사항은 Linux와 Python 3.10 이상입니다. 그 밖에 기능별로 필요한 것:
+분석과 디컴파일은 어느 운영체제에서나 같습니다. 그 밖에 기능별로 필요한 것:
 
 - 디버거: `gdb` (`sudo apt install gdb`)
 - ARM·MIPS 등 다른 아키텍처 바이너리 디버깅: `gdb-multiarch`, `qemu-user`
