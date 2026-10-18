@@ -24,7 +24,7 @@ def lifter_for(an: Analysis):
     if an.bin.arch in ("mips", "mips64"):
         from .mips import MipsLifter
         return MipsLifter(an)
-    if an.bin.arch == "riscv64":
+    if an.bin.arch in ("riscv64", "riscv32"):
         from .riscv import RiscVLifter
         return RiscVLifter(an)
     if an.bin.arch in ("ppc", "ppc64"):

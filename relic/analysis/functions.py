@@ -764,13 +764,14 @@ class FunctionAnalyzer:
             auipc a4, hi ; addi a4, a4, lo      table T
             slli a0, a0, 2 ; add a0, a0, a4
             lw a5, 0(a0) ; add a5, a5, a4       entries are offsets from T (PIC)
-            jr a5                               (non-PIC: `ld` of absolute addresses)
+            jr a5                               (non-PIC: `ld` / RV32 `lw` of absolute addresses)
         """
         b, msk = self.bin, self.dis._mask
         hist = list(reversed(self._back(jmp.addr, 24)))
         consts: dict[str, int] = {}
         table = entry = None
         bound = None
+        pic = True
         for i in hist:
             c, m = i.cs, i.mnemonic
             ops = c.operands
@@ -781,6 +782,9 @@ class FunctionAnalyzer:
             if m == "auipc" and imm is not None:
                 hi = imm & 0xFFFFF
                 new = (i.addr + ((hi - (1 << 20) if hi & 0x80000 else hi) << 12)) & msk
+            elif m in ("lui", "c.lui") and imm is not None:                 # (non-PIC)
+                hi = imm & 0xFFFFF
+                new = ((hi - (1 << 20) if hi & 0x80000 else hi) << 12) & msk
             elif m in ("li", "c.li") and imm is not None:
                 new = imm & msk
             elif m in ("addi", "c.addi") and imm is not None:
@@ -797,6 +801,9 @@ class FunctionAnalyzer:
                 continue
             elif m in ("lw", "ld", "c.lw", "c.ld"):
                 entry = 4 if m.endswith("lw") else 8
+                pic = False
+            elif m in ("add", "c.add") and entry:
+                pic = True                                      # an offset from the table
             if new is not None and d is not None:
                 consts[d] = new
                 sec = b.section_at(new)
@@ -809,11 +816,11 @@ class FunctionAnalyzer:
         sec = b.section_at(jmp.addr)
         out = []
         for k in range(bound):
-            if entry == 4:
+            if entry == 4 and (pic or b.bits == 64):
                 v = b.read_int(table + 4 * k, 4, signed=True)
                 t = (table + v) & msk if v is not None else None
-            else:
-                t = b.read_ptr(table + 8 * k)
+            else:                                               # absolute addresses
+                t = b.read_ptr(table + entry * k)
             if t is None or not (sec and sec.contains(t)):
                 return []
             out.append(t)
@@ -959,7 +966,8 @@ class FunctionAnalyzer:
     def _scan_gaps(self):
         """Pick up functions only reachable indirectly (prologue scan: x86, ARM, AArch64, MIPS,
         RISC-V)."""
-        if self.dis.arch not in ("x86", "x64", "arm", "arm64", "mips", "mips64", "riscv64", "ppc", "ppc64"):
+        if self.dis.arch not in ("x86", "x64", "arm", "arm64", "mips", "mips64", "riscv64", "riscv32", "ppc",
+                                 "ppc64"):
             return
         prologues = (b"\xf3\x0f\x1e\xfa", b"\xf3\x0f\x1e\xfb", b"\x55\x48\x89\xe5", b"\x55\x89\xe5")
         tried: set[int] = set()
@@ -984,7 +992,7 @@ class FunctionAnalyzer:
                     start = self._arm_gap_function(s, e)
                 elif self.dis.arch in ("mips", "mips64"):
                     start = self._mips_gap_function(s, e)
-                elif self.dis.arch == "riscv64":
+                elif self.dis.arch.startswith("riscv"):
                     start = self._riscv_gap_function(s, e)
                 elif self.dis.arch in ("ppc", "ppc64"):
                     start = self._ppc_gap_function(s, e)

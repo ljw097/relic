@@ -109,7 +109,7 @@ def _canon_for(an: "Analysis"):
         return _canon_arm()
     if arch in ("mips", "mips64"):
         return _canon_mips(arch == "mips64")
-    if arch == "riscv64":
+    if arch in ("riscv64", "riscv32"):
         return _canon_riscv()
     if arch in ("ppc", "ppc64"):
         return _canon_ppc()

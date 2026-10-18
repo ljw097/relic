@@ -57,7 +57,8 @@ def _arch_key(arch: str) -> str:
 _QEMU = {("x86", "little"): "qemu-i386", ("x64", "little"): "qemu-x86_64", ("arm", "little"): "qemu-arm",
          ("arm", "big"): "qemu-armeb", ("arm64", "little"): "qemu-aarch64", ("mips", "little"): "qemu-mipsel",
          ("mips", "big"): "qemu-mips", ("mips64", "little"): "qemu-mips64el", ("mips64", "big"): "qemu-mips64",
-         ("riscv64", "little"): "qemu-riscv64", ("ppc", "big"): "qemu-ppc", ("ppc64", "little"): "qemu-ppc64le",
+         ("riscv64", "little"): "qemu-riscv64",
+         ("riscv32", "little"): "qemu-riscv32", ("ppc", "big"): "qemu-ppc", ("ppc64", "little"): "qemu-ppc64le",
          ("ppc64", "big"): "qemu-ppc64"}
 _SYSROOT = {"arm": "/usr/arm-linux-gnueabihf", "arm64": "/usr/aarch64-linux-gnu", "mips": "/usr/mipsel-linux-gnu",
             ("mips", "big"): "/usr/mips-linux-gnu", "mips64": "/usr/mips64el-linux-gnuabi64",

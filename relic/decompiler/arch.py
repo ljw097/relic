@@ -132,11 +132,16 @@ RISCV64 = ArchInfo(
     syscall_reads=("a7", *_RV_ARGS[:6]),
     syscall_clobbers=("a0",),
 )
+RISCV32 = ArchInfo(
+    "riscv32-ilp32d", 32, "sp", "a0",
+    call_reads=RISCV64.call_reads, call_clobbers=RISCV64.call_clobbers,
+    syscall_reads=RISCV64.syscall_reads, syscall_clobbers=RISCV64.syscall_clobbers,
+)
 
 
 def sext_ints(arch: ArchInfo) -> bool:
     """Whether 32-bit integers live sign-extended in 64-bit registers (RISC-V, MIPS n64)."""
-    return arch.name.startswith(("riscv", "mips-n64", "ppc64"))
+    return arch.name.startswith(("riscv64", "mips-n64", "ppc64"))
 
 
 def arch_for(binary) -> ArchInfo:
@@ -154,6 +159,8 @@ def arch_for(binary) -> ArchInfo:
         return MIPS_N64
     if binary.arch == "riscv64":
         return RISCV64
+    if binary.arch == "riscv32":
+        return RISCV32
     if binary.arch == "ppc":
         return PPC32
     if binary.arch == "ppc64":

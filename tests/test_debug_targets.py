@@ -23,7 +23,8 @@ CROSS = {"arm64": ("aarch64-linux-gnu-gcc", "qemu-aarch64", ["x0", "x1"]),
          "mips64": ("mips64el-linux-gnuabi64-gcc", "qemu-mips64el", ["zero", "at"]),
          "ppc": ("powerpc-linux-gnu-gcc", "qemu-ppc", ["r0", "r1"]),
          "ppc64": ("powerpc64le-linux-gnu-gcc", "qemu-ppc64le", ["r0", "r1"]),
-         "riscv64": ("riscv64-linux-gnu-gcc", "qemu-riscv64", ["ra", "sp"])}
+         "riscv64": ("riscv64-linux-gnu-gcc", "qemu-riscv64", ["ra", "sp"]),
+         "riscv32": ("riscv64-linux-gnu-gcc", "qemu-riscv32", ["ra", "sp"])}
 
 
 def _multiarch() -> bool:
@@ -64,7 +65,11 @@ def test_qemu_target(arch, tmp_path):
     cc, qemu, regs = CROSS[arch]
     if shutil.which(qemu) is None or not _multiarch():
         pytest.skip(f"needs {qemu} and a gdb for {arch} (gdb-multiarch)")
-    path = _build(tmp_path, cc, f"t_{arch}")
+    flags = []
+    if arch == "riscv32":                   # (no RV32 libc: freestanding, with the tests' own runtime)
+        from test_floats import RV32_RUN
+        flags = [*RV32_RUN, os.path.join(HERE, "src", "rv32rt.c")]
+    path = _build(tmp_path, cc, f"t_{arch}", *flags)
     an = analyze(path)
     assert an.bin.arch == arch.removesuffix("be") and Target.for_binary(an.bin).kind == "qemu" and qemu_for(an.bin)
     s = Session(path, ["a", "b"], an, target=Target("qemu", env={"RELIC_T": "env-ok"}))

@@ -62,7 +62,7 @@ def load_elf_object(b: Binary, elf) -> None:
     # 2. what is used without being defined, and what is reached through a GOT
     externs: dict[str, int] = {}
     got_syms: dict[tuple, int] = {}
-    got_kinds = {"x64": {9, 41, 42}, "arm64": {311, 312}, "riscv64": {20},
+    got_kinds = {"x64": {9, 41, 42}, "arm64": {311, 312}, "riscv64": {20}, "riscv32": {20},
                  "mips": {9, 11, 29, 30, 31}}.get(b.arch, set())
     relsecs = [rs for rs in elf.iter_sections() if isinstance(rs, RelocationSection) and rs["sh_info"] in secs]
     for rs in relsecs:
@@ -372,6 +372,7 @@ def _riscv(img, t, off, S, A, P, G, ctx):
         img.put(off, 2, (h & 0xE003) | enc)
 
 
-_APPLY = {"x64": _x64, "x86": _x86, "arm64": _arm64, "arm": _arm, "mips": _mips, "riscv64": _riscv}
+_APPLY = {"x64": _x64, "x86": _x86, "arm64": _arm64, "arm": _arm, "mips": _mips,
+          "riscv64": _riscv, "riscv32": _riscv}
 
 __all__ = ["BASE", "load_elf_object"]

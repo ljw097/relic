@@ -1,6 +1,6 @@
-"""RISC-V (RV64GC, LP64D) lifter.
+"""RISC-V (RV64GC / LP64D, RV32GC / ILP32D) lifter.
 
-Registers are the 64-bit `ra`, `sp`, `gp`, `tp`, `t0`-`t6`, `s0`-`s11`
+Registers are the XLEN-bit (64 or 32) `ra`, `sp`, `gp`, `tp`, `t0`-`t6`, `s0`-`s11`
 (`fp` = `s0`) and `a0`-`a7`; `zero` reads as 0 and ignores writes. The
 floating-point registers `ft0`-`ft11`, `fa0`-`fa7`, `fs0`-`fs11` are 64-bit
 too: a double fills one, a single its low half.
@@ -87,10 +87,10 @@ def _hi20(imm: int) -> int:
 
 
 class RiscVLifter:
-    bits = 64
-
     def __init__(self, an: "Analysis"):
         self.an = an
+        self.W = self.bits = 32 if an.bin.arch == "riscv32" else 64       # XLEN
+        self.M = mask(self.W)
         self.out: list[Stmt] = []
         self.insn: Insn | None = None
         self._tmp = 0
@@ -119,10 +119,12 @@ class RiscVLifter:
     def read_reg(self, name: str) -> Expr:
         name = self.canon(name)
         if name == "zero":
-            return Const(0, 64)
+            return Const(0, self.W)
         if name == "gp" and self.gp is not None:
-            return Const(self.gp, 64)
-        if name in _GPR or name in _FPR:
+            return Const(self.gp, self.W)
+        if name in _GPR:
+            return Reg(name, self.W)
+        if name in _FPR:
             return Reg(name, 64)
         raise LiftError(f"register {name}")
 
@@ -131,8 +133,8 @@ class RiscVLifter:
         if name == "zero" or name == "gp" and self.gp is not None:
             return
         r = self.read_reg(name)
-        if v.bits != 64:
-            v = cast("low", v, 64) if v.bits > 64 else cast("sext" if signed else "zext", v, 64)
+        if v.bits != r.bits:
+            v = cast("low", v, r.bits) if v.bits > r.bits else cast("sext" if signed else "zext", v, r.bits)
         self.assign(r, v)
 
     def freg(self, op, bits: int) -> Expr:
@@ -143,7 +145,7 @@ class RiscVLifter:
         if op.type == OP_REG:
             return self.read_reg(self.name(op))
         if op.type == OP_IMM:
-            return Const(op.imm & M64, 64)
+            return Const(op.imm & self.M, self.W)
         raise LiftError("operand")
 
     def address(self, ops) -> Expr:
@@ -154,10 +156,10 @@ class RiscVLifter:
         else:
             base, d = self.read_reg(self.name(ops[2])), ops[1].imm
         if isinstance(base, Const):
-            return Const((base.value + d) & M64, 64)
+            return Const((base.value + d) & self.M, self.W)
         if not d:
             return base
-        return BinOp("+", base, Const(d, 64), 64) if d > 0 else BinOp("-", base, Const(-d, 64), 64)
+        return BinOp("+", base, Const(d, self.W), self.W) if d > 0 else BinOp("-", base, Const(-d, self.W), self.W)
 
     def unknown(self, i: Insn) -> Unknown:
         def regs(names):
@@ -165,7 +167,7 @@ class RiscVLifter:
             for n in names:
                 n = self.canon(n)
                 if n in _GPR or n in _FPR:
-                    out[n] = Reg(n, 64)
+                    out[n] = Reg(n, self.W if n in _GPR else 64)
             return list(out.items())
         try:
             r, w = i.cs.regs_access()
@@ -211,7 +213,7 @@ class RiscVLifter:
             a, b = self.read_reg(d), self.operand(ops[1])
         else:
             a, b = self.operand(ops[1]), self.operand(ops[2])
-        w = 32 if word else 64
+        w = 32 if word else self.W
         if word:
             a = Const(a.value & mask(32), 32) if isinstance(a, Const) else cast("low", a, 32)
             b = Const(b.value & mask(32), 32) if isinstance(b, Const) else cast("low", b, 32)
@@ -238,17 +240,17 @@ class RiscVLifter:
     _i_c_mv = _i_mv
 
     def _i_li(self, i, ops):
-        self.write_reg(self.name(ops[0]), Const(ops[1].imm & M64, 64))
+        self.write_reg(self.name(ops[0]), Const(ops[1].imm & self.M, self.W))
 
     _i_c_li = _i_li
 
     def _i_lui(self, i, ops):
-        self.write_reg(self.name(ops[0]), Const(_hi20(ops[1].imm) & M64, 64))
+        self.write_reg(self.name(ops[0]), Const(_hi20(ops[1].imm) & self.M, self.W))
 
     _i_c_lui = _i_lui
 
     def _i_auipc(self, i, ops):
-        self.write_reg(self.name(ops[0]), Const((i.addr + _hi20(ops[1].imm)) & M64, 64))
+        self.write_reg(self.name(ops[0]), Const((i.addr + _hi20(ops[1].imm)) & self.M, self.W))
 
     def _i_c_addi16sp(self, i, ops):
         self._alu([ops[0], ops[0], ops[1]], "+", False)
@@ -260,13 +262,13 @@ class RiscVLifter:
         v = self.operand(ops[1])
         if word:
             v = cast("low", v, 32)
-        self.write_reg(self.name(ops[0]), f(v, 32 if word else 64), signed=True)
+        self.write_reg(self.name(ops[0]), f(v, 32 if word else self.W), signed=True)
 
     def _i_not(self, i, ops):
         self._unary(ops, lambda v, w: UnOp("~", v, w))
 
     def _i_c_not(self, i, ops):
-        self.write_reg(self.name(ops[0]), UnOp("~", self.read_reg(self.name(ops[0])), 64))
+        self.write_reg(self.name(ops[0]), UnOp("~", self.read_reg(self.name(ops[0])), self.W))
 
     def _i_neg(self, i, ops):
         self._unary(ops, lambda v, w: BinOp("-", Const(0, w), v, w))
@@ -279,7 +281,7 @@ class RiscVLifter:
 
     def _ext(self, ops, bits: int, signed: bool):
         v = cast("low", self.operand(ops[1]), bits)
-        self.write_reg(self.name(ops[0]), cast("sext" if signed else "zext", v, 64))
+        self.write_reg(self.name(ops[0]), cast("sext" if signed else "zext", v, self.W))
 
     def _i_sext_b(self, i, ops):
         self._ext(ops, 8, True)
@@ -300,7 +302,7 @@ class RiscVLifter:
         _i_zext_b, _i_zext_h, _i_zext_w, _i_sext_b, _i_sext_h
 
     def _set(self, d: str, cond: Expr):
-        self.write_reg(d, cast("zext", cond, 64))
+        self.write_reg(d, cast("zext", cond, self.W))
 
     def _i_slt(self, i, ops):
         self._set(self.name(ops[0]), BinOp("<s", self.operand(ops[1]), self.operand(ops[2]), 1))
@@ -313,21 +315,21 @@ class RiscVLifter:
     _i_sltiu = _i_sltu
 
     def _i_seqz(self, i, ops):
-        self._set(self.name(ops[0]), BinOp("==", self.operand(ops[1]), Const(0, 64), 1))
+        self._set(self.name(ops[0]), BinOp("==", self.operand(ops[1]), Const(0, self.W), 1))
 
     def _i_snez(self, i, ops):
-        self._set(self.name(ops[0]), BinOp("!=", self.operand(ops[1]), Const(0, 64), 1))
+        self._set(self.name(ops[0]), BinOp("!=", self.operand(ops[1]), Const(0, self.W), 1))
 
     def _i_sltz(self, i, ops):
-        self._set(self.name(ops[0]), BinOp("<s", self.operand(ops[1]), Const(0, 64), 1))
+        self._set(self.name(ops[0]), BinOp("<s", self.operand(ops[1]), Const(0, self.W), 1))
 
     def _i_sgtz(self, i, ops):
-        self._set(self.name(ops[0]), BinOp("<s", Const(0, 64), self.operand(ops[1]), 1))
+        self._set(self.name(ops[0]), BinOp("<s", Const(0, self.W), self.operand(ops[1]), 1))
 
     def _mulh(self, ops, ka: str, kb: str):
-        a, b = cast(ka, self.operand(ops[1]), 128), cast(kb, self.operand(ops[2]), 128)
-        p = BinOp("*", a, b, 128)
-        self.write_reg(self.name(ops[0]), cast("low", BinOp(">>u", p, Const(64, 8), 128), 64))
+        a, b = cast(ka, self.operand(ops[1]), 2 * self.W), cast(kb, self.operand(ops[2]), 2 * self.W)
+        p = BinOp("*", a, b, 2 * self.W)
+        self.write_reg(self.name(ops[0]), cast("low", BinOp(">>u", p, Const(self.W, 8), 2 * self.W), self.W))
 
     def _i_mulh(self, i, ops):
         self._mulh(ops, "sext", "sext")
@@ -340,8 +342,8 @@ class RiscVLifter:
 
     def _minmax(self, ops, op: str, smaller: bool):
         a, b = self.operand(ops[1]), self.operand(ops[2])
-        self.write_reg(self.name(ops[0]), Ite(BinOp(op, a, b, 1), a, b, 64) if smaller else
-                       Ite(BinOp(op, a, b, 1), b, a, 64))
+        self.write_reg(self.name(ops[0]), Ite(BinOp(op, a, b, 1), a, b, self.W) if smaller else
+                       Ite(BinOp(op, a, b, 1), b, a, self.W))
 
     def _i_min(self, i, ops):
         self._minmax(ops, "<s", True)
@@ -357,18 +359,18 @@ class RiscVLifter:
 
     def _i_czero_eqz(self, i, ops):
         a, c = self.operand(ops[1]), self.operand(ops[2])
-        self.write_reg(self.name(ops[0]), Ite(BinOp("==", c, Const(0, 64), 1), Const(0, 64), a, 64))
+        self.write_reg(self.name(ops[0]), Ite(BinOp("==", c, Const(0, self.W), 1), Const(0, self.W), a, self.W))
 
     def _i_czero_nez(self, i, ops):
         a, c = self.operand(ops[1]), self.operand(ops[2])
-        self.write_reg(self.name(ops[0]), Ite(BinOp("!=", c, Const(0, 64), 1), Const(0, 64), a, 64))
+        self.write_reg(self.name(ops[0]), Ite(BinOp("!=", c, Const(0, self.W), 1), Const(0, self.W), a, self.W))
 
     def _shadd(self, ops, n: int, uw: bool = False):
         a = self.operand(ops[1])
         if uw:
-            a = cast("zext", cast("low", a, 32), 64)
+            a = cast("zext", cast("low", a, 32), self.W)
         self.write_reg(self.name(ops[0]), BinOp("+", self.operand(ops[2]),
-                                                BinOp("<<", a, Const(n, 8), 64) if n else a, 64))
+                                                BinOp("<<", a, Const(n, 8), self.W) if n else a, self.W))
 
     def _i_sh1add(self, i, ops):
         self._shadd(ops, 1)
@@ -383,13 +385,13 @@ class RiscVLifter:
         self._shadd(ops, 0, True)
 
     def _i_clz(self, i, ops):
-        self.write_reg(self.name(ops[0]), Intrinsic("clz", (self.operand(ops[1]),), 64))
+        self.write_reg(self.name(ops[0]), Intrinsic("clz", (self.operand(ops[1]),), self.W))
 
     def _i_ctz(self, i, ops):
-        self.write_reg(self.name(ops[0]), Intrinsic("ctz", (self.operand(ops[1]),), 64))
+        self.write_reg(self.name(ops[0]), Intrinsic("ctz", (self.operand(ops[1]),), self.W))
 
     def _i_cpop(self, i, ops):
-        self.write_reg(self.name(ops[0]), Intrinsic("popcount", (self.operand(ops[1]),), 64))
+        self.write_reg(self.name(ops[0]), Intrinsic("popcount", (self.operand(ops[1]),), self.W))
 
     # --------------------------------------------------------- loads/stores
     def _ldst(self, i, m, ops):
@@ -398,14 +400,14 @@ class RiscVLifter:
         if m in _LOAD:
             size, signed = _LOAD[m]
             v: Expr = Load(addr, size)
-            self.write_reg(r, v if size == 64 else cast("sext" if signed else "zext", v, 64))
+            self.write_reg(r, v if size == self.W else cast("sext" if signed else "zext", v, self.W))
         elif m in _FLOAD:
             size = _FLOAD[m]
             self.write_reg(r, Load(addr, size))
         elif m in _STORE:
             size = _STORE[m]
             val = self.read_reg(r)
-            self.emit(Store(i.addr, addr, val if size == 64 else cast("low", val, size)))
+            self.emit(Store(i.addr, addr, val if size == self.W else cast("low", val, size)))
         else:
             self.emit(Store(i.addr, addr, self.freg(ops[0], _FSTORE[m])))
 
@@ -423,13 +425,13 @@ class RiscVLifter:
             addr = self.tmp(addr)
         if parts[0] == "lr":
             v: Expr = Load(addr, size)
-            self.write_reg(regs[0], v if size == 64 else cast("sext", v, 64))
+            self.write_reg(regs[0], v if size == self.W else cast("sext", v, self.W))
             return
         src = self.read_reg(regs[1])
-        src = src if size == 64 else cast("low", src, size)
+        src = src if size == self.W else cast("low", src, size)
         if parts[0] == "sc":
             self.emit(Store(i.addr, addr, src))
-            self.write_reg(regs[0], Const(0, 64))
+            self.write_reg(regs[0], Const(0, self.W))
             return
         if parts[0] not in self._AMO:
             raise LiftError(m)
@@ -445,12 +447,12 @@ class RiscVLifter:
         else:
             new = BinOp(op, old, src, size)
         self.emit(Store(i.addr, addr, new))
-        self.write_reg(regs[0], old if size == 64 else cast("sext", old, 64))
+        self.write_reg(regs[0], old if size == self.W else cast("sext", old, self.W))
 
     def _effect(self, i, name):
         if name == "syscall":
-            uses = [(r, Reg(r, 64)) for r in ("a7", "a0", "a1", "a2", "a3", "a4", "a5")]
-            self.emit(Effect(i.addr, "syscall", (), uses, [("a0", Reg("a0", 64))]))
+            uses = [(r, Reg(r, self.W)) for r in ("a7", "a0", "a1", "a2", "a3", "a4", "a5")]
+            self.emit(Effect(i.addr, "syscall", (), uses, [("a0", Reg("a0", self.W))]))
         else:
             self.emit(Effect(i.addr, name, ()))
 
@@ -559,7 +561,7 @@ class RiscVLifter:
 
     def _fcmp(self, ops, op, bits):
         c = BinOp(op, self.freg(ops[1], bits), self.freg(ops[2], bits), 1)
-        self.write_reg(self.name(ops[0]), cast("zext", c, 64))
+        self.write_reg(self.name(ops[0]), cast("zext", c, self.W))
 
     def _f_feq(self, i, parts, bits, ops):
         self._fcmp(ops, "f==", bits)
@@ -606,7 +608,7 @@ class RiscVLifter:
     # --------------------------------------------------------- control flow
     def _branch(self, i, m, ops):
         a = self.operand(ops[0])
-        b = self.operand(ops[1]) if len(ops) == 3 else Const(0, 64)
+        b = self.operand(ops[1]) if len(ops) == 3 else Const(0, self.W)
         op = _BRANCH[m]
         if op[0] == ">":                            # a > b: b < a
             a, b, op = b, a, "<" + op[1:]
@@ -624,12 +626,12 @@ class RiscVLifter:
     def _call(self, i, target: Expr):
         if not isinstance(target, Const):
             target = self.tmp(target)
-        self.emit(CallStmt(i.addr, Call(target, (), 64), noreturn=self._noreturn(i), name=self.an.call_name(i)))
+        self.emit(CallStmt(i.addr, Call(target, (), self.W), noreturn=self._noreturn(i), name=self.an.call_name(i)))
 
     def _i_jal(self, i, ops):
         if i.kind != "call":
             raise LiftError("jal outside a call")
-        self._call(i, Const(i.target, 64))
+        self._call(i, Const(i.target, self.W))
 
     _i_c_jal = _i_jal
 
@@ -643,8 +645,8 @@ class RiscVLifter:
             base = self.read_reg(self.name(regs[-1]))
             d = next((o.imm for o in ops if o.type == OP_IMM), 0)
         if isinstance(base, Const):
-            return Const((base.value + d) & M64, 64)
-        return BinOp("+", base, Const(d & M64, 64), 64) if d else base
+            return Const((base.value + d) & self.M, self.W)
+        return BinOp("+", base, Const(d & self.M, self.W), self.W) if d else base
 
     def _i_jalr(self, i, ops):
         if i.kind == "ret":
@@ -682,7 +684,8 @@ class RiscVLifter:
             if i.target in func.blocks:
                 self.emit(Jump(i.addr, i.target))
             else:
-                self.emit(CallStmt(i.addr, Call(Const(i.target, 64), (), 64), tail=True, name=self.an.name(i.target)))
+                self.emit(CallStmt(i.addr, Call(Const(i.target, self.W), (), self.W), tail=True,
+                                   name=self.an.name(i.target)))
                 self.emit(Return(i.addr))
             return self.out
         try:
@@ -697,7 +700,7 @@ class RiscVLifter:
             self.emit(IndirectJump(i.addr, target, seen, list(table)))
         else:
             # an indirect jump that is not a switch leaves the function: a tail call
-            self.emit(CallStmt(i.addr, Call(target, (), 64), tail=True, name=self.an.call_name(i)))
+            self.emit(CallStmt(i.addr, Call(target, (), self.W), tail=True, name=self.an.call_name(i)))
             self.emit(Return(i.addr))
         return self.out
 
