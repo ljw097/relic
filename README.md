@@ -46,7 +46,8 @@ foreign binaries, install `gdb-multiarch` and `qemu-user` as well.
 
 Roughly, here's what works:
 
-- **Files it opens**: ELF (executables, shared libraries, `.o` files, core dumps), PE, COFF objects, members of `.a`
+- **Files it opens**: ELF (executables, shared libraries, `.o` files, core dumps), PE, Mach-O (executables, dylibs,
+  universal files), COFF objects, members of `.a`
   archives, Intel HEX / S-record, and plain raw dumps. For raw firmware it will also guess the load address (`--base auto`).
 - **Architectures**: x86, x86-64, ARM/Thumb, AArch64, MIPS32 (both byte orders), MIPS64, RISC-V (RV64GC), and
   PowerPC (32-bit and 64-bit little-endian) go all the way to pseudocode.
@@ -68,11 +69,11 @@ Roughly, here's what works:
 ### Where it stands against IDA
 
 These numbers are eyeballed. Read them as "the share of what IDA does in that area that Relic does about as well."
-The total is a weighted average, with weights from how much each area matters to me when I'm actually reversing. Right now it's **about 78%**.
+The total is a weighted average, with weights from how much each area matters to me when I'm actually reversing. Right now it's **about 79%**.
 
 | Area (weight) | Progress | Notes |
 |---|---|---|
-| File formats (8) | 70% | No Mach-O |
+| File formats (8) | 85% | Mach-O: no `.o` files, chained fixups or Objective-C metadata yet |
 | Processors (8) | 80% | IDA handles 60+ CPU families, so this is the furthest behind |
 | Auto-analysis (14) | 55% | Still misses some functions and indirect jumps in big binaries |
 | Library identification (8) | 100% | On the stripped static C test binaries, 83–94% of the functions that had symbols get named, with no wrong names |

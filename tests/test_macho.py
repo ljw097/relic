@@ -145,3 +145,10 @@ def test_stripped_keeps_function_starts():
     # every function LC_FUNCTION_STARTS lists is found, named or not
     assert set(an.bin.function_starts) <= set(an.functions)
     assert any('system("/bin/sh")' in decompile(an, f).text for f in an.functions.values() if not f.is_import)
+
+
+def test_checksec(exe):
+    name, path = exe
+    cs = analyze(path).checksec()
+    assert cs["PIE"] == "Yes" and cs["NX stack"] == "Yes" and cs["NX heap"] == "Yes" and cs["Canary"] == "Yes"
+    assert cs["Code signature"] == ("Yes" if name.startswith("a64") else "No")    # (ld64 signs arm64 ad hoc)
