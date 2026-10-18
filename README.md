@@ -68,7 +68,7 @@ Roughly, here's what works:
 ### Where it stands against IDA
 
 These numbers are eyeballed. Read them as "the share of what IDA does in that area that Relic does about as well."
-The total is a weighted average, with weights from how much each area matters to me when I'm actually reversing. Right now it's **about 77%**.
+The total is a weighted average, with weights from how much each area matters to me when I'm actually reversing. Right now it's **about 78%**.
 
 | Area (weight) | Progress | Notes |
 |---|---|---|
@@ -80,7 +80,7 @@ The total is a weighted average, with weights from how much each area matters to
 | Decompiler (20) | 52% | Too many gotos left, no x87 floating point or SIMD |
 | Interactive UI (12) | 100% | |
 | Scripting & extensions (8) | 100% | |
-| Debugger (7) | 90% | No Windows (PE) targets |
+| Debugger (7) | 100% | Windows (PE) programs run under wine with Windows' own gdbserver.exe |
 | Projects & collaboration (5) | 100% | Snapshots, version history, merging, Lumina-style name sharing |
 
 What "100%" means for each area, and what's left, is written down in [TODO.md](TODO.md).
@@ -213,6 +213,7 @@ If you've used IDA, these will feel familiar.
 
 The Debug menu (`F9`) runs the open binary under gdb. Connecting to a remote gdbserver, running a foreign-architecture binary
 under qemu-user, or attaching to a process that's already running are all picked in Debug ▸ Debugger target. The program's input and output go through the Console panel.
+Windows executables open under wine on Linux, debugged through Windows' own `gdbserver.exe` (`sudo apt install wine gdb-mingw-w64-target`).
 
 The panels will feel familiar if you've used pwndbg. Registers highlights what changed since the last stop and shows where pointers lead;
 Stack is a telescope; there are also Backtrace, Vmmap, Memory, Breakpoints, Threads and Modules panels.

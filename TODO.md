@@ -76,7 +76,7 @@ IDA의 60여 개 CPU 계열 전부가 아니라, 리버싱·포너블·펌웨어
 - [x] RAW 펌웨어의 적재 주소 추정(문자열 포인터 상관, Cortex-M 벡터 테이블; `--base auto`, `relic info`에 후보)
 - [ ] Mach-O
 
-## P1 — 디버거 100%까지 (README 90%)
+## P1 — 디버거 100%까지 (README 100%)
 
 - [x] 로컬: 실행·단계 실행·중단점(조건·활성화·적중 횟수·라이브러리 함수)·하드웨어 watchpoint·레지스터/메모리 보기·편집·telescope·vmmap·백트레이스·콘솔·힙 뷰·PIE 슬라이드
 - [x] 원격 gdbserver(`host:port`)
@@ -87,7 +87,7 @@ IDA의 60여 개 CPU 계열 전부가 아니라, 리버싱·포너블·펌웨어
 - [x] 공유 라이브러리(모듈) 목록(Modules 창), 라이브러리 적재 시 정지
 - [x] 시그널: 정지·전달 정책(Debug ▸ Signals, 세션마다 유지), 정지 이유에 시그널 정보
 - [x] 추적: 명령 단위 추적 기록(Debug ▸ Trace instructions), 리스팅에 실행된 명령 표시
-- [ ] Windows(PE) 대상: Windows의 gdbserver로 원격(이 환경에서 시험할 수 없음)
+- [x] Windows(PE) 대상: Windows의 gdbserver.exe로 원격, Linux에서는 wine으로 자동 실행(win32·win64, 입출력·환경 변수·DLL 모듈)
 
 ## P1 — 타입 시스템 100%까지 (README 85%)
 

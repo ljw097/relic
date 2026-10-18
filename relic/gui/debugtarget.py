@@ -1,13 +1,15 @@
 """Debug > Target: where the program runs -- here under gdb, under qemu-user (a program of
-another architecture), on a gdbserver, or a process already running (attach) -- and how it
-starts (environment, working directory, a file for its input)."""
+another architecture), under wine with Windows' gdbserver.exe (a Windows program), on a
+gdbserver, or a process already running (attach) -- and how it starts (environment, working
+directory, a file for its input)."""
 from __future__ import annotations
 
 from PySide6.QtWidgets import (QComboBox, QDialog, QDialogButtonBox, QFormLayout, QLineEdit, QPlainTextEdit,
                                QSpinBox)
 
-KINDS = [("auto", "Automatic (here, or under QEMU for another architecture)"), ("local", "This machine (gdb)"),
-         ("qemu", "QEMU user mode (gdb stub)"), ("remote", "Remote gdbserver (host:port)"),
+KINDS = [("auto", "Automatic (here, under QEMU for another architecture, under wine for Windows)"),
+         ("local", "This machine (gdb)"), ("qemu", "QEMU user mode (gdb stub)"),
+         ("wine", "Wine with Windows' gdbserver.exe"), ("remote", "Remote gdbserver (host:port)"),
          ("attach", "Attach to a running process")]
 
 
@@ -48,7 +50,7 @@ class TargetDialog(QDialog):
         k = self.kind.currentData()
         self.address.setEnabled(k == "remote")
         self.pid.setEnabled(k == "attach")
-        starts = k in ("auto", "local", "qemu")
+        starts = k in ("auto", "local", "qemu", "wine")
         for w in (self.env, self.cwd, self.stdin):
             w.setEnabled(starts)
         self.sysroot.setEnabled(k in ("auto", "qemu", "remote"))

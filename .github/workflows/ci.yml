@@ -46,6 +46,27 @@ jobs:
           QT_QPA_PLATFORM: offscreen
         run: pytest -q -rs
 
+  # Windows (PE) debugging: wine runs Windows' own gdbserver.exe (from gdb-mingw-w64-target)
+  test-wine:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+          cache: pip
+      - name: System packages (wine, MinGW, Windows gdbserver)
+        run: |
+          sudo dpkg --add-architecture i386
+          sudo apt-get update -q
+          sudo apt-get install -y -q gcc-mingw-w64-x86-64 gcc-mingw-w64-i686 gdb gdb-mingw-w64-target
+          sudo apt-get install -y -q --no-install-recommends wine wine64 wine32:i386 || sudo apt-get install -y -q --no-install-recommends wine wine64
+          ls /usr/share/win64/gdbserver.exe /usr/share/win32/gdbserver.exe
+      - name: Install
+        run: pip install -e '.[dev]'
+      - name: Test (Windows programs under wine)
+        run: pytest -q -rs tests/test_debug_targets.py -k wine
+
   # the ARM cross compilers cannot be installed next to gcc-multilib on the runner image,
   # so the ARM / AArch64 samples are built (and their own tests run) in a job of their own
   test-cross:

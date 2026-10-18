@@ -76,9 +76,11 @@ class Target:
     """Where and how the program runs.
 
     kind: `local` (gdb runs it here), `qemu` (qemu-user runs it with its gdb stub: another
-    architecture's program on this machine), `remote` (a gdbserver at `address`, `host:port`,
-    already holding the program), `attach` (the process `pid`, already running here).
-    env / cwd / stdin (a file to read input from): for a program Relic starts (local, qemu).
+    architecture's program on this machine), `wine` (a Windows program under Windows'
+    gdbserver.exe, both run by wine), `remote` (a gdbserver at `address`, `host:port`, already
+    holding the program -- also a gdbserver.exe on a Windows machine), `attach` (the process
+    `pid`, already running here).
+    env / cwd / stdin (a file to read input from): for a program Relic starts (local, qemu, wine).
     sysroot: where the target's shared libraries are (qemu `-L`, gdb `set sysroot`)."""
     kind: str = "local"
     address: str = ""
@@ -90,10 +92,13 @@ class Target:
 
     @staticmethod
     def for_binary(b) -> "Target":
-        """Local for a program this machine runs, qemu-user for one of another architecture."""
+        """Local for a program this machine runs, qemu-user for one of another architecture, wine
+        for a Windows program."""
         import platform
         host = {"x86_64": "x64", "amd64": "x64", "aarch64": "arm64", "riscv64": "riscv64"}.get(platform.machine(), "")
         native = b.arch == host or (host == "x64" and b.arch == "x86")
+        if getattr(b, "format", "") in ("PE", "COFF") and platform.system() != "Windows":
+            return Target("wine")           # a Windows program: Windows' gdbserver.exe under wine
         return Target() if native else Target("qemu")
 
 
@@ -101,6 +106,19 @@ def qemu_for(b) -> str | None:
     """The qemu-user that runs binary `b`, when installed."""
     name = _QEMU.get((b.arch, getattr(b, "endian", "little")))
     return shutil.which(name) if name else None
+
+
+# Windows' gdbserver (MinGW-w64's, Debian / Ubuntu package gdb-mingw-w64-target) per word size
+_WIN_GDBSERVER = {64: ["/usr/share/win64/gdbserver.exe"], 32: ["/usr/share/win32/gdbserver.exe"]}
+
+
+def wine_gdbserver_for(b) -> tuple[str, str] | None:
+    """(wine, gdbserver.exe) that run Windows binary `b` here, when both are installed."""
+    wine = shutil.which("wine")
+    if wine is None:
+        return None
+    server = next((p for p in _WIN_GDBSERVER.get(getattr(b, "bits", 64), []) if os.path.exists(p)), None)
+    return (wine, server) if server else None
 
 
 def _free_port() -> int:
@@ -186,6 +204,7 @@ class Session:
         self.an = analysis
         self.target = target or Target()
         self.qemu: subprocess.Popen | None = None
+        self._pipe_in: int | None = None            # the program's stdin when it is a pipe (wine)
         self.connected = False                      # (remote / qemu / attach: the program is there)
         self.on_stop = on_stop
         self.on_output = on_output
@@ -263,7 +282,28 @@ class Session:
     def send_input(self, data: bytes | str):
         if isinstance(data, str):
             data = data.encode()
+        if self._pipe_in is not None:              # (a program under wine reads a pipe)
+            try:
+                os.write(self._pipe_in, data)
+            except OSError:
+                pass
+            return
         os.write(self.master, data)
+
+    def _read_pipe(self, fd: int):
+        """A program's output through a pipe (wine), handled like the terminal's."""
+        while True:
+            try:
+                data = os.read(fd, 4096)
+            except OSError:
+                return
+            if not data:
+                os.close(fd)
+                return
+            with self._out_lock:
+                self._out.append(data)
+            if self.on_output:
+                self.on_output(data)
 
     # ------------------------------------------------------------- execution
     def _async(self, r):
@@ -329,8 +369,10 @@ class Session:
                 address = t.address
                 if t.kind == "qemu":
                     address = self._start_qemu()
+                elif t.kind == "wine":
+                    address = self._start_wine()
                 deadline = time.monotonic() + timeout
-                while True:                         # (qemu needs a moment before it listens)
+                while True:                         # (qemu / wine need a moment before they listen)
                     try:
                         self.mi.command(f"-target-select remote {address}", timeout)
                         break
@@ -368,6 +410,39 @@ class Session:
                                      cwd=t.cwd or None, start_new_session=True)
         if t.stdin:
             stdin.close()
+        return f"127.0.0.1:{port}"
+
+    def _start_wine(self) -> str:
+        """Run a Windows program under Windows' own gdbserver.exe, both under wine, on a free local
+        port; the program's input and output on the session's terminal (gdbserver's messages go
+        nowhere). The address to connect to."""
+        from ..loader import load
+        b = self.an.bin if self.an is not None else load(self.path)
+        found = wine_gdbserver_for(b)
+        if found is None:
+            raise DebugError("debugging a Windows program here needs wine and gdbserver.exe "
+                             "(the gdb-mingw-w64-target package)")
+        wine, server = found
+        port = _free_port()
+        t = self.target
+        env = dict(os.environ, WINEDEBUG="-all")
+        env.update(t.env)
+        # pipes, not the terminal: given a tty, wine plays a Windows console on it (escape codes,
+        # Enter as \r)
+        if t.stdin:
+            stdin = open(t.stdin, "rb")                                 # noqa: SIM115 - closed below
+        else:
+            stdin, self._pipe_in = os.pipe()
+        out_r, out_w = os.pipe()
+        self.qemu = subprocess.Popen([wine, server, f"localhost:{port}", self.path, *self.args], stdin=stdin,
+                                     stdout=out_w, stderr=subprocess.DEVNULL, cwd=t.cwd or None, env=env,
+                                     start_new_session=True)
+        os.close(out_w)
+        if t.stdin:
+            stdin.close()
+        else:
+            os.close(stdin)
+        threading.Thread(target=self._read_pipe, args=(out_r,), daemon=True).start()
         return f"127.0.0.1:{port}"
 
     def detach(self):
@@ -419,11 +494,14 @@ class Session:
             self.mi.close()
             self._stop_qemu()
         finally:
-            for fd in (self.master, self._slave):
+            for fd in (self.master, self._slave, self._pipe_in):
+                if fd is None:
+                    continue
                 try:
                     os.close(fd)
                 except OSError:
                     pass
+            self._pipe_in = None
 
     # ----------------------------------------------------------- breakpoints
     def add_breakpoint(self, live_addr: int, condition: str = "", enabled: bool = True) -> int:
@@ -625,6 +703,11 @@ class Session:
             if m:
                 out.append(Module(int(m.group(1), 16), int(m.group(2), 16), m.group(4).strip(),
                                   m.group(3) == "Yes"))
+                continue
+            # a library gdb could not read (a Windows DLL on a remote gdbserver): no address range
+            m = re.match(r"\s+(Yes|No)(?:\s+\(\*\))?\s+(\S.*)$", line)
+            if m:
+                out.append(Module(0, 0, m.group(2).strip(), m.group(1) == "Yes"))
         return out
 
     def stop_on_library_load(self, on: bool = True):

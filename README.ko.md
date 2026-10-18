@@ -71,7 +71,7 @@ python3 -m venv .venv
 
 정밀하게 잰 값이 아니라 어림값입니다. 각 영역에서 "IDA가 하는 일 중 Relic이 비슷한 수준으로 하는 비율"로 읽어 주세요.
 전체 값은 영역별 가중 평균이며, 가중치는 실제 리버싱에서 각 영역이 차지하는 비중을 제 기준으로 정했습니다.
-현재 **약 77%**입니다.
+현재 **약 78%**입니다.
 
 | 영역 (가중치) | 진행률 | 비고 |
 |---|---|---|
@@ -83,7 +83,7 @@ python3 -m venv .venv
 | 디컴파일러 (20) | 52% | goto가 아직 많고, x87 부동소수점과 SIMD는 미지원 |
 | 대화형 UI (12) | 100% | |
 | 스크립팅·확장 (8) | 100% | |
-| 디버거 (7) | 90% | Windows(PE) 대상 미지원 |
+| 디버거 (7) | 100% | Windows(PE) 프로그램은 wine에서 Windows용 gdbserver.exe로 |
 | 프로젝트·협업 (5) | 100% | 스냅숏, 버전 기록, 병합, Lumina 방식의 이름 공유 |
 
 영역별로 무엇을 100%의 기준으로 삼았는지와 남은 작업은 [TODO.md](TODO.md)에,
@@ -219,6 +219,7 @@ IDA를 써 봤다면 대부분 같은 키입니다.
 Debug 메뉴(`F9`)를 쓰면 열려 있는 바이너리를 gdb에서 실행합니다. 원격 gdbserver 연결, qemu-user로 다른 아키텍처
 바이너리 실행, 실행 중인 프로세스에 붙기는 Debug ▸ Debugger target에서 선택합니다.
 디버깅 중인 프로그램의 표준 입출력은 Console 패널로 주고받습니다.
+Windows 실행 파일은 Linux에서 wine으로 띄우고 Windows용 `gdbserver.exe`로 디버깅합니다(`sudo apt install wine gdb-mingw-w64-target`).
 
 패널 구성은 pwndbg와 비슷합니다. Registers 패널은 직전 정지 이후 바뀐 값을 강조하고, 포인터는 가리키는 값을 따라가
 함께 보여 줍니다. Stack 패널은 telescope 형식이며, 그 밖에 Backtrace, Vmmap, Memory, Breakpoints, Threads, Modules
