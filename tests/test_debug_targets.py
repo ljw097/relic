@@ -21,6 +21,8 @@ CROSS = {"arm64": ("aarch64-linux-gnu-gcc", "qemu-aarch64", ["x0", "x1"]),
          "mips": ("mipsel-linux-gnu-gcc", "qemu-mipsel", ["zero", "at"]),
          "mipsbe": ("mips-linux-gnu-gcc", "qemu-mips", ["zero", "at"]),
          "mips64": ("mips64el-linux-gnuabi64-gcc", "qemu-mips64el", ["zero", "at"]),
+         "ppc": ("powerpc-linux-gnu-gcc", "qemu-ppc", ["r0", "r1"]),
+         "ppc64": ("powerpc64le-linux-gnu-gcc", "qemu-ppc64le", ["r0", "r1"]),
          "riscv64": ("riscv64-linux-gnu-gcc", "qemu-riscv64", ["ra", "sp"])}
 
 

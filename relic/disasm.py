@@ -286,6 +286,9 @@ class Disassembler:
         if arch.startswith("riscv"):
             self._classify_riscv(c, i)
             return
+        if arch.startswith("ppc"):
+            self._classify_ppc(c, i)
+            return
         if cs.CS_GRP_RET in groups or m in ("ret", "c.ret") or \
                 (arch.startswith("ppc") and m == "blr") or \
                 (arch.startswith("mips") and m == "jr" and c.op_str.strip() == "$ra") or \
@@ -325,6 +328,53 @@ class Disassembler:
                 v &= self._mask
                 if v > 0xFF and self.bin.is_mapped(v):
                     i.refs.append(v)
+
+    def _classify_ppc(self, c, i: Insn):
+        """PowerPC control flow from the instruction word (capstone's simplified mnemonics hide
+        the BO field: `bcl 20,31,.+4` decodes as `bdnzl`). Branch targets are absolute in
+        capstone's operands. `b<cond>lr` / `b<cond>ctr`: conditional return / jump."""
+        raw = int.from_bytes(c.bytes, "big" if self.bin.endian == "big" else "little")
+        op = raw >> 26
+        lk = raw & 1
+        imm = next((o.imm for o in c.operands if o.type == OP_IMM), None)
+        if op == 18:                                          # b / ba / bl / bla
+            i.kind = CALL if lk else JMP
+            i.target = imm & self._mask if imm is not None else None
+            if i.target is not None:                          # (ELFv2: a local entry is its function)
+                i.target = self.bin.ppc_local_entry.get(i.target, i.target)
+            return
+        if op == 16:                                          # bc
+            bo = (raw >> 21) & 0x1F
+            always = bo & 0x14 == 0x14
+            target = imm & self._mask if imm is not None else None
+            if lk:
+                if always and target == i.addr + 4:
+                    return                                    # `bcl 20,31,.+4`: reads pc into lr (PIC)
+                i.kind, i.target = CALL, target
+                return
+            i.kind, i.target = (JMP if always else CJMP), target
+            return
+        if op == 19:
+            xo = (raw >> 1) & 0x3FF
+            bo = (raw >> 21) & 0x1F
+            always = bo & 0x14 == 0x14
+            if xo == 16:                                      # bclr: return (or call through lr)
+                if lk:
+                    i.kind = CALL
+                else:
+                    i.kind = RET if always else CJMP
+                return
+            if xo == 528:                                     # bcctr: indirect call / jump
+                i.kind = CALL if lk else (JMP if always else CJMP)
+                return
+            return
+        if c.mnemonic in ("trap",) or (op == 31 and ((raw >> 1) & 0x3FF) == 4 and (raw >> 21) & 0x1F == 31):
+            i.kind = HALT                                     # `trap` (tw 31, 0, 0)
+            return
+        for v in (o.imm for o in c.operands if o.type == OP_IMM):
+            v &= self._mask
+            if v > 0xFF and self.bin.is_mapped(v):
+                i.refs.append(v)
 
     def _classify_riscv(self, c, i: Insn):
         """RISC-V control flow by its operands (capstone's groups call `jr t3` and the PLT's

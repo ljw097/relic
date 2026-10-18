@@ -25,7 +25,8 @@ def _c(an, name):
 
 @pytest.fixture(scope="module", params=["floats_O0", "floats_O2", "floats_a64_O0", "floats_a64_O2",
                                         "floats_arm_O0", "floats_arm_O2", "floats_thumb_O2", "floats_rv64_O0",
-                                        "floats_rv64_O2"])
+                                        "floats_rv64_O2", "floats_ppc_O0", "floats_ppc_O2", "floats_ppc64_O0",
+                                        "floats_ppc64_O2"])
 def an(request):
     return request.param, analyze(request.getfixturevalue(request.param))
 
@@ -38,7 +39,10 @@ def test_signatures(an):
     assert sig["cmpd"] == "int cmpd(double a1, double a2)", sig
     long_ = "int" if a.bin.bits == 32 else "int64_t"
     assert sig["to_long"] == f"{long_} to_long(double a1)", sig
-    assert sig["to_int"] == "int to_int(float a1)", sig
+    # PowerPC passes a float in its double form: one only converted (`fctiwz`) or used in double
+    # arithmetic reads exactly like a double parameter
+    f_ = "(float|double)" if a.bin.arch.startswith("ppc") else "float"
+    assert re.fullmatch(rf"int to_int\({f_} a1\)", sig["to_int"]), sig
     assert sig["clampd"] == "double clampd(double a1, double a2, double a3)", sig
     assert sig["narrow"] == "float narrow(double a1)", sig
     assert sig["avg"].startswith("double avg(int *a1, int a2)"), sig
@@ -48,7 +52,10 @@ def test_signatures(an):
     assert re.fullmatch(rf"int count_above\(double \*a1, {n_} a2, double a3\)", sig["count_above"]), sig
     assert re.fullmatch(rf"double sum_f\(float \*a1, {n_} a2\)", sig["sum_f"]), sig
     # integer parameters first, then the float ones (the registers do not say how C interleaved them)
-    assert sig["mix"] == f"double mix(int a1, {long_} a2, double a3, float a4)", sig
+    if a.bin.arch == "ppc64":                    # ELFv2 places arguments by position: the C order
+        assert re.fullmatch(rf"double mix\((int|int64_t) a1, double a2, {f_} a3, {long_} a4\)", sig["mix"]), sig
+    else:
+        assert re.fullmatch(rf"double mix\(int a1, {long_} a2, double a3, {f_} a4\)", sig["mix"]), sig
 
 
 def test_expressions(an):
@@ -102,7 +109,9 @@ def test_call_arguments_and_results(an):
     text = _c(a, "main")
     assert "poly(2.0)" in text or re.search(r"poly\(v\d+\)", text), text
     assert "scale(2.0f, 3.0f)" in text, text
-    assert "mix(3, 10, 1.5, 0.25f)" in text, text
+    mix = r"mix\(3, 1\.5, 0\.25f?, 10\)" if a.bin.arch == "ppc64" else \
+        r"mix\(3, 10, 1\.5, 0\.25f?\)" if a.bin.arch == "ppc" else r"mix\(3, 10, 1\.5, 0\.25f\)"
+    assert re.search(mix, text), text
     assert "to_long(3.7)" in text, text
     assert re.search(r"(= |, |\()twice\(", text), text       # the result is used (xmm0 / d0)
 
@@ -185,7 +194,8 @@ def test_recompiled_pseudocode_matches(an, tmp_path):
     name, a = an
     run = []
     cross = {"a64": ("aarch64-linux-gnu-gcc", "qemu-aarch64"), "arm": ("arm-linux-gnueabihf-gcc", "qemu-arm"),
-             "thumb": ("arm-linux-gnueabihf-gcc", "qemu-arm"), "rv64": ("riscv64-linux-gnu-gcc", "qemu-riscv64")}
+             "thumb": ("arm-linux-gnueabihf-gcc", "qemu-arm"), "rv64": ("riscv64-linux-gnu-gcc", "qemu-riscv64"),
+             "ppc": ("powerpc-linux-gnu-gcc", "qemu-ppc"), "ppc64": ("powerpc64le-linux-gnu-gcc", "qemu-ppc64le")}
     kind = next((k for k in cross if f"_{k}_" in name), None)
     if kind is not None:
         cc, qemu = (shutil.which(t) for t in cross[kind])
@@ -277,7 +287,7 @@ def test_optimisation_preserves_meaning(an, fname):
                   if isinstance(x, Var) and x.version == 0}:
             m.regs[x] = 0                         # entry registers the test does not set
         m.regs.update({k: 0 for k in ("rax", "rdi", "rsi", "rbp", "x0", "x29", "x30", "r0", "r11", "lr")},
-                      rsp=0x7FFF0000, sp=0x7FFF0000)
+                      rsp=0x7FFF0000, sp=0x7FFF0000, r1=0x7FFF0000)
         m.write(0x7FFF0000, 0xDEAD0000, 8)
         for k, v in enumerate(args):
             w = 32 if fname == "scale" else 64
@@ -288,6 +298,9 @@ def test_optimisation_preserves_meaning(an, fname):
                     m.regs[d] = m.regs.get(d, 0) | bits << (32 * (k & 1))
                 else:
                     m.regs[f"d{k}"] = bits
+                continue
+            if a.bin.arch.startswith("ppc"):        # f1, f2, ...: a float too in its double form
+                m.regs[f"f{k + 1}"] = from_float(v, 64)
                 continue
             m.regs[{"arm64": f"v{k}", "riscv64": f"fa{k}"}.get(a.bin.arch, f"xmm{k}")] = bits
         it = Interpreter(fn, m)

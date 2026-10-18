@@ -23,8 +23,9 @@ from ..progress import checkpoint
 from .arch import ArchInfo
 from .fp import fold_fcmp, is_fcmp, negate_fcmp
 from .interp import InterpError, apply_binop, apply_cast, apply_unop
-from .ir import (BARRIERS, Assign, BinOp, Branch, Call, CallStmt, Cast, Const, Effect, Expr, Extract, IRFunction,
-                 Ite, Jump, Load, Phi, Return, UnOp, Unknown, Var, children, mask, stmt_exprs, transform, walk)
+from .ir import (BARRIERS, Assign, BinOp, Branch, Call, CallStmt, Cast, Const, Effect, Expr, Extract, Intrinsic,
+                 IRFunction, Ite, Jump, Load, Phi, Return, UnOp, Unknown, Var, children, mask, stmt_defs, stmt_exprs,
+                 transform, walk)
 
 MAX_ITERS = 64
 
@@ -259,6 +260,14 @@ def _simp_node(e: Expr) -> Expr:
         if op == "+":
             if z(b): return a
             if z(a): return b
+            if (isinstance(a, UnOp) and a.op == "~" and a.a == b or isinstance(b, UnOp) and b.op == "~" and
+                    b.a == a) and _droppable(a) and _droppable(b):
+                return Const(mask(w), w)                  # `~x + x` is -1 (PowerPC `subfe r, r, r`)
+            if isinstance(b, Const) and isinstance(a, BinOp) and a.op == "+" and isinstance(a.a, Const):
+                return BinOp("+", a.b, Const((a.a.value + b.value) & mask(w), w), w)
+            if isinstance(b, Const) and isinstance(a, BinOp) and a.op == "+" and isinstance(a.b, Const):
+                k = (a.b.value + b.value) & mask(w)      # `(x + 4) + 4` -> `x + 8`
+                return a.a if k == 0 else BinOp("+", a.a, Const(k, w), w)
         elif op == "-":
             if z(b): return a
             if a == b and _droppable(a): return Const(0, w)
@@ -276,16 +285,34 @@ def _simp_node(e: Expr) -> Expr:
             if ones(b): return a
             if ones(a): return b
             if a == b and _droppable(a): return a
-            if isinstance(a, Cast) and a.kind == "zext" and a.a.bits == 1 and isinstance(b, Const) and b.value & 1:
-                return a                                  # `(int)c & 0xff`: c is 0 or 1 already
+            if isinstance(a, Cast) and a.kind == "zext" and isinstance(b, Const) and \
+                    b.value & mask(a.a.bits) == mask(a.a.bits):
+                return a                                  # `(int)c & 0xff`: a zero-extended byte already
         elif op == "<u" and one(b):
             return BinOp("==", a, Const(0, a.bits), 1)    # `x <u 1` (MIPS `sltiu x, 1`): x == 0
         elif op == "^":
             if z(b): return a
             if z(a): return b
+            if isinstance(b, Const) and isinstance(a, BinOp) and a.op == "^" and isinstance(a.b, Const):
+                k = (a.b.value ^ b.value) & mask(w)       # `(x ^ c1) ^ c2` -> `x ^ (c1 ^ c2)`
+                return a.a if k == 0 else BinOp("^", a.a, Const(k, w), w)
             if a == b and _droppable(a): return Const(0, w)
+        elif op == "f-" and w == 64 and isinstance(b, Const) and b.value in (0x4330000080000000, 0x4330000000000000) \
+                and isinstance(a, BinOp) and a.op == "|" and isinstance(a.a, Const) and \
+                a.a.value == 0x4330000000000000 and isinstance(a.b, Cast) and a.b.kind == "zext" and \
+                a.b.a.bits == 32:
+            # (2^52 + y) - (2^52 + 2^31) is the signed value of y ^ 2^31; - 2^52 the unsigned y
+            y = a.b.a
+            if b.value == 0x4330000000000000:
+                return Intrinsic("uitofp", (y,), 64)
+            return Intrinsic("sitofp", (BinOp("^", y, Const(0x80000000, 32), 32),), 64)
         elif op in ("<<", ">>u", ">>s"):
             if z(b): return a
+            if op == ">>u" and isinstance(b, Const) and isinstance(a, Intrinsic) and \
+                    a.name in ("clz", "clzll") and len(a.args) == 1 and b.value == (a.args[0].bits).bit_length() - 1:
+                # count-leading-zeros of x is the width only for x == 0 (PowerPC `cntlzw; srwi 5`)
+                x = a.args[0]
+                return Cast("zext", BinOp("==", x, Const(0, x.bits), 1), w)
         elif op in ("&&", "||"):
             if a == b and _droppable(a): return a
         elif op in ("==", "!=") and z(b) and isinstance(a, BinOp) and a.op == "|" and \
@@ -315,8 +342,29 @@ def _simp_node(e: Expr) -> Expr:
     elif isinstance(e, Ite) and isinstance(e.b, Ite) and (e.b.cond == e.cond or _negation(e.b.cond, e.cond)):
         # predicated moves (`moveq r3, #1; movne r3, #0`): the inner test is decided by the outer one
         return Ite(e.cond, e.a, e.b.b if e.b.cond == e.cond else e.b.a, e.bits)
+    elif isinstance(e, Intrinsic) and e.name in ("fpconv", "fptosi", "fptoui") and len(e.args) == 1 and \
+            isinstance(e.args[0], Intrinsic) and e.args[0].name == "fpconv" and e.args[0].bits == 64 and \
+            e.args[0].args[0].bits == 32 and (e.name != "fpconv" or e.bits == 32):
+        # a float widened to double and back (or converted to an integer): exactly the float
+        x = e.args[0].args[0]
+        return x if e.name == "fpconv" else Intrinsic(e.name, (x,), e.bits)
+    elif isinstance(e, Intrinsic) and e.name == "fpconv" and len(e.args) == 1 and isinstance(e.args[0], Const) \
+            and e.bits == 64 and e.args[0].bits == 32:
+        from .fp import from_float, to_float
+        return Const(from_float(to_float(e.args[0].value, 32), 64), 64)     # `(double)0.25f` is 0.25
+    elif isinstance(e, Intrinsic) and e.name == "fpconv" and len(e.args) == 1 and isinstance(e.args[0], Const) \
+            and e.bits == 32 and e.args[0].bits == 64:
+        from .fp import from_float, to_float
+        v = to_float(e.args[0].value, 64)
+        if from_float(v, 64) == e.args[0].value and to_float(from_float(v, 32), 32) == v:
+            return Const(from_float(v, 32), 32)       # a double constant that is exactly a float
+        return e
     elif isinstance(e, Cast) and e.a.bits == e.bits:
         return e.a
+    elif isinstance(e, Cast) and e.kind == "low" and isinstance(e.a, Cast) and e.a.kind in ("zext", "sext") and \
+            e.a.a.bits <= e.bits:
+        # the low part of a widened value is the narrower widening (`(int)(uint64_t)c`: `(int)c`)
+        return e.a.a if e.a.a.bits == e.bits else Cast(e.a.kind, e.a.a, e.bits)
     elif isinstance(e, Extract):
         r = _simp_extract(e)
         if r is not e:
@@ -355,6 +403,11 @@ def _propagate(fn: IRFunction) -> bool:
     sub: dict[Var, Expr] = {}
     for v, src in defs.items():
         if isinstance(src, Phi):
+            # a phi of one constant from every side (or of itself around a loop and one constant):
+            # that constant -- a register set alike on each path (PowerPC `lis r9, hi` per path)
+            vals = {x for _, x in src.sources if x != v}
+            if len(vals) == 1 and isinstance(next(iter(vals)), Const):
+                sub[v] = next(iter(vals))
             continue
         if _trivial(src):
             sub[v] = src
@@ -799,11 +852,85 @@ def _join_halves(fn: IRFunction) -> bool:
     return changed
 
 
+def _known_zext(fn: IRFunction) -> dict:
+    """SSA variables whose value fits in n low bits (every definition a zero-extension of an n-bit
+    value, or a phi of such): var -> n."""
+    defs: dict = {}
+    other = set()                     # variables some other statement (a call, an unknown) writes
+    for s in fn.stmts():
+        if isinstance(s, Assign) and isinstance(s.dst, Var):
+            defs.setdefault(s.dst, []).append(s.src)
+        else:
+            other.update(d for d in stmt_defs(s) if isinstance(d, Var))
+    known: dict = {}
+    changed = True
+    while changed:
+        changed = False
+        for v, srcs in defs.items():
+            if v in known or v in other:
+                continue
+            ws = []
+            for e in srcs:
+                if isinstance(e, Cast) and e.kind == "low" and isinstance(e.a, Cast) and e.a.kind == "zext" and \
+                        e.a.a.bits <= e.bits:
+                    e = e.a                             # (narrowed: `low32(zext64(byte))`)
+                if isinstance(e, Cast) and e.kind == "zext":
+                    ws.append(e.a.bits)
+                elif isinstance(e, Phi):
+                    ws += [known.get(x) if isinstance(x, Var) else None for _, x in e.sources]
+                else:
+                    ws.append(None)
+            if ws and all(w is not None for w in ws):
+                known[v] = max(ws)
+                changed = True
+    return known
+
+
+def _redundant_masks(fn: IRFunction) -> bool:
+    """`v & 0xff` of a variable that only ever holds a zero-extended byte is `v` (a loop's loaded
+    character, masked again at each use)."""
+    known = _known_zext(fn)
+    if not known:
+        return False
+
+    def node(e: Expr) -> Expr:
+        if isinstance(e, BinOp) and e.op == "&":
+            for x, k in ((e.a, e.b), (e.b, e.a)):
+                n = known.get(x) if isinstance(x, Var) else None
+                if n is not None and isinstance(k, Const) and k.value & mask(n) == mask(n):
+                    return x
+        return e
+    return _rewrite(fn, lambda e: transform(e, node))
+
+
+def _plain_single(e: Expr) -> Expr:
+    """PowerPC `fpsingle` (a float read from its double form, see the lifter) is a `fpconv` once
+    the parameters' types are known."""
+    if isinstance(e, Intrinsic) and e.name == "fpsingle":
+        return Intrinsic("fpconv", e.args, e.bits)
+    return e
+
+
+def _const_loads(fn: IRFunction) -> bool:
+    """A load of a word in `fn.const_words` (at a constant address) is that constant."""
+    words = fn.const_words
+
+    def node(e: Expr) -> Expr:
+        if isinstance(e, Load) and isinstance(e.addr, Const) and e.bits % 8 == 0:
+            v = words.value(e.addr.value, e.bits // 8)
+            if v is not None:
+                return Const(v, e.bits)
+        return e
+    return _rewrite(fn, lambda e: transform(e, node))
+
+
 def optimize(fn: IRFunction, arch: ArchInfo | None = None) -> IRFunction:
     """Run every pass to a fixpoint. Mutates and returns `fn` (expects SSA input)."""
     folded: dict = {}
     conds: dict = {}
     halves = arch is not None and arch.name.startswith("arm-aapcs")
+    if arch is not None and arch.name.startswith("ppc"):
+        _rewrite(fn, lambda e: transform(e, _plain_single))
     for _ in range(MAX_ITERS):
         checkpoint()                 # a cancelled decompilation stops between rounds
         changed = False
@@ -813,6 +940,9 @@ def optimize(fn: IRFunction, arch: ArchInfo | None = None) -> IRFunction:
         changed |= _fold_pass(fn, folded)
         changed |= _propagate(fn)
         changed |= _forward_loads(fn)
+        if fn.const_words:
+            changed |= _const_loads(fn)
+        changed |= _redundant_masks(fn)
         changed |= _conditions(fn, conds)
         changed |= _sign_fixups(fn)
         changed |= _dce(fn)

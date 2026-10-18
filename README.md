@@ -48,8 +48,8 @@ Roughly, here's what works:
 
 - **Files it opens**: ELF (executables, shared libraries, `.o` files, core dumps), PE, COFF objects, members of `.a`
   archives, Intel HEX / S-record, and plain raw dumps. For raw firmware it will also guess the load address (`--base auto`).
-- **Architectures**: x86, x86-64, ARM/Thumb, AArch64, MIPS32 (both byte orders), MIPS64 and RISC-V (RV64GC) go all the way to pseudocode.
-  PPC is disassembly only.
+- **Architectures**: x86, x86-64, ARM/Thumb, AArch64, MIPS32 (both byte orders), MIPS64, RISC-V (RV64GC), and
+  PowerPC (32-bit and 64-bit little-endian) go all the way to pseudocode.
 - **Analysis**: functions, CFGs, xrefs, strings, jump tables, finding `main` in stripped binaries, and working out
   which compiler and libc built the binary.
 - **Library function names**: in statically linked, stripped binaries it finds libc and other library functions by
@@ -68,12 +68,12 @@ Roughly, here's what works:
 ### Where it stands against IDA
 
 These numbers are eyeballed. Read them as "the share of what IDA does in that area that Relic does about as well."
-The total is a weighted average, with weights from how much each area matters to me when I'm actually reversing. Right now it's **about 76%**.
+The total is a weighted average, with weights from how much each area matters to me when I'm actually reversing. Right now it's **about 77%**.
 
 | Area (weight) | Progress | Notes |
 |---|---|---|
 | File formats (8) | 70% | No Mach-O |
-| Processors (8) | 55% | IDA handles 60+ CPU families, so this is the furthest behind |
+| Processors (8) | 70% | IDA handles 60+ CPU families, so this is the furthest behind |
 | Auto-analysis (14) | 55% | Still misses some functions and indirect jumps in big binaries |
 | Library identification (8) | 100% | On the stripped static C test binaries, 83–94% of the functions that had symbols get named, with no wrong names |
 | Type system (10) | 85% | No by-value struct arguments or returns |

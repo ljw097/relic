@@ -347,6 +347,12 @@ class Analysis:
             if not (isinstance(s, CallStmt) and (s.name or "").split("@")[0] == "__libc_start_main"):
                 continue
             v = dict(s.uses).get(regs[0]) if regs else None
+            if arch.name.startswith("ppc"):
+                # PowerPC glibc: r8 points at `{sda_base, main, init, fini}`
+                info = dict(s.uses).get("r8")
+                word = arch.bits // 8
+                m = self.bin.read_int(info.value + word, word) if isinstance(info, Const) else None
+                v = Const(m, arch.bits) if m is not None else None
             if isinstance(v, Load) and isinstance(v.addr, Const):
                 v = self.bin.read_int(v.addr.value, v.bits // 8)
                 v = Const(v, arch.bits) if v is not None else None

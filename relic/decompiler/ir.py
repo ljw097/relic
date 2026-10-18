@@ -382,11 +382,29 @@ def copy_stmt(s: Stmt) -> Stmt:
     return c
 
 
+class ConstWords(dict):
+    """Memory words that hold link-time constants though their section is writable (a GOT the
+    loader fills from relocations): address -> (size in bytes, value). Shared, never copied.
+    `ro_reader(addr, size)`: also a word of read-only data (PowerPC64 loads 64-bit constants
+    from there through the TOC), or None."""
+    ro_reader = None
+
+    def __deepcopy__(self, memo):
+        return self
+
+    def value(self, addr: int, size: int):
+        w = self.get(addr)
+        if w is not None:
+            return w[1] if w[0] == size else None
+        return self.ro_reader(addr, size) if self.ro_reader is not None else None
+
+
 @dataclass
 class IRFunction:
     addr: int
     name: str
     blocks: dict[int, IRBlock] = field(default_factory=dict)
+    const_words: ConstWords | None = None
 
     def __deepcopy__(self, memo):
         # expressions are immutable: new blocks and statements share them (much faster than a

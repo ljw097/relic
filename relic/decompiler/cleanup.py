@@ -61,7 +61,7 @@ def _reaches_tls(e: Expr, defs: dict[Var, Expr], depth: int = 4, guards=frozense
         if isinstance(x, Const) and x.value in guards:
             return True
         if isinstance(x, Var):
-            if x.name in ("fs_base", "gs_base"):
+            if x.name in ("fs_base", "gs_base", "tp_base"):
                 return True
             if depth and x in defs:
                 key = (x, depth)

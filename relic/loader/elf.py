@@ -1,6 +1,7 @@
 """ELF loader built on pyelftools."""
 from __future__ import annotations
 
+import bisect
 import io
 
 import capstone as cs
@@ -97,6 +98,14 @@ def load_elf(path: str, data: bytes) -> Binary:
             if kind is None:
                 continue
             addr = sym["st_value"]
+            if arch == "ppc64" and kind == "func":
+                # ELFv2: callers sharing the TOC enter past the TOC setup (st_other bits 5-7)
+                try:
+                    v = int(sym["st_other"]["local"])
+                except (KeyError, TypeError):
+                    v = 0
+                if 2 <= v <= 6:
+                    b.ppc_local_entry[addr + (((1 << v) >> 2) << 2)] = addr
             if arch == "arm" and kind == "func":
                 if addr & 1:
                     b.thumb_code.add(addr & ~1)
@@ -143,8 +152,15 @@ def load_elf(path: str, data: bytes) -> Binary:
                                        rel["r_addend"] if rel.is_RELA() else 0))
             if name:
                 got_names[off] = name
+            elif rel.is_RELA() and rel["r_addend"] and "RELATIVE" in b.relocs[-1].kind and \
+                    b.read_int(off, b.bits // 8) == 0:
+                b.fill_relocation(off, rel["r_addend"], b.bits // 8)
     b.got_names = got_names
 
+    if arch == "ppc64":
+        got = next((s for s in b.sections if s.name == ".got"), None)
+        if got is not None:
+            b.ppc_toc = got.addr + 0x8000            # ELFv2's `.TOC.`
     if arch.startswith("mips"):
         _resolve_mips_got(b, elf, got_names)
         if getattr(b, "mips_gp", None) is None:
@@ -152,6 +168,90 @@ def load_elf(path: str, data: bytes) -> Binary:
     _resolve_plt(b, got_names)
     b._finalize()
     return b
+
+
+def _ppc_call_stubs(b: Binary, got_names: dict[int, str], found: dict[int, str]):
+    """PowerPC calls go through stubs in `.text` that load a `.plt` slot into `ctr`:
+
+        lis r11, hi ; lwz r11, lo(r11) ; mtctr r11 ; bctr          32-bit, absolute
+        lwz r11, off(r30) ; mtctr r11 ; bctr                       32-bit PIC
+        [std r2, 24(r1)] ; addis r12, r2, hi ; ld r12, lo(r12) ; mtctr r12 ; bctr   64-bit (r2 = TOC)
+
+    A 32-bit PIC stub indexes from the `r30` of its callers: their object's `.got2` + 0x8000,
+    which each builds with `bcl 20,31,.+4; mflr r30; addis r30,r30,hi; addi r30,r30,lo`."""
+    bits = 64 if b.arch == "ppc64" else 32
+    mode = (cs.CS_MODE_64 if bits == 64 else cs.CS_MODE_32) | \
+        (cs.CS_MODE_BIG_ENDIAN if b.endian == "big" else cs.CS_MODE_LITTLE_ENDIAN)
+    md = cs.Cs(cs.CS_ARCH_PPC, mode)
+    md.detail = True
+    md.skipdata = True                  # (words in .text that are not instructions: keep going)
+    mask = (1 << bits) - 1
+    toc = getattr(b, "ppc_toc", None)
+    listings = [list(md.disasm(b.data[sec.offset:sec.offset + sec.size], sec.addr)) for sec in b.exec_sections]
+    by_addr = {i.address: (insns, k) for insns in listings for k, i in enumerate(insns)}
+    starts = sorted(s.addr for s in b.symbols.values() if s.kind == "func")
+
+    def stub_at(addr):
+        """(start, slot register, displacement, absolute slot or None) of the stub at `addr`."""
+        pos = by_addr.get(addr)
+        if pos is None:
+            return None
+        insns, k = pos
+        seq = insns[k:k + 6]
+        n = next((j for j, i in enumerate(seq) if i.mnemonic == "bctr"), None)
+        if n is None or n < 2 or seq[n - 1].mnemonic != "mtctr":
+            return None
+        ld = seq[n - 2]
+        if ld.mnemonic not in ("lwz", "ld") or len(ld.operands) != 2 or ld.operands[1].type != cs.ppc.PPC_OP_MEM:
+            return None
+        r = ld.reg_name(ld.operands[0].reg)
+        base, disp = ld.reg_name(ld.operands[1].mem.base), ld.operands[1].mem.disp
+        hi = seq[n - 3] if n >= 3 else None
+        if base == "r2" and toc is not None:                  # `ld r12, off(r2)`: a TOC-relative slot
+            start = addr
+            return start, None, 0, (toc + disp) & mask
+        if hi is not None and hi.mnemonic in ("lis", "addis") and base == r and hi.reg_name(hi.operands[0].reg) == r:
+            imm = hi.operands[-1].imm << 16
+            if hi.mnemonic == "lis":
+                return addr, None, 0, (imm + disp) & mask
+            src = hi.reg_name(hi.operands[1].reg)
+            if src == "r2" and toc is not None:
+                return addr, None, 0, (toc + imm + disp) & mask
+            return None
+        return addr, base, disp, None
+
+    # absolute stubs: wherever they are
+    for insns in listings:
+        for i in insns:
+            st = stub_at(i.address) if i.mnemonic in ("lis", "std", "addis") else None
+            if st and st[3] in got_names and i.address not in found:
+                b.imports.append(Import(got_names[st[3]], i.address, st[3]))
+                found[i.address] = got_names[st[3]]
+    # PIC stubs: through their callers' r30
+    for insns in listings:
+        r30 = None
+        func = None
+        for k, i in enumerate(insns):
+            f = starts[bisect.bisect_right(starts, i.address) - 1] if starts and i.address >= starts[0] else None
+            if f != func:
+                func, r30 = f, None
+            raw = int.from_bytes(i.bytes, "big" if b.endian == "big" else "little")
+            if raw == 0x429F0005 and k + 3 < len(insns):         # bcl 20,31,.+4 (capstone: `bdnzl`)
+                m, hi, lo = insns[k + 1:k + 4]
+                if m.mnemonic == "mflr" and hi.mnemonic == "addis" and lo.mnemonic == "addi" and \
+                        len(hi.operands) == 3 and len(lo.operands) == 3:
+                    r30 = (m.address + (hi.operands[2].imm << 16) + lo.operands[2].imm) & mask
+                continue
+            if i.mnemonic != "bl" or r30 is None or not i.operands:
+                continue
+            t = i.operands[0].imm & mask
+            if t in found:
+                continue
+            st = stub_at(t)
+            if st and st[1] == "r30" and (r30 + st[2]) & mask in got_names:
+                slot = (r30 + st[2]) & mask
+                b.imports.append(Import(got_names[slot], t, slot))
+                found[t] = got_names[slot]
 
 
 # dynamic relocation types pyelftools does not name for RISC-V
@@ -308,8 +408,10 @@ def _resolve_plt(b: Binary, got_names: dict[int, str]):
                 if slot in got_names and a.address not in found:
                     b.imports.append(Import(got_names[slot], a.address, slot))
                     found[a.address] = got_names[slot]
+    elif b.arch in ("ppc", "ppc64"):
+        _ppc_call_stubs(b, got_names, found)
     # fallback: order of .rela.plt entries -> sequential PLT stubs
-    if not found and plt_secs and got_names:
+    if not found and plt_secs and got_names and not b.arch.startswith("ppc"):
         plt = plt_secs[0]
         ent = 16 if b.arch in ("x64", "x86", "arm64") else 12
         hdr = 32 if b.arch == "arm64" else (20 if b.arch == "arm" else ent)
@@ -321,9 +423,10 @@ def _resolve_plt(b: Binary, got_names: dict[int, str]):
     # data imports (GLOB_DAT): no stub, referenced through GOT
     have = {i.got for i in b.imports}
     for r in b.relocs:
-        # (RISC-V has no GLOB_DAT: a symbol's GOT slot is an R_RISCV_64 in .got)
-        got_slot = r.kind in ("R_RISCV_64",) and any(s.name == ".got" and s.addr <= r.addr < s.addr + s.size
-                                                    for s in b.sections)
+        # (RISC-V has no GLOB_DAT: a symbol's GOT slot is an R_RISCV_64 in .got; PowerPC PIC code
+        # reads `.got2` / `.toc` words relocated by R_PPC_ADDR32 / R_PPC64_ADDR64)
+        got_slot = r.kind in ("R_RISCV_64", "R_PPC_ADDR32", "R_PPC64_ADDR64") and \
+            any(s.name in (".got", ".got2", ".toc") and s.addr <= r.addr < s.addr + s.size for s in b.sections)
         if r.name and r.addr not in have and ("GLOB_DAT" in r.kind or "JUMP_SLOT" in r.kind or got_slot):
             b.imports.append(Import(r.name, 0, r.addr))
             have.add(r.addr)

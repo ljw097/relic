@@ -840,6 +840,10 @@ class CWriter:
         if e.op in ("funord", "ford"):
             text = f"isunordered({self.fexpr(e.a)}, {self.fexpr(e.b)})"
             return (text, PREC_POSTFIX) if e.op == "funord" else (f"!{text}", PREC_UNARY)
+        if e.op in ("f<u", "f<=u"):
+            # unordered or less (than or equal): exactly "not greater (than or equal)" in C, NaN included
+            neg = ">=" if e.op == "f<u" else ">"
+            return f"!({self.fexpr(e.a, 10)} {neg} {self.fexpr(e.b, 11)})", PREC_UNARY
         a, b, op = e.a, e.b, self._FCMP_C[e.op]
         if isinstance(self._unwrap_float(a), Const) and not isinstance(self._unwrap_float(b), Const):
             a, b, op = b, a, FLIP.get(op, op)
@@ -861,6 +865,8 @@ class CWriter:
             return f"({int_type(e.bits, e.name == 'fptoui')}){self.fexpr(x, PREC_UNARY)}", PREC_UNARY
         if e.name == "fpconv":
             t = "double" if e.bits == 64 else "float"
+            if isinstance(x, (Var, StackVar)) and self.ftypes.get(x.name) == e.bits:
+                return self._expr(x)               # (PowerPC: a float variable held as a double)
             return f"({t}){self.fexpr(x, PREC_UNARY)}", PREC_UNARY
         return f"{e.name}({', '.join(self.fexpr(a) for a in e.args)})", PREC_POSTFIX
 

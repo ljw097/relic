@@ -53,14 +53,15 @@
 - [x] RISC-V 링커 완화(relaxation) 모델링: `call` → `jal`/`c.j`, 주소를 만드는 auipc/lui 삭제(쓰는 명령의 기준 레지스터는 gp/tp로), TLS add 삭제, 정렬 nop 삭제
 - [x] GUI 시그니처 창(File ▸ Library signatures, `Shift+F5`): 세트 목록(라이브러리·버전·아키텍처·형식·시그니처 수), 이 바이너리에 맞는 세트, 세트별 이름 붙인 수, 적용·이름 되돌리기·파일 추가·툴체인에서 생성
 
-## P1 — 프로세서 100%까지 (README 55%)
+## P1 — 프로세서 100%까지 (README 70%)
 
 IDA의 60여 개 CPU 계열 전부가 아니라, 리버싱·포너블·펌웨어에서 실제로 만나는 계열을 기준으로 삼습니다.
 
 - [x] 분석·디컴파일: x86, x86-64, ARM/Thumb, AArch64, RISC-V RV64GC
 - [x] MIPS32 little/big-endian(o32), MIPS64(n64: `d...` 명령, 32비트 연산의 부호 확장, `a4`-`a7` 인자, `.gpdword` 점프 테이블, `$t9`로 만드는 `_gp`), qemu로 디버깅
 - [ ] RISC-V RV32(ILP32)
-- [ ] PowerPC 32비트(SysV), PowerPC64(ELFv2 LE / ELFv1 BE 함수 디스크립터)
+- [x] PowerPC 32비트(SysV, 빅 엔디언)·PowerPC64(ELFv2 리틀 엔디언): 리프터(명령 필드에서 직접 해독, CR 필드·record 형식·ctr·carry), PLT 호출 스텁(`.text`의 스텁, PIE는 호출자의 r30으로), ctr 점프 테이블, TOC·로컬 진입점, 스택 보호값(스레드 포인터), 부동소수점(FPR은 항상 double 형태, 단정밀도 연산·`0x43300000` 정수→double 관용구·VSX 스칼라·POWER9 `lxsd`), 위치로 정해지는 ELFv2 인자 순서, stripped `main`(r8의 시작 정보 블록), qemu 디버깅
+- [ ] PowerPC64 ELFv1(빅 엔디언, 함수 디스크립터 `.opd`)
 - [ ] 디스어셈블만: capstone이 아는 나머지(SPARC, SystemZ, M68K, SH, TriCore, BPF, WASM 등)
 
 ## P1 — 파일 포맷 100%까지 (README 70%)
@@ -112,5 +113,5 @@ IDA의 60여 개 CPU 계열 전부가 아니라, 리버싱·포너블·펌웨어
 
 - [ ] 부동소수점: x87(`fld`/`fstp`, 32비트 cdecl의 `double` 반환), `unsigned` ↔ `double` 변환 관용구(`cvtsi2sd` + 보정 분기)
 - [ ] C 헤더: 매크로 상수(`#define`) 이름으로 상수 출력(어느 인자에 쓰이는지 알아야 함), 구조체 by-value 인자, MS ABI 비트필드 레이아웃
-- [ ] PPC 리프터(호출 인자 추출은 같은 경로로), PPC64 ELFv1 함수 디스크립터; RV32(ILP32) 리프터
+- [ ] RV32(ILP32) 리프터
 - [ ] ARM 데이터 영역을 코드로 잘못 읽은 경우(coprocessor 명령 등) 감지

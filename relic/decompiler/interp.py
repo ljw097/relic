@@ -113,12 +113,13 @@ def apply_cast(kind: str, a: int, src_bits: int, bits: int) -> int:
 
 
 class Machine:
-    """Registers + sparse little-endian memory backed by the binary image."""
+    """Registers + sparse memory backed by the binary image, in the binary's byte order."""
 
     def __init__(self, binary=None):
         self.bin = binary
         self.regs: dict[str, int] = {}
         self.mem: dict[int, int] = {}
+        self.big = getattr(binary, "endian", "little") == "big"
 
     def read(self, addr: int, size: int) -> int:
         out = 0
@@ -131,12 +132,12 @@ class Machine:
                 b = data[0] if data else 0
             else:
                 raise InterpError(f"read of uninitialised memory at {a:#x}")
-            out |= b << (8 * k)
+            out |= b << (8 * (size - 1 - k if self.big else k))
         return out
 
     def write(self, addr: int, value: int, size: int):
         for k in range(size):
-            self.mem[addr + k] = (value >> (8 * k)) & 0xFF
+            self.mem[addr + k] = (value >> (8 * (size - 1 - k if self.big else k))) & 0xFF
 
     def write_bytes(self, addr: int, data: bytes):
         for k, b in enumerate(data):
@@ -192,6 +193,8 @@ class Interpreter:
             return apply_fintrinsic(e.name, args, e.bits)
         if e.name in FP_CASTS:
             return apply_fcast(e.name, args[0], e.args[0].bits, e.bits)
+        if e.name == "fpsingle":                    # PowerPC: a float-valued double, as a float
+            return apply_fcast("fpconv", args[0], e.args[0].bits, e.bits)
         if e.name == "parity":
             return int(bin(args[0] & 0xFF).count("1") % 2 == 0)
         if e.name == "smul_overflow":
