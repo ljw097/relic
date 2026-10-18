@@ -1,4 +1,4 @@
-"""Exploit-mitigation summary (checksec) for ELF and PE."""
+"""Exploit-mitigation summary (checksec) for ELF, PE and Mach-O."""
 from __future__ import annotations
 
 from ..loader.base import Binary
@@ -14,6 +14,8 @@ def checksec(b: Binary) -> dict[str, str]:
         return _elf(b)
     if b.format == "PE":
         return _pe(b)
+    if b.format == "Mach-O":
+        return _macho(b)
     return {"Arch": b.arch}
 
 
@@ -78,4 +80,26 @@ def _pe(b: Binary) -> dict[str, str]:
         "SEH": "No (NO_SEH)" if dc & 0x400 else "Yes",
         "GS": "Yes" if gs else "No",
         "Subsystem": str(b.info.get("subsystem", "")),
+    }
+
+
+MH_ALLOW_STACK_EXECUTION, MH_PIE, MH_NO_HEAP_EXECUTION = 0x20000, 0x200000, 0x1000000
+
+
+def _macho(b: Binary) -> dict[str, str]:
+    flags = getattr(b, "macho_flags", 0)
+    imported = {i.name for i in b.imports}
+    fortified = sorted(n for n in imported if n.startswith("__") and n.endswith("_chk") and n != "__stack_chk_fail")
+    return {
+        "Arch": f"{b.arch}-{b.bits}-{b.endian}",
+        "PIE": "Yes" if flags & MH_PIE else "No",
+        "NX stack": "No (MH_ALLOW_STACK_EXECUTION)" if flags & MH_ALLOW_STACK_EXECUTION else "Yes",
+        # (64-bit processes never get an executable heap; the flag matters for 32-bit ones)
+        "NX heap": "Yes" if flags & MH_NO_HEAP_EXECUTION or b.bits == 64 else "No",
+        "Canary": "Yes" if imported & {"__stack_chk_fail", "__stack_chk_guard"} else "No",
+        "Fortify": ", ".join(fortified) if fortified else "No",
+        "Code signature": "Yes" if "code signature" in b.info else "No",
+        "Encrypted": "Yes" if "encrypted" in b.info else "No",
+        "Restrict": "Yes" if "__RESTRICT" in getattr(b, "macho_segments", ()) else "No",
+        "ARC": "Yes" if imported & {"objc_release", "objc_retain", "objc_storeStrong"} else "No",
     }

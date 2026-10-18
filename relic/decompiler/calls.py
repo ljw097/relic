@@ -26,6 +26,7 @@ _INT_ARGS = {
     "x64-win": ("rcx", "rdx", "r8", "r9"),
     "x86-cdecl": (),  # arguments are passed on the stack (recovered with the frame, stage 3b)
     "arm64-aapcs": tuple(f"x{k}" for k in range(8)),
+    "arm64-aapcs-apple": tuple(f"x{k}" for k in range(8)),
     "arm-aapcs": ("r0", "r1", "r2", "r3"),
     "arm-aapcs-vfp": ("r0", "r1", "r2", "r3"),
     "mips-o32": ("a0", "a1", "a2", "a3"),
@@ -240,7 +241,8 @@ def _compute_livein(an: "Analysis", arch: ArchInfo, target: int, prefix: bool = 
                 keep = set(argregs[:n])
                 if is_fp_arch(arch) and fmt is not None:
                     classes = arg_classes(sig, fmt, scan="scanf" in (s.name or ""))
-                    keep = {r for r in place_args(arch, classes, argregs, variadic=True) if r in argregs}
+                    keep = {r for r in place_args(arch, classes, argregs, variadic=True, fixed=sig.fmt + 1)
+                            if r in argregs}
                 tops += [v for r, v in s.uses if r in keep]
         used |= {x for top in tops for x in walk(top) if isinstance(x, Var)}
     work = [v for v in used if v in phis]
@@ -531,7 +533,8 @@ def recover_calls(fn: IRFunction, an: "Analysis", arch: ArchInfo) -> IRFunction:
                     sig.fmt < len(argregs) else None
                 if is_fp_arch(arch) and (fmt is not None or any(t in ("double", "float") for t in sig.types)):
                     classes = arg_classes(sig, fmt, scan="scanf" in (name or ""))
-                    placed = place_args(arch, classes, argregs, variadic=fmt is not None)
+                    placed = place_args(arch, classes, argregs, variadic=fmt is not None,
+                                        fixed=sig.fmt + 1 if sig.fmt is not None else None)
                 else:
                     n = arg_count(sig, fmt)
                     selected = list(argregs[:n]) + [None] * (n - len(argregs))   # the rest on the stack

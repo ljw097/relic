@@ -138,6 +138,13 @@ def _recognise(full: Expr, x: Expr) -> Expr | None:
     if q != 0:
         c0 = round(probe / q)
         cands += [c for c in (c0, c0 - 1, c0 + 1) if 2 <= abs(c) < (1 << (w - 1))]
+        # a large divisor leaves a small quotient: every divisor giving that quotient (`x / 100000`
+        # of a 32-bit x: probe / q is ~100005)
+        aq = abs(q)
+        lo, hi = probe // (aq + 1) + 1, probe // aq
+        if 0 < hi - lo < 64:
+            sign = 1 if q > 0 else -1
+            cands += [sign * c for c in range(lo, hi + 1) if sign * c not in cands and 2 <= c < (1 << (w - 1))]
     for c in cands:
         for signed in (True, False):
             if c < 0 and not signed:

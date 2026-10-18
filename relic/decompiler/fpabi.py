@@ -20,6 +20,7 @@ if TYPE_CHECKING:
 
 FP_ARGS = {"x64-sysv": tuple(f"xmm{k}" for k in range(8)), "x64-win": tuple(f"xmm{k}" for k in range(4)),
            "arm64-aapcs": tuple(f"v{k}" for k in range(8)),
+           "arm64-aapcs-apple": tuple(f"v{k}" for k in range(8)),
            "arm-aapcs-vfp": tuple(f"d{k}" for k in range(8)),
            "riscv64-lp64d": tuple(f"fa{k}" for k in range(8)),
            "riscv32-ilp32d": tuple(f"fa{k}" for k in range(8)),
@@ -477,12 +478,15 @@ def arg_classes(sig, fmt: str | None, fsig=None, scan: bool = False) -> list[str
 
 
 def place_args(arch: ArchInfo, classes: list[str], int_regs: tuple[str, ...],
-               variadic: bool = False) -> list[str | None]:
+               variadic: bool = False, fixed: int | None = None) -> list[str | None]:
     """Where each argument goes, in argument order: its register, or None for the stack. SysV /
     AAPCS64 fill integer and float registers separately (a float after the seventh integer still
     gets an xmm register); Win64 gives argument k the k-th register of its kind."""
     fpr = FP_ARGS.get(arch.name, ())
     out: list[str | None] = []
+    if arch.name == "arm64-aapcs-apple" and variadic and fixed is not None:
+        # Apple arm64: the fixed arguments in registers, every variadic one in an 8-byte stack slot
+        return place_args(arch, classes[:fixed], int_regs) + [None] * (len(classes) - fixed)
     if arch.name == "arm-aapcs-vfp" and variadic:
         # a variadic call uses the base standard even on armhf: a double in an even-odd pair of
         # core registers (`r2:r3`), else on the stack -- and once one is there, all that follow

@@ -32,6 +32,10 @@ def load_bytes(data: bytes, path: str = "<memory>", arch: str | None = None, bas
     if data[:4] == b"\x7fELF":
         from .elf import load_elf
         b = load_elf(path, data)
+    elif _is_macho(data):
+        from .macho import load_macho
+        b = load_macho(path, data, arch)
+        arch = None                          # (picked the slice)
     elif data[:2] == b"MZ":
         from .pe import load_pe
         b = load_pe(path, data)
@@ -46,6 +50,11 @@ def load_bytes(data: bytes, path: str = "<memory>", arch: str | None = None, bas
     if arch and b.format != "RAW":
         b.arch = arch
     return b
+
+
+def _is_macho(data: bytes) -> bool:
+    from .macho import is_macho
+    return is_macho(data)
 
 
 def _is_coff(data: bytes) -> bool:

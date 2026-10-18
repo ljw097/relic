@@ -64,7 +64,7 @@ IDA의 60여 개 CPU 계열 전부가 아니라, 리버싱·포너블·펌웨어
 - [ ] PowerPC64 ELFv1(빅 엔디언, 함수 디스크립터 `.opd`)
 - [ ] 디스어셈블만: capstone이 아는 나머지(SPARC, SystemZ, M68K, SH, TriCore, BPF, WASM 등)
 
-## P1 — 파일 포맷 100%까지 (README 70%)
+## P1 — 파일 포맷 100%까지 (README 85%)
 
 - [x] ELF(실행·공유·정적), PE(import/export/COFF 심볼/.pdata), RAW
 - [x] ELF 재배치 객체(`.o`): 섹션 배치, 재배치 적용(x86-64·x86·AArch64·ARM/Thumb·MIPS·RISC-V), 외부 심볼은 import 스텁, GOT 슬롯
@@ -74,7 +74,10 @@ IDA의 60여 개 CPU 계열 전부가 아니라, 리버싱·포너블·펌웨어
 - [x] ELF 코어 덤프(메모리·레지스터·시그널·매핑된 파일, 디스크에 남은 실행 파일의 심볼·툴체인)
 - [x] PE: TLS 콜백, 리소스·버전 정보, 지연 import(데이터 디렉터리 13 또는 MinGW 서술자 심볼), .NET 감지(CLR 헤더·메타데이터 런타임 버전), 디버그 디렉터리(PDB 경로·GUID·age)
 - [x] RAW 펌웨어의 적재 주소 추정(문자열 포인터 상관, Cortex-M 벡터 테이블; `--base auto`, `relic info`에 후보)
-- [ ] Mach-O
+- [x] Mach-O: 실행 파일·dylib·번들(32/64비트), 유니버설 파일(슬라이스 선택), 세그먼트·섹션, nlist 심볼, 간접 심볼 표로 import(`__stubs`·`__la_symbol_ptr`·`__got`, 2단계 이름공간의 라이브러리), `LC_MAIN`/`LC_UNIXTHREAD` 진입점, `LC_FUNCTION_STARTS`, UUID·플랫폼·rpath, checksec(PIE·NX·카나리·코드 서명·암호화·`__RESTRICT`·ARC), Apple arm64 가변 인자(스택)
+- [ ] Mach-O 재배치 객체(`MH_OBJECT`)
+- [ ] Mach-O chained fixups(`LC_DYLD_CHAINED_FIXUPS`: macOS 12+ 바이너리의 import·포인터)
+- [ ] Objective-C 메타데이터(클래스·메서드 이름, `objc_msgSend` 셀렉터)
 
 ## P1 — 디버거 100%까지 (README 100%)
 
