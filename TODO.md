@@ -53,6 +53,16 @@
 - [x] RISC-V 링커 완화(relaxation) 모델링: `call` → `jal`/`c.j`, 주소를 만드는 auipc/lui 삭제(쓰는 명령의 기준 레지스터는 gp/tp로), TLS add 삭제, 정렬 nop 삭제
 - [x] GUI 시그니처 창(File ▸ Library signatures, `Shift+F5`): 세트 목록(라이브러리·버전·아키텍처·형식·시그니처 수), 이 바이너리에 맞는 세트, 세트별 이름 붙인 수, 적용·이름 되돌리기·파일 추가·툴체인에서 생성
 
+## P1 — 프로세서 100%까지 (README 55%)
+
+IDA의 60여 개 CPU 계열 전부가 아니라, 리버싱·포너블·펌웨어에서 실제로 만나는 계열을 기준으로 삼습니다.
+
+- [x] 분석·디컴파일: x86, x86-64, ARM/Thumb, AArch64, RISC-V RV64GC
+- [x] MIPS32 little/big-endian(o32), MIPS64(n64: `d...` 명령, 32비트 연산의 부호 확장, `a4`-`a7` 인자, `.gpdword` 점프 테이블, `$t9`로 만드는 `_gp`), qemu로 디버깅
+- [ ] RISC-V RV32(ILP32)
+- [ ] PowerPC 32비트(SysV), PowerPC64(ELFv2 LE / ELFv1 BE 함수 디스크립터)
+- [ ] 디스어셈블만: capstone이 아는 나머지(SPARC, SystemZ, M68K, SH, TriCore, BPF, WASM 등)
+
 ## P1 — 파일 포맷 100%까지 (README 70%)
 
 - [x] ELF(실행·공유·정적), PE(import/export/COFF 심볼/.pdata), RAW

@@ -19,6 +19,8 @@ SRC = os.path.join(HERE, "src", "dbg_target.c")
 CROSS = {"arm64": ("aarch64-linux-gnu-gcc", "qemu-aarch64", ["x0", "x1"]),
          "arm": ("arm-linux-gnueabihf-gcc", "qemu-arm", ["r0", "r1"]),
          "mips": ("mipsel-linux-gnu-gcc", "qemu-mipsel", ["zero", "at"]),
+         "mipsbe": ("mips-linux-gnu-gcc", "qemu-mips", ["zero", "at"]),
+         "mips64": ("mips64el-linux-gnuabi64-gcc", "qemu-mips64el", ["zero", "at"]),
          "riscv64": ("riscv64-linux-gnu-gcc", "qemu-riscv64", ["ra", "sp"])}
 
 
@@ -62,7 +64,7 @@ def test_qemu_target(arch, tmp_path):
         pytest.skip(f"needs {qemu} and a gdb for {arch} (gdb-multiarch)")
     path = _build(tmp_path, cc, f"t_{arch}")
     an = analyze(path)
-    assert an.bin.arch == arch and Target.for_binary(an.bin).kind == "qemu" and qemu_for(an.bin)
+    assert an.bin.arch == arch.removesuffix("be") and Target.for_binary(an.bin).kind == "qemu" and qemu_for(an.bin)
     s = Session(path, ["a", "b"], an, target=Target("qemu", env={"RELIC_T": "env-ok"}))
     try:
         start, first, hit, end, out = _session_run(s, an)

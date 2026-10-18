@@ -106,9 +106,10 @@ def prepare(an: "Analysis", func: "Function") -> Prepared:
         if w is not None:
             narrow_returns(fn, w)
     from .calls import int_arg_regs
-    # RISC-V passes an `int` sign-extended to 64 bits: a parameter read as its low half and
+    # RISC-V and MIPS n64 pass an `int` sign-extended to 64 bits: a parameter read as its low half and
     # otherwise only compared is one
-    narrow(fn, sext_params=set(int_arg_regs(arch)) if arch.name.startswith("riscv") else frozenset())
+    from .arch import sext_ints
+    narrow(fn, sext_params=set(int_arg_regs(arch)) if sext_ints(arch) else frozenset())
     from .fpconst import fold_float_constants
     from .cleanup import propagate_ro_loads
     if arch.name.startswith("riscv"):
@@ -116,8 +117,13 @@ def prepare(an: "Analysis", func: "Function") -> Prepared:
     fold_float_constants(an, fn)
     inline_single_use(fn)
     _fold_pass(fn)          # constants exposed by narrowing and inlining
-    if recover_division(fn):    # magic-number multiplies -> x / c, x % c
+    sext_params = frozenset(int_arg_regs(arch)) if sext_ints(arch) else frozenset()
+    if recover_division(fn, sext_params):       # magic-number multiplies -> x / c, x % c
         _fold_pass(fn)
+        if sext_params:                         # (a 32-bit dividend now read only as its low half)
+            _dce(fn)
+            narrow(fn, sext_params=set(sext_params))
+            _fold_pass(fn)
     _dce(fn)
     fold_short_circuits(fn)
     st = Structurer(fn)

@@ -1,10 +1,11 @@
-"""MIPS32: GOT-based imports, branch delay slots, $gp-relative data and calls through $t9."""
+"""MIPS32 (little- and big-endian) and MIPS64 (n64): GOT-based imports, branch delay slots,
+$gp-relative data and calls through $t9."""
 import pytest
 
 from relic.analysis import analyze
 from relic.disasm import CALL, CJMP, JMP, RET
 
-VARIANTS = ["vuln_mips", "vuln_mips_pie"]
+VARIANTS = ["vuln_mips", "vuln_mips_pie", "vuln_mipsbe", "vuln_mipsbe_pie", "vuln_mips64", "vuln_mips64_pie"]
 
 
 @pytest.mark.parametrize("variant", VARIANTS)

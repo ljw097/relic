@@ -1,8 +1,12 @@
-"""MIPS32 (o32) lifter.
+"""MIPS32 (o32) and MIPS64 (n64) lifter.
 
-Registers are the 32-bit `zero`, `at`, `v0`-`v1`, `a0`-`a3`, `t0`-`t9`,
-`s0`-`s7`, `fp` (= `s8`), `sp`, `ra`, and `hi` / `lo` for multiply and
-divide results. `$zero` reads as 0 and ignores writes.
+Registers are `zero`, `at`, `v0`-`v1`, `a0`-`a3`, `t0`-`t9`, `s0`-`s7`,
+`fp` (= `s8`), `sp`, `ra`, and `hi` / `lo` for multiply and divide results,
+32 or 64 bits wide. `$zero` reads as 0 and ignores writes. n64 names
+registers 8-11 `a4`-`a7` (arguments) and 12-15 `t0`-`t3`; capstone prints the
+o32 names, which `canon` renames. On MIPS64 the 32-bit operations (`addu`,
+`sll`, `lw`, `mult`, ...) sign-extend their result to the register; the
+`d...` forms (`daddu`, `dsll`, `ld`, ...) work on all 64 bits.
 
 `$gp` is the module's constant `_gp` (GOT + 0x7ff0): it reads as that
 constant and every write to it -- the PIC prologue that rebuilds it from
@@ -32,11 +36,13 @@ if TYPE_CHECKING:
     from ...analysis.functions import Function
 
 OP_REG, OP_IMM, OP_MEM = 1, 2, 3
-HI, LO = Reg("hi", 32), Reg("lo", 32)
+# o32 names capstone prints for registers 8-15 -> their n64 names
+_N64 = {"t0": "a4", "t1": "a5", "t2": "a6", "t3": "a7", "t4": "t0", "t5": "t1", "t6": "t2", "t7": "t3",
+        "12": "t0", "13": "t1", "14": "t2", "15": "t3", "8": "a4", "9": "a5", "10": "a6", "11": "a7"}
 
 _ALIAS = {"s8": "fp", "30": "fp", "29": "sp", "28": "gp", "31": "ra", "25": "t9", "0": "zero"}
 _GPR = ({"at", "v0", "v1", "a0", "a1", "a2", "a3", "fp", "sp", "ra"} | {f"t{k}" for k in range(10)}
-        | {f"s{k}" for k in range(8)} | {"k0", "k1", "hi", "lo"})
+        | {f"s{k}" for k in range(8)} | {"k0", "k1", "hi", "lo"} | {f"a{k}" for k in range(4, 8)})
 
 _NOPS = {"nop", "ssnop", "ehb", "sync", "pause", "synci", "pref", "cache",
          # trap if (divide by zero, overflow checks gcc inserts after `div`)
@@ -77,14 +83,16 @@ def _cmp(op: str, a: Expr, b: Expr) -> Expr:
 
 
 class MipsLifter:
-    bits = 32
-
     def __init__(self, an: "Analysis"):
         self.an = an
         self.out: list[Stmt] = []
         self.insn: Insn | None = None
         self._tmp = 0
         self.gp = an.bin.mips_gp
+        self.bits = W = 64 if an.bin.bits == 64 else 32
+        self.W = W
+        self.n64 = W == 64
+        self.HI, self.LO = Reg("hi", W), Reg("lo", W)
 
     # ----------------------------------------------------------- helpers
     def emit(self, s: Stmt):
@@ -100,63 +108,87 @@ class MipsLifter:
         return t
 
     @staticmethod
-    def canon(name: str) -> str:
+    def canon(name: str, n64: bool = False) -> str:
         name = name.lstrip("$") if name else name
-        return _ALIAS.get(name, name) if name else name
+        if not name:
+            return name
+        if n64 and name in _N64:
+            return _N64[name]
+        return _ALIAS.get(name, name)
 
     def reg_name(self, rid) -> str:
-        return self.canon(self.insn.cs.reg_name(rid))
+        return self.canon(self.insn.cs.reg_name(rid), self.n64)
 
-    def read_reg(self, name: str) -> Expr:
-        name = self.canon(name)
+    def read_reg(self, name: str, canon: bool = False) -> Expr:
+        """A register by its canonical name (`reg_name`); `canon`: by capstone's name."""
+        W = self.W
+        name = self.canon(name, self.n64) if canon else name
         if name == "zero":
-            return Const(0, 32)
+            return Const(0, W)
         if name == "gp":
             if self.gp is None:
                 raise LiftError("$gp without a GOT")
-            return Const(self.gp, 32)
+            return Const(self.gp, W)
         if name in _GPR:
-            return Reg(name, 32)
+            return Reg(name, W)
         if name[:1] == "f" and name[1:].isdigit():                    # FPU
             return Reg(name, 32)
         raise LiftError(f"register {name}")
 
-    def write_reg(self, name: str, v: Expr):
-        name = self.canon(name)
+    def write_reg(self, name: str, v: Expr, canon: bool = False):
+        name = self.canon(name, self.n64) if canon else name
         if name in ("zero", "gp"):
             return
         r = self.read_reg(name)
         if v.bits != r.bits:
-            v = cast("low", v, r.bits) if v.bits > r.bits else cast("zext", v, r.bits)
+            v = cast("low", v, r.bits) if v.bits > r.bits else cast("sext", v, r.bits)
         self.assign(r, v)
 
     def operand(self, op) -> Expr:
         if op.type == OP_REG:
-            return self.read_reg(self.insn.cs.reg_name(op.reg))
+            return self.read_reg(self.reg_name(op.reg))
         if op.type == OP_IMM:
-            return Const(op.imm & mask(32), 32)
+            return Const(op.imm & mask(self.W), self.W)
         raise LiftError("operand")
 
     def address(self, op) -> Expr:
-        base = self.read_reg(self.insn.cs.reg_name(op.mem.base))
+        W = self.W
+        base = self.read_reg(self.reg_name(op.mem.base))
         d = op.mem.disp
         if isinstance(base, Const):
-            return Const((base.value + d) & mask(32), 32)
+            return Const((base.value + d) & mask(W), W)
         if not d:
             return base
-        return BinOp("+", base, Const(d, 32), 32) if d > 0 else BinOp("-", base, Const(-d, 32), 32)
+        return BinOp("+", base, Const(d, W), W) if d > 0 else BinOp("-", base, Const(-d, W), W)
 
     def unknown(self, i: Insn) -> Unknown:
         def regs(names):
             out = {}
             for n in names:
-                n = self.canon(n)
+                n = self.canon(n, self.n64)
                 if n in _GPR:
-                    out[n] = Reg(n, 32)
+                    out[n] = Reg(n, self.W)
             return list(out.items())
         return Unknown(i.addr, f"{i.mnemonic} {i.op_str}".strip(), regs(i.regs_read), regs(i.regs_write))
 
+    # 32-bit operations on MIPS64: on the low words, the result sign-extended
+    def lo32(self, e: Expr) -> Expr:
+        if e.bits == 32:
+            return e
+        return Const(e.value & mask(32), 32) if isinstance(e, Const) else cast("low", e, 32)
+
+    def word(self, op: str, a: Expr, b: Expr) -> Expr:
+        """`a op b` as a 32-bit operation (sign-extended into a MIPS64 register)."""
+        if self.W == 32:
+            return BinOp(op, a, b, 32)
+        return cast("sext", BinOp(op, self.lo32(a), self.lo32(b), 32), 64)
+
     # ----------------------------------------------------------- entry points
+    def entry_stmts(self, f: "Function") -> list[Stmt]:
+        """PIC code finds `_gp` from `$t9`, which holds the function's address on entry (o32 builds
+        it straight into `$gp`, whose writes are dropped; n64 leaf functions into another register)."""
+        return [Assign(f.addr, Reg("t9", self.W), Const(f.addr, self.W))]
+
     def lift_insn(self, i: Insn, func: "Function | None" = None) -> list[Stmt]:
         self.out = []
         self.insn = i
@@ -198,37 +230,58 @@ class MipsLifter:
             # FPU moves and the rest (`mfc1`, `cfc1`, `rdhwr`, ...): an opaque value of the sources
             srcs = tuple(self.operand(o) for o in ops[1:] if o.type == OP_IMM or
                          self.reg_name(o.reg) in _GPR or self.reg_name(o.reg)[:1] == "f")
-            self.write_reg(self.reg_name(ops[0].reg), Intrinsic(m, srcs, 32))
+            self.write_reg(self.reg_name(ops[0].reg), Intrinsic(m, srcs, self.W))
         else:
             self.out = [self.unknown(i)]
 
     def _effect(self, i, name):
         if name == "syscall":
-            uses = [(r, Reg(r, 32)) for r in ("v0", "a0", "a1", "a2", "a3")]
-            self.emit(Effect(i.addr, "syscall", (), uses, [("v0", Reg("v0", 32)), ("a3", Reg("a3", 32))]))
+            W = self.W
+            args = ("v0", "a0", "a1", "a2", "a3", "a4", "a5") if self.n64 else ("v0", "a0", "a1", "a2", "a3")
+            uses = [(r, Reg(r, W)) for r in args]
+            self.emit(Effect(i.addr, "syscall", (), uses, [("v0", Reg("v0", W)), ("a3", Reg("a3", W))]))
         else:
             self.emit(Effect(i.addr, name, ()))
 
     # ------------------------------------------------------- data processing
     def _three(self, ops, op: str):
-        self.write_reg(self.reg_name(ops[0].reg), BinOp(op, self.operand(ops[1]), self.operand(ops[2]), 32))
+        W = self.W
+        self.write_reg(self.reg_name(ops[0].reg), BinOp(op, self.operand(ops[1]), self.operand(ops[2]), W))
 
-    def _i_addu(self, i, ops):
+    def _add(self, ops, wide: bool):
         a, b = self.operand(ops[1]), self.operand(ops[2])
-        if isinstance(b, Const) and b.value >> 31:              # `addiu sp, sp, -8`: sp - 8
-            e: Expr = BinOp("-", a, Const(-b.value & mask(32), 32), 32)
+        w = self.W if wide else 32
+        if not wide:
+            a, b = self.lo32(a), self.lo32(b)
+        if isinstance(b, Const) and b.value >> (w - 1):          # `addiu sp, sp, -8`: sp - 8
+            e: Expr = BinOp("-", a, Const(-b.value & mask(w), w), w)
         elif isinstance(a, Const) and a.value == 0:              # `addiu v0, $zero, 5`: li
             e = b
+        elif isinstance(b, Const) and b.value == 0 and wide:     # `daddiu a0, a1, 0`: move
+            e = a
         else:
-            e = BinOp("+", a, b, 32)
+            e = BinOp("+", a, b, w)
         self.write_reg(self.reg_name(ops[0].reg), e)
+
+    def _i_addu(self, i, ops):
+        self._add(ops, False)
 
     _i_add = _i_addiu = _i_addi = _i_addu
 
+    def _i_daddu(self, i, ops):
+        self._add(ops, True)
+
+    _i_dadd = _i_daddiu = _i_daddi = _i_daddu
+
     def _i_subu(self, i, ops):
-        self._three(ops, "-")
+        self.write_reg(self.reg_name(ops[0].reg), self.word("-", self.operand(ops[1]), self.operand(ops[2])))
 
     _i_sub = _i_subu
+
+    def _i_dsubu(self, i, ops):
+        self._three(ops, "-")
+
+    _i_dsub = _i_dsubu
 
     def _i_and(self, i, ops):
         self._three(ops, "&")
@@ -250,30 +303,50 @@ class MipsLifter:
     _i_xori = _i_xor
 
     def _i_nor(self, i, ops):
+        W = self.W
         self.write_reg(self.reg_name(ops[0].reg),
-                       UnOp("~", BinOp("|", self.operand(ops[1]), self.operand(ops[2]), 32), 32))
+                       UnOp("~", BinOp("|", self.operand(ops[1]), self.operand(ops[2]), W), W))
 
     def _i_not(self, i, ops):
-        self.write_reg(self.reg_name(ops[0].reg), UnOp("~", self.operand(ops[1]), 32))
+        self.write_reg(self.reg_name(ops[0].reg), UnOp("~", self.operand(ops[1]), self.W))
 
     def _i_negu(self, i, ops):
-        self.write_reg(self.reg_name(ops[0].reg), BinOp("-", Const(0, 32), self.operand(ops[1]), 32))
+        self.write_reg(self.reg_name(ops[0].reg), self.word("-", Const(0, 32), self.operand(ops[1])))
 
     _i_neg = _i_negu
+
+    def _i_dnegu(self, i, ops):
+        W = self.W
+        self.write_reg(self.reg_name(ops[0].reg), BinOp("-", Const(0, W), self.operand(ops[1]), W))
+
+    _i_dneg = _i_dnegu
 
     def _i_move(self, i, ops):
         self.write_reg(self.reg_name(ops[0].reg), self.operand(ops[1]))
 
     def _i_li(self, i, ops):
-        self.write_reg(self.reg_name(ops[0].reg), Const(ops[1].imm & mask(32), 32))
+        self.write_reg(self.reg_name(ops[0].reg), Const(ops[1].imm & mask(self.W), self.W))
+
+    _i_dli = _i_li
 
     def _i_lui(self, i, ops):
-        self.write_reg(self.reg_name(ops[0].reg), Const((ops[1].imm << 16) & mask(32), 32))
+        v = (ops[1].imm << 16) & mask(32)
+        if self.W == 64 and v >> 31:                              # (sign-extended on MIPS64)
+            v |= mask(64) ^ mask(32)
+        self.write_reg(self.reg_name(ops[0].reg), Const(v, self.W))
 
-    def _shift(self, ops, op: str, variable: bool):
+    def _shift(self, ops, op: str, variable: bool, wide: bool = False, plus: int = 0):
+        w = self.W if wide else 32
         v = self.operand(ops[1])
-        n = BinOp("&", self.operand(ops[2]), Const(31, 32), 32) if variable else Const(ops[2].imm & 31, 8)
-        self.write_reg(self.reg_name(ops[0].reg), BinOp(op, v, n, 32))
+        if not wide:
+            v = self.lo32(v)
+        if variable:
+            n: Expr = BinOp("&", self.lo32(self.operand(ops[2])) if not wide else self.operand(ops[2]),
+                            Const(w - 1, w), w)
+        else:
+            n = Const((ops[2].imm + plus) & (w - 1), 8)
+        e = BinOp(op, v, n, w)
+        self.write_reg(self.reg_name(ops[0].reg), e)
 
     def _i_sll(self, i, ops):
         self._shift(ops, "<<", False)
@@ -299,11 +372,48 @@ class MipsLifter:
     def _i_rotrv(self, i, ops):
         self._shift(ops, "ror", True)
 
+    def _i_dsll(self, i, ops):
+        self._shift(ops, "<<", False, True)
+
+    def _i_dsrl(self, i, ops):
+        self._shift(ops, ">>u", False, True)
+
+    def _i_dsra(self, i, ops):
+        self._shift(ops, ">>s", False, True)
+
+    def _i_drotr(self, i, ops):
+        self._shift(ops, "ror", False, True)
+
+    def _i_dsll32(self, i, ops):
+        self._shift(ops, "<<", False, True, 32)
+
+    def _i_dsrl32(self, i, ops):
+        self._shift(ops, ">>u", False, True, 32)
+
+    def _i_dsra32(self, i, ops):
+        self._shift(ops, ">>s", False, True, 32)
+
+    def _i_drotr32(self, i, ops):
+        self._shift(ops, "ror", False, True, 32)
+
+    def _i_dsllv(self, i, ops):
+        self._shift(ops, "<<", True, True)
+
+    def _i_dsrlv(self, i, ops):
+        self._shift(ops, ">>u", True, True)
+
+    def _i_dsrav(self, i, ops):
+        self._shift(ops, ">>s", True, True)
+
+    def _i_drotrv(self, i, ops):
+        self._shift(ops, "ror", True, True)
+
     def _set(self, ops, op: str):
+        W = self.W
         b = self.operand(ops[2])
         if isinstance(b, Const) and ops[2].type == OP_IMM:
-            b = Const(ops[2].imm & mask(32), 32)            # slti / sltiu: sign-extended immediate
-        self.write_reg(self.reg_name(ops[0].reg), cast("zext", BinOp(op, self.operand(ops[1]), b, 1), 32))
+            b = Const(ops[2].imm & mask(W), W)              # slti / sltiu: sign-extended immediate
+        self.write_reg(self.reg_name(ops[0].reg), cast("zext", BinOp(op, self.operand(ops[1]), b, 1), W))
 
     def _i_slt(self, i, ops):
         self._set(ops, "<s")
@@ -316,54 +426,102 @@ class MipsLifter:
     _i_sltiu = _i_sltu
 
     def _i_movn(self, i, ops):
+        W = self.W
         d = self.reg_name(ops[0].reg)
-        c = BinOp("!=", self.operand(ops[2]), Const(0, 32), 1)
-        self.write_reg(d, Ite(c, self.operand(ops[1]), self.read_reg(d), 32))
+        c = BinOp("!=", self.operand(ops[2]), Const(0, W), 1)
+        self.write_reg(d, Ite(c, self.operand(ops[1]), self.read_reg(d), W))
 
     def _i_movz(self, i, ops):
+        W = self.W
         d = self.reg_name(ops[0].reg)
-        c = BinOp("==", self.operand(ops[2]), Const(0, 32), 1)
-        self.write_reg(d, Ite(c, self.operand(ops[1]), self.read_reg(d), 32))
+        c = BinOp("==", self.operand(ops[2]), Const(0, W), 1)
+        self.write_reg(d, Ite(c, self.operand(ops[1]), self.read_reg(d), W))
 
     def _i_seb(self, i, ops):
-        self.write_reg(self.reg_name(ops[0].reg), cast("sext", cast("low", self.operand(ops[1]), 8), 32))
+        self.write_reg(self.reg_name(ops[0].reg), cast("sext", cast("low", self.operand(ops[1]), 8), self.W))
 
     def _i_seh(self, i, ops):
-        self.write_reg(self.reg_name(ops[0].reg), cast("sext", cast("low", self.operand(ops[1]), 16), 32))
+        self.write_reg(self.reg_name(ops[0].reg), cast("sext", cast("low", self.operand(ops[1]), 16), self.W))
+
+    def _extract(self, ops, pos: int, size: int, wide: bool):
+        w = self.W if wide else 32
+        v = self.operand(ops[1]) if wide else self.lo32(self.operand(ops[1]))
+        if pos:
+            v = BinOp(">>u", v, Const(pos, 8), w)
+        e = BinOp("&", v, Const(mask(size), w), w) if size < w else v
+        self.write_reg(self.reg_name(ops[0].reg), cast("zext", e, self.W) if size < 32 or wide else e)
 
     def _i_ext(self, i, ops):
-        pos, size = ops[2].imm, ops[3].imm
-        v = BinOp(">>u", self.operand(ops[1]), Const(pos, 8), 32) if pos else self.operand(ops[1])
-        self.write_reg(self.reg_name(ops[0].reg), BinOp("&", v, Const(mask(size), 32), 32))
+        self._extract(ops, ops[2].imm, ops[3].imm, False)
+
+    def _i_dext(self, i, ops):
+        self._extract(ops, ops[2].imm, ops[3].imm, True)
+
+    def _i_dextm(self, i, ops):              # (size 33-64; capstone gives it as is or minus 32)
+        size = ops[3].imm if ops[3].imm > 32 else ops[3].imm + 32
+        self._extract(ops, ops[2].imm, size, True)
+
+    def _i_dextu(self, i, ops):              # (position 32-63)
+        pos = ops[2].imm if ops[2].imm >= 32 else ops[2].imm + 32
+        self._extract(ops, pos, ops[3].imm, True)
+
+    def _insert(self, ops, pos: int, size: int, wide: bool):
+        w = self.W if wide else 32
+        d = self.reg_name(ops[0].reg)
+        cur = self.read_reg(d)
+        src = self.operand(ops[1])
+        if not wide:
+            cur, src = self.lo32(cur), self.lo32(src)
+        field = mask(size) << pos
+        keep = BinOp("&", cur, Const(~field & mask(w), w), w)
+        put = BinOp("&", BinOp("<<", src, Const(pos, 8), w) if pos else src, Const(field, w), w)
+        self.write_reg(d, BinOp("|", keep, put, w))
 
     def _i_ins(self, i, ops):
-        d = self.reg_name(ops[0].reg)
-        pos, size = ops[2].imm, ops[3].imm
-        field = mask(size) << pos
-        keep = BinOp("&", self.read_reg(d), Const(~field & mask(32), 32), 32)
-        put = BinOp("&", BinOp("<<", self.operand(ops[1]), Const(pos, 8), 32), Const(field, 32), 32)
-        self.write_reg(d, BinOp("|", keep, put, 32))
+        self._insert(ops, ops[2].imm, ops[3].imm, False)
+
+    def _i_dins(self, i, ops):
+        self._insert(ops, ops[2].imm, ops[3].imm, True)
+
+    def _i_dinsm(self, i, ops):
+        size = ops[3].imm if ops[3].imm > 32 else ops[3].imm + 32
+        self._insert(ops, ops[2].imm, size, True)
+
+    def _i_dinsu(self, i, ops):
+        pos = ops[2].imm if ops[2].imm >= 32 else ops[2].imm + 32
+        self._insert(ops, pos, ops[3].imm, True)
 
     def _i_clz(self, i, ops):
-        self.write_reg(self.reg_name(ops[0].reg), Intrinsic("clz", (self.operand(ops[1]),), 32))
+        self.write_reg(self.reg_name(ops[0].reg), Intrinsic("clz", (self.lo32(self.operand(ops[1])),), 32))
+
+    def _i_dclz(self, i, ops):
+        self.write_reg(self.reg_name(ops[0].reg), Intrinsic("clzll", (self.operand(ops[1]),), 64))
 
     def _i_wsbh(self, i, ops):
-        self.write_reg(self.reg_name(ops[0].reg), Intrinsic("wsbh", (self.operand(ops[1]),), 32))
+        self.write_reg(self.reg_name(ops[0].reg), Intrinsic("wsbh", (self.lo32(self.operand(ops[1])),), 32))
 
     # ------------------------------------------------------- multiply / divide
     def _i_mul(self, i, ops):
+        self.write_reg(self.reg_name(ops[0].reg), self.word("*", self.operand(ops[1]), self.operand(ops[2])))
+
+    def _i_dmul(self, i, ops):
         self._three(ops, "*")
+
+    def _hilo(self, lo: Expr, hi: Expr):
+        """Write hi / lo (32-bit halves sign-extended on MIPS64)."""
+        self.assign(self.LO, cast("sext", lo, self.W))
+        self.assign(self.HI, cast("sext", hi, self.W))
 
     def _mult(self, ops, signed: bool, acc: str = ""):
         kind = "sext" if signed else "zext"
         a, b = ops[-2:]
-        p = BinOp("*", cast(kind, self.operand(a), 64), cast(kind, self.operand(b), 64), 64)
+        p = BinOp("*", cast(kind, self.lo32(self.operand(a)), 64), cast(kind, self.lo32(self.operand(b)), 64), 64)
         if acc:
-            cur = BinOp("|", BinOp("<<", cast("zext", HI, 64), Const(32, 8), 64), cast("zext", LO, 64), 64)
+            cur = BinOp("|", BinOp("<<", cast("zext", self.lo32(self.HI), 64), Const(32, 8), 64),
+                        cast("zext", self.lo32(self.LO), 64), 64)
             p = BinOp(acc, cur, p, 64)
         p = self.tmp(p)
-        self.assign(LO, cast("low", p, 32))
-        self.assign(HI, cast("low", BinOp(">>u", p, Const(32, 8), 64), 32))
+        self._hilo(cast("low", p, 32), cast("low", BinOp(">>u", p, Const(32, 8), 64), 32))
 
     def _i_mult(self, i, ops):
         self._mult(ops, True)
@@ -383,64 +541,103 @@ class MipsLifter:
     def _i_msubu(self, i, ops):
         self._mult(ops, False, "-")
 
+    def _dmult(self, ops, signed: bool):
+        kind = "sext" if signed else "zext"
+        a, b = ops[-2:]
+        p = self.tmp(BinOp("*", cast(kind, self.operand(a), 128), cast(kind, self.operand(b), 128), 128))
+        self.assign(self.LO, cast("low", p, 64))
+        self.assign(self.HI, cast("low", BinOp(">>u", p, Const(64, 8), 128), 64))
+
+    def _i_dmult(self, i, ops):
+        self._dmult(ops, True)
+
+    def _i_dmultu(self, i, ops):
+        self._dmult(ops, False)
+
     def _div(self, ops, sign: str):
-        a, b = (self.tmp(self.operand(o)) for o in ops[-2:])
-        self.assign(LO, BinOp("/" + sign, a, b, 32))
-        self.assign(HI, BinOp("%" + sign, a, b, 32))
+        a, b = (self.tmp(self.lo32(self.operand(o))) for o in ops[-2:])
+        self._hilo(BinOp("/" + sign, a, b, 32), BinOp("%" + sign, a, b, 32))
 
     def _i_div(self, i, ops):
+        if len(ops) == 3 and ops[0].type == OP_REG and self.reg_name(ops[0].reg) != "zero":
+            # MIPS R6 / the `div rd, rs, rt` macro: the quotient in rd
+            self.write_reg(self.reg_name(ops[0].reg), self.word("/s", self.operand(ops[1]), self.operand(ops[2])))
+            return
         self._div(ops, "s")
 
     def _i_divu(self, i, ops):
+        if len(ops) == 3 and ops[0].type == OP_REG and self.reg_name(ops[0].reg) != "zero":
+            self.write_reg(self.reg_name(ops[0].reg), self.word("/u", self.operand(ops[1]), self.operand(ops[2])))
+            return
         self._div(ops, "u")
 
+    def _ddiv(self, ops, sign: str):
+        W = self.W
+        a, b = (self.tmp(self.operand(o)) for o in ops[-2:])
+        self.assign(self.LO, BinOp("/" + sign, a, b, W))
+        self.assign(self.HI, BinOp("%" + sign, a, b, W))
+
+    def _i_ddiv(self, i, ops):
+        self._ddiv(ops, "s")
+
+    def _i_ddivu(self, i, ops):
+        self._ddiv(ops, "u")
+
     def _i_mfhi(self, i, ops):
-        self.write_reg(self.reg_name(ops[0].reg), HI)
+        self.write_reg(self.reg_name(ops[0].reg), self.HI)
 
     def _i_mflo(self, i, ops):
-        self.write_reg(self.reg_name(ops[0].reg), LO)
+        self.write_reg(self.reg_name(ops[0].reg), self.LO)
 
     def _i_mthi(self, i, ops):
-        self.assign(HI, self.operand(ops[0]))
+        self.assign(self.HI, self.operand(ops[0]))
 
     def _i_mtlo(self, i, ops):
-        self.assign(LO, self.operand(ops[0]))
+        self.assign(self.LO, self.operand(ops[0]))
 
     # --------------------------------------------------------- loads/stores
-    _LOAD = {"lw": (32, False), "lb": (8, True), "lbu": (8, False), "lh": (16, True), "lhu": (16, False),
-             "ll": (32, False)}
-    _STORE = {"sw": 32, "sb": 8, "sh": 16}
+    _LOAD = {"lw": (32, True), "lb": (8, True), "lbu": (8, False), "lh": (16, True), "lhu": (16, False),
+             "ll": (32, True), "lwu": (32, False), "ld": (64, False), "lld": (64, False)}
+    _STORE = {"sw": 32, "sb": 8, "sh": 16, "sd": 64}
 
     def _ldst(self, i, m, ops):
+        W = self.W
         mem = next(o for o in ops if o.type == OP_MEM)
         dst = self.reg_name(ops[0].reg)
         if m in self._LOAD:
             size, signed = self._LOAD[m]
+            if size > W:
+                raise LiftError(f"{m} on a 32-bit MIPS")
             addr = self.address(mem)
             lo, hi = self.an.bin.mips_local_got
-            if m == "lw" and isinstance(addr, Const) and lo <= addr.value < hi:
+            if size == W and isinstance(addr, Const) and lo <= addr.value < hi:
                 # a local GOT entry (`lw $a0, %got(page)($gp)`): a link-time constant
-                v = self.an.bin.read_int(addr.value, 4)
+                v = self.an.bin.read_int(addr.value, W // 8)
                 if v is not None:
-                    self.write_reg(dst, Const(v, 32))
+                    self.write_reg(dst, Const(v, W))
                     return
             v: Expr = Load(addr, size)
-            if size < 32:
-                v = cast("sext" if signed else "zext", v, 32)
+            if size < W:
+                v = cast("sext" if signed else "zext", v, W)
             self.write_reg(dst, v)
             return
         if dst == "gp" and self.reg_name(mem.mem.base) in ("sp", "fp"):
             return                              # `sw $gp, 16($sp)`: the cprestore slot
         size = self._STORE[m]
+        if size > W:
+            raise LiftError(f"{m} on a 32-bit MIPS")
         val = self.read_reg(dst)
-        self.emit(Store(i.addr, self.address(mem), val if size == 32 else cast("low", val, size)))
+        self.emit(Store(i.addr, self.address(mem), val if size == W else cast("low", val, size)))
 
     def _i_sc(self, i, ops):
         """`sc rt, off(base)`: the store, and rt = 1 (the conditional store is taken to succeed)."""
         mem = next(o for o in ops if o.type == OP_MEM)
         r = self.reg_name(ops[0].reg)
-        self.emit(Store(i.addr, self.address(mem), self.read_reg(r)))
-        self.write_reg(r, Const(1, 32))
+        v = self.read_reg(r)
+        self.emit(Store(i.addr, self.address(mem), self.lo32(v) if i.mnemonic == "sc" else v))
+        self.write_reg(r, Const(1, self.W))
+
+    _i_scd = _i_sc
 
     def _fpu_ldst(self, i, ops, size: int, load: bool):
         mem = next(o for o in ops if o.type == OP_MEM)
@@ -465,7 +662,7 @@ class MipsLifter:
     # --------------------------------------------------------- control flow
     def _branch(self, i, m, ops):
         a = self.operand(ops[0])
-        b = Const(0, 32) if m.endswith("z") or len(ops) == 2 else self.operand(ops[1])
+        b = Const(0, self.W) if m.endswith("z") or len(ops) == 2 else self.operand(ops[1])
         test = self.tmp(_cmp(_BRANCH[m], a, b))
         self.emit(Branch(i.addr, test, i.target, i.end + 4))      # falls through past the delay slot
 
@@ -480,16 +677,16 @@ class MipsLifter:
     def _call(self, i, target: Expr):
         if not isinstance(target, Const):
             target = self.tmp(target)
-        self.emit(CallStmt(i.addr, Call(target, (), 32), noreturn=self._noreturn(i), name=self.an.call_name(i)))
+        self.emit(CallStmt(i.addr, Call(target, (), self.W), noreturn=self._noreturn(i), name=self.an.call_name(i)))
 
     def _i_jal(self, i, ops):
         if i.target is None:
             raise LiftError("call without a target")
-        self._call(i, Const(i.target, 32))
+        self._call(i, Const(i.target, self.W))
 
     def _i_bal(self, i, ops):
         if i.kind == "normal":                      # `bal .+8`: only reads pc into $ra
-            self.write_reg("ra", Const(i.addr + 8, 32))
+            self.write_reg("ra", Const(i.addr + 8, self.W))
             return
         self._i_jal(i, ops)
 
@@ -515,11 +712,12 @@ class MipsLifter:
         """`b` / `j` (a jump or tail call) or `jr rN` (a switch or a tail call through `$t9`)."""
         self.out = []
         self.insn = i
+        W = self.W
         if i.target is not None:
             if i.target in func.blocks:
                 self.emit(Jump(i.addr, i.target))
             else:
-                self.emit(CallStmt(i.addr, Call(Const(i.target, 32), (), 32), tail=True, name=self.an.name(i.target)))
+                self.emit(CallStmt(i.addr, Call(Const(i.target, W), (), W), tail=True, name=self.an.name(i.target)))
                 self.emit(Return(i.addr))
             return self.out
         try:
@@ -535,7 +733,7 @@ class MipsLifter:
             seen = list(dict.fromkeys(t for t in table if t in func.blocks))
             self.emit(IndirectJump(i.addr, target, seen, list(table)))
         elif r == "t9":
-            self.emit(CallStmt(i.addr, Call(target, (), 32), tail=True, name=self.an.call_name(i)))
+            self.emit(CallStmt(i.addr, Call(target, (), W), tail=True, name=self.an.call_name(i)))
             self.emit(Return(i.addr))
         else:
             self.emit(IndirectJump(i.addr, target, []))

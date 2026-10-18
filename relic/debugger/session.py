@@ -53,9 +53,19 @@ def _arch_key(arch: str) -> str:
 # qemu-user for a binary of Relic's arch name (and byte order), and where its libraries are
 _QEMU = {("x86", "little"): "qemu-i386", ("x64", "little"): "qemu-x86_64", ("arm", "little"): "qemu-arm",
          ("arm", "big"): "qemu-armeb", ("arm64", "little"): "qemu-aarch64", ("mips", "little"): "qemu-mipsel",
-         ("mips", "big"): "qemu-mips", ("riscv64", "little"): "qemu-riscv64", ("ppc", "big"): "qemu-ppc"}
+         ("mips", "big"): "qemu-mips", ("mips64", "little"): "qemu-mips64el", ("mips64", "big"): "qemu-mips64",
+         ("riscv64", "little"): "qemu-riscv64", ("ppc", "big"): "qemu-ppc", ("ppc64", "little"): "qemu-ppc64le",
+         ("ppc64", "big"): "qemu-ppc64"}
 _SYSROOT = {"arm": "/usr/arm-linux-gnueabihf", "arm64": "/usr/aarch64-linux-gnu", "mips": "/usr/mipsel-linux-gnu",
-            "riscv64": "/usr/riscv64-linux-gnu"}
+            ("mips", "big"): "/usr/mips-linux-gnu", "mips64": "/usr/mips64el-linux-gnuabi64",
+            ("mips64", "big"): "/usr/mips64-linux-gnuabi64", "riscv64": "/usr/riscv64-linux-gnu",
+            "ppc": "/usr/powerpc-linux-gnu", "ppc64": "/usr/powerpc64le-linux-gnu",
+            ("ppc64", "big"): "/usr/powerpc64-linux-gnu"}
+
+
+def sysroot_for(b) -> str:
+    """Where the target libraries of binary `b`'s architecture and byte order are installed."""
+    return _SYSROOT.get((b.arch, getattr(b, "endian", "little")), _SYSROOT.get(b.arch, ""))
 
 
 @dataclass
@@ -221,7 +231,7 @@ class Session:
                 self.mi.command("-exec-arguments " + args.strip())
         else:
             if t.kind == "qemu" and not t.sysroot and self.an is not None:
-                root = _SYSROOT.get(self.an.bin.arch, "")
+                root = sysroot_for(self.an.bin)
                 t.sysroot = root if os.path.isdir(root) else ""
             if t.sysroot:
                 self.mi.console(f"set sysroot {t.sysroot}")

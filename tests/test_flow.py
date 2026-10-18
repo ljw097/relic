@@ -81,7 +81,8 @@ int main(void) {
 
 @pytest.fixture(scope="module", params=["flow_O0", "flow_O2", "flow32_O0", "flow32_O2", "flow_a64_O0", "flow_a64_O2",
                                               "flow_arm_O0", "flow_arm_O2", "flow_thumb_O0", "flow_thumb_O2",
-                                              "flow_mips_O0", "flow_mips_O2", "flow_rv64_O0", "flow_rv64_O2"])
+                                              "flow_mips_O0", "flow_mips_O2", "flow_mipsbe_O0", "flow_mipsbe_O2",
+                                              "flow_mips64_O0", "flow_mips64_O2", "flow_rv64_O0", "flow_rv64_O2"])
 def flow(request):
     path = request.getfixturevalue(request.param)
     return request.param, analyze(path)
@@ -114,7 +115,9 @@ def test_flow_recompiles_and_matches_source(flow, tmp_path):
     exe = tmp_path / "re"
     if name.startswith(("flow_mips", "flow_rv64")):
         # MIPS / RISC-V pseudocode runs as such: the cross compiler, statically linked, under qemu-user
-        tool, emu = ("mipsel-linux-gnu-gcc", "qemu-mipsel") if "mips" in name else \
+        tool, emu = ("mips-linux-gnu-gcc", "qemu-mips") if "mipsbe" in name else \
+            ("mips64el-linux-gnuabi64-gcc", "qemu-mips64el") if "mips64" in name else \
+            ("mipsel-linux-gnu-gcc", "qemu-mipsel") if "mips" in name else \
             ("riscv64-linux-gnu-gcc", "qemu-riscv64")
         mcc, qemu = shutil.which(tool), shutil.which(emu)
         if mcc is None or qemu is None:
