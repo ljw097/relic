@@ -64,7 +64,7 @@ IDA의 60여 개 CPU 계열 전부가 아니라, 리버싱·포너블·펌웨어
 - [ ] PowerPC64 ELFv1(빅 엔디언, 함수 디스크립터 `.opd`)
 - [ ] 디스어셈블만: capstone이 아는 나머지(SPARC, SystemZ, M68K, SH, TriCore, BPF, WASM 등)
 
-## P1 — 파일 포맷 100%까지 (README 90%)
+## P1 — 파일 포맷 100%까지 (README 100%)
 
 - [x] ELF(실행·공유·정적), PE(import/export/COFF 심볼/.pdata), RAW
 - [x] ELF 재배치 객체(`.o`): 섹션 배치, 재배치 적용(x86-64·x86·AArch64·ARM/Thumb·MIPS·RISC-V), 외부 심볼은 import 스텁, GOT 슬롯
@@ -77,7 +77,7 @@ IDA의 60여 개 CPU 계열 전부가 아니라, 리버싱·포너블·펌웨어
 - [x] Mach-O: 실행 파일·dylib·번들(32/64비트), 유니버설 파일(슬라이스 선택), 세그먼트·섹션, nlist 심볼, 간접 심볼 표로 import(`__stubs`·`__la_symbol_ptr`·`__got`, 2단계 이름공간의 라이브러리), `LC_MAIN`/`LC_UNIXTHREAD` 진입점, `LC_FUNCTION_STARTS`, UUID·플랫폼·rpath, checksec(PIE·NX·카나리·코드 서명·암호화·`__RESTRICT`·ARC), Apple arm64 가변 인자(스택)
 - [x] Mach-O 재배치 객체(`MH_OBJECT`): 섹션을 기준 주소에서부터, 외부 심볼은 스텁·GOT 슬롯, 재배치 적용(x86-64 BRANCH·SIGNED·GOT_LOAD·UNSIGNED, arm64 BRANCH26·PAGE21·PAGEOFF12·GOT_LOAD·ADDEND), 어셈블러 지역 레이블(`ltmp`·`l_`)은 이름 아님
 - [x] Mach-O chained fixups(`LC_DYLD_CHAINED_FIXUPS`): 체인을 따라 rebase는 실제 주소로 읽히게, bind는 import 이름으로(포인터 형식 64·64_OFFSET·32·arm64e 계열)
-- [ ] Objective-C 메타데이터(클래스·메서드 이름, `objc_msgSend` 셀렉터)
+- [x] Objective-C 메타데이터(`relic/loader/objc.py`): 클래스·상위 클래스·메서드(포인터 목록과 상대 오프셋 목록)·ivar·속성·카테고리, 메서드 구현에 `-[Class sel:]` 이름(stripped에서도), selector·class 참조 슬롯 이름; 의사 코드에서 `objc_msgSend`를 `[recv sel:arg]`로(셀렉터의 `:` 수로 인자, 레지스터에 담아 둔 objc_msgSend·꼬리 호출도), `objc_alloc_init` 등은 `[[Cls alloc] init]`, 메서드는 `self`·`_cmd`, 반환 형식은 타입 인코딩에서, ivar 접근은 `self->ivar`
 
 ## P1 — 디버거 100%까지 (README 100%)
 

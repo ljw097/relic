@@ -32,6 +32,14 @@ if TYPE_CHECKING:
     from .pipeline import Prepared
 
 
+def objc_method(name: str):
+    """(`-` / `+`, class, selector) of an Objective-C method's name (`-[Animal speak:times:]`,
+    `+[NSString(Extra) foo]`), else None."""
+    import re
+    m = re.fullmatch(r"([-+])\[([A-Za-z_$][\w$]*)(?:\([^)]*\))? ([^\]\s]+)\]", name)
+    return (m.group(1), m.group(2), m.group(3)) if m else None
+
+
 @dataclass
 class Line:
     text: str
@@ -545,6 +553,13 @@ class CWriter:
             self.names[r] = self.MAIN_PARAMS[k][0] if main else f"a{k + 1}"
             if main:
                 self.types[r] = parse_ctype(self.MAIN_PARAMS[k][1])
+        m = objc_method(self.an.name(self.p.fn.addr) or "")
+        if m is not None and len(self.p.params) >= 2:
+            # an Objective-C method: the receiver and the selector come first
+            kind, cls, _sel = m
+            self.names[self.p.params[0]], self.names[self.p.params[1]] = "self", "_cmd"
+            self.types[self.p.params[0]] = CType(cls, 1) if kind == "-" else CType("Class")
+            self.types[self.p.params[1]] = CType("SEL")
         n = 0
         for s in self.p.fn.stmts():
             if id(s) in self.p.hidden:
@@ -729,6 +744,9 @@ class CWriter:
             lay = entry.get("layout", {}).get("0x0")
             if lay and lay[0] == bits:
                 return f"{self.vname(addr.name)}.{entry['fields'].get('f_0', 'f_0')}"
+        ivar = self._objc_ivar(addr)
+        if ivar is not None:
+            return ivar
         fa = self.structs.field(addr, bits)
         if fa is not None and not self._bit_unit(*fa[1:]):
             return f"{self.expr(fa[0], PREC_POSTFIX)}->{self.fname(*fa[1:])}"
@@ -1109,12 +1127,88 @@ class CWriter:
             imp = self.an.bin.imports_by_got.get(t.addr.value)
             if imp is not None:                 # through the import's GOT slot (MIPS `jalr $t9`)
                 return base_name(imp.name)
+            got = getattr(self.an.bin, "got_names", {}).get(t.addr.value)
+            if got and any(i.name == got for i in self.an.bin.imports):      # (a second GOT slot)
+                return base_name(got)
         if isinstance(t, Const):
             return self.symbol(t.value) or f"sub_{t.value:x}"
+        names = self.__dict__.get("_call_names")
+        if names is None:                       # (the callee the lifter traced a register call to)
+            names = self._call_names = {id(st.call): st.name for st in self.p.fn.stmts()
+                                        if isinstance(st, CallStmt) and st.name}
+        name = names.get(id(c))
+        return base_name(name) if name else None
+
+    def _ivar_vars(self) -> dict:
+        """Variables whose only definition loads an ivar offset: name -> that load."""
+        got = self.__dict__.get("_ivar_var_map")
+        if got is None:
+            objc = self.an.bin.objc
+            defs: dict = {}
+            for st in self.p.fn.stmts():
+                if isinstance(st, Assign) and isinstance(st.dst, Var):
+                    src = st.src
+                    while isinstance(src, Cast):        # (arm64 `ldrsw`: sign-extended)
+                        src = src.a
+                    defs.setdefault(st.dst.name, []).append(src)
+            got = self._ivar_var_map = {
+                n: srcs[0] for n, srcs in defs.items() if len(srcs) == 1 and isinstance(srcs[0], Load)
+                and isinstance(srcs[0].addr, Const) and srcs[0].addr.value in objc.ivar_slots}
+        return got
+
+    def _objc_ivar(self, addr) -> str | None:
+        """`obj->ivar`: an object plus the ivar offset its metadata says the code reads."""
+        objc = getattr(self.an.bin, "objc", None)
+        if objc is None or not objc.ivar_slots or not (isinstance(addr, BinOp) and addr.op == "+"):
+            return None
+        for obj, off in ((addr.a, addr.b), (addr.b, addr.a)):
+            o = off
+            while isinstance(o, Cast):
+                o = o.a
+            if isinstance(o, Var):              # the offset loaded once, ahead of a loop
+                o = self._ivar_vars().get(o.name, o)
+            if isinstance(o, Load) and isinstance(o.addr, Const) and o.addr.value in objc.ivar_slots:
+                return f"{self.expr(obj, PREC_POSTFIX)}->{objc.ivar_slots[o.addr.value][1]}"
         return None
+
+    def _objc_ref(self, e, table: str) -> str | None:
+        """What an Objective-C selector / class reference load names, else None."""
+        objc = getattr(self.an.bin, "objc", None)
+        e = _bare(e)
+        if objc is None or not (isinstance(e, Load) and isinstance(e.addr, Const)):
+            return None
+        return getattr(objc, table).get(e.addr.value)
+
+    def _objc_send(self, name: str, c: ir.Call) -> str | None:
+        """`[receiver part1:arg1 part2:arg2]` for a message send (and clang's alloc / init / new
+        shortcuts), else None."""
+        from .sigs import OBJC_SENDS
+        args = c.args
+        if name in ("objc_alloc_init", "objc_alloc", "objc_opt_new") and len(args) == 1:
+            cls = self._objc_ref(args[0], "classrefs") or self.expr(args[0])
+            return {"objc_alloc_init": f"[[{cls} alloc] init]", "objc_alloc": f"[{cls} alloc]",
+                    "objc_opt_new": f"[{cls} new]"}[name]
+        if name not in OBJC_SENDS or len(args) < 2:
+            return None
+        sel = self._objc_ref(args[1], "selrefs")
+        if sel is None:
+            return None
+        if name.startswith("objc_msgSendSuper"):
+            recv = "super"
+        else:
+            recv = self._objc_ref(args[0], "classrefs") or self.expr(args[0], PREC_POSTFIX)
+        parts = sel.split(":")
+        if len(parts) == 1:
+            return f"[{recv} {sel}]"
+        rest = [self.expr(_bare(a)) for a in args[2:]]
+        words = [f"{p}:{rest[k] if k < len(rest) else '?'}" for k, p in enumerate(parts[:-1])]
+        return f"[{recv} {' '.join(words)}]"
 
     def call(self, c: ir.Call) -> str:
         name = self._callee_name(c) or f"(*{self.expr(c.target, PREC_UNARY)})"
+        send = self._objc_send(name, c)
+        if send is not None:
+            return send
         fl = dict(c.fargs)
         from .sigs import arg_type, lookup
         sig = lookup(name, self.an)
@@ -1149,6 +1243,9 @@ class CWriter:
         if isinstance(s, Assign):
             if isinstance(s.src, ir.Phi):
                 return None
+            if isinstance(s.dst, Var) and getattr(self.an.bin, "objc", None) is not None and \
+                    s.dst.name in self._ivar_vars():
+                return None                     # (an ivar offset: its uses read `obj->ivar`)
             lhs = self.expr(s.dst)
             src = s.src
             if isinstance(src, BinOp) and src.a == s.dst and src.op in ("+", "-", "*", "&", "|", "^", "<<"):

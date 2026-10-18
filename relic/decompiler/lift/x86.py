@@ -275,6 +275,7 @@ class X86Lifter:
         """Statements for one instruction (control flow included)."""
         self.out = []
         self.insn = i
+        self._func = func
         if i.addr != self._last_end:
             self._xmm_const.clear()
         self._last_end = i.end
@@ -972,8 +973,45 @@ class X86Lifter:
             self.write_reg(thunk, Const(i.end, 32))      # the thunk returns its return address
             return
         target = Const(i.target, self.bits) if i.target is not None else self.read(ops[0])
-        name = self.an.call_name(i)
+        name = self.an.call_name(i) or self._reg_import(i, ops[0], func=getattr(self, "_func", None))
         self.emit(CallStmt(i.addr, Call(target, (), self.bits), noreturn=self._noreturn(i), name=name))
+
+    def _reg_import(self, i, op, func) -> str | None:
+        """The import a `call reg` / `jmp reg` goes to when the register was loaded from the
+        import's GOT slot earlier in the function (clang keeps `objc_msgSend` in a callee-saved
+        register for a run of calls): back through the block and single predecessors."""
+        if op.type != OP_REG or func is None:
+            return None
+        want = self.full(i.cs.reg_name(op.reg)).name
+        blk = func.block_at(i.addr)
+        seen = 0
+        start = i.addr
+        while blk is not None and seen < 200:
+            for j in reversed([x for x in blk.insns if x.addr < start]):
+                seen += 1
+                try:
+                    _r, w = j.cs.regs_access()
+                    written = {self.full(j.cs.reg_name(x)).name for x in w if j.cs.reg_name(x) in self.regs}
+                except Exception:               # noqa: BLE001 - capstone cannot always tell
+                    return None
+                if want in written:
+                    src = j.cs.operands[1] if j.mnemonic == "mov" and len(j.cs.operands) == 2 else None
+                    if src is not None and src.type == OP_MEM and j.cs.reg_name(src.mem.base) == "rip":
+                        slot = j.end + src.mem.disp            # `mov r14, [rip + got]`
+                        imp = self.an.bin.imports_by_got.get(slot)
+                        if imp is not None:
+                            return imp.name
+                        name = getattr(self.an.bin, "got_names", {}).get(slot)    # (a second GOT slot)
+                        return name if name and any(x.name == name for x in self.an.bin.imports) else None
+                    if src is not None and src.type == OP_REG and j.cs.reg_name(src.reg) in self.regs:
+                        want = self.full(j.cs.reg_name(src.reg)).name     # `mov rax, r14`: follow r14
+                        continue
+                    return None
+            if len(blk.preds) != 1:
+                return None
+            blk = func.blocks.get(blk.preds[0])
+            start = blk.end if blk is not None else 0
+        return None
 
     def _i_ret(self, i, ops):
         if ops:  # ret imm16 (stdcall)
@@ -1028,6 +1066,10 @@ class X86Lifter:
             self.emit(IndirectJump(i.addr, expr, seen, list(table)))
         elif i.mem_target is not None and self.an.bin.imports_by_got.get(i.mem_target):
             self.emit(CallStmt(i.addr, Call(expr, (), self.bits), tail=True, name=self.an.call_name(i)))
+            self.emit(Return(i.addr))
+        elif (imp := self._reg_import(i, i.cs.operands[0], func)) is not None:
+            # a tail call through a register holding an import (`jmp rbx` = objc_msgSend)
+            self.emit(CallStmt(i.addr, Call(expr, (), self.bits), tail=True, name=imp))
             self.emit(Return(i.addr))
         else:
             self.emit(IndirectJump(i.addr, expr, []))

@@ -77,7 +77,22 @@ SIGS: dict[str, Sig] = {
     "__strcpy_chk": Sig(3, ret="char *", args="ssn"), "__strncpy_chk": Sig(4, ret="char *", args="ssnn"),
     "__strcat_chk": Sig(3, ret="char *", args="ssn"), "__strncat_chk": Sig(4, ret="char *", args="ssnn"),
     "__gets_chk": Sig(2, ret="char *", args="sn"), "__read_chk": Sig(4, ret="ssize_t", args="ipnn"),
+    # Objective-C runtime (objc_msgSend's own arguments are counted from its selector: calls.py)
+    "objc_alloc": Sig(1, ret="id", types=("Class",)), "objc_alloc_init": Sig(1, ret="id", types=("Class",)),
+    "objc_opt_new": Sig(1, ret="id", types=("Class",)), "objc_opt_class": Sig(1, ret="Class", types=("id",)),
+    "objc_retain": Sig(1, ret="id", types=("id",)), "objc_release": Sig(1, ret="void", types=("id",)),
+    "objc_autorelease": Sig(1, ret="id", types=("id",)),
+    "objc_retainAutoreleasedReturnValue": Sig(1, ret="id", types=("id",)),
+    "objc_autoreleaseReturnValue": Sig(1, ret="id", types=("id",)),
+    "objc_storeStrong": Sig(2, ret="void", types=("id *", "id")),
+    "objc_getProperty": Sig(4, ret="id", types=("id", "SEL", "ptrdiff_t", "BOOL")),
+    "objc_setProperty_nonatomic": Sig(4, ret="void", types=("id", "SEL", "id", "ptrdiff_t")),
+    "objc_autoreleasePoolPush": Sig(0, ret="void *"), "objc_autoreleasePoolPop": Sig(1, ret="void", args="p"),
 }
+
+# message sends: receiver, selector, then one argument per `:` of the selector
+OBJC_SENDS = {"objc_msgSend", "objc_msgSendSuper", "objc_msgSendSuper2", "objc_msgSend_stret",
+              "objc_msgSend_fpret", "objc_msgSendSuper2_stret"}
 
 # %[flags][width][.precision][length]conversion   (width/precision may be `*` = an extra arg)
 _CONV = re.compile(r"%([-+ 0#]*)(\*|\d+)?(\.(\*|\d+))?(hh|h|ll|l|j|z|t|L)?([diouxXeEfFgGaAcspn%])")
