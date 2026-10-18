@@ -976,6 +976,16 @@ class X86Lifter:
         name = self.an.call_name(i) or self._reg_import(i, ops[0], func=getattr(self, "_func", None))
         self.emit(CallStmt(i.addr, Call(target, (), self.bits), noreturn=self._noreturn(i), name=name))
 
+    def _after_epilogue(self, i, func) -> bool:
+        """Whether the instructions just before `i` in its block tear the frame down (`pop`,
+        `leave`, `add rsp, k`)."""
+        blk = func.block_at(i.addr) if func is not None else None
+        if blk is None:
+            return False
+        before = [x for x in blk.insns if x.addr < i.addr][-3:]
+        return any(x.mnemonic in ("pop", "leave") or x.mnemonic == "add" and x.op_str.startswith(("rsp", "esp"))
+                   for x in before)
+
     def _reg_import(self, i, op, func) -> str | None:
         """The import a `call reg` / `jmp reg` goes to when the register was loaded from the
         import's GOT slot earlier in the function (clang keeps `objc_msgSend` in a callee-saved
@@ -1070,6 +1080,10 @@ class X86Lifter:
         elif (imp := self._reg_import(i, i.cs.operands[0], func)) is not None:
             # a tail call through a register holding an import (`jmp rbx` = objc_msgSend)
             self.emit(CallStmt(i.addr, Call(expr, (), self.bits), tail=True, name=imp))
+            self.emit(Return(i.addr))
+        elif self._after_epilogue(i, func):
+            # `pop rbp; jmp rax`: the frame is gone, so not a switch -- a tail call through a pointer
+            self.emit(CallStmt(i.addr, Call(expr, (), self.bits), tail=True))
             self.emit(Return(i.addr))
         else:
             self.emit(IndirectJump(i.addr, expr, []))

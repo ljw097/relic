@@ -72,6 +72,12 @@ class _Cover:
         return (pos, min(e, end)) if pos < min(e, end) else self.next_gap(min(e, end), end) if e < end else None
 
 
+def _fragment(name: str) -> bool:
+    """gcc's names for pieces split off a function (`f.cold`, `f.cold.3`): its code, not one of
+    their own (`f.part.0` and `f.isra.0` are real functions)."""
+    return ".cold" in name
+
+
 @dataclass
 class Function:
     addr: int
@@ -116,6 +122,7 @@ class FunctionAnalyzer:
         self.funcs: dict[int, Function] = {}
         self.prev: dict[int, int] = {}  # insn addr -> previous insn addr on fallthrough
         self._queue: list[int] = []
+        self._fde: set[int] = set()     # ELF: function starts `.eh_frame` describes
 
     # ------------------------------------------------------------- driver
     def run(self) -> dict[int, Function]:
@@ -124,8 +131,9 @@ class FunctionAnalyzer:
             if imp.addr and b.is_exec(imp.addr):
                 f = Function(imp.addr, imp.name, is_import=True, noreturn=imp.name in NORETURN)
                 self.funcs[imp.addr] = f
+        self._fde = self._eh_frame_starts()
         seeds = [b.entry] if b.entry and b.is_exec(b.entry) else []
-        seeds += sorted(a for a, s in b.symbols.items() if s.kind == "func" and b.is_exec(a))
+        seeds += sorted(a for a, s in b.symbols.items() if s.kind == "func" and b.is_exec(a) and not _fragment(s.name))
         seeds += self._elf_ctor_seeds()
         seeds += [a for a in getattr(b, "function_starts", []) if b.is_exec(a)]   # PE .pdata
         self._queue.extend(seeds)
@@ -134,9 +142,62 @@ class FunctionAnalyzer:
         if main is not None:
             self._queue.append(main)
             self._drain()
+        self._eh_frame_seeds()
         self._scan_gaps()
         self._link()
         return self.funcs
+
+    # DWARF number of the stack pointer and the CFA offset from it at a function's first
+    # instruction (only the return address pushed, on x86)
+    _ENTRY_CFA = {"x64": (7, 8), "x86": (4, 4), "arm64": (31, 0), "arm": (13, 0), "mips": (29, 0),
+                  "mips64": (29, 0), "riscv64": (2, 0), "riscv32": (2, 0), "ppc": (1, 0), "ppc64": (1, 0)}
+
+    def _eh_frame_starts(self) -> set[int]:
+        """ELF: the start of every function `.eh_frame` describes (stripped or not). An FDE whose
+        first row is not the entry state (a `.cold` fragment, the PLT) does not start one."""
+        b = self.bin
+        if b.format != "ELF" or b.section(".eh_frame") is None:
+            return set()
+        entry = self._ENTRY_CFA.get(b.arch)
+        out = set()
+        try:
+            import io
+
+            from elftools.elf.elffile import ELFFile
+            dwarf = ELFFile(io.BytesIO(b.data)).get_dwarf_info()
+            for e in dwarf.EH_CFI_entries():
+                if type(e).__name__ != "FDE":
+                    continue
+                if entry is not None:
+                    rows = e.get_decoded().table
+                    cfa = rows[0].get("cfa") if rows else None
+                    if cfa is None or (cfa.reg, cfa.offset) != entry:
+                        continue
+                out.add(e.header["initial_location"])
+        except Exception:                       # noqa: BLE001 - malformed or unusual CFI: none
+            return set()
+        return out
+
+    def _eh_frame_seeds(self):
+        """The functions `.eh_frame` describes that nothing reached. After the others are found,
+        so that the separate FDE of a `.cold` fragment -- code of a function already found --
+        does not start one."""
+        b = self.bin
+        starts = sorted(self._fde)
+        if not starts:
+            return
+        covered = sorted((blk.addr, blk.end) for f in self.funcs.values() if not f.is_import
+                         for blk in f.blocks.values())
+        firsts = [c[0] for c in covered]
+        import bisect
+        for a in starts:
+            if a in self.funcs or not b.is_exec(a):
+                continue
+            k = bisect.bisect_right(firsts, a) - 1
+            if k >= 0 and covered[k][0] <= a < covered[k][1]:
+                continue                        # (inside a function found already)
+            self._queue.append(a)
+        self._drain()
 
     def _drain(self):
         while self._queue:
@@ -191,6 +252,8 @@ class FunctionAnalyzer:
             while a not in insns:
                 if a != start and a in self.funcs and not self.funcs[a].is_import:
                     break
+                if a != start and a in self._fde and self.prev.get(a) is not None and a not in leaders:
+                    break               # (falling into the next function: unwind info starts one here)
                 i = self.dis.decode(a)
                 if i is None:
                     break
@@ -213,7 +276,8 @@ class FunctionAnalyzer:
                         f.calls.add(tgt)
                         if tgt not in self.funcs:
                             self._queue.append(tgt)
-                    if self._is_noreturn_call(i):
+                    if self._is_noreturn_call(i) or nxt in self._fde and nxt != start:
+                        # (a call the next function's unwind info follows does not come back)
                         edges[a] = []
                         break
                     if i.cond:
@@ -348,8 +412,10 @@ class FunctionAnalyzer:
             return False
         if tgt in self.funcs:
             return True
+        if tgt in self._fde:
+            return True                         # a function's entry by its unwind info
         s = self.bin.symbols.get(tgt)
-        return bool(s and s.kind == "func")
+        return bool(s and s.kind == "func" and not _fragment(s.name))
 
     def _looks_like_code(self, addr: int) -> bool:
         i = self.dis.decode(addr)
@@ -849,6 +915,7 @@ class FunctionAnalyzer:
         for op in jmp.cs.operands:
             if op.type == 3 and op.mem.index and op.mem.scale == ptr and op.mem.disp:
                 base, relative = op.mem.disp & self.dis._mask, False
+        tbl_reg = self._table_reg(hist)
         if base is None:
             for i in hist:
                 for op in i.cs.operands:
@@ -859,9 +926,12 @@ class FunctionAnalyzer:
                         base, relative = m.disp & self.dis._mask, False
                 if base is not None:
                     break
-                if i.mnemonic == "lea" and i.refs:
-                    base = i.refs[0]
+                if i.mnemonic == "lea" and i.refs and (tbl_reg is None or (
+                        i.cs.operands[0].type == 1 and self._full_reg(i.cs.reg_name(i.cs.operands[0].reg)) == tbl_reg)):
+                    base = i.refs[0]            # (the lea of the register the table is read through)
                     break
+        if base is None:
+            base = self._x86_hoisted_table(jmp, hist)
         if base is None and self.bin.bits == 32:
             # x86-32 PIC: `add/mov R, [G + idx*4 + d]` with G holding the GOT address, entries
             # are offsets from the GOT (`add R, G; jmp R`)
@@ -882,8 +952,14 @@ class FunctionAnalyzer:
             if i.mnemonic in ("ja", "jae", "jb", "jbe") and k + 1 < len(hist):
                 cmp = hist[k + 1]
                 if cmp.mnemonic == "cmp" and cmp.cs.operands[-1].type == 2:
-                    v = cmp.cs.operands[-1].imm
-                    count = v + 1 if i.mnemonic in ("ja", "jbe") else v
+                    width = cmp.cs.operands[0].size * 8
+                    v = cmp.cs.operands[-1].imm & ((1 << width) - 1)
+                    if i.mnemonic == "jb" and v >> (width - 1):
+                        # `cmp x, -5; jb default`: x in [-5, -1], the index `x + 5` (gcc's switch on
+                        # negative cases): as many entries as values up to the top
+                        count = (1 << width) - v
+                    else:
+                        count = v + 1 if i.mnemonic in ("ja", "jbe") else v
                 break
         limit = count if count is not None and 0 < count <= 4096 else 512
         sec = self.bin.section_at(jmp.addr)
@@ -904,6 +980,71 @@ class FunctionAnalyzer:
                 continue
             out.append(t)
         return out
+
+    def _x86_hoisted_table(self, jmp: Insn, hist: list[Insn]) -> int | None:
+        """A relative table read as `movsxd rax, [R + idx*4]` with R set by `lea R, [rip + table]`
+        out of sight of the dispatch (hoisted out of a loop, or kept for several switches): back
+        through earlier instructions to R's last write."""
+        if self.bin.bits != 64:
+            return None
+        want = self._table_reg(hist)
+        if want is None:
+            return None
+        back = self._back(jmp.addr, 400)
+        found = self._last_lea(back, want)
+        if found is None and getattr(self, "_jt_func", None) is not None and 0 < jmp.addr - self._jt_func < 0x8000:
+            # the dispatch block is reached by a jump: the function's code in address order (gcc
+            # keeps data out of .text), the latest write before the dispatch
+            linear, a = [], self._jt_func
+            while a < jmp.addr:
+                i = self.dis.decode(a)
+                if i is None:
+                    break
+                linear.append(i)
+                a = i.end
+            if a == jmp.addr:
+                found = self._last_lea(list(reversed(linear)), want, calls_kill=False)
+        return found or None
+
+    def _table_reg(self, hist: list[Insn]) -> str | None:
+        """The register a relative table is read through (`movsxd rax, [R + idx*4]`), as its
+        64-bit name, or None."""
+        if self.bin.bits != 64:
+            return None
+        for i in hist:
+            if i.mnemonic in ("movsxd", "mov") and len(i.cs.operands) == 2 and i.cs.operands[1].type == 3:
+                m = i.cs.operands[1].mem
+                if m.base and m.index and m.scale == 4 and not m.disp:
+                    reg = i.cs.reg_name(m.base)
+                    return None if reg in ("rip", "rsp") else self._full_reg(reg)
+        return None
+
+    def _last_lea(self, insns: list[Insn], want: str, calls_kill: bool = True) -> int | None:
+        """The table a `lea want, [rip + table]` gives, if that is the latest write to `want` in
+        `insns` (newest first); 0 when something else writes it first, None when nothing does."""
+        for i in insns:
+            try:
+                _r, w = i.cs.regs_access()
+            except Exception:                   # noqa: BLE001 - capstone cannot always tell
+                return 0
+            if want in {self._full_reg(i.cs.reg_name(x)) for x in w}:
+                if i.mnemonic == "lea" and i.refs:
+                    return i.refs[0]
+                return 0
+            if calls_kill and i.kind == "call" and want in ("rax", "rcx", "rdx", "rsi", "rdi", "r8", "r9", "r10",
+                                                             "r11"):
+                return 0                        # (a caller-saved register does not survive a call)
+        return None
+
+    @staticmethod
+    def _full_reg(name: str) -> str:
+        """The 64-bit register a sub-register belongs to (`ebx` -> `rbx`, `r12d` -> `r12`)."""
+        if name.startswith("r") and name[1:].rstrip("dwb").isdigit():
+            return name.rstrip("dwb") if name[-1] in "dwb" else name
+        base = {"al": "ax", "bl": "bx", "cl": "cx", "dl": "dx", "sil": "si", "dil": "di", "bpl": "bp", "spl": "sp"}
+        n = base.get(name, name)
+        n = n[1:] if n[0] == "e" or n[0] == "r" and len(n) == 3 else n
+        return "r" + n
 
     def _got_base(self) -> int | None:
         """The x86-32 PIC GOT pointer: `_GLOBAL_OFFSET_TABLE_`, else the start of .got.plt."""

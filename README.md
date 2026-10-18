@@ -69,13 +69,13 @@ Roughly, here's what works:
 ### Where it stands against IDA
 
 These numbers are eyeballed. Read them as "the share of what IDA does in that area that Relic does about as well."
-The total is a weighted average, with weights from how much each area matters to me when I'm actually reversing. Right now it's **about 81%**.
+The total is a weighted average, with weights from how much each area matters to me when I'm actually reversing. Right now it's **about 83%**.
 
 | Area (weight) | Progress | Notes |
 |---|---|---|
 | File formats (8) | 100% | Mach-O with Objective-C metadata (`[obj msg:arg]` in the pseudocode) |
 | Processors (8) | 80% | IDA handles 60+ CPU families, so this is the furthest behind |
-| Auto-analysis (14) | 55% | Still misses some functions and indirect jumps in big binaries |
+| Auto-analysis (14) | 70% | Finds 99.9% of the functions `.eh_frame` lists in stripped bash; no noreturn inference or indirect-call targets yet |
 | Library identification (8) | 100% | On the stripped static C test binaries, 83–94% of the functions that had symbols get named, with no wrong names |
 | Type system (10) | 85% | No by-value struct arguments or returns |
 | Decompiler (20) | 52% | Too many gotos left, no x87 floating point or SIMD |

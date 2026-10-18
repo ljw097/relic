@@ -309,8 +309,9 @@ def _set_before_call(fn: IRFunction, argregs, uses: dict, params=()) -> list[str
     out: list[str] = []
     for r in argregs:
         v = uses.get(r)
-        if not (isinstance(v, Const) or (isinstance(v, Var) and (v in defined or
-                                                                  (v.version == 0 and v.name in params)))):
+        computed = v is not None and not isinstance(v, (Var, Const, Phi))     # (propagated into the call)
+        if not (isinstance(v, Const) or computed or (isinstance(v, Var) and (v in defined or
+                                                                              (v.version == 0 and v.name in params)))):
             break
         out.append(r)
     return out
