@@ -106,6 +106,9 @@ def hide_canary(fn: IRFunction, frame: Frame) -> bool:
         if isinstance(last, Branch) and _reaches_tls(last.cond, defs, guards=frame.guards, memo=memo):
             for fail, ok in ((last.true, last.false), (last.false, last.true)):
                 fb = fn.blocks.get(fail)
+                for _ in range(3):              # (clang -O0: through a block that only jumps there)
+                    if fb is not None and len(fb.stmts) == 1 and isinstance(fb.stmts[0], Jump):
+                        fb = fn.blocks.get(fb.stmts[0].target)
                 if fb is not None and _is_fail_block(fb):
                     b.stmts[-1] = Jump(last.addr, ok)
                     b.succs = [ok]

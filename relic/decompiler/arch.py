@@ -1,7 +1,7 @@
 """Per-architecture register conventions used by the architecture-neutral passes."""
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 FLAGS = ("zf", "cf", "sf", "of", "pf")
 
@@ -55,6 +55,8 @@ ARM64 = ArchInfo(
     syscall_reads=("x8", "x0", "x1", "x2", "x3", "x4", "x5"),
     syscall_clobbers=("x0",),
 )
+# Apple's arm64 ABI: the same registers, but variadic arguments always on the stack
+ARM64_APPLE = replace(ARM64, name="arm64-aapcs-apple")
 
 
 _A32_ARGS = ("r0", "r1", "r2", "r3")
@@ -150,7 +152,7 @@ def arch_for(binary) -> ArchInfo:
     if binary.arch == "x86":
         return X86_CDECL
     if binary.arch == "arm64":
-        return ARM64
+        return ARM64_APPLE if binary.format == "Mach-O" else ARM64
     if binary.arch == "arm":
         return ARM_VFP if getattr(binary, "arm_hard_float", False) else ARM
     if binary.arch == "mips" and binary.bits == 32:

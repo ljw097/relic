@@ -266,12 +266,12 @@ def _symbols(b: Binary, data: bytes, end: str, is64: bool, symtab, secs) -> list
         b.add_symbol(sym)
         if ntype & N_EXT:
             b.exports.append(sym)
-    # sizes: up to the next symbol in the same section
+    # nlist has no sizes: a function runs up to the next symbol (data objects stay unsized, their
+    # neighbour says nothing about how big they are)
     addrs = sorted(b.symbols)
-    for i, a in enumerate(addrs):
-        nxt = addrs[i + 1] if i + 1 < len(addrs) else None
-        if nxt is not None:
-            b.symbols[a].size = nxt - a
+    for i, a in enumerate(addrs[:-1]):
+        if b.symbols[a].kind == "func":
+            b.symbols[a].size = addrs[i + 1] - a
     return names
 
 

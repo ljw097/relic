@@ -97,14 +97,22 @@ def test_calls_resolve_to_imports(exe):
     assert {"classify", "checksum", "win", "vuln", "main"} <= names and "_mh_execute_header" not in names
 
 
-def test_decompile_x64(request):
-    an = analyze(_build("x64_O0"))
+def test_decompile(exe):
+    """Imports by name, Apple arm64's variadic arguments on the stack, the canary check hidden
+    (clang -O0 reaches __stack_chk_fail through a jump), clang's division by a large constant."""
+    name, path = exe
+    an = analyze(path)
     code = decompile(an, an.function_by_name("vuln")).text
-    assert 'puts("name?");' in code and "gets(" in code and 'printf("hello %s (%d)\\n", ' in code, code
-    assert "checksum(" in code
-    code = decompile(an, an.function_by_name("classify")).text
-    assert "switch (" in code and "case 5:" in code, code
-    assert 'system("/bin/sh");' in decompile(an, an.function_by_name("win")).text
+    assert 'puts("name?");' in code and "gets(" in code, code
+    assert 'printf("hello %s (%d)\\n", ' in code and "__stack_chk" not in code and "canary)" not in code, code
+    assert "checksum(" in code if name.endswith("O0") else "% 100000" in code, code
+    code = decompile(an, an.function_by_name("checksum")).text
+    assert "% 100000" in code and "0x14f8b589" not in code, code
+    code = decompile(an, an.function_by_name("main")).text
+    assert 'printf("%s %d\\n", names[' in code and "counter[0]" not in code, code
+    if name.endswith("O0"):
+        assert "switch (" in decompile(an, an.function_by_name("classify")).text
+        assert 'system("/bin/sh");' in decompile(an, an.function_by_name("win")).text
 
 
 def test_universal_file(fat):
