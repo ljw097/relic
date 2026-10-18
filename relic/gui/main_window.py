@@ -264,6 +264,7 @@ class MainWindow(QMainWindow):
         self.fwd: list[int] = []
         self.dirty = False
         self.setWindowTitle("Relic")
+        self.setAcceptDrops(True)               # (drop a binary on the window to open it)
 
         self.disasm = DisasmView()
         self.graph = GraphView()
@@ -588,6 +589,16 @@ class MainWindow(QMainWindow):
         self.fwd_act.setEnabled(self.an is not None and bool(self.fwd))
 
     # --------------------------------------------------------------- loading
+    def dragEnterEvent(self, e):
+        if e.mimeData().hasUrls() and any(u.isLocalFile() for u in e.mimeData().urls()):
+            e.acceptProposedAction()
+
+    def dropEvent(self, e):
+        paths = [u.toLocalFile() for u in e.mimeData().urls() if u.isLocalFile()]
+        if paths:
+            e.acceptProposedAction()
+            self.open_file(paths[0])
+
     def open_dialog(self):
         path, _ = QFileDialog.getOpenFileName(self, "Open binary")
         if path:

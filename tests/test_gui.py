@@ -1375,3 +1375,29 @@ def test_debugger_threads_modules_trace_signals(app, tmp_path):
     assert _debug_wait(app, w, lambda: w.dbg.session is None)
     w.dirty = False
     w.close()
+
+
+def test_starts_empty_and_opens_a_dropped_file(app, vuln64, tmp_path):
+    """Started with no file (a double-clicked executable), the window takes one dropped on it."""
+    from PySide6.QtCore import QMimeData, QUrl
+    path = tmp_path / "vuln64"
+    shutil.copy(vuln64, path)
+    w = MainWindow()
+    assert w.an is None and w.acceptDrops()
+    mime = QMimeData()
+    mime.setUrls([QUrl.fromLocalFile(str(path))])
+
+    class Drop:                                 # (what Qt hands dragEnterEvent / dropEvent)
+        accepted = False
+
+        def mimeData(self):
+            return mime
+
+        def acceptProposedAction(self):
+            Drop.accepted = True
+    w.dragEnterEvent(Drop())
+    assert Drop.accepted
+    w.dropEvent(Drop())
+    assert w.wait() and w.an is not None and w.an.function_by_name("main") is not None
+    w.dirty = False
+    w.close()
