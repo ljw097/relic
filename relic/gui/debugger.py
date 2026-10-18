@@ -175,7 +175,7 @@ class DebugController(QObject):
                 self.log.emit(f"[ debugging the patched image ({n} patch{'es' if n != 1 else ''}): {run} ]\n")
             self.session = Session(run, self.args, analysis, on_output=self.output.emit, target=target)
             if target is not None and target.kind != "local":
-                where = {"qemu": "under QEMU", "remote": f"on {target.address}",
+                where = {"qemu": "under QEMU", "wine": "under wine (gdbserver.exe)", "remote": f"on {target.address}",
                          "attach": f"attached to process {target.pid}"}.get(target.kind, target.kind)
                 self.log.emit(f"[ {where} ]\n")
             self.mem_addr = None

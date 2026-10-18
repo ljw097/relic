@@ -1327,7 +1327,10 @@ def test_debugger_target_dialog(app, win, tmp_path):
     win.dbg_target = d.target()
     got = win.debug_target()
     assert got.kind == "local" and got.env == {"A": "1", "B": "x=y"}
-    d.kind.setCurrentIndex(4)
+    from relic.gui.debugtarget import KINDS
+    d.kind.setCurrentIndex([k for k, _ in KINDS].index("wine"))
+    assert d.target().kind == "wine" and not d.pid.isEnabled() and not d.address.isEnabled()
+    d.kind.setCurrentIndex([k for k, _ in KINDS].index("attach"))
     assert d.pid.isEnabled() and d.target().kind == "attach"
     win.dbg_target = None
 

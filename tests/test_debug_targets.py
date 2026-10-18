@@ -212,3 +212,98 @@ def test_threads_modules_signals_and_trace(threads_bin):
         assert describe_stop(s.cont(30)).startswith("library event")
     finally:
         s.close()
+
+
+# ------------------------------------------------------------------ Windows (PE) targets
+WINE_GDBSERVER = {"win64": ("x86_64-w64-mingw32-gcc", "/usr/share/win64/gdbserver.exe", ["rax", "rbx"]),
+                  "win32": ("i686-w64-mingw32-gcc", "/usr/share/win32/gdbserver.exe", ["eax", "ebx"])}
+
+
+@pytest.fixture(scope="module")
+def wine_env(tmp_path_factory):
+    """A wine prefix to run Windows programs (and Windows' gdbserver.exe) in."""
+    wine = shutil.which("wine")
+    if wine is None:
+        pytest.skip("needs wine")
+    prefix = tmp_path_factory.mktemp("wineprefix")
+    env = dict(os.environ, WINEDEBUG="err+all", WINEPREFIX=str(prefix), DISPLAY="")
+    r = subprocess.run([wine, "wineboot", "-i"], env=env, capture_output=True, timeout=300)
+    if r.returncode:
+        pytest.skip("wine cannot make a prefix here")
+    return wine, env
+
+
+@pytest.mark.parametrize("kind", sorted(WINE_GDBSERVER))
+def test_windows_gdbserver_under_wine(kind, tmp_path, wine_env):
+    """A PE program debugged through Windows' own gdbserver.exe (run by wine here; the same
+    `host:port` target as a gdbserver on a Windows machine): main, a breakpoint, registers,
+    frames, the loaded DLLs, the program's input and its exit."""
+    cc, server, regs = WINE_GDBSERVER[kind]
+    if shutil.which(cc) is None or not os.path.exists(server) or find_gdb() is None:
+        pytest.skip(f"needs {cc}, {server} (gdb-mingw-w64-target) and gdb")
+    wine, env = wine_env
+    path = _build(tmp_path, cc, f"t_{kind}.exe")
+    an = analyze(path)
+    port = _free_port()
+    srv = subprocess.Popen([wine, server, f"127.0.0.1:{port}", path, "a"], cwd=str(tmp_path), env=env,
+                           stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+    try:
+        s = None
+        for _ in range(60):                                       # (wine takes a while to start it)
+            try:
+                s = Session(path, [], an, target=Target("remote", address=f"127.0.0.1:{port}"))
+                break
+            except DebugError:
+                if srv.poll() is not None:
+                    pytest.skip("gdbserver.exe does not run under this wine")
+                time.sleep(1)
+        assert s is not None, "could not connect to gdbserver.exe"
+        try:
+            try:
+                st = s.start("main", 120)
+            except DebugError as e:
+                srv.kill()
+                pytest.fail(f"{e}\nwine/gdbserver.exe said:\n{srv.stdout.read().decode(errors='replace')}")
+            assert s.symbolize(s.pc).startswith("main"), describe_stop(st)
+            s.add_breakpoint(s.to_live(an.function_by_name("work").addr))
+            srv.stdin.write(b"line1\n")
+            srv.stdin.flush()
+            st = s.cont(120)
+            assert s.symbolize(s.pc).startswith("work"), describe_stop(st)
+            assert [n for n, _, _ in s.gprs()][:2] == regs
+            assert [f.func for f in s.backtrace()][:2] == ["work", "main"]
+            assert any(m.path.lower().endswith("kernel32.dll") for m in s.modules())
+            assert describe_stop(s.cont(120)) == "exited normally"
+        finally:
+            s.close()
+    finally:
+        srv.kill()
+    out = srv.stdout.read()
+    assert b"hello -" in out and b"got line1" in out
+
+
+@pytest.mark.parametrize("kind", sorted(WINE_GDBSERVER))
+def test_windows_program_runs_under_wine_automatically(kind, tmp_path, wine_env, monkeypatch):
+    """A Windows program debugged here with no target set: gdbserver.exe under wine, started by
+    the session -- its environment, arguments and input like a local program's."""
+    from relic.debugger.session import wine_gdbserver_for
+    cc, _, regs = WINE_GDBSERVER[kind]
+    if shutil.which(cc) is None or find_gdb() is None:
+        pytest.skip(f"needs {cc} and gdb")
+    path = _build(tmp_path, cc, f"w_{kind}.exe")
+    an = analyze(path)
+    assert Target.for_binary(an.bin).kind == "wine"
+    if wine_gdbserver_for(an.bin) is None:
+        pytest.skip("needs gdbserver.exe (gdb-mingw-w64-target)")
+    _, env = wine_env
+    monkeypatch.setenv("WINEPREFIX", env["WINEPREFIX"])
+    s = Session(path, ["a", "b"], an, target=Target("wine", env={"RELIC_T": "env-ok"}))
+    try:
+        start, first, hit, end, out = _session_run(s, an)
+    finally:
+        s.close()
+    assert first.startswith("main"), first
+    assert hit[1].startswith("work") and hit[2] == regs and hit[3] == ["work", "main"], hit
+    assert end == "exited normally", end
+    assert b"hello env-ok" in out and b"got line1" in out and b"r=" in out, out
+    assert s.qemu.poll() is not None                               # (wine went with the session)
