@@ -456,6 +456,41 @@ def _forward_loads(fn: IRFunction) -> bool:
     return changed
 
 
+def _split_word_loads(fn: IRFunction) -> bool:
+    """RV32 (little-endian): a word loaded from a stack slot a 64-bit value was just stored to is
+    that value's low or high half (`fsd fa0, 8(sp)`; `lw a2, 8(sp)`; `lw a3, 12(sp)`: the double
+    handed on in a pair of core registers). Within a block, until anything else writes memory."""
+    from .calls import _split_addr
+    from .ir import Store, map_stmt
+    changed = False
+    for b in fn.blocks.values():
+        stored: dict = {}                       # (base, offset) -> the 64-bit value stored there
+
+        def half(e):
+            nonlocal changed
+            if isinstance(e, Load) and e.bits == 32:
+                base, k = _split_addr(e.addr)
+                if (base, k) in stored:
+                    changed = True
+                    return Cast("low", stored[(base, k)], 32)
+                if (base, k - 4) in stored:
+                    changed = True
+                    return Extract(stored[(base, k - 4)], 32, 32)
+            return e
+        for s in b.stmts:
+            if stored and not isinstance(s, Store):
+                map_stmt(s, lambda e: transform(e, half))
+            if isinstance(s, Store):
+                if stored:
+                    s.src = transform(s.src, half)
+                stored = {}
+                if s.src.bits == 64:          # (a load in it: nothing writes memory before the uses)
+                    stored[_split_addr(s.dst)] = s.src
+            elif isinstance(s, BARRIERS):
+                stored = {}
+    return changed
+
+
 # ------------------------------------------------------------- condition recovery
 def _sub_ops(x: Expr):
     return (x.a, x.b) if isinstance(x, BinOp) and x.op == "-" else None
@@ -929,6 +964,7 @@ def optimize(fn: IRFunction, arch: ArchInfo | None = None) -> IRFunction:
     folded: dict = {}
     conds: dict = {}
     halves = arch is not None and arch.name.startswith("arm-aapcs")
+    words = arch is not None and arch.name.startswith("riscv32")
     if arch is not None and arch.name.startswith("ppc"):
         _rewrite(fn, lambda e: transform(e, _plain_single))
     for _ in range(MAX_ITERS):
@@ -940,6 +976,8 @@ def optimize(fn: IRFunction, arch: ArchInfo | None = None) -> IRFunction:
         changed |= _fold_pass(fn, folded)
         changed |= _propagate(fn)
         changed |= _forward_loads(fn)
+        if words:
+            changed |= _split_word_loads(fn)
         if fn.const_words:
             changed |= _const_loads(fn)
         changed |= _redundant_masks(fn)

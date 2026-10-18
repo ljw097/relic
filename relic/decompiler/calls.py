@@ -33,6 +33,7 @@ _INT_ARGS = {
     "ppc32-sysv": tuple(f"r{k}" for k in range(3, 11)),
     "ppc64-elfv2": tuple(f"r{k}" for k in range(3, 11)),
     "riscv64-lp64d": tuple(f"a{k}" for k in range(8)),
+    "riscv32-ilp32d": tuple(f"a{k}" for k in range(8)),
 }
 
 
@@ -545,7 +546,8 @@ def recover_calls(fn: IRFunction, an: "Analysis", arch: ArchInfo) -> IRFunction:
                 fps = fp_params(an, arch, tgt)
                 widths = dict(fps)
                 fints = dict(float_int_params(an, arch, tgt))      # RISC-V: floats past fa7
-                selected = [r for r in selected if r not in fints]
+                halves = {x for r in fints for x in r.split(":")}
+                selected = [r for r in selected if r not in halves]
                 slots = stack_param_slots(an, arch, tgt) if stack_params_used(arch) else []
                 if fps or slots:
                     placed = selected + [r for r, _ in fps] + ["=" + r for r in fints] + [None] * len(slots)
@@ -587,8 +589,8 @@ def recover_calls(fn: IRFunction, an: "Analysis", arch: ArchInfo) -> IRFunction:
                         v = Cast("low", v, 64) if v.bits > 64 else v
                     args.append(v)
                     continue
-                if ":" in r:                      # a double in a pair of core registers (variadic ARM)
-                    lo_r, hi_r = r.split(":")
+                if ":" in r:                      # a double in a pair of core registers (variadic ARM, RV32)
+                    lo_r, hi_r = r.lstrip("=").split(":")
                     if lo_r not in uses or hi_r not in uses:
                         continue
                     if defs is None:
@@ -617,7 +619,7 @@ def recover_calls(fn: IRFunction, an: "Analysis", arch: ArchInfo) -> IRFunction:
                     fargs.append((len(args), w))
                 args.append(v)
             s.call = Call(s.call.target, tuple(args), s.call.bits, tuple(fargs))
-            used = dict.fromkeys(x for r in placed if r is not None for x in fp_part(r)[0].split(":"))
+            used = dict.fromkeys(x for r in placed if r is not None for x in fp_part(r.lstrip("="))[0].split(":"))
             s.uses = [(r, uses[r]) for r in used if r in uses]
         if consumed:
             b.stmts = [t for j, t in enumerate(b.stmts) if j not in consumed]
@@ -639,9 +641,15 @@ def _pair_value(lo: Expr, hi: Expr, defs: dict | None = None) -> Expr:
             lb = _split_addr(la)
             if rlo.bits == rhi.bits == 32 and hb[0] == lb[0] and hb[1] + ha[1] == lb[1] + 4:
                 return Load(la, 64)
+        whole = _pair_value(rlo, rhi)
+        if not (isinstance(whole, BinOp) and whole.op == "|"):
+            return whole                             # (the halves of one value, through their variables)
     if isinstance(lo, Cast) and lo.kind == "low" and isinstance(hi, Extract) and hi.lo == 32 and lo.a == hi.a \
             and lo.a.bits == 64:
         return lo.a
+    if isinstance(lo, Cast) and lo.kind == "low" and lo.a.bits == 64 and isinstance(hi, Cast) and hi.kind == "low" \
+            and isinstance(hi.a, BinOp) and hi.a.op == ">>u" and hi.a.a == lo.a and hi.a.b == Const(32, hi.a.b.bits):
+        return lo.a                                  # (the high half as `low(x >>u 32)`)
     from .ir import Load
     if isinstance(lo, Load) and isinstance(hi, Load) and lo.bits == hi.bits == 32 and \
             _split_addr(hi.addr) == (_split_addr(lo.addr)[0], _split_addr(lo.addr)[1] + 4):

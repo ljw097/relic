@@ -47,6 +47,11 @@ def prepare(an: "Analysis", func: "Function") -> Prepared:
     from .calls import _livein_arg_regs
     arch = arch_for(an.bin)
     fn = copy.deepcopy(cached_ir(an, func))
+    if arch.bits == 32 and arch.name.startswith("riscv"):
+        from .fpabi import float_int_params, join_pair_params
+        pairs = [r for r, _ in float_int_params(an, arch, func.addr) if ":" in r]
+        if pairs:
+            join_pair_params(fn, pairs)
     from .cleanup import stack_guards
     frame = analyze_frame(fn, arch, stack_guards(an))
     hide_canary(fn, frame)
@@ -79,8 +84,10 @@ def prepare(an: "Analysis", func: "Function") -> Prepared:
     else:
         from .fpabi import float_int_params
         fints = [r for r, _ in float_int_params(an, arch, func.addr)]       # RISC-V: floats past fa7
-        ints = [r for r in _livein_arg_regs(an, arch, func.addr) if r not in fints]
+        halves = {x for r in fints for x in r.split(":")}
+        ints = [r for r in _livein_arg_regs(an, arch, func.addr) if r not in halves]
         fpl = fp_params(an, arch, func.addr)
+        fints = [r.split(":")[0] for r in fints]          # (RV32: a pair is named after its low register)
         params = ints + [r for r, _ in fpl] + fints
         from .calls import positional_order
         order = positional_order(arch, ints, fpl)

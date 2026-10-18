@@ -15,6 +15,9 @@ from relic.decompiler.interp import apply_binop
 from relic.decompiler.ir import BinOp, Const, UnOp, Var
 
 HERE = os.path.dirname(__file__)
+# RV32 programs: freestanding (tests/src/rv32rt.c for a libc), run under qemu-riscv32
+RV32_RUN = ["-march=rv32gc", "-mabi=ilp32d", "-static", "-nostdlib", "-fno-pic", "-fno-math-errno",
+            "-Wl,--no-relax", "-I", os.path.join(HERE, "src", "rv32inc")]
 FUNCS = ["poly", "avg", "scale", "cmpd", "to_long", "to_int", "mix", "clampd", "narrow", "absneg",
          "count_above", "sum_f", "is_equal", "hyp", "twice", "many", "many_f"]     # callees first
 
@@ -25,8 +28,8 @@ def _c(an, name):
 
 @pytest.fixture(scope="module", params=["floats_O0", "floats_O2", "floats_a64_O0", "floats_a64_O2",
                                         "floats_arm_O0", "floats_arm_O2", "floats_thumb_O2", "floats_rv64_O0",
-                                        "floats_rv64_O2", "floats_ppc_O0", "floats_ppc_O2", "floats_ppc64_O0",
-                                        "floats_ppc64_O2"])
+                                        "floats_rv64_O2", "floats_rv32_O0", "floats_rv32_O2", "floats_ppc_O0",
+                                        "floats_ppc_O2", "floats_ppc64_O0", "floats_ppc64_O2"])
 def an(request):
     return request.param, analyze(request.getfixturevalue(request.param))
 
@@ -202,6 +205,12 @@ def test_recompiled_pseudocode_matches(an, tmp_path):
         if cc is None or qemu is None:
             pytest.skip(f"no {cross[kind][0]} / {cross[kind][1]} to run the pseudocode")
         run, static = [qemu], ["-static"] + (["-mthumb"] if kind == "thumb" else ["-marm"] if kind == "arm" else [])
+    elif "_rv32_" in name:
+        # no RV32 libc: freestanding, with a minimal runtime of our own, under qemu-riscv32
+        cc, qemu = shutil.which("riscv64-linux-gnu-gcc"), shutil.which("qemu-riscv32")
+        if cc is None or qemu is None:
+            pytest.skip("no riscv64-linux-gnu-gcc / qemu-riscv32 to run the pseudocode")
+        run, static = [qemu], RV32_RUN
     else:
         cc, static = shutil.which("gcc"), []
     if cc is None:
@@ -216,8 +225,9 @@ def test_recompiled_pseudocode_matches(an, tmp_path):
                                "defines": "\n".join(f"#define {f} ref_{f}" for f in FUNCS),
                                "undefs": "\n".join(f"#undef {f}" for f in FUNCS)})
     exe = tmp_path / "re"
+    libs = [os.path.join(HERE, "src", "rv32rt.c")] if static is RV32_RUN else ["-lm"]
     r = subprocess.run([cc, "-O1", "-w", "-fwrapv", "-ffp-contract=off", "-fno-builtin", *static, "-o", str(exe),
-                        str(src), "-lm"], capture_output=True, text=True)
+                        str(src), *libs], capture_output=True, text=True)
     assert r.returncode == 0, f"{name}: does not compile:\n{r.stderr[:3000]}\n{code}"
     r = subprocess.run([*run, str(exe)], capture_output=True, text=True, timeout=120)
     assert r.stdout.strip().endswith("ok"), f"{name}:\n{r.stdout[:2000]}\n{code}"
@@ -302,7 +312,7 @@ def test_optimisation_preserves_meaning(an, fname):
             if a.bin.arch.startswith("ppc"):        # f1, f2, ...: a float too in its double form
                 m.regs[f"f{k + 1}"] = from_float(v, 64)
                 continue
-            m.regs[{"arm64": f"v{k}", "riscv64": f"fa{k}"}.get(a.bin.arch, f"xmm{k}")] = bits
+            m.regs[{"arm64": f"v{k}", "riscv64": f"fa{k}", "riscv32": f"fa{k}"}.get(a.bin.arch, f"xmm{k}")] = bits
         it = Interpreter(fn, m)
         it.run()
         return it.result

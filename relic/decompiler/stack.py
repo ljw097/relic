@@ -251,6 +251,16 @@ def analyze_frame(fn: IRFunction, arch: ArchInfo, guards=frozenset()) -> Frame:
             del frame.slots[off]
             continue
         buf = sl if sl.kind == "local" and sl.taken and sl.width <= 1 else None
+    # the high word of a double slot read on its own (RV32 copies a double through two core
+    # registers): part of that slot, not a variable overlapping it
+    wide = None
+    for off in sorted(frame.slots):
+        sl = frame.slots[off]
+        if wide is not None and sl.kind == "local" and off < wide.offset + wide.width and \
+                off + sl.width <= wide.offset + wide.width:
+            del frame.slots[off]
+            continue
+        wide = sl if sl.kind == "local" and sl.width > frame.arch.bits // 8 else None
     # size each slot by the distance to the next slot above it; classify leftovers
     offs = sorted(frame.slots)
     for i, off in enumerate(offs):

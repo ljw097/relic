@@ -11,6 +11,8 @@ HERE = os.path.dirname(__file__)
 SRC = os.path.join(HERE, "src", "vuln.c")
 FLOW_SRC = os.path.join(HERE, "src", "flow.c")
 BINS = os.path.join(HERE, "bins")
+RV32 = ["-march=rv32gc", "-mabi=ilp32d", "-nostdlib", "-static", "-ffreestanding", "-Wl,-e,main"]
+RV32_OBJ = ["-march=rv32gc", "-mabi=ilp32d", "-c", "-I", os.path.join(HERE, "src", "rv32inc")]
 
 VARIANTS = {
     "vuln64": ["-O0", "-fno-stack-protector", "-no-pie"],
@@ -69,6 +71,12 @@ VARIANTS = {
     "flow_rv64_O2": ["-O2", "-fno-tree-vectorize"],
     "floats_rv64_O0": ["-O0"],
     "floats_rv64_O2": ["-O2", "-fno-tree-vectorize"],
+    # RISC-V RV32GC (ILP32D): no 32-bit libc next to the RV64 cross compiler, so freestanding
+    "flow_rv32_O0": ["-O0", *RV32],
+    "flow_rv32_O2": ["-O2", "-fno-tree-vectorize", *RV32],
+    # (floats.c calls libc: an object file, its calls relocations to the imports)
+    "floats_rv32_O0": ["-O0", *RV32_OBJ],
+    "floats_rv32_O2": ["-O2", "-fno-tree-vectorize", *RV32_OBJ],
     "floats_ppc_O0": ["-O0"],
     "floats_ppc_O2": ["-O2", "-fno-tree-vectorize"],
     "floats_ppc64_O0": ["-O0"],
@@ -108,7 +116,8 @@ COMPILERS = {"vuln64_pe": "x86_64-w64-mingw32-gcc", "vuln32_pe": "i686-w64-mingw
              **{n: "mips64el-linux-gnuabi64-gcc" for n in ("vuln_mips64", "vuln_mips64_pie", "flow_mips64_O0",
                                                            "flow_mips64_O2")},
              **{n: "riscv64-linux-gnu-gcc" for n in ("vuln_rv64", "vuln_rv64_pie", "flow_rv64_O0", "flow_rv64_O2",
-                                                     "floats_rv64_O0", "floats_rv64_O2")},
+                                                     "floats_rv64_O0", "floats_rv64_O2", "flow_rv32_O0",
+                                                     "flow_rv32_O2", "floats_rv32_O0", "floats_rv32_O2")},
              **{n: "arm-linux-gnueabihf-gcc" for n in ("vuln_arm", "vuln_thumb", "flow_arm_O0", "flow_arm_O2",
                                                        "flow_thumb_O0", "flow_thumb_O2", "floats_arm_O0",
                                                        "floats_arm_O2", "floats_thumb_O2")}}
@@ -117,7 +126,8 @@ SOURCES = {"structs_O0": os.path.join(HERE, "src", "structs.c"), "structs_O2": o
            **{n: os.path.join(HERE, "src", "floats.c") for n in ("floats_O0", "floats_O2", "floats_a64_O0",
                                                                 "floats_a64_O2", "floats_arm_O0", "floats_arm_O2",
                                                                 "floats_thumb_O2", "floats_rv64_O0",
-                                                                "floats_rv64_O2", "floats_ppc_O0", "floats_ppc_O2",
+                                                                "floats_rv64_O2", "floats_rv32_O0", "floats_rv32_O2",
+                                                                "floats_ppc_O0", "floats_ppc_O2",
                                                                 "floats_ppc64_O0", "floats_ppc64_O2")},
            "libcalls_O1": os.path.join(HERE, "src", "libcalls.c"),
            "types_O0": os.path.join(HERE, "src", "types.c"), "types_O2": os.path.join(HERE, "src", "types.c"),
@@ -126,7 +136,8 @@ SOURCES = {"structs_O0": os.path.join(HERE, "src", "structs.c"), "structs_O2": o
            **{n: FLOW_SRC for n in ("flow_arm_O0", "flow_arm_O2", "flow_thumb_O0", "flow_thumb_O2",
                                     "flow_mips_O0", "flow_mips_O2", "flow_mipsbe_O0", "flow_mipsbe_O2",
                                     "flow_mips64_O0", "flow_mips64_O2", "flow_rv64_O0", "flow_rv64_O2",
-                                    "flow_ppc_O0", "flow_ppc_O2", "flow_ppc64_O0", "flow_ppc64_O2")}}
+                                    "flow_rv32_O0", "flow_rv32_O2", "flow_ppc_O0", "flow_ppc_O2", "flow_ppc64_O0",
+                                    "flow_ppc64_O2")}}
 
 
 # libraries go after the source: linkers drop the ones nothing before them uses
@@ -246,6 +257,10 @@ flow_rv64_O0 = _fixture("flow_rv64_O0")
 flow_rv64_O2 = _fixture("flow_rv64_O2")
 floats_rv64_O0 = _fixture("floats_rv64_O0")
 floats_rv64_O2 = _fixture("floats_rv64_O2")
+flow_rv32_O0 = _fixture("flow_rv32_O0")
+flow_rv32_O2 = _fixture("flow_rv32_O2")
+floats_rv32_O0 = _fixture("floats_rv32_O0")
+floats_rv32_O2 = _fixture("floats_rv32_O2")
 libcalls_O1 = _fixture("libcalls_O1")
 types_O0 = _fixture("types_O0")
 types_O2 = _fixture("types_O2")

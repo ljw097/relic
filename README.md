@@ -73,7 +73,7 @@ The total is a weighted average, with weights from how much each area matters to
 | Area (weight) | Progress | Notes |
 |---|---|---|
 | File formats (8) | 70% | No Mach-O |
-| Processors (8) | 70% | IDA handles 60+ CPU families, so this is the furthest behind |
+| Processors (8) | 80% | IDA handles 60+ CPU families, so this is the furthest behind |
 | Auto-analysis (14) | 55% | Still misses some functions and indirect jumps in big binaries |
 | Library identification (8) | 100% | On the stripped static C test binaries, 83–94% of the functions that had symbols get named, with no wrong names |
 | Type system (10) | 85% | No by-value struct arguments or returns |

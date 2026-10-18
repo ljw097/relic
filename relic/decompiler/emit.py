@@ -744,6 +744,13 @@ class CWriter:
         if idx is not None:
             base, i = idx
             return f"{base}[{self.expr(i)}]"
+        if isinstance(addr, BinOp) and addr.op == "+" and isinstance(addr.a, StackAddr) and \
+                isinstance(addr.b, Const) and addr.b.value % size == 0:
+            slot = self.p.frame.slots.get(addr.a.offset)
+            if slot is not None and slot.kind != "buffer" and \
+                    addr.a.offset not in self.__dict__.get("stack_structs", {}):
+                # a word of a wider local (`((int *)&var_20)[1]`: the high half of a double)
+                return f"(({int_type(bits)} *)&{self.vname(addr.a.name)})[{addr.b.value // size}]"
         base = addr if isinstance(addr, (Var, StackVar)) else None
         if base is not None:
             t = self.types.get(base.name)
@@ -887,11 +894,32 @@ class CWriter:
                 return s
         return None
 
+    def _double_word(self, e: Expr) -> str | None:
+        """A word of a double variable's bits (RV32 copies doubles through core registers a word at
+        a time): `((unsigned int *)&x)[0]`, the low word on a little-endian target."""
+        if e.bits != 32 or self.p.arch.bits != 32:
+            return None
+        if isinstance(e, Cast) and e.kind == "low":
+            x, hi = e.a, False
+            if isinstance(x, BinOp) and x.op == ">>u" and isinstance(x.b, Const) and x.b.value == 32:
+                x, hi = x.a, True
+        elif isinstance(e, Extract) and e.lo == 32:
+            x, hi = e.a, True
+        else:
+            return None
+        if not (isinstance(x, (Var, StackVar)) and x.bits == 64 and self.ftypes.get(x.name) == 64):
+            return None
+        k = int(hi) ^ (getattr(self.an.bin, "endian", "little") == "big")
+        return f"((unsigned int *)&{self.vname(x.name)})[{k}]"
+
     def _expr(self, e: Expr) -> tuple[str, int]:
         if isinstance(e, (Cast, Extract, Var)) and self.p.arch.name == "arm-aapcs-vfp":
             s = self._vfp_param(e)
             if s is not None:
                 return self.vname(s), PREC_POSTFIX
+        half = self._double_word(e)
+        if half is not None:
+            return half, PREC_POSTFIX
         if isinstance(e, Cast) and e.kind in ("low", "zext") and self._unwrap_float(e) is not e:
             return self._expr(self._unwrap_float(e))
         if isinstance(e, Const):

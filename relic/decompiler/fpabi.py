@@ -22,6 +22,7 @@ FP_ARGS = {"x64-sysv": tuple(f"xmm{k}" for k in range(8)), "x64-win": tuple(f"xm
            "arm64-aapcs": tuple(f"v{k}" for k in range(8)),
            "arm-aapcs-vfp": tuple(f"d{k}" for k in range(8)),
            "riscv64-lp64d": tuple(f"fa{k}" for k in range(8)),
+           "riscv32-ilp32d": tuple(f"fa{k}" for k in range(8)),
            "ppc32-sysv": tuple(f"f{k}" for k in range(1, 9)),
            "ppc64-elfv2": tuple(f"f{k}" for k in range(1, 14))}
 FP_RET = "xmm0"                  # x86-64; AArch64 returns floats in v0 (see fp_ret_reg)
@@ -362,7 +363,9 @@ def fp_params(an: "Analysis", arch: ArchInfo, target: int) -> list[tuple[str, in
 def float_int_params(an: "Analysis", arch: ArchInfo, target: int) -> list[tuple[str, int]]:
     """RISC-V: once fa0-fa7 are taken, further float arguments travel in the integer argument
     registers. The ones an internal callee moves straight into an FP register (`fmv.d.x fa5, a0`)
-    with the width moved (64 double, 32 float); empty unless every fa register is a parameter."""
+    with the width moved (64 double, 32 float); empty unless every fa register is a parameter.
+    RV32 has no 64-bit move: a double comes in a pair of registers (`a0:a1`) the callee stores
+    side by side and reloads with `fld`."""
     if not arch.name.startswith("riscv") or len(fp_params(an, arch, target)) < len(FP_ARGS[arch.name]):
         return []
     c = _cache(an, "fint")
@@ -378,10 +381,24 @@ def float_int_params(an: "Analysis", arch: ArchInfo, target: int) -> list[tuple[
         # `fld fa5, -80(s0)`)
         spilled = {s.dst: s.src for s in ssa.stmts() if isinstance(s, Store) and isinstance(s.src, Var)
                    and s.src.version == 0 and s.src.name in regs}
+        from .calls import _split_addr
+        words: dict = {}                  # the word stored at each stack slot so far (in order)
+        order = list(int_arg_regs(arch))
         for s in ssa.stmts():
+            if isinstance(s, Store):
+                words[_split_addr(s.dst)] = s.src
+                continue
             if not (isinstance(s, Assign) and isinstance(s.dst, Var) and is_fp_reg(s.dst.name)):
                 continue
             src = s.src
+            if arch.bits == 32 and isinstance(src, Load) and src.bits == 64:
+                base, k = _split_addr(src.addr)
+                lo, hi = words.get((base, k)), words.get((base, k + 4))
+                if isinstance(lo, Var) and isinstance(hi, Var) and lo.version == hi.version == 0 and \
+                        lo.name in order and hi.name in order and \
+                        order.index(hi.name) == order.index(lo.name) + 1:
+                    found[f"{lo.name}:{hi.name}"] = 64
+                continue
             if isinstance(src, Load) and src.addr in spilled:
                 src = spilled[src.addr] if src.bits == 64 else Cast("low", spilled[src.addr], src.bits)
                 if src.bits < 64:
@@ -392,8 +409,49 @@ def float_int_params(an: "Analysis", arch: ArchInfo, target: int) -> list[tuple[
                 src, w = src.a.a, src.a.bits
             if isinstance(src, Var) and src.version == 0 and src.name in regs:
                 found[src.name] = w
-    c[target] = out = [(r, found[r]) for r in int_arg_regs(arch) if r in found]
+    regs = list(int_arg_regs(arch))
+    c[target] = out = sorted(found.items(), key=lambda rw: regs.index(rw[0].split(":")[0]))
     return out
+
+
+def join_pair_params(fn, pairs: list[str]):
+    """RV32: each double that came in a pair of core registers (`a0:a1`) becomes one 64-bit entry
+    value named after the low register, and the two word stores spilling its halves next to each
+    other one store of it (so the `fld` that reloads them reads the double)."""
+    from .calls import _split_addr
+    from .ir import Load, Store, map_stmt, stmt_exprs, transform, walk
+    halves = {}
+    for p in pairs:
+        lo, hi = p.split(":")
+        whole = Var(lo, 0, 64)
+        halves[(lo, 32)] = Cast("low", whole, 32)
+        halves[(hi, 32)] = Extract(whole, 32, 32)
+
+    def sub(e):
+        if isinstance(e, Var) and e.version == 0:
+            return halves.get((e.name, e.bits), e)
+        return e
+    for s in fn.stmts():
+        map_stmt(s, lambda e: transform(e, sub))
+    for b in fn.blocks.values():
+        stmts = b.stmts
+        for j, s in enumerate(stmts):
+            if not (isinstance(s, Store) and isinstance(s.src, Cast) and s.src.kind == "low" and
+                    isinstance(s.src.a, Var) and s.src.a.bits == 64 and s.src.a.version == 0):
+                continue
+            base, k = _split_addr(s.dst)
+            for j2 in range(j + 1, len(stmts)):
+                t = stmts[j2]
+                if isinstance(t, Store) and isinstance(t.src, Extract) and t.src.a == s.src.a and \
+                        t.src.lo == 32 and _split_addr(t.dst) == (base, k + 4):
+                    s.src = s.src.a
+                    stmts[j2] = None
+                    break
+                if not isinstance(t, (Assign, Store)) or isinstance(t, Store) and \
+                        _split_addr(t.dst)[0] == base or any(isinstance(x, Load) and _split_addr(x.addr)[0] == base
+                                                              for e in stmt_exprs(t) for x in walk(e)):
+                    break                               # (something between may read the slot)
+        b.stmts = [s for s in stmts if s is not None]
 
 
 def arg_classes(sig, fmt: str | None, fsig=None, scan: bool = False) -> list[str] | None:
@@ -469,6 +527,23 @@ def place_args(arch: ArchInfo, classes: list[str], int_regs: tuple[str, ...],
             else:
                 free[slot] = False
                 out.append(f"s{slot}")
+        return out
+    if arch.name.startswith("riscv") and variadic and arch.bits == 32:
+        # RV32: a variadic double in an even-aligned pair of core registers (`a2:a3`), else on the
+        # stack
+        n = 0
+        for c in classes:
+            if c in "df":
+                n += n & 1
+                if n + 1 < len(int_regs):
+                    out.append(f"{int_regs[n]}:{int_regs[n + 1]}")
+                    n += 2
+                else:
+                    n = len(int_regs)
+                    out.append(None)
+            else:
+                out.append(int_regs[n] if n < len(int_regs) else None)
+                n += 1
         return out
     if arch.name.startswith("riscv") and variadic:
         # the variadic arguments of a RISC-V call travel in core registers, floats too (and the

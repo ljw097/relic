@@ -83,6 +83,7 @@ int main(void) {
                                               "flow_arm_O0", "flow_arm_O2", "flow_thumb_O0", "flow_thumb_O2",
                                               "flow_mips_O0", "flow_mips_O2", "flow_mipsbe_O0", "flow_mipsbe_O2",
                                               "flow_mips64_O0", "flow_mips64_O2", "flow_rv64_O0", "flow_rv64_O2",
+                                              "flow_rv32_O0", "flow_rv32_O2",
                                               "flow_ppc_O0", "flow_ppc_O2", "flow_ppc64_O0", "flow_ppc64_O2"])
 def flow(request):
     path = request.getfixturevalue(request.param)
@@ -114,6 +115,18 @@ def test_flow_recompiles_and_matches_source(flow, tmp_path):
     src = tmp_path / "re.c"
     src.write_text(_HARNESS % {"code": code, "defines": defines, "src": os.path.join(HERE, "src", "flow.c")})
     exe = tmp_path / "re"
+    if name.startswith("flow_rv32"):
+        # no RV32 libc: freestanding with a minimal runtime of our own, under qemu-riscv32
+        from test_floats import RV32_RUN
+        mcc, qemu = shutil.which("riscv64-linux-gnu-gcc"), shutil.which("qemu-riscv32")
+        if mcc is None or qemu is None:
+            pytest.skip("no riscv64-linux-gnu-gcc / qemu-riscv32 to run the pseudocode")
+        r = subprocess.run([mcc, *RV32_RUN, "-w", "-fwrapv", "-o", str(exe), str(src),
+                            os.path.join(HERE, "src", "rv32rt.c")], capture_output=True, text=True)
+        assert r.returncode == 0, f"{name}: pseudocode does not compile:\n{r.stderr[:3000]}\n{code}"
+        r = subprocess.run([qemu, str(exe)], capture_output=True, text=True, timeout=120)
+        assert r.stdout.strip().endswith("ok"), f"{name}: mismatches:\n{r.stdout[:3000]}\n{code}"
+        return
     if name.startswith(("flow_mips", "flow_rv64", "flow_ppc")):
         # MIPS / RISC-V pseudocode runs as such: the cross compiler, statically linked, under qemu-user
         tool, emu = ("powerpc64le-linux-gnu-gcc", "qemu-ppc64le") if "ppc64" in name else \
@@ -173,7 +186,7 @@ def test_big_switch_is_a_switch_everywhere(flow):
     text = decompile(an, an.function_by_name("sw_big")).text
     assert "switch (" in text and "case 11:" in text and "default:" in text, f"{name}:\n{text}"
     assert "unresolved" not in text and "goto" not in text, f"{name}:\n{text}"
-    if name.endswith("O2") and not name.startswith(("flow32", "flow_arm", "flow_thumb")):
+    if name.endswith("O2") and not name.startswith(("flow32", "flow_arm", "flow_thumb", "flow_rv32")):
         # a negative int argument in a 64-bit register: printed as the int the callee reads
         assert "clamp(" in text and ", -5, 50)" in text, f"{name}:\n{text}"
 
