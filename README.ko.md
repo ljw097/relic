@@ -13,7 +13,7 @@ GUI는 PySide6, 명령어 디코딩은 capstone을 쓰고, 그 위의 분석·�
 
 ## 설치
 
-[릴리스 페이지](https://github.com/ljw097/relic/releases/latest)에서 자기 운영체제에 맞는 실행 파일을 받아
+[릴리스 페이지](https://github.com/ljw097/relic/releases/tag/v0.2.0)에서 자기 운영체제에 맞는 실행 파일을 받아
 실행하면 됩니다. 따로 설치할 것은 없습니다.
 
 - **Windows**: `relic-<버전>-windows-x86_64.exe`
