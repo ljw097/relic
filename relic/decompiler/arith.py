@@ -84,6 +84,9 @@ def _interesting(e: Expr) -> bool:
             if n.op in (">>s", ">>u") and isinstance(n.b, Const) and n.b.value >= 16 and \
                     sum(isinstance(k, BinOp) and k.op == "<<" for k in walk(n.a)) >= 3:
                 return True
+        # ... or by adding the sign test (`(x >> 4) + (x < 0 && (x & 15))`: PowerPC `srawi; addze`)
+        if isinstance(n, BinOp) and n.op == "<s" and isinstance(n.b, Const) and n.b.value == 0:
+            return True
         # ... or with a conditional add on negative inputs (`x < 0 ? x + 15 : x`)
         if isinstance(n, Ite) and isinstance(n.cond, BinOp) and n.cond.op in ("<s", "<=s") and \
                 any(isinstance(k, Const) and k.value == 0 for k in (n.cond.a, n.cond.b)):
@@ -289,11 +292,14 @@ def recover_division(fn: IRFunction, sext_params: frozenset = frozenset()) -> in
                             # the first dividend that explains it (`v1 = a1 & 0x80000007` is not one)
                             rep = _recognise(full, x)
                             if rep is None and x.bits == 64:
-                                kind = _ext32(avail[x]) if x in avail else \
-                                    "sext" if isinstance(x, Var) and x.version == 0 and x.name in sext_params \
-                                    else None
-                                if kind is not None:
-                                    rep = _recognise_narrow(full, x, kind)
+                                # an argument register holds an int sign-extended, an unsigned int
+                                # zero-extended: the one that explains the code is its type
+                                kinds = (_ext32(avail[x]),) if x in avail else \
+                                    ("sext", "zext") if isinstance(x, Var) and x.version == 0 and \
+                                    x.name in sext_params else ()
+                                for kind in kinds:
+                                    if kind is not None and rep is None:
+                                        rep = _recognise_narrow(full, x, kind)
                             if rep is not None:
                                 count += 1
                                 return rep

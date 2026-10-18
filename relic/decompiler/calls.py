@@ -30,6 +30,8 @@ _INT_ARGS = {
     "arm-aapcs-vfp": ("r0", "r1", "r2", "r3"),
     "mips-o32": ("a0", "a1", "a2", "a3"),
     "mips-n64": tuple(f"a{k}" for k in range(8)),
+    "ppc32-sysv": tuple(f"r{k}" for k in range(3, 11)),
+    "ppc64-elfv2": tuple(f"r{k}" for k in range(3, 11)),
     "riscv64-lp64d": tuple(f"a{k}" for k in range(8)),
 }
 
@@ -253,11 +255,41 @@ def _compute_livein(an: "Analysis", arch: ArchInfo, target: int, prefix: bool = 
     # take the contiguous prefix of argument registers: a gap means the later
     # ones are scratch (e.g. a partial write like `mov dl, al` reads rdx), not parameters
     params: list[str] = []
+    gaps = 0
+    if arch.name.startswith("ppc64"):
+        # ELFv2 assigns registers by position: a floating-point argument also takes up the GPR of
+        # its slot, so `f(int, double, float, long)` reads r3 and r6 -- a gap a parameter in an
+        # FPR explains is no end of the list
+        from .fpabi import fp_params
+        gaps = len(fp_params(an, arch, target))
     for r in int_arg_regs(arch):
         if r not in livein:
+            if gaps:
+                gaps -= 1
+                continue
             break
         params.append(r)
     return params
+
+
+def positional_order(arch: ArchInfo, ints: list[str], fps: list) -> list[int] | None:
+    """PowerPC64 ELFv2: the C order of a callee's parameters, as indexes into `ints + fps`.
+    Argument k goes in r(3+k) if it is an integer, else in the next FPR (taking r(3+k) up too),
+    so each integer parameter's register says where it was; the floats fill the other places.
+    None elsewhere (integers first, then floats: the registers do not say)."""
+    if not arch.name.startswith("ppc64"):
+        return None
+    pos = {int(r[1:]) - 3: k for k, r in enumerate(ints) if r[:1] == "r" and r[1:].isdigit()}
+    order, f = [], 0
+    for k in range(len(ints) + len(fps)):
+        if k in pos:
+            order.append(pos[k])
+        elif f < len(fps):
+            order.append(len(ints) + f)
+            f += 1
+    seen = set(order)
+    order += [k for k in range(len(ints) + len(fps)) if k not in seen]
+    return order
 
 
 def _set_before_call(fn: IRFunction, argregs, uses: dict, params=()) -> list[str]:
@@ -362,12 +394,16 @@ def stack_param_slots(an: "Analysis", arch: ArchInfo, target: int) -> list[tuple
 def param_base(arch: ArchInfo) -> int:
     """Entry-stack-pointer offset of the first stack parameter: above the return address on x86,
     at the stack pointer itself where the return address is in a register (AArch64)."""
+    if arch.name.startswith("ppc32"):
+        return 8                    # above the back chain and the callee's LR save word
+    if arch.name.startswith("ppc64"):
+        return 96                   # the parameter save area (32), past the 8 register doublewords
     return arch.bits // 8 if arch.name.startswith(("x86", "x64")) else 0
 
 
 def stack_params_used(arch: ArchInfo) -> bool:
     """Whether calls on this convention get stack arguments recovered (cdecl has its own path)."""
-    return arch.name.startswith(("x64", "arm64", "arm-aapcs", "riscv", "mips-n64"))
+    return arch.name.startswith(("x64", "arm64", "arm-aapcs", "riscv", "mips-n64", "ppc"))
 
 
 def stack_param_floats(an: "Analysis", arch: ArchInfo, target: int) -> dict[int, int]:
@@ -516,6 +552,11 @@ def recover_calls(fn: IRFunction, an: "Analysis", arch: ArchInfo) -> IRFunction:
                     classes = ["i"] * len(selected) + ["d"] * len(fps) + \
                         ["f" if w == 32 else "d" for w in fints.values()] + \
                         [("f" if fw == 32 else "d") if fw else "i" for _, _, fw in slots]
+                    order = positional_order(arch, selected, fps)
+                    if order is not None:            # (the parameters' C order: see pipeline)
+                        head = len(selected) + len(fps)
+                        placed = [placed[k] for k in order] + placed[head:]
+                        classes = [classes[k] for k in order] + classes[head:]
                     stack_offs = [rel for rel, _, _ in slots]
                     stack_sizes = [size for _, size, _ in slots]
             else:
@@ -568,7 +609,11 @@ def recover_calls(fn: IRFunction, an: "Analysis", arch: ArchInfo) -> IRFunction:
                 v = uses[full]
                 if is_fp_reg(r):                  # the float in the register (its low lanes, or an ARM half)
                     w = widths.get(r) or part or (32 if pos < len(classes) and classes[pos] == "f" else 64)
-                    v = Extract(v, lo, w) if lo else Cast("low", v, w) if v.bits > w else v
+                    if arch.name.startswith("ppc") and w < v.bits:
+                        from .ir import Intrinsic     # PowerPC: a float travels in its double form
+                        v = Intrinsic("fpconv", (v,), w)
+                    else:
+                        v = Extract(v, lo, w) if lo else Cast("low", v, w) if v.bits > w else v
                     fargs.append((len(args), w))
                 args.append(v)
             s.call = Call(s.call.target, tuple(args), s.call.bits, tuple(fargs))

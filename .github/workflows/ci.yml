@@ -56,7 +56,7 @@ jobs:
         with:
           python-version: "3.13"
           cache: pip
-      - name: System packages (ARM / AArch64 / MIPS / RISC-V cross compilers)
+      - name: System packages (ARM / AArch64 / MIPS / RISC-V / PowerPC cross compilers)
         run: |
           sudo apt-get update -q
           sudo apt-get install -y -q gcc binutils
@@ -64,17 +64,18 @@ jobs:
           sudo apt-get install -y -q gcc-arm-linux-gnueabihf || sudo apt-get install -y -q gcc-14-arm-linux-gnueabihf
           sudo apt-get install -y -q gcc-mipsel-linux-gnu || sudo apt-get install -y -q gcc-14-mipsel-linux-gnu
           sudo apt-get install -y -q gcc-mips-linux-gnu gcc-mips64el-linux-gnuabi64 || true
+          sudo apt-get install -y -q gcc-powerpc-linux-gnu gcc-powerpc64le-linux-gnu || true
           sudo apt-get install -y -q gcc-riscv64-linux-gnu || sudo apt-get install -y -q gcc-14-riscv64-linux-gnu
           sudo apt-get install -y -q qemu-user        # runs the recompiled MIPS / AArch64 / ARM / RISC-V pseudocode
           sudo apt-get install -y -q gdb-multiarch    # debugs them under qemu-user's gdb stub
           ls /usr/bin/aarch64-linux-gnu-gcc* /usr/bin/arm-linux-gnueabihf-gcc*
       - name: Install
         run: pip install -e '.[dev]'
-      - name: Test (ARM / AArch64 / MIPS / RISC-V samples)
+      - name: Test (ARM / AArch64 / MIPS / RISC-V / PowerPC samples)
         run: |
-          pytest -q -rs tests/test_arm64.py tests/test_arm.py tests/test_mips.py tests/test_riscv.py
-          pytest -q -rs tests/test_flow.py -k "a64 or arm or thumb or mips or rv64"
-          pytest -q -rs tests/test_floats.py -k "a64 or arm or thumb or rv64"
+          pytest -q -rs tests/test_arm64.py tests/test_arm.py tests/test_mips.py tests/test_riscv.py tests/test_ppc.py
+          pytest -q -rs tests/test_flow.py -k "a64 or arm or thumb or mips or rv64 or ppc"
+          pytest -q -rs tests/test_floats.py -k "a64 or arm or thumb or rv64 or ppc"
           pytest -q -rs tests/test_libsigs.py -k cross
           pytest -q -rs tests/test_debug_targets.py -k qemu
       - uses: actions/upload-artifact@v4

@@ -21,7 +21,9 @@ if TYPE_CHECKING:
 FP_ARGS = {"x64-sysv": tuple(f"xmm{k}" for k in range(8)), "x64-win": tuple(f"xmm{k}" for k in range(4)),
            "arm64-aapcs": tuple(f"v{k}" for k in range(8)),
            "arm-aapcs-vfp": tuple(f"d{k}" for k in range(8)),
-           "riscv64-lp64d": tuple(f"fa{k}" for k in range(8))}
+           "riscv64-lp64d": tuple(f"fa{k}" for k in range(8)),
+           "ppc32-sysv": tuple(f"f{k}" for k in range(1, 9)),
+           "ppc64-elfv2": tuple(f"f{k}" for k in range(1, 14))}
 FP_RET = "xmm0"                  # x86-64; AArch64 returns floats in v0 (see fp_ret_reg)
 
 
@@ -32,6 +34,8 @@ def fp_ret_reg(arch: ArchInfo) -> str:
         return "d0"                      # a float result is s0, its low half
     if arch.name.startswith("riscv"):
         return "fa0"
+    if arch.name.startswith("ppc"):
+        return "f1"
     return FP_RET
 
 
@@ -54,7 +58,7 @@ def reg_bits(name: str) -> int:
 
 def is_fp_reg(name: str) -> bool:
     """An SSE / SIMD-and-FP register (`xmm3`, AArch64 `v3`, ARM VFP `d3` / `s5`, RISC-V `fa3`)."""
-    return name.startswith("xmm") or name[:1] in ("v", "d", "s") and name[1:].isdigit() or \
+    return name.startswith("xmm") or name[:1] in ("v", "d", "s", "f") and name[1:].isdigit() or \
         name[:2] in ("fa", "ft", "fs") and name[2:].isdigit()
 FLOAT_CONVS = "eEfFgGaA"
 # libc functions taking / returning floating point: argument codes `d` double, `f` float
@@ -171,9 +175,14 @@ def set_fp_returns(an: "Analysis", func: "Function", fn: IRFunction) -> int | No
     if w is not None:
         from .arch import arch_for
         reg = fp_ret_reg(arch_for(an.bin))
+        ppc = an.bin.arch.startswith("ppc")
         for s in fn.stmts():
             if isinstance(s, Return) and s.value is None:
-                s.value = Cast("low", Reg(reg, reg_bits(reg)), w) if w < reg_bits(reg) else Reg(reg, w)
+                if ppc and w == 32:                      # a float result is the double form's value
+                    from .ir import Intrinsic
+                    s.value = Intrinsic("fpconv", (Reg(reg, 64),), 32)
+                else:
+                    s.value = Cast("low", Reg(reg, reg_bits(reg)), w) if w < reg_bits(reg) else Reg(reg, w)
     return w
 
 
@@ -182,10 +191,12 @@ def _fp_return(an, func, arch) -> int | None:
     xr = result_reads(an, func, fp_ret_reg(arch))
     ir_ = result_reads(an, func, arch.ret)
     xmm_w = [r for r in xr if isinstance(r, int)]
-    if fp_ret_reg(arch)[:1] in ("d", "f"):              # ARM d0 / RISC-V fa0 read whole: a double
+    if fp_ret_reg(arch)[:1] in ("d", "f") and not arch.name.startswith("ppc"):
+        # ARM d0 / RISC-V fa0 read whole: a double (a PowerPC FPR always holds a double form)
         xmm_w += [64 for r in xr if r == "whole"]
     int_r = [r for r in ir_ if r != "none"]
-    if int_r and not xmm_w:
+    ppc_whole = arch.name.startswith("ppc") and any(r == "whole" for r in xr)
+    if int_r and not xmm_w and not ppc_whole:
         return None                             # callers use the integer result
     try:
         fn = _lifted(an, func)
@@ -199,6 +210,8 @@ def _fp_return(an, func, arch) -> int | None:
         return None
     if xmm_w:
         return 32 if all(w == 32 for w in xmm_w) else 64
+    if ppc_whole and not last:
+        return 64          # PowerPC: callers read f1 (its double form), the callee only passes one on
     return last or None
 
 
@@ -236,7 +249,10 @@ def _scan_back(an, fn, b, k, arch, seen, depth, reg: str | None = None) -> int |
                 if src is not None:
                     reg = src                           # a copy: what the source held
                     break
-                return _width(s.src)
+                w = _width(s.src)
+                if w == 64 and arch.name.startswith("ppc") and _widened_float(s.src):
+                    return 32                           # PowerPC: a float result, held as a double
+                return w
             if isinstance(d, Reg) and d.name == reg:
                 return None
     if not b.preds:                                     # the function's entry
@@ -250,6 +266,12 @@ def _scan_back(an, fn, b, k, arch, seen, depth, reg: str | None = None) -> int |
         return None
     ws = [w for w in ws if w]
     return 0 if not ws else 32 if all(w == 32 for w in ws) else 64
+
+
+def _widened_float(e: Expr) -> bool:
+    """A float widened to double (`fpconv64(<32-bit>)`): how a PowerPC FPR holds a single."""
+    from .ir import Intrinsic
+    return isinstance(e, Intrinsic) and e.name == "fpconv" and e.bits == 64 and e.args[0].bits == 32
 
 
 def _ends_jump(b) -> bool:
@@ -287,6 +309,7 @@ def fp_params(an: "Analysis", arch: ArchInfo, target: int) -> list[tuple[str, in
         widths: dict[str, int] = {}
 
         halves: dict[str, set] = {}                      # ARM: d register -> {"lo", "hi", "whole"}
+        ppc = arch.name.startswith("ppc")
 
         def visit(e: Expr, under: int | None):
             if isinstance(e, Var) and e.version == 0 and e.name in regs:
@@ -301,6 +324,9 @@ def fp_params(an: "Analysis", arch: ArchInfo, target: int) -> list[tuple[str, in
                 return
             if isinstance(e, Cast) and e.kind == "low":
                 visit(e.a, e.bits)
+                return
+            if ppc and type(e).__name__ == "Intrinsic" and e.name == "fpsingle":
+                visit(e.args[0], 32)                    # PowerPC: a float read from its double form
                 return
             if isinstance(e, BinOp) and e.op == "&" and isinstance(e.a, Var) and isinstance(e.b, Const) and \
                     e.b.value in (0xFFFFFFFF, 0xFFFFFFFF00000000):
@@ -469,4 +495,8 @@ def place_args(arch: ArchInfo, classes: list[str], int_regs: tuple[str, ...],
 def stack_arg_base(arch: ArchInfo) -> int:
     """Offset of the first stack argument from the stack pointer at the call (Win64 leaves the
     callee 32 bytes of home space for the register arguments)."""
+    if arch.name.startswith("ppc32"):
+        return 8                    # past the back chain and the LR save word
+    if arch.name.startswith("ppc64"):
+        return 96                   # the parameter save area past the 8 register doublewords
     return 32 if arch.name == "x64-win" else 0

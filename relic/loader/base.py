@@ -94,6 +94,12 @@ class Binary:
         self.arm_hard_float = False      # AAPCS-VFP (armhf): floats travel in s / d registers
         self.mips_gp: int | None = None     # MIPS: value of $gp (GOT + 0x7ff0)
         self.mips_local_got = (0, 0)         # MIPS: [start, end) of the GOT's local entries
+        # words a RELA relocation fills (the file holds 0, the value is the addend: PowerPC's
+        # `.got2` in a PIE): reads see the link-time value, the file bytes stay as they are
+        self.reloc_fill: dict[int, bytes] = {}
+        self.ppc_local_entry: dict[int, int] = {}   # PowerPC64 ELFv2: local entry -> function start
+        self.ppc_toc: int | None = None             # PowerPC64: the TOC base (r2)
+        self._fill_addrs: list[int] = []
 
     # ------------------------------------------------------------------ memory
     def _finalize(self):
@@ -156,6 +162,7 @@ class Binary:
 
     def read(self, addr: int, size: int) -> bytes:
         out = bytearray()
+        start = addr
         while size > 0:
             seg = self.segment_at(addr)
             if seg is None:
@@ -172,7 +179,25 @@ class Binary:
                 out += b"\0" * n
             addr += n
             size -= n
+        if self._fill_addrs and out:
+            self._apply_fill(start, out)
         return bytes(out)
+
+    def _apply_fill(self, start: int, out: bytearray):
+        end = start + len(out)
+        k = bisect.bisect_left(self._fill_addrs, start - 8)
+        while k < len(self._fill_addrs) and self._fill_addrs[k] < end:
+            a = self._fill_addrs[k]
+            word = self.reloc_fill[a]
+            for j, byte in enumerate(word):
+                if start <= a + j < end:
+                    out[a + j - start] = byte
+            k += 1
+
+    def fill_relocation(self, addr: int, value: int, size: int):
+        """Record a RELA-relocated word's link-time value (see `reloc_fill`)."""
+        self.reloc_fill[addr] = (value & ((1 << 8 * size) - 1)).to_bytes(size, self.endian)
+        self._fill_addrs = sorted(self.reloc_fill)
 
     def read_ptr(self, addr: int) -> int | None:
         n = self.bits // 8

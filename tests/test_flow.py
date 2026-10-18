@@ -82,7 +82,8 @@ int main(void) {
 @pytest.fixture(scope="module", params=["flow_O0", "flow_O2", "flow32_O0", "flow32_O2", "flow_a64_O0", "flow_a64_O2",
                                               "flow_arm_O0", "flow_arm_O2", "flow_thumb_O0", "flow_thumb_O2",
                                               "flow_mips_O0", "flow_mips_O2", "flow_mipsbe_O0", "flow_mipsbe_O2",
-                                              "flow_mips64_O0", "flow_mips64_O2", "flow_rv64_O0", "flow_rv64_O2"])
+                                              "flow_mips64_O0", "flow_mips64_O2", "flow_rv64_O0", "flow_rv64_O2",
+                                              "flow_ppc_O0", "flow_ppc_O2", "flow_ppc64_O0", "flow_ppc64_O2"])
 def flow(request):
     path = request.getfixturevalue(request.param)
     return request.param, analyze(path)
@@ -113,9 +114,11 @@ def test_flow_recompiles_and_matches_source(flow, tmp_path):
     src = tmp_path / "re.c"
     src.write_text(_HARNESS % {"code": code, "defines": defines, "src": os.path.join(HERE, "src", "flow.c")})
     exe = tmp_path / "re"
-    if name.startswith(("flow_mips", "flow_rv64")):
+    if name.startswith(("flow_mips", "flow_rv64", "flow_ppc")):
         # MIPS / RISC-V pseudocode runs as such: the cross compiler, statically linked, under qemu-user
-        tool, emu = ("mips-linux-gnu-gcc", "qemu-mips") if "mipsbe" in name else \
+        tool, emu = ("powerpc64le-linux-gnu-gcc", "qemu-ppc64le") if "ppc64" in name else \
+            ("powerpc-linux-gnu-gcc", "qemu-ppc") if "ppc" in name else \
+            ("mips-linux-gnu-gcc", "qemu-mips") if "mipsbe" in name else \
             ("mips64el-linux-gnuabi64-gcc", "qemu-mips64el") if "mips64" in name else \
             ("mipsel-linux-gnu-gcc", "qemu-mipsel") if "mips" in name else \
             ("riscv64-linux-gnu-gcc", "qemu-riscv64")

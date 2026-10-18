@@ -48,6 +48,15 @@ VARIANTS = {
     "vuln_mipsbe_pie": ["-O1", "-fstack-protector-strong", "-pie", "-fPIE"],
     "flow_mipsbe_O0": ["-O0"],
     "flow_mipsbe_O2": ["-O2", "-fno-tree-vectorize"],
+    # PowerPC 32-bit (big-endian, SysV) and PowerPC64 little-endian (ELFv2)
+    "vuln_ppc": ["-O0"],
+    "vuln_ppc_pie": ["-O1", "-fstack-protector-strong", "-pie", "-fPIE"],
+    "flow_ppc_O0": ["-O0"],
+    "flow_ppc_O2": ["-O2", "-fno-tree-vectorize"],
+    "vuln_ppc64": ["-O0"],
+    "vuln_ppc64_pie": ["-O1", "-fstack-protector-strong", "-pie", "-fPIE"],
+    "flow_ppc64_O0": ["-O0"],
+    "flow_ppc64_O2": ["-O2", "-fno-tree-vectorize"],
     # MIPS64 little-endian, n64 ABI
     "vuln_mips64": ["-O0"],
     "vuln_mips64_pie": ["-O1", "-fstack-protector-strong", "-pie", "-fPIE"],
@@ -60,6 +69,10 @@ VARIANTS = {
     "flow_rv64_O2": ["-O2", "-fno-tree-vectorize"],
     "floats_rv64_O0": ["-O0"],
     "floats_rv64_O2": ["-O2", "-fno-tree-vectorize"],
+    "floats_ppc_O0": ["-O0"],
+    "floats_ppc_O2": ["-O2", "-fno-tree-vectorize"],
+    "floats_ppc64_O0": ["-O0"],
+    "floats_ppc64_O2": ["-O2", "-fno-tree-vectorize"],
     # struct recovery
     "structs_O0": ["-O0", "-fno-stack-protector", "-no-pie"],
     "structs_O2": ["-O2", "-fno-stack-protector", "-no-pie", "-fno-inline"],
@@ -88,6 +101,10 @@ COMPILERS = {"vuln64_pe": "x86_64-w64-mingw32-gcc", "vuln32_pe": "i686-w64-mingw
              **{n: "mipsel-linux-gnu-gcc" for n in ("vuln_mips", "vuln_mips_pie", "flow_mips_O0", "flow_mips_O2")},
              **{n: "mips-linux-gnu-gcc" for n in ("vuln_mipsbe", "vuln_mipsbe_pie", "flow_mipsbe_O0",
                                                   "flow_mipsbe_O2")},
+             **{n: "powerpc-linux-gnu-gcc" for n in ("vuln_ppc", "vuln_ppc_pie", "flow_ppc_O0", "flow_ppc_O2",
+                                                     "floats_ppc_O0", "floats_ppc_O2")},
+             **{n: "powerpc64le-linux-gnu-gcc" for n in ("vuln_ppc64", "vuln_ppc64_pie", "flow_ppc64_O0",
+                                                         "flow_ppc64_O2", "floats_ppc64_O0", "floats_ppc64_O2")},
              **{n: "mips64el-linux-gnuabi64-gcc" for n in ("vuln_mips64", "vuln_mips64_pie", "flow_mips64_O0",
                                                            "flow_mips64_O2")},
              **{n: "riscv64-linux-gnu-gcc" for n in ("vuln_rv64", "vuln_rv64_pie", "flow_rv64_O0", "flow_rv64_O2",
@@ -100,19 +117,22 @@ SOURCES = {"structs_O0": os.path.join(HERE, "src", "structs.c"), "structs_O2": o
            **{n: os.path.join(HERE, "src", "floats.c") for n in ("floats_O0", "floats_O2", "floats_a64_O0",
                                                                 "floats_a64_O2", "floats_arm_O0", "floats_arm_O2",
                                                                 "floats_thumb_O2", "floats_rv64_O0",
-                                                                "floats_rv64_O2")},
+                                                                "floats_rv64_O2", "floats_ppc_O0", "floats_ppc_O2",
+                                                                "floats_ppc64_O0", "floats_ppc64_O2")},
            "libcalls_O1": os.path.join(HERE, "src", "libcalls.c"),
            "types_O0": os.path.join(HERE, "src", "types.c"), "types_O2": os.path.join(HERE, "src", "types.c"),
            "flow_O0": FLOW_SRC, "flow_O2": FLOW_SRC, "flow32_O0": FLOW_SRC, "flow32_O2": FLOW_SRC,
            "shapes": os.path.join(HERE, "src", "shapes.cpp"), "flow_a64_O0": FLOW_SRC, "flow_a64_O2": FLOW_SRC,
            **{n: FLOW_SRC for n in ("flow_arm_O0", "flow_arm_O2", "flow_thumb_O0", "flow_thumb_O2",
                                     "flow_mips_O0", "flow_mips_O2", "flow_mipsbe_O0", "flow_mipsbe_O2",
-                                    "flow_mips64_O0", "flow_mips64_O2", "flow_rv64_O0", "flow_rv64_O2")}}
+                                    "flow_mips64_O0", "flow_mips64_O2", "flow_rv64_O0", "flow_rv64_O2",
+                                    "flow_ppc_O0", "flow_ppc_O2", "flow_ppc64_O0", "flow_ppc64_O2")}}
 
 
 # libraries go after the source: linkers drop the ones nothing before them uses
 LIBS = {n: ["-lm"] for n in ("floats_O0", "floats_O2", "floats_a64_O0", "floats_a64_O2", "floats_arm_O0",
-                              "floats_arm_O2", "floats_thumb_O2", "floats_rv64_O0", "floats_rv64_O2")}
+                              "floats_arm_O2", "floats_thumb_O2", "floats_rv64_O0", "floats_rv64_O2",
+                              "floats_ppc_O0", "floats_ppc_O2", "floats_ppc64_O0", "floats_ppc64_O2")}
 
 
 def _build(name: str) -> str:
@@ -235,6 +255,20 @@ vuln_mipsbe = _fixture("vuln_mipsbe")
 vuln_mipsbe_pie = _fixture("vuln_mipsbe_pie")
 flow_mipsbe_O0 = _fixture("flow_mipsbe_O0")
 flow_mipsbe_O2 = _fixture("flow_mipsbe_O2")
+floats_ppc_O0 = _fixture("floats_ppc_O0")
+floats_ppc_O2 = _fixture("floats_ppc_O2")
+floats_ppc64_O0 = _fixture("floats_ppc64_O0")
+floats_ppc64_O2 = _fixture("floats_ppc64_O2")
+vuln_ppc_stripped = _fixture("vuln_ppc_stripped")
+vuln_ppc64_stripped = _fixture("vuln_ppc64_stripped")
+vuln_ppc = _fixture("vuln_ppc")
+vuln_ppc_pie = _fixture("vuln_ppc_pie")
+flow_ppc_O0 = _fixture("flow_ppc_O0")
+flow_ppc_O2 = _fixture("flow_ppc_O2")
+vuln_ppc64 = _fixture("vuln_ppc64")
+vuln_ppc64_pie = _fixture("vuln_ppc64_pie")
+flow_ppc64_O0 = _fixture("flow_ppc64_O0")
+flow_ppc64_O2 = _fixture("flow_ppc64_O2")
 vuln_mips64 = _fixture("vuln_mips64")
 vuln_mips64_pie = _fixture("vuln_mips64_pie")
 flow_mips64_O0 = _fixture("flow_mips64_O0")

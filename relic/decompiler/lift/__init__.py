@@ -27,6 +27,9 @@ def lifter_for(an: Analysis):
     if an.bin.arch == "riscv64":
         from .riscv import RiscVLifter
         return RiscVLifter(an)
+    if an.bin.arch in ("ppc", "ppc64"):
+        from .ppc import PpcLifter
+        return PpcLifter(an)
     raise NotImplementedError(f"no lifter for {an.bin.arch} yet")
 
 
@@ -56,6 +59,7 @@ def lift_function(an: Analysis, f: Function) -> IRFunction:
         if not ends and len(blk.succs) == 1:
             ib.stmts.append(Jump(blk.last.addr, blk.succs[0]))
         out.blocks[a] = ib
+    out.const_words = getattr(lifter, "const_words", None)
     entry = getattr(lifter, "entry_stmts", None)
     if entry is not None and f.addr in out.blocks:
         out.blocks[f.addr].stmts[:0] = entry(f)

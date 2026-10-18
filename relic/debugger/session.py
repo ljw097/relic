@@ -38,16 +38,19 @@ _GPRS = {
              "s0", "s1", "s2", "s3", "s4", "s5", "s6", "s7", "t8", "t9", "gp", "sp", "s8", "ra", "pc"],
     "riscv": ["ra", "sp", "gp", "tp", "t0", "t1", "t2", "fp", "s1", "a0", "a1", "a2", "a3", "a4", "a5", "a6",
               "a7", "s2", "s3", "s4", "s5", "s6", "s7", "s8", "s9", "s10", "s11", "t3", "t4", "t5", "t6", "pc"],
+    "powerpc": [f"r{k}" for k in range(32)] + ["pc", "lr", "ctr", "cr", "xer"],
 }
-_PC = {"i386:x86-64": "rip", "i386": "eip", "aarch64": "pc", "arm": "pc", "mips": "pc", "riscv": "pc"}
-_SP = {"i386:x86-64": "rsp", "i386": "esp", "aarch64": "sp", "arm": "sp", "mips": "sp", "riscv": "sp"}
+_PC = {"i386:x86-64": "rip", "i386": "eip", "aarch64": "pc", "arm": "pc", "mips": "pc", "riscv": "pc",
+       "powerpc": "pc"}
+_SP = {"i386:x86-64": "rsp", "i386": "esp", "aarch64": "sp", "arm": "sp", "mips": "sp", "riscv": "sp",
+       "powerpc": "r1"}
 
 
 def _arch_key(arch: str) -> str:
     """The register table for a gdb architecture name (`i386:x86-64`, `armv7`, `riscv:rv64`)."""
     if arch in _GPRS:
         return arch
-    return next((k for k in ("aarch64", "arm", "mips", "riscv", "i386") if arch.startswith(k)), arch)
+    return next((k for k in ("aarch64", "arm", "mips", "riscv", "powerpc", "i386") if arch.startswith(k)), arch)
 
 
 # qemu-user for a binary of Relic's arch name (and byte order), and where its libraries are
@@ -426,10 +429,23 @@ class Session:
     def add_breakpoint(self, live_addr: int, condition: str = "", enabled: bool = True) -> int:
         cond = f'-c "{_mi_quote(condition)}" ' if condition else ""
         off = "-d " if not enabled else ""
-        r = self.mi.command(f"-break-insert {off}{cond}*{live_addr:#x}")
+        at = live_addr
+        local = self._local_entries()
+        st = self.to_static(live_addr) if local else None
+        if st is not None and st in local:
+            # PowerPC64 ELFv2: calls enter past the TOC setup (and calls through the global
+            # entry fall into it too): stop there
+            at = live_addr + (local[st] - st)
+        r = self.mi.command(f"-break-insert {off}{cond}*{at:#x}")
         n = int(r.results["bkpt"]["number"])
         self.breakpoints[live_addr] = n
         return n
+
+    def _local_entries(self) -> dict[int, int]:
+        """Function start -> its local entry (PowerPC64 ELFv2), from the loader's map."""
+        b = self.an.bin if self.an is not None else None
+        m = getattr(b, "ppc_local_entry", None) if b is not None else None
+        return {g: loc for loc, g in m.items()} if m else {}
 
     def set_breakpoint_enabled(self, live_addr: int, enabled: bool):
         self.set_enabled(live_addr, enabled)

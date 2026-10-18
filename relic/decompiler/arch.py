@@ -101,6 +101,27 @@ MIPS_N64 = ArchInfo(
 )
 
 
+_PPC_ARGS = tuple(f"r{k}" for k in range(3, 11))
+_PPC_CR_SCRATCH = tuple(f"cr{n}_{b}" for n in (0, 1, 5, 6, 7) for b in ("lt", "gt", "eq", "so"))
+PPC32 = ArchInfo(
+    "ppc32-sysv", 32, "r1", "r3",
+    call_reads=(*_PPC_ARGS, "r1", *(f"f{k}" for k in range(1, 9))),
+    # r0, r3-r12, ctr, lr, the carry and cr0-1 / cr5-7 are caller-saved; f0-f13 too
+    call_clobbers=("r0", *(f"r{k}" for k in range(3, 13)), "ctr", "lr", "ca", *_PPC_CR_SCRATCH,
+                   *(f"f{k}" for k in range(14))),
+    syscall_reads=("r0", *_PPC_ARGS[:6]),
+    syscall_clobbers=("r3", "cr0_so"),
+)
+PPC64 = ArchInfo(
+    "ppc64-elfv2", 64, "r1", "r3",
+    call_reads=(*_PPC_ARGS, "r1", *(f"f{k}" for k in range(1, 14))),
+    call_clobbers=("r0", *(f"r{k}" for k in range(3, 13)), "ctr", "lr", "ca", *_PPC_CR_SCRATCH,
+                   *(f"f{k}" for k in range(14))),
+    syscall_reads=("r0", *_PPC_ARGS[:6]),
+    syscall_clobbers=("r3", "cr0_so"),
+)
+
+
 _RV_ARGS = tuple(f"a{k}" for k in range(8))
 _RV_FARGS = tuple(f"fa{k}" for k in range(8))
 RISCV64 = ArchInfo(
@@ -115,7 +136,7 @@ RISCV64 = ArchInfo(
 
 def sext_ints(arch: ArchInfo) -> bool:
     """Whether 32-bit integers live sign-extended in 64-bit registers (RISC-V, MIPS n64)."""
-    return arch.name.startswith(("riscv", "mips-n64"))
+    return arch.name.startswith(("riscv", "mips-n64", "ppc64"))
 
 
 def arch_for(binary) -> ArchInfo:
@@ -133,4 +154,8 @@ def arch_for(binary) -> ArchInfo:
         return MIPS_N64
     if binary.arch == "riscv64":
         return RISCV64
+    if binary.arch == "ppc":
+        return PPC32
+    if binary.arch == "ppc64":
+        return PPC64
     raise NotImplementedError(f"no calling convention for {binary.arch} yet")

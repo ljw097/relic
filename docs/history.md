@@ -63,6 +63,11 @@
 - [x] 출력: 부호 있는 값을 좁힌 피연산자의 `/u`·`%u`·`>>u`는 `(unsigned int)` 캐스트(전에는 `(int)v / 10`처럼 부호 있는 나눗셈으로 보였음)
 - [x] 테스트 빌드를 임시 파일 + 이름 바꾸기로(병렬 워커가 같은 샘플을 동시에 빌드하다 덜 쓴 파일을 읽던 문제)
 
+- [x] PowerPC(`lift/ppc.py`): 32비트 SysV(빅 엔디언)와 64비트 ELFv2(리틀 엔디언). capstone의 단순화 니모닉(`slwi`·`clrlwi`·`bdnzl`로 보이는 `bcl 20,31`) 대신 명령 필드에서 해독; CR을 1비트 필드(`crN_lt/gt/eq/so`)로, record 형식은 결과를 0과 비교, `mfcr`+`rlwinm`은 CR 비트 하나로; `stwu`/`stdu`로 만든 프레임(back chain은 모델링하지 않음); 스레드 포인터(r2/r13) → `tp_base`로 스택 보호값 숨김; PPC64 TOC(r2)는 상수, 로컬 진입점(st_other)은 함수 자체로(디버거 중단점도 로컬 진입점에)
+- [x] PPC 로더: `.text`의 PLT 호출 스텁 이름(절대 주소 / PIE는 호출자가 `bcl;mflr;addis;addi`로 만든 r30 기준 / PPC64는 TOC 기준), RELA RELATIVE 워드 채우기(`Binary.reloc_fill`: 파일은 0, 읽기는 링크 시 값), `.got2`·`.toc` 워드를 IR 단계에서 상수로(`IRFunction.const_words`), `R_PPC_ADDR32` GOT 워드를 데이터 import로, 점프 테이블(`lis/addi`·GOT·TOC 테이블, `slwi`+`lwzx`, `extsw`된 상대 엔트리), stripped `main`(r8이 가리키는 `{sda_base, main, init, fini}`), 프롤로그 스캔
+- [x] PPC 부동소수점: FPR은 항상 double 형태 — 단정밀도 연산은 피연산자를 float로 읽어(`fpsingle`, float 매개변수의 증거) 결과를 double로 넓힘(`fmadds` = `fmaf`), `frsp`는 명시적 변환; 반환은 넓힌 float이면 float; `fctiwz; stfd; lwz`·`mfcr`·`0x43300000` 정수→double 관용구(루프 밖으로 끌어올린 상위 워드 포함)·POWER8/9 VSX 스칼라(`xscmpgtdp`+`xxsel`, `xsmadd*`, `mffprd`, `lfiwax`, `lxsd v12`), ELFv2의 위치 기반 인자(부동소수점 인자도 GPR 자리를 차지 → 매개변수를 C 순서로), 스택 인자(r1+8 / r1+96)
+- [x] 공통 개선: 인터프리터 메모리를 바이너리의 바이트 순서로, unordered 비교는 `!(a > b)`로 출력(NaN 정확), `~x + x` = -1, `(x ^ c1) ^ c2`, `(x + c1) + c2`, `low(zext(x))`, 0으로 확장된 바이트의 중복 `& 0xff`(phi 포함), `clz(x) >> 5` = `x == 0`, 같은 상수의 phi, `srawi; addze` 부호 있는 2의 거듭제곱 나눗셈, 피제수가 unsigned int일 때 0 확장으로도 시도
+
 ## 파일 포맷
 
 - [x] ELF 재배치 객체(`relic/loader/elfobj.py`): 할당 섹션을 0x100000부터 정렬해 배치, 정의 안 된 심볼은 `.extern` 스텁(import), GOT 형태 재배치는 `.got` 슬롯, 공통 심볼은 `.common`; 재배치 적용 — x86-64(64/PC32/PLT32/32/32S/GOTPCREL(X)), x86(32/PC32/PLT32), AArch64(ABS·PREL·CALL26/JUMP26·ADR(_GOT)_PAGE·ADD/LDST lo12·CONDBR19·TSTBR14), ARM(ABS32·REL32·CALL/JUMP24·THM_CALL/JUMP24·MOVW/MOVT), MIPS o32(32·26·HI16/LO16·GOT16·CALL16·GOT_DISP), RISC-V(32/64·CALL·PCREL_HI20/LO12·HI20/LO12·JAL·BRANCH·RVC); COFF 객체(`coff.py`, AMD64·i386 재배치, `__imp_` 슬롯); 정적 라이브러리 멤버(`archive.py`, `lib.a:member.o`); Intel HEX·S-record(`firmware.py`, 체크섬 확인, 시작 주소 레코드 또는 Cortex-M 리셋 벡터); COFF도 Windows ABI·LLP64; 로드 오류는 CLI 메시지로

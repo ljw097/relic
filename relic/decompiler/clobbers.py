@@ -89,6 +89,16 @@ def _canon_riscv():
     return canon
 
 
+def _canon_ppc():
+    def canon(name: str) -> tuple[str, ...]:
+        if name.startswith("cr") and name[2:].isdigit():
+            return tuple(f"{name}_{b}" for b in ("lt", "gt", "eq", "so"))
+        if name in ("xer", "carry"):
+            return ("ca",)
+        return (name,)
+    return canon
+
+
 def _canon_for(an: "Analysis"):
     arch = an.bin.arch
     if arch in ("x86", "x64"):
@@ -101,6 +111,8 @@ def _canon_for(an: "Analysis"):
         return _canon_mips(arch == "mips64")
     if arch == "riscv64":
         return _canon_riscv()
+    if arch in ("ppc", "ppc64"):
+        return _canon_ppc()
     return None
 
 

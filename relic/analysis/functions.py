@@ -630,6 +630,134 @@ class FunctionAnalyzer:
             out.append(t)
         return out if bound is None or len(out) == bound else []
 
+    def _ppc_jump_table(self, jmp: Insn) -> list[int]:
+        """gcc's PowerPC switch dispatch, `bctr` after:
+
+            cmplwi rI, N ; bgt default                       the bound
+            lis rT, hi ; addi rT, rT, lo                     the table (or `lwz rT, off(r30)` / TOC)
+            slwi rI, rI, 2 ; lwzx rE, rT, rI                 (or `add` + `lwz 0(...)`, `lwax`)
+            add rE, rE, rT ; mtctr rE ; bctr                 entries are offsets from the table
+
+        Followed with a few symbolic values per register, from the instruction words."""
+        b, msk = self.bin, self.dis._mask
+        big = b.endian == "big"
+        hist = self._back(jmp.addr, 24)[::-1]
+        regs: dict[int, tuple] = {}
+        lr = None
+        ctr = None
+        bound = None
+        toc = getattr(b, "ppc_toc", None) if b.bits == 64 else None
+
+        def val(r):
+            if r == 2 and toc is not None:
+                return ("c", toc)
+            return regs.get(r)
+
+        def sx(v, n):
+            v &= (1 << n) - 1
+            return v - (1 << n) if v >> (n - 1) else v
+
+        for i in hist:
+            w = int.from_bytes(i.raw, "big" if big else "little")
+            op = w >> 26
+            rt, ra, rb = (w >> 21) & 31, (w >> 16) & 31, (w >> 11) & 31
+            simm = sx(w, 16)
+            new, dst = None, None
+            if op in (14, 15):                                   # addi / addis (li / lis)
+                k = simm << 16 if op == 15 else simm
+                base = ("c", 0) if ra == 0 else val(ra)
+                dst = rt
+                if base and base[0] == "c":
+                    new = ("c", (base[1] + k) & msk)
+            elif op == 24 and rt == ra and (w & 0xFFFF) == 0:
+                continue                                         # nop
+            elif op == 24:                                       # ori
+                dst = ra
+                v = val(rt)
+                if v and v[0] == "c":
+                    new = ("c", v[1] | (w & 0xFFFF))
+            elif op == 16 and w & 1 and (w >> 21) & 0x14 == 0x14:
+                lr = i.end                                       # bcl 20,31,.+4
+                continue
+            elif op == 31 and (w >> 1) & 0x3FF == 339 and (ra | rb << 5) == 8:     # mflr
+                dst = rt
+                new = ("c", lr) if lr is not None else None
+            elif op == 31 and (w >> 1) & 0x3FF == 467 and (ra | rb << 5) == 9:     # mtctr
+                ctr = val(rt)
+                continue
+            elif op == 10:                                       # cmplwi / cmpldi
+                bound = (w & 0xFFFF) + 1
+                continue
+            elif op == 21:                                       # rlwinm: slwi 2
+                dst = ra
+                sh, mb, me = rb, (w >> 6) & 31, (w >> 1) & 31
+                if sh == 2 and mb == 0 and me == 29:
+                    new = ("scaled", 4)
+            elif op == 30 and (w >> 2) & 7 == 1:                 # rldicr: sldi 2 / 3
+                dst = ra
+                sh = rb | (((w >> 1) & 1) << 5)
+                if sh in (2, 3):
+                    new = ("scaled", 1 << sh)
+            elif op == 31 and (w >> 1) & 0x1FF == 266:           # add
+                dst = rt
+                x, y = val(ra), val(rb)
+                if x and y:
+                    kinds = {x[0], y[0]}
+                    c = x if x[0] == "c" else y
+                    o = y if c is x else x
+                    if kinds == {"c", "scaled"}:
+                        new = ("elem", c[1], o[1])
+                    elif kinds == {"c", "entry"} and o[1] == c[1]:
+                        new = ("rel", o[1], o[2])
+                    elif kinds == {"c"}:
+                        new = ("c", (x[1] + y[1]) & msk)
+            elif op == 31 and (w >> 1) & 0x3FF in (23, 341, 21):  # lwzx / lwax / ldx
+                dst = rt
+                x, y = val(ra), val(rb)
+                size = 8 if (w >> 1) & 0x3FF == 21 else 4
+                if x and y and {x[0], y[0]} == {"c", "scaled"}:
+                    c = x if x[0] == "c" else y
+                    new = ("entry", c[1], size, (w >> 1) & 0x3FF == 341)
+            elif op == 31 and (w >> 1) & 0x3FF == 986:          # extsw: a signed 32-bit entry
+                dst = ra
+                v = val(rt)
+                new = ("entry", v[1], v[2], True) if v and v[0] == "entry" and v[2] == 4 else None
+            elif op == 31 and (w >> 1) & 0x3FF == 444 and rt == rb:              # mr
+                dst = ra
+                new = val(rt)
+            elif op in (32, 58):                                 # lwz / ld / lwa
+                dst = rt
+                d = simm if op == 32 else sx(w & 0xFFFC, 16)
+                size = 4 if op == 32 or w & 3 == 2 else 8
+                v = val(ra)
+                if v and v[0] == "elem" and d == 0:
+                    new = ("entry", v[1], size, op == 58 and w & 3 == 2)
+                elif v and v[0] == "c":
+                    m = b.read_int((v[1] + d) & msk, size)       # a GOT / TOC word: the table's address
+                    new = ("c", m) if m is not None else None
+            else:
+                continue
+            if dst is not None:
+                if new is None:
+                    regs.pop(dst, None)
+                else:
+                    regs[dst] = new
+        if not ctr or ctr[0] not in ("rel", "entry") or not bound:
+            return []
+        table = ctr[1]
+        size = ctr[2] if ctr[0] == "entry" else 4
+        rel = ctr[0] == "rel"
+        out = []
+        for k in range(bound):
+            e = b.read_int((table + size * k) & msk, size)
+            if e is None:
+                return []
+            t = (table + sx(e, size * 8)) & msk if rel else e
+            if not b.is_exec(t) or t & 3:
+                return []
+            out.append(t)
+        return out
+
     def _riscv_jump_table(self, jmp: Insn) -> list[int]:
         """gcc's RISC-V switch dispatch, bounded by a `bltu K, idx` (K in a register) before it:
 
@@ -701,6 +829,8 @@ class FunctionAnalyzer:
             return self._arm64_jump_table(jmp)
         if self.dis.arch in ("mips", "mips64"):
             return self._mips_jump_table(jmp)
+        if self.dis.arch in ("ppc", "ppc64"):
+            return self._ppc_jump_table(jmp)
         if self.dis.arch not in ("x86", "x64"):
             return []
         ptr = self.bin.bits // 8
@@ -829,7 +959,7 @@ class FunctionAnalyzer:
     def _scan_gaps(self):
         """Pick up functions only reachable indirectly (prologue scan: x86, ARM, AArch64, MIPS,
         RISC-V)."""
-        if self.dis.arch not in ("x86", "x64", "arm", "arm64", "mips", "mips64", "riscv64"):
+        if self.dis.arch not in ("x86", "x64", "arm", "arm64", "mips", "mips64", "riscv64", "ppc", "ppc64"):
             return
         prologues = (b"\xf3\x0f\x1e\xfa", b"\xf3\x0f\x1e\xfb", b"\x55\x48\x89\xe5", b"\x55\x89\xe5")
         tried: set[int] = set()
@@ -856,6 +986,8 @@ class FunctionAnalyzer:
                     start = self._mips_gap_function(s, e)
                 elif self.dis.arch == "riscv64":
                     start = self._riscv_gap_function(s, e)
+                elif self.dis.arch in ("ppc", "ppc64"):
+                    start = self._ppc_gap_function(s, e)
                 else:
                     start = self._gap_function(s, e, prologues)
                 if start is None or start in tried:
@@ -961,6 +1093,32 @@ class FunctionAnalyzer:
             if i.kind != "normal" or i.mnemonic != "nop":
                 return None
             a = i.end
+        return None
+
+    def _ppc_gap_function(self, s: int, e: int) -> int | None:
+        """First PowerPC prologue in [s, e) past zero / `nop` padding: `addis r2, r12, hi` (an ELFv2
+        global entry), `mflr r0`, `stwu r1, -n(r1)` / `stdu r1, -n(r1)`, or `std rX, -n(r1)`."""
+        a = s
+        big = self.bin.endian == "big"
+        while a + 4 <= e:
+            raw = self.bin.read(a, 4)
+            if len(raw) < 4:
+                return None
+            w = int.from_bytes(raw, "big" if big else "little")
+            if w in (0, 0x60000000):                         # padding / nop
+                a += 4
+                continue
+            op = w >> 26
+            rt, ra = (w >> 21) & 31, (w >> 16) & 31
+            if op == 15 and rt == 2 and ra == 12:            # addis r2, r12, hi
+                return a
+            if w == 0x7C0802A6:                              # mflr r0
+                return a
+            if op == 37 and rt == 1 and ra == 1 and w & 0x8000:   # stwu r1, -n(r1)
+                return a
+            if op == 62 and ra == 1 and w & 0x8000 and (w & 3) in (0, 1):    # std / stdu rX, -n(r1)
+                return a
+            return None
         return None
 
     def _gap_function(self, s: int, e: int, prologues: tuple[bytes, ...]) -> int | None:

@@ -41,6 +41,10 @@ def _callee_saved(arch: ArchInfo) -> set[str]:
         return {f"s{k}" for k in range(12)} | {"ra"} | {f"fs{k}" for k in range(12)}
     if arch.name.startswith("mips"):
         return {f"s{k}" for k in range(8)} | {"fp", "ra"}
+    if arch.name.startswith("ppc"):
+        # r14-r31 (r31 = frame pointer), f14-f31, cr2-cr4, lr (saved by the prologue)
+        return {f"r{k}" for k in range(14, 32)} | {f"f{k}" for k in range(14, 32)} | {"lr"} | \
+            {f"cr{n}_{b}" for n in (2, 3, 4) for b in ("lt", "gt", "eq", "so")}
     if arch.name == "x64-win":
         return {"rbp", "rbx", "rsi", "rdi", "r12", "r13", "r14", "r15", *(f"xmm{k}" for k in range(6, 16))}
     if arch.bits == 64:
@@ -122,7 +126,7 @@ def _is_canary(e: Expr, guards=frozenset(), defs=None, depth: int = 3) -> bool:
     its address and GOT slots) -- also through a few SSA definitions (`defs`), for a guard
     address kept in a callee-saved register across the function (MIPS PIC)."""
     for n in walk(e):
-        if (isinstance(n, (Reg, Var)) and n.name in ("fs_base", "gs_base")) or \
+        if (isinstance(n, (Reg, Var)) and n.name in ("fs_base", "gs_base", "tp_base")) or \
                 (isinstance(n, Const) and n.value in guards):
             return True
         if defs and depth and isinstance(n, Var) and n in defs and _is_canary(defs[n], guards, defs, depth - 1):

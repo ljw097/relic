@@ -79,15 +79,21 @@ def prepare(an: "Analysis", func: "Function") -> Prepared:
     else:
         from .fpabi import float_int_params
         fints = [r for r, _ in float_int_params(an, arch, func.addr)]       # RISC-V: floats past fa7
-        params = [r for r in _livein_arg_regs(an, arch, func.addr) if r not in fints] + \
-            [r for r, _ in fp_params(an, arch, func.addr)] + fints
+        ints = [r for r in _livein_arg_regs(an, arch, func.addr) if r not in fints]
+        fpl = fp_params(an, arch, func.addr)
+        params = ints + [r for r, _ in fpl] + fints
+        from .calls import positional_order
+        order = positional_order(arch, ints, fpl)
+        if order is not None:                   # PowerPC64: in the order C had them
+            params = [params[k] for k in order] + fints
         from .calls import param_base, stack_param_count, stack_params_used
         if stack_params_used(arch):
             # parameters past the registers, on the stack (above the return address on x86-64,
             # and past Win64's home space for the four register parameters)
             from .fpabi import stack_arg_base
             word = arch.bits // 8
-            first = param_base(arch) + stack_arg_base(arch)
+            # (PowerPC's offset from the caller's r1 is the same from this function's entry r1)
+            first = param_base(arch) + (0 if arch.name.startswith("ppc") else stack_arg_base(arch))
             from .calls import stack_param_slots
             params += [frame.slots[first + rel].name() if first + rel in frame.slots else f"arg_{first + rel:x}"
                        for rel, _, _ in stack_param_slots(an, arch, func.addr)]
@@ -110,6 +116,8 @@ def prepare(an: "Analysis", func: "Function") -> Prepared:
     # otherwise only compared is one
     from .arch import sext_ints
     narrow(fn, sext_params=set(int_arg_regs(arch)) if sext_ints(arch) else frozenset())
+    from .passes import _redundant_masks
+    _redundant_masks(fn)                    # (narrowing leaves `(int)c & 0xff` of a loaded byte)
     from .fpconst import fold_float_constants
     from .cleanup import propagate_ro_loads
     if arch.name.startswith("riscv"):
