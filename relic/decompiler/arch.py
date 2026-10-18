@@ -90,6 +90,17 @@ MIPS_O32 = ArchInfo(
 )
 
 
+_N64_ARGS = tuple(f"a{k}" for k in range(8))
+MIPS_N64 = ArchInfo(
+    "mips-n64", 64, "sp", "v0",
+    call_reads=(*_N64_ARGS, "sp"),
+    # n64: at, v0-v1, a0-a7, t0-t3, t8-t9 and hi/lo are caller-saved (gp is callee-saved)
+    call_clobbers=("at", "v0", "v1", *_N64_ARGS, "t0", "t1", "t2", "t3", "t8", "t9", "ra", "hi", "lo"),
+    syscall_reads=("v0", *_N64_ARGS[:6]),
+    syscall_clobbers=("v0", "a3"),
+)
+
+
 _RV_ARGS = tuple(f"a{k}" for k in range(8))
 _RV_FARGS = tuple(f"fa{k}" for k in range(8))
 RISCV64 = ArchInfo(
@@ -100,6 +111,11 @@ RISCV64 = ArchInfo(
     syscall_reads=("a7", *_RV_ARGS[:6]),
     syscall_clobbers=("a0",),
 )
+
+
+def sext_ints(arch: ArchInfo) -> bool:
+    """Whether 32-bit integers live sign-extended in 64-bit registers (RISC-V, MIPS n64)."""
+    return arch.name.startswith(("riscv", "mips-n64"))
 
 
 def arch_for(binary) -> ArchInfo:
@@ -113,6 +129,8 @@ def arch_for(binary) -> ArchInfo:
         return ARM_VFP if getattr(binary, "arm_hard_float", False) else ARM
     if binary.arch == "mips" and binary.bits == 32:
         return MIPS_O32
+    if binary.arch == "mips64":
+        return MIPS_N64
     if binary.arch == "riscv64":
         return RISCV64
     raise NotImplementedError(f"no calling convention for {binary.arch} yet")

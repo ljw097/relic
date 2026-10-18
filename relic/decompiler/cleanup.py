@@ -585,8 +585,8 @@ def _clean(e: Expr, bits: int, defs: dict, an: "Analysis", ret_reg: str, seen: s
     from .ir import Cast
     from .sigs import lookup
     if isinstance(e, Const):
-        # RISC-V keeps an int sign-extended: `li a0, -1` is the int -1
-        return e.value < (1 << bits) or an.bin.arch == "riscv64" and e.value >> (bits - 1) == \
+        # RISC-V / MIPS64 keep an int sign-extended: `li a0, -1` is the int -1
+        return e.value < (1 << bits) or an.bin.arch in ("riscv64", "mips64") and e.value >> (bits - 1) == \
             (1 << (e.bits - bits + 1)) - 1
     if isinstance(e, Cast) and e.kind in ("zext", "sext"):
         return e.a.bits <= bits

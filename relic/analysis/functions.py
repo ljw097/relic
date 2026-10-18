@@ -236,6 +236,7 @@ class FunctionAnalyzer:
                         elif self.bin.is_exec(tgt):
                             succ = [tgt]
                     else:
+                        self._jt_func = f.addr
                         table = self._jump_table(i)
                         if table:
                             f.jump_tables[i.addr] = table
@@ -317,7 +318,7 @@ class FunctionAnalyzer:
             if p.mnemonic == "move" and len(ops) == 2:
                 want = ops[1]
                 continue
-            if p.mnemonic == "lw" and len(ops) == 2 and ops[1].endswith("($gp)"):
+            if p.mnemonic in ("lw", "ld") and len(ops) == 2 and ops[1].endswith("($gp)"):
                 try:
                     return (gp + int(ops[1][:-5] or "0", 0)) & ((1 << self.bin.bits) - 1)
                 except ValueError:
@@ -557,15 +558,21 @@ class FunctionAnalyzer:
         regs: dict[str, tuple] = {}                               # register -> ("c", v) / ("idx",) / ...
         gp = b.mips_gp
         bound = None
+        word = b.bits // 8                                        # (MIPS64: `.gpdword` entries)
+        shift = "3" if word == 8 else "2"
 
         def ops_of(i):
             return [o.strip().lstrip("$") for o in i.op_str.split(",")]
+
+        t9_written = False
 
         def val(r):
             if r == "zero":
                 return ("c", 0)
             if r == "gp" and gp is not None:
                 return ("c", gp)
+            if r == "t9" and r not in regs and not t9_written and getattr(self, "_jt_func", None) is not None:
+                return ("c", self._jt_func)           # PIC: `$t9` holds the function's own address
             return regs.get(r)
 
         for i in hist:
@@ -576,33 +583,37 @@ class FunctionAnalyzer:
             new = None
             if m == "lui" and len(ops) == 2:
                 new = ("c", (int(ops[1], 0) << 16) & msk)
-            elif m in ("addiu", "ori") and len(ops) == 3 and (v := val(ops[1])) and v[0] == "c":
+            elif m in ("addiu", "daddiu", "ori") and len(ops) == 3 and (v := val(ops[1])) and v[0] == "c":
                 k = int(ops[2], 0)
                 new = ("c", (v[1] | k if m == "ori" else v[1] + k) & msk)
-            elif m == "sll" and len(ops) == 3 and ops[2] == "2":
+            elif m in ("sll", "dsll") and len(ops) == 3 and ops[2] in (shift, hex(int(shift))):
                 new = ("scaled",)
             elif m == "sltiu" and len(ops) == 3:
                 bound = int(ops[2], 0)
-            elif m == "addu" and len(ops) == 3:
+            elif m in ("addu", "daddu") and len(ops) == 3:
                 a, c = val(ops[1]), val(ops[2])
-                if a and c and {a[0], c[0]} == {"c", "scaled"}:
+                if a and c and a[0] == c[0] == "c":
+                    new = ("c", (a[1] + c[1]) & msk)          # `daddu a1, a1, $t9`: building _gp
+                elif a and c and {a[0], c[0]} == {"c", "scaled"}:
                     new = ("elem", a[1] if a[0] == "c" else c[1])
                 elif a and c and a[0] == "entry" and c == ("c", gp):
                     new = ("gprel", a[1])
                 elif a and c and c[0] == "entry" and a == ("c", gp):
                     new = ("gprel", c[1])
-            elif m == "lw" and len(ops) == 2 and "(" in ops[1]:
+            elif m == ("ld" if word == 8 else "lw") and len(ops) == 2 and "(" in ops[1]:
                 off, base = ops[1].rstrip(")").split("(")
                 off = int(off or "0", 0)
                 v = val(base.lstrip("$"))
                 if v and v[0] == "elem" and off == 0:
                     new = ("entry", v[1])
                 elif v and v[0] == "c":
-                    w = b.read_int((v[1] + off) & msk, 4)       # a GOT entry holding the table's page
+                    w = b.read_int((v[1] + off) & msk, word)    # a GOT entry holding the table's page
                     new = ("c", w) if w is not None else None
+            if d == "t9" and m not in ("sw", "sd"):
+                t9_written = True
             if new is not None:
                 regs[d] = new
-            elif d in regs and m not in ("sw", "sh", "sb", "beqz", "bnez", "beq", "bne", "sltiu"):
+            elif d in regs and m not in ("sw", "sh", "sb", "sd", "beqz", "bnez", "beq", "bne", "sltiu"):
                 del regs[d]
         target = val(ops_of(jmp)[0]) if jmp.op_str else None
         if not target or target[0] not in ("entry", "gprel"):
@@ -610,7 +621,7 @@ class FunctionAnalyzer:
         table, rel = target[1], target[0] == "gprel"
         out = []
         for k in range(bound if bound else 256):
-            w = b.read_int((table + 4 * k) & msk, 4)
+            w = b.read_int((table + word * k) & msk, word)
             if w is None:
                 break
             t = (w + gp) & msk if rel else w
@@ -688,7 +699,7 @@ class FunctionAnalyzer:
             return self._arm_jump_table(jmp)
         if self.dis.arch == "arm64":
             return self._arm64_jump_table(jmp)
-        if self.dis.arch == "mips" and self.bin.bits == 32:
+        if self.dis.arch in ("mips", "mips64"):
             return self._mips_jump_table(jmp)
         if self.dis.arch not in ("x86", "x64"):
             return []
@@ -818,7 +829,7 @@ class FunctionAnalyzer:
     def _scan_gaps(self):
         """Pick up functions only reachable indirectly (prologue scan: x86, ARM, AArch64, MIPS,
         RISC-V)."""
-        if self.dis.arch not in ("x86", "x64", "arm", "arm64", "mips", "riscv64"):
+        if self.dis.arch not in ("x86", "x64", "arm", "arm64", "mips", "mips64", "riscv64"):
             return
         prologues = (b"\xf3\x0f\x1e\xfa", b"\xf3\x0f\x1e\xfb", b"\x55\x48\x89\xe5", b"\x55\x89\xe5")
         tried: set[int] = set()
@@ -841,7 +852,7 @@ class FunctionAnalyzer:
                 s, e = gap
                 if self.dis.arch in ("arm", "arm64"):
                     start = self._arm_gap_function(s, e)
-                elif self.dis.arch == "mips":
+                elif self.dis.arch in ("mips", "mips64"):
                     start = self._mips_gap_function(s, e)
                 elif self.dis.arch == "riscv64":
                     start = self._riscv_gap_function(s, e)
@@ -943,7 +954,7 @@ class FunctionAnalyzer:
             if i is None:
                 return None
             ops = [o.strip() for o in i.op_str.split(",")]
-            if i.mnemonic == "addiu" and ops[:2] == ["$sp", "$sp"] and ops[2].startswith("-"):
+            if i.mnemonic in ("addiu", "daddiu") and ops[:2] == ["$sp", "$sp"] and ops[2].startswith("-"):
                 return a
             if i.mnemonic == "lui" and ops[0] == "$gp":
                 return a

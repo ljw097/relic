@@ -55,6 +55,14 @@
 - [x] **P1** ARM Thumb 모드: 주소별 명령어 집합(`$a`/`$t` 매핑 심볼, 심볼·엔트리 LSB, `bl`은 유지·`blx label`은 전환), IT 블록(조건을 한 번에 디코딩), Thumb PLT 진입점(`bx pc`)
   - [x] 심볼 없는(stripped) ARM / Thumb / AArch64: `_start`의 리프트된 IR에서 `__libc_start_main` 첫 인자(GOT·리터럴 풀 슬롯)를 읽어 `main` 복원, 함수 사이 빈 구간의 프롤로그 스캔(A32/Thumb `push {…, lr}`, AArch64 `stp x29, x30`·`paciasp`·`bti c`)으로 포인터로만 쓰이는 함수(`win`) 발견
 
+## 프로세서
+
+- [x] MIPS 빅 엔디언(`mips-linux-gnu`): 분석·디컴파일·재컴파일 실행 검증(qemu-mips)·디버깅 — 바이트 순서 외에는 리틀 엔디언과 같은 경로
+- [x] MIPS64 n64(`lift/mips.py`를 32/64비트로): 64비트 레지스터, `a4`-`a7`(capstone의 o32 이름 `t0`-`t3`을 n64 이름으로), 32비트 연산(`addu`·`sll`·`lw`·`mult`·`div`)은 결과를 부호 확장, `d...` 명령(`daddu`·`dsll32`·`dmult`(128비트 곱)·`ddiv`·`dext`/`dins`·`ld`/`sd`·`lwu`), `lui`의 부호 확장; 진입 시 `$t9` = 함수 주소(리프 함수가 `_gp`를 다른 레지스터에 만들 때), `ld $t9, slot($gp)` 호출, `.gpdword` 점프 테이블(`dsll 3`); `mips-n64` 호출 규약(인자 a0-a7, int는 64비트로 부호 확장된 채 전달 → RISC-V와 같은 좁히기); qemu-mips64el 디버깅
+- [x] 상수 나눗셈: 곱셈 대신 시프트·덧셈 사슬로 만든 매직 곱(MIPS64 gcc)도 후보로, 32비트 값을 담은 64비트 피제수(`x & 0xffffffff`, 부호 확장된 int 인자)는 32비트로 인식 후 다시 좁히기
+- [x] 출력: 부호 있는 값을 좁힌 피연산자의 `/u`·`%u`·`>>u`는 `(unsigned int)` 캐스트(전에는 `(int)v / 10`처럼 부호 있는 나눗셈으로 보였음)
+- [x] 테스트 빌드를 임시 파일 + 이름 바꾸기로(병렬 워커가 같은 샘플을 동시에 빌드하다 덜 쓴 파일을 읽던 문제)
+
 ## 파일 포맷
 
 - [x] ELF 재배치 객체(`relic/loader/elfobj.py`): 할당 섹션을 0x100000부터 정렬해 배치, 정의 안 된 심볼은 `.extern` 스텁(import), GOT 형태 재배치는 `.got` 슬롯, 공통 심볼은 `.common`; 재배치 적용 — x86-64(64/PC32/PLT32/32/32S/GOTPCREL(X)), x86(32/PC32/PLT32), AArch64(ABS·PREL·CALL26/JUMP26·ADR(_GOT)_PAGE·ADD/LDST lo12·CONDBR19·TSTBR14), ARM(ABS32·REL32·CALL/JUMP24·THM_CALL/JUMP24·MOVW/MOVT), MIPS o32(32·26·HI16/LO16·GOT16·CALL16·GOT_DISP), RISC-V(32/64·CALL·PCREL_HI20/LO12·HI20/LO12·JAL·BRANCH·RVC); COFF 객체(`coff.py`, AMD64·i386 재배치, `__imp_` 슬롯); 정적 라이브러리 멤버(`archive.py`, `lib.a:member.o`); Intel HEX·S-record(`firmware.py`, 체크섬 확인, 시작 주소 레코드 또는 Cortex-M 리셋 벡터); COFF도 Windows ABI·LLP64; 로드 오류는 CLI 메시지로

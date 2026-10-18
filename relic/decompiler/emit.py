@@ -976,6 +976,11 @@ class CWriter:
                 op, p = BIN[e.op]
                 flag = self._enum_text(b, a) or None if e.op in ("&", "|", "^") else None
                 ta = flag if flag else self._num(a) if isinstance(a, Const) else self.expr(a, p)
+                if e.op in ("/u", "%u", ">>u") and not isinstance(a, Const) and a.bits in (8, 16, 32, 64) and \
+                        not self._unsigned(a) and isinstance(a, Cast):
+                    # an unsigned operation on a narrowed signed value: C needs the unsigned type
+                    ta = f"(unsigned {int_type(a.bits)}){self.expr(a.a if a.kind == 'low' else a, PREC_UNARY)}" \
+                        if a.bits in (8, 16, 32) else f"({int_type(a.bits, True)}){self.expr(a, PREC_UNARY)}"
                 flag = self._enum_text(a, b) if e.op in ("&", "|", "^") else None
                 tb = flag if flag else self._num(b) if isinstance(b, Const) else self.expr(b, p + 1)
                 return f"{ta} {op} {tb}", p

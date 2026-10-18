@@ -70,11 +70,11 @@ def _canon_arm():
     return canon
 
 
-def _canon_mips():
+def _canon_mips(n64: bool = False):
     from .lift.mips import MipsLifter
 
     def canon(name: str) -> tuple[str, ...]:
-        n = MipsLifter.canon(name)
+        n = MipsLifter.canon(name, n64)
         if n in ("ac0", "hi0", "lo0"):
             return ("hi", "lo")
         return (n,)
@@ -97,8 +97,8 @@ def _canon_for(an: "Analysis"):
         return _canon_arm64()
     if arch == "arm":
         return _canon_arm()
-    if arch == "mips" and an.bin.bits == 32:
-        return _canon_mips()
+    if arch in ("mips", "mips64"):
+        return _canon_mips(arch == "mips64")
     if arch == "riscv64":
         return _canon_riscv()
     return None
@@ -119,7 +119,7 @@ def _own_writes(an: "Analysis", f, canon):
             try:
                 _, written = i.cs.regs_access()
             except Exception:                       # noqa: BLE001 - capstone cannot tell (MIPS)
-                if an.bin.arch != "mips":
+                if an.bin.arch not in ("mips", "mips64"):
                     return None
                 if lifter is None:
                     from .lift.mips import MipsLifter

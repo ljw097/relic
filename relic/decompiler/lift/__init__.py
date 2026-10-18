@@ -21,7 +21,7 @@ def lifter_for(an: Analysis):
     if an.bin.arch == "arm":
         from .arm import ArmLifter
         return ArmLifter(an)
-    if an.bin.arch == "mips" and an.bin.bits == 32:
+    if an.bin.arch in ("mips", "mips64"):
         from .mips import MipsLifter
         return MipsLifter(an)
     if an.bin.arch == "riscv64":
@@ -56,6 +56,9 @@ def lift_function(an: Analysis, f: Function) -> IRFunction:
         if not ends and len(blk.succs) == 1:
             ib.stmts.append(Jump(blk.last.addr, blk.succs[0]))
         out.blocks[a] = ib
+    entry = getattr(lifter, "entry_stmts", None)
+    if entry is not None and f.addr in out.blocks:
+        out.blocks[f.addr].stmts[:0] = entry(f)
     # blocks the lifter split off an instruction (`blne f`, `addls pc, pc, ...`): the block
     # ending in that instruction now branches to the synthetic block or falls through
     extra = getattr(lifter, "extra_blocks", {})

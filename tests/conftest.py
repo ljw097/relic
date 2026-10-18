@@ -43,6 +43,16 @@ VARIANTS = {
     "vuln_mips_pie": ["-O1", "-fstack-protector-strong", "-pie", "-fPIE"],
     "flow_mips_O0": ["-O0"],
     "flow_mips_O2": ["-O2", "-fno-tree-vectorize"],
+    # MIPS32 big-endian
+    "vuln_mipsbe": ["-O0"],
+    "vuln_mipsbe_pie": ["-O1", "-fstack-protector-strong", "-pie", "-fPIE"],
+    "flow_mipsbe_O0": ["-O0"],
+    "flow_mipsbe_O2": ["-O2", "-fno-tree-vectorize"],
+    # MIPS64 little-endian, n64 ABI
+    "vuln_mips64": ["-O0"],
+    "vuln_mips64_pie": ["-O1", "-fstack-protector-strong", "-pie", "-fPIE"],
+    "flow_mips64_O0": ["-O0"],
+    "flow_mips64_O2": ["-O2", "-fno-tree-vectorize"],
     # RISC-V RV64GC (cross compiler; skipped without it): PIE by default
     "vuln_rv64": ["-O0"],
     "vuln_rv64_pie": ["-O1", "-fstack-protector-strong", "-pie", "-fPIE"],
@@ -76,6 +86,10 @@ COMPILERS = {"vuln64_pe": "x86_64-w64-mingw32-gcc", "vuln32_pe": "i686-w64-mingw
              **{n: "aarch64-linux-gnu-gcc" for n in ("vuln_a64", "vuln_a64_pie", "flow_a64_O0", "flow_a64_O2",
                                                      "floats_a64_O0", "floats_a64_O2")},
              **{n: "mipsel-linux-gnu-gcc" for n in ("vuln_mips", "vuln_mips_pie", "flow_mips_O0", "flow_mips_O2")},
+             **{n: "mips-linux-gnu-gcc" for n in ("vuln_mipsbe", "vuln_mipsbe_pie", "flow_mipsbe_O0",
+                                                  "flow_mipsbe_O2")},
+             **{n: "mips64el-linux-gnuabi64-gcc" for n in ("vuln_mips64", "vuln_mips64_pie", "flow_mips64_O0",
+                                                           "flow_mips64_O2")},
              **{n: "riscv64-linux-gnu-gcc" for n in ("vuln_rv64", "vuln_rv64_pie", "flow_rv64_O0", "flow_rv64_O2",
                                                      "floats_rv64_O0", "floats_rv64_O2")},
              **{n: "arm-linux-gnueabihf-gcc" for n in ("vuln_arm", "vuln_thumb", "flow_arm_O0", "flow_arm_O2",
@@ -92,7 +106,8 @@ SOURCES = {"structs_O0": os.path.join(HERE, "src", "structs.c"), "structs_O2": o
            "flow_O0": FLOW_SRC, "flow_O2": FLOW_SRC, "flow32_O0": FLOW_SRC, "flow32_O2": FLOW_SRC,
            "shapes": os.path.join(HERE, "src", "shapes.cpp"), "flow_a64_O0": FLOW_SRC, "flow_a64_O2": FLOW_SRC,
            **{n: FLOW_SRC for n in ("flow_arm_O0", "flow_arm_O2", "flow_thumb_O0", "flow_thumb_O2",
-                                    "flow_mips_O0", "flow_mips_O2", "flow_rv64_O0", "flow_rv64_O2")}}
+                                    "flow_mips_O0", "flow_mips_O2", "flow_mipsbe_O0", "flow_mipsbe_O2",
+                                    "flow_mips64_O0", "flow_mips64_O2", "flow_rv64_O0", "flow_rv64_O2")}}
 
 
 # libraries go after the source: linkers drop the ones nothing before them uses
@@ -115,7 +130,9 @@ def _build(name: str) -> str:
             if prefix else shutil.which("strip")
         if strip is None:
             pytest.skip(f"no strip for {base}")
-        subprocess.run([strip, "-o", out, src], check=True)
+        tmp = f"{out}.{os.getpid()}"
+        subprocess.run([strip, "-o", tmp, src], check=True)
+        os.replace(tmp, out)                    # (atomic: parallel test workers may build it too)
         return out
     if name in COMPILERS:   # cross compilers may only exist under a versioned name (`...-gcc-14`)
         cc = shutil.which(COMPILERS[name]) or next(
@@ -126,8 +143,10 @@ def _build(name: str) -> str:
         pytest.skip(f"no C compiler for {name}")
     os.makedirs(BINS, exist_ok=True)
     try:
-        subprocess.run([cc, *VARIANTS[name], "-w", "-o", out, src_path, *LIBS.get(name, ())], check=True,
+        tmp = f"{out}.{os.getpid()}"
+        subprocess.run([cc, *VARIANTS[name], "-w", "-o", tmp, src_path, *LIBS.get(name, ())], check=True,
                        capture_output=True)
+        os.replace(tmp, out)
     except subprocess.CalledProcessError as e:
         pytest.skip(f"cannot build {name}: {e.stderr.decode(errors='replace')[:200]}")
     return out
@@ -212,6 +231,14 @@ types_O0 = _fixture("types_O0")
 types_O2 = _fixture("types_O2")
 flow_mips_O0 = _fixture("flow_mips_O0")
 flow_mips_O2 = _fixture("flow_mips_O2")
+vuln_mipsbe = _fixture("vuln_mipsbe")
+vuln_mipsbe_pie = _fixture("vuln_mipsbe_pie")
+flow_mipsbe_O0 = _fixture("flow_mipsbe_O0")
+flow_mipsbe_O2 = _fixture("flow_mipsbe_O2")
+vuln_mips64 = _fixture("vuln_mips64")
+vuln_mips64_pie = _fixture("vuln_mips64_pie")
+flow_mips64_O0 = _fixture("flow_mips64_O0")
+flow_mips64_O2 = _fixture("flow_mips64_O2")
 
 
 @pytest.fixture(autouse=True)

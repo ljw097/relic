@@ -79,6 +79,11 @@ def _interesting(e: Expr) -> bool:
             # signed division by 2^k rounds towards zero with the sign bit: `x >>s (w-1)`
             if n.op in (">>s", ">>u") and isinstance(n.b, Const) and n.b.value == n.a.bits - 1:
                 return True
+            # a magic multiply spelled as shifts and adds (MIPS64: `dsll` / `daddu` chains),
+            # then the high bits taken
+            if n.op in (">>s", ">>u") and isinstance(n.b, Const) and n.b.value >= 16 and \
+                    sum(isinstance(k, BinOp) and k.op == "<<" for k in walk(n.a)) >= 3:
+                return True
         # ... or with a conditional add on negative inputs (`x < 0 ? x + 15 : x`)
         if isinstance(n, Ite) and isinstance(n.cond, BinOp) and n.cond.op in ("<s", "<=s") and \
                 any(isinstance(k, Const) and k.value == 0 for k in (n.cond.a, n.cond.b)):
@@ -209,8 +214,32 @@ def _divisibility(full: Expr, x: Expr) -> Expr | None:
     return None
 
 
-def recover_division(fn: IRFunction) -> int:
-    """Rewrite division / remainder sequences by constants (non-SSA input, in place)."""
+def _ext32(e: Expr) -> str | None:
+    """"zext" / "sext" if `e` is a 32-bit value widened to 64 bits (`x & 0xffffffff`, a cast)."""
+    if e.bits != 64:
+        return None
+    if isinstance(e, Cast) and e.kind in ("zext", "sext") and e.a.bits <= 32:
+        return e.kind
+    if isinstance(e, BinOp) and e.op == "&" and any(isinstance(k, Const) and k.value == 0xFFFFFFFF
+                                                    for k in (e.a, e.b)):
+        return "zext"
+    return None
+
+
+def _recognise_narrow(full: Expr, x: Expr, kind: str) -> Expr | None:
+    """`full` of a 64-bit `x` known to hold a 32-bit value (`kind`-extended): recognised on that
+    value, in terms of `low32(x)`."""
+    x32 = Var("__x32", 0, 32)
+    proxy = transform(full, lambda n: Cast(kind, x32, 64) if n == x else n)
+    rep = _recognise(proxy, x32)
+    if rep is None:
+        return None
+    return transform(rep, lambda n: Cast("low", x, 32) if n == x32 else n)
+
+
+def recover_division(fn: IRFunction, sext_params: frozenset = frozenset()) -> int:
+    """Rewrite division / remainder sequences by constants (non-SSA input, in place).
+    `sext_params`: argument registers that hold `int`s sign-extended to 64 bits (RISC-V, MIPS64)."""
     from .ssa import reachable_order
     count = 0
     out_avail: dict[int, dict] = {}
@@ -259,6 +288,12 @@ def recover_division(fn: IRFunction) -> int:
                         if _leaves(full) == {x} and _pure(full) and _interesting(full):
                             # the first dividend that explains it (`v1 = a1 & 0x80000007` is not one)
                             rep = _recognise(full, x)
+                            if rep is None and x.bits == 64:
+                                kind = _ext32(avail[x]) if x in avail else \
+                                    "sext" if isinstance(x, Var) and x.version == 0 and x.name in sext_params \
+                                    else None
+                                if kind is not None:
+                                    rep = _recognise_narrow(full, x, kind)
                             if rep is not None:
                                 count += 1
                                 return rep

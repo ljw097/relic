@@ -29,6 +29,7 @@ _INT_ARGS = {
     "arm-aapcs": ("r0", "r1", "r2", "r3"),
     "arm-aapcs-vfp": ("r0", "r1", "r2", "r3"),
     "mips-o32": ("a0", "a1", "a2", "a3"),
+    "mips-n64": tuple(f"a{k}" for k in range(8)),
     "riscv64-lp64d": tuple(f"a{k}" for k in range(8)),
 }
 
@@ -366,7 +367,7 @@ def param_base(arch: ArchInfo) -> int:
 
 def stack_params_used(arch: ArchInfo) -> bool:
     """Whether calls on this convention get stack arguments recovered (cdecl has its own path)."""
-    return arch.name.startswith(("x64", "arm64", "arm-aapcs", "riscv"))
+    return arch.name.startswith(("x64", "arm64", "arm-aapcs", "riscv", "mips-n64"))
 
 
 def stack_param_floats(an: "Analysis", arch: ArchInfo, target: int) -> dict[int, int]:
