@@ -158,6 +158,9 @@ def _recognise(full: Expr, x: Expr) -> Expr | None:
     # remainder: the divisor comes from a division already recovered inside
     divisors = {n.b.value for n in walk(full) if isinstance(n, BinOp) and n.op in ("/s", "/u")
                 and isinstance(n.b, Const)}
+    # ... or a remainder already, of the dividend widened (x86 `cdq; idiv`: edx:eax % c)
+    divisors |= {n.b.value for n in walk(full) if isinstance(n, BinOp) and n.op in ("%s", "%u")
+                 and isinstance(n.b, Const) and 2 <= n.b.value < (1 << (w - 1))}
     # a power of two: the remainder keeps the low bits (`& 7` for `% 8`)
     divisors |= {n.b.value + 1 for n in walk(full) if isinstance(n, BinOp) and n.op == "&"
                  and isinstance(n.b, Const) and n.b.value and (n.b.value + 1) & n.b.value == 0}
