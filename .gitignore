@@ -6,5 +6,5 @@ build/
 dist/
 .pytest_cache/
 *.relic.json
-tests/bins/*.out
+tests/bins/
 .claude/

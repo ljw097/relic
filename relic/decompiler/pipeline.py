@@ -59,6 +59,9 @@ def prepare(an: "Analysis", func: "Function") -> Prepared:
     fret = fp_return(an, func)
     rets = fret is not None or returns_value(an, func, fn, arch.ret)
     user_ret = an.var_types.get(func.addr, {}).get("@return")       # the user's / a header's type
+    enc = getattr(an.bin, "objc_types", {}).get(func.addr, "").lstrip("rnNoORV")
+    if user_ret is None and enc[:1] == "v":
+        user_ret = "void"                       # an Objective-C method's type encoding says so
     if user_ret is not None and fret is None:
         rets = user_ret != "void"
     if not rets:
@@ -88,6 +91,13 @@ def prepare(an: "Analysis", func: "Function") -> Prepared:
         ints = [r for r in _livein_arg_regs(an, arch, func.addr) if r not in halves]
         fpl = fp_params(an, arch, func.addr)
         fints = [r.split(":")[0] for r in fints]          # (RV32: a pair is named after its low register)
+        from .emit import objc_method
+        m = objc_method(an.name(func.addr) or "")
+        if m is not None and not fpl:
+            # an Objective-C method: self, _cmd, then one per `:` of its selector, used or not
+            from .calls import int_arg_regs
+            n = 2 + m[2].count(":")
+            ints = list(int_arg_regs(arch)[:n]) + [r for r in ints if r not in int_arg_regs(arch)[:n]]
         params = ints + [r for r, _ in fpl] + fints
         from .calls import positional_order
         order = positional_order(arch, ints, fpl)

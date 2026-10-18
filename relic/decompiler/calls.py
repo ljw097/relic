@@ -12,7 +12,7 @@ from __future__ import annotations
 from typing import TYPE_CHECKING
 
 from .arch import ArchInfo
-from .ir import (Assign, Call, CallStmt, Cast, Const, Expr, Extract, IRFunction, Phi, Return, Var, children,
+from .ir import (Assign, Call, CallStmt, Cast, Const, Reg, Expr, Extract, IRFunction, Phi, Return, Var, children,
                  stmt_exprs, walk)
 from .fpabi import arg_classes, float_int_params, fp_params, fp_part, fp_sig, is_fp_arch, is_fp_reg, place_args
 from .sigs import arg_count, lookup
@@ -525,7 +525,11 @@ def recover_calls(fn: IRFunction, an: "Analysis", arch: ArchInfo) -> IRFunction:
             f = an.functions.get(tgt) if tgt is not None else None
             fsig = fp_sig(name) if is_fp_arch(arch) else None
             placed: list | None = None          # per argument: register, or None (on the stack)
-            if fsig is not None:
+            sel = objc_selector(an, fn, name, uses.get(argregs[1]) if len(argregs) > 1 else None)
+            if sel is not None:
+                n = 2 + sel.count(":")
+                placed = list(argregs[:n]) + [None] * (n - len(argregs))
+            elif fsig is not None:
                 classes = arg_classes(None, None, fsig)
                 placed = place_args(arch, classes, argregs)
             elif sig is not None:
@@ -621,12 +625,46 @@ def recover_calls(fn: IRFunction, an: "Analysis", arch: ArchInfo) -> IRFunction:
                         v = Extract(v, lo, w) if lo else Cast("low", v, w) if v.bits > w else v
                     fargs.append((len(args), w))
                 args.append(v)
-            s.call = Call(s.call.target, tuple(args), s.call.bits, tuple(fargs))
+            target = s.call.target
+            if isinstance(target, (Var, Reg)) and s.name:
+                # through a register the lifter traced to an import (`call r14` = objc_msgSend)
+                stub = next((i.addr for i in an.bin.imports if i.addr and i.name == s.name), None)
+                slot = next((a for a, n in getattr(an.bin, "got_names", {}).items() if n == s.name), None)
+                if stub is not None:
+                    target = Const(stub, target.bits)
+                elif slot is not None:                  # (called only through its GOT slot)
+                    from .ir import Load
+                    target = Load(Const(slot, target.bits), target.bits)
+            s.call = Call(target, tuple(args), s.call.bits, tuple(fargs))
             used = dict.fromkeys(x for r in placed if r is not None for x in fp_part(r.lstrip("="))[0].split(":"))
             s.uses = [(r, uses[r]) for r in used if r in uses]
         if consumed:
             b.stmts = [t for j, t in enumerate(b.stmts) if j not in consumed]
     return fn
+
+
+def objc_selector(an: "Analysis", fn: IRFunction, name: str | None, sel_value) -> str | None:
+    """The selector of an `objc_msgSend` call: what its selector register is loaded from (a
+    `__objc_selrefs` slot), else None (not a send, or not known)."""
+    from .ir import Load
+    from .sigs import OBJC_SENDS, base_name
+    objc = getattr(an.bin, "objc", None)
+    if objc is None or base_name(name) not in OBJC_SENDS or sel_value is None:
+        return None
+    v = sel_value
+    defs = None
+    for _ in range(4):
+        if isinstance(v, Load) and isinstance(v.addr, Const):
+            return objc.selrefs.get(v.addr.value)
+        if isinstance(v, Var):
+            if defs is None:
+                defs = {t.dst: t.src for t in fn.stmts() if isinstance(t, Assign) and isinstance(t.dst, Var)}
+            v = defs.get(v)
+        elif isinstance(v, Cast):
+            v = v.a
+        else:
+            return None
+    return None
 
 
 def _pair_value(lo: Expr, hi: Expr, defs: dict | None = None) -> Expr:

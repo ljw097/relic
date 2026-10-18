@@ -224,6 +224,11 @@ def _load_thin(path: str, data: bytes) -> Binary:
         # LC_MAIN points at main itself; LC_UNIXTHREAD at the runtime's start
         b.add_symbol(Symbol("main" if entryoff is not None else "start", b.entry, 0, "func", "synthetic"))
     b._finalize()
+    from .objc import name_objc, parse_objc
+    b.objc = parse_objc(b)
+    if b.objc is not None:
+        name_objc(b, b.objc)
+        b._finalize()
     return b
 
 
