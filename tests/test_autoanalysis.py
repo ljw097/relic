@@ -179,3 +179,24 @@ def test_data_among_code(tmp_path):
     from relic.datalist import region_lines, window
     text = "\n".join(f"{ln.mnemonic} {ln.operands}" for ln in region_lines(an, *window(an, msg)))
     assert 'db "hello from text", 0' in text and "dd 2, 3, 4" in text
+
+
+_CROSS = ["aarch64-linux-gnu-gcc", "arm-linux-gnueabihf-gcc", "mips-linux-gnu-gcc", "riscv64-linux-gnu-gcc",
+          "powerpc-linux-gnu-gcc", "powerpc64le-linux-gnu-gcc"]
+
+
+@pytest.mark.parametrize("cc", _CROSS)
+def test_cross_function_pointer_variables(cc, tmp_path):
+    """Other processors: a register call (`blr`, `blx`, `jalr`, `bctrl`) of a register loaded from
+    a function-pointer variable -- the address built over several instructions (`adrp`/`add`,
+    `lis`/`addi`, `auipc`/`addi`, the PowerPC TOC)."""
+    if shutil.which(cc) is None:
+        pytest.skip(f"needs {cc}")
+    out = str(tmp_path / "noret")
+    subprocess.run([cc, "-O2", "-w", "-o", out, os.path.join(HERE, "src", "noret.c")], check=True)
+    an = analyze(out)
+    f = an.function_by_name("checked")
+    sym = an.bin.name_to_addr
+    sites = sorted((v for a, v in an.icalls.items() if f.block_at(a) is not None), key=lambda v: len(v[0]))
+    die, plain, loud = (sym[n] & ~1 for n in ("die_cb", "log_plain", "log_loud"))
+    assert sites == [(frozenset({die}), True), (frozenset({plain, loud}), True)]

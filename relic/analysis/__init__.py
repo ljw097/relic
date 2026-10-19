@@ -114,6 +114,8 @@ class Analysis:
         report("data references", 0, force=True)
         from .constprop import propagate_refs
         propagate_refs(self)     # addresses built over several instructions (adrp + add, ...)
+        from .icalls import SlotTargets
+        self.icalls.update(SlotTargets(self.bin, self.functions).run(generic=True))
         report("strings", 0, force=True)
         self.strings = find_strings(self.bin)
         from .strings import String
