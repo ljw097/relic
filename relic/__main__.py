@@ -8,6 +8,7 @@
     relic cfg FILE WHERE          control-flow graph as Graphviz dot
     relic strings FILE            strings in data sections
     relic imports FILE            imported / exported symbols
+    relic classes FILE            C++ classes from RTTI: bases, vtables, virtual methods
     relic xrefs FILE WHERE        cross references to an address or symbol
     relic vulns FILE              pwnable heuristics (dangerous calls, format strings, ...)
     relic ir FILE [WHERE]         decompiler IR of a function (debugging aid)
@@ -29,8 +30,8 @@ import sys
 
 from . import __version__
 
-COMMANDS = ("info", "checksec", "funcs", "disasm", "cfg", "strings", "imports", "xrefs", "vulns", "ir", "opt",
-            "decompile", "search", "patch", "script", "sigs", "types", "project", "lumina", "gui")
+COMMANDS = ("info", "checksec", "funcs", "disasm", "cfg", "strings", "imports", "classes", "xrefs", "vulns", "ir",
+            "opt", "decompile", "search", "patch", "script", "sigs", "types", "project", "lumina", "gui")
 
 
 def _parser() -> argparse.ArgumentParser:
@@ -63,6 +64,7 @@ def _parser() -> argparse.ArgumentParser:
     s.add_argument("-m", "--min", type=int, default=4)
     s.add_argument("-g", "--grep", help="only strings containing this substring (case-insensitive)")
     add("imports", "imported and exported symbols")
+    add("classes", "C++ classes from RTTI: bases, vtables, virtual methods")
     add("xrefs", "cross references to an address/symbol", where=True, where_required=True)
     add("vulns", "pwnable heuristics")
     add("ir", "decompiler IR of a function", where=True)
@@ -300,6 +302,21 @@ def cmd_imports(args):
         print("Exports:")
         for e in sorted(b.exports, key=lambda e: e.addr):
             print(f"  {e.addr:#18x}  {e.name}")
+
+
+def cmd_classes(args):
+    an = _analyze(args)
+    if not an.classes:
+        print("no C++ classes (RTTI) found")
+        return
+    for c in sorted(an.classes.values(), key=lambda c: c.name):
+        bases = f" : {', '.join(c.bases)}" if c.bases else ""
+        print(f"class {c.name}{bases}  (typeinfo {c.typeinfo:#x})")
+        for vt in c.vtables:
+            at = "" if vt.offset == 0 else f" (in {-vt.offset:#x})"
+            print(f"  vtable {vt.addr:#x}{at}")
+            for k, m in enumerate(vt.slots):
+                print(f"    [{k}] " + (f"{m:#x} {an.name(m) or ''}" if m else "pure virtual"))
 
 
 def cmd_xrefs(args):
