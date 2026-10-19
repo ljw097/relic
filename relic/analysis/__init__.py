@@ -31,6 +31,7 @@ class Analysis:
         self.functions: dict[int, Function] = {}
         self.icalls: dict[int, tuple] = {}      # indirect call -> (possible targets, whether all)
         self.classes: dict = {}                 # C++ class name -> rtti.CppClass
+        self.code_data: dict[int, list] = {}    # data found among code (data_defs form)
         self.strings: list[String] = []
         self.xrefs_to: dict[int, list[Xref]] = defaultdict(list)
         self.xrefs_from: dict[int, list[Xref]] = defaultdict(list)
@@ -115,6 +116,12 @@ class Analysis:
         propagate_refs(self)     # addresses built over several instructions (adrp + add, ...)
         report("strings", 0, force=True)
         self.strings = find_strings(self.bin)
+        from .strings import String
+        code_strings = [String(a, self.bin.read(a, d[1] - 1).decode("latin-1"), "ascii",
+                               getattr(self.bin.section_at(a), "name", ""))
+                        for a, d in self.code_data.items() if d[0] == "string"]
+        if code_strings:
+            self.strings = sorted(self.strings + code_strings, key=lambda s: s.addr)
         self._strings_by_addr = {s.addr: s for s in self.strings}
         self._build_xrefs()
         if load_project:
@@ -143,6 +150,7 @@ class Analysis:
         finder = FunctionAnalyzer(self.bin, self.dis, noreturn)
         self.functions = finder.run()
         self.icalls = finder.icalls
+        self.code_data = finder.code_data
         return finder
 
     def _library_names(self, finder: FunctionAnalyzer | None = None) -> set[int]:
