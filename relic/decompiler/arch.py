@@ -167,4 +167,7 @@ def arch_for(binary) -> ArchInfo:
         return PPC32
     if binary.arch == "ppc64":
         return PPC64
+    from ..disasm import DISASM_ONLY
+    if binary.arch in DISASM_ONLY:
+        raise NotImplementedError(f"{binary.arch}: disassembly only, no decompiler for this processor")
     raise NotImplementedError(f"no calling convention for {binary.arch} yet")

@@ -22,6 +22,10 @@ MACHINES = {
     "EM_RISCV": ("riscv64", 64),
     "EM_PPC": ("ppc", 32),
     "EM_PPC64": ("ppc64", 64),
+    # disassembly (and function discovery) only: no decompiler for these
+    "EM_SPARC": ("sparc", 32), "EM_SPARC32PLUS": ("sparc", 32), "EM_SPARCV9": ("sparc64", 64),
+    "EM_S390": ("s390x", 64), "EM_68K": ("m68k", 32), "EM_SH": ("sh", 32), "EM_TRICORE": ("tricore", 32),
+    "EM_BPF": ("bpf", 64),
 }
 
 SHF_WRITE, SHF_ALLOC, SHF_EXECINSTR = 1, 2, 4
@@ -161,6 +165,7 @@ def load_elf(path: str, data: bytes) -> Binary:
         got = next((s for s in b.sections if s.name == ".got"), None)
         if got is not None:
             b.ppc_toc = got.addr + 0x8000            # ELFv2's `.TOC.`
+        _ppc64_descriptors(b)
     if arch.startswith("mips"):
         _resolve_mips_got(b, elf, got_names)
         if getattr(b, "mips_gp", None) is None:
@@ -168,6 +173,39 @@ def load_elf(path: str, data: bytes) -> Binary:
     _resolve_plt(b, got_names)
     b._finalize()
     return b
+
+
+def _ppc64_descriptors(b: Binary):
+    """PowerPC64 ELFv1: a function's symbol, the entry point and function pointers name its
+    descriptor in `.opd` -- the code address, then the function's TOC (r2), then an environment
+    pointer. The functions are at the code addresses (under the symbols' names: the descriptors
+    become `name_desc`), and the TOC is the one the descriptors give."""
+    opd = b.section(".opd")
+    if opd is None or b.endian != "big":
+        return
+    descs: dict[int, int] = {}
+    tocs: dict[int, int] = {}
+    code_secs = [(sec.addr, sec.end) for sec in b.sections if sec.x and sec.loaded]   # (before _finalize)
+    for a in range(opd.addr, opd.end - 15, 24):
+        code = b.read_ptr(a)
+        if code and any(lo <= code < hi for lo, hi in code_secs):
+            descs[a] = code
+            tocs[a] = b.read_ptr(a + 8) or 0
+    if not descs:
+        return
+    b.func_descriptors = descs
+    for sym in list(b.symbols.values()):
+        code = descs.get(sym.addr)
+        if code is None:
+            continue
+        b.symbols[sym.addr] = Symbol(f"{sym.name}_desc", sym.addr, 24, "object", sym.source)
+        b.add_symbol(Symbol(sym.name, code, 0, "func", sym.source), override=True)
+    b.function_starts = list(getattr(b, "function_starts", [])) + sorted(set(descs.values()))
+    toc = tocs.get(b.entry) or next((t for t in tocs.values() if t), None)
+    if b.entry in descs:
+        b.entry = descs[b.entry]
+    if toc:
+        b.ppc_toc = toc
 
 
 def _ppc_call_stubs(b: Binary, got_names: dict[int, str], found: dict[int, str]):

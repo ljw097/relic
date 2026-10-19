@@ -35,7 +35,11 @@ def operands(an: Analysis, i: Insn) -> str:
         return apply_formats(op, fmts, an.bin.bits, lambda v: an.label(v) if an.bin.is_mapped(v) else None)
     if i.target is not None and i.kind != "normal":
         name = an.label(i.target)
-        if an.bin.arch.startswith("riscv"):
+        if an.bin.arch == "wasm":
+            op = name                           # (the operand is a function index)
+        elif an.bin.arch == "bpf":
+            op = re.sub(r"[+-]?(0x[0-9a-fA-F]+|\d+)$", name, op)      # (`+0x19`: instructions ahead)
+        elif an.bin.arch.startswith("riscv"):
             # the operand is an offset from the instruction (`jal -0x488`): the last number is it
             op = re.sub(r"-?(0x[0-9a-fA-F]+|\d+)$", name, op)
         else:

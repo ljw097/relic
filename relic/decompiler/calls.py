@@ -210,6 +210,7 @@ def _compute_livein(an: "Analysis", arch: ArchInfo, target: int, prefix: bool = 
     # Phis are followed only from such real uses (clobbered registers merge at joins).
     phis: dict[Var, Phi] = {}
     used: set[Var] = set()
+    passed: set[str] = set()        # argument registers handed on to a call as they came in
     # a function returning a float does not return the integer register: its `return` (which
     # reads that register until the float result is known) is no use of an argument register
     float_result = None
@@ -226,6 +227,7 @@ def _compute_livein(an: "Analysis", arch: ArchInfo, target: int, prefix: bool = 
             if float_result:
                 continue
         if isinstance(s, CallStmt):
+            passed |= {r for r, v in s.uses if isinstance(v, Var) and v.version == 0 and v.name == r}
             tops = [s.call]
             # a value computed for the call (folded into it by the optimiser) reads what it uses;
             # a register handed on untouched says nothing
@@ -265,10 +267,14 @@ def _compute_livein(an: "Analysis", arch: ArchInfo, target: int, prefix: bool = 
         # FPR explains is no end of the list
         from .fpabi import fp_params
         gaps = len(fp_params(an, arch, target))
-    for r in int_arg_regs(arch):
+    regs = int_arg_regs(arch)
+    for k, r in enumerate(regs):
         if r not in livein:
             if gaps:
                 gaps -= 1
+                continue
+            if r in passed and any(x in livein for x in regs[k + 1:]):
+                params.append(r)        # (handed on to a call untouched, before one that is read)
                 continue
             break
         params.append(r)
@@ -293,6 +299,21 @@ def positional_order(arch: ArchInfo, ints: list[str], fps: list) -> list[int] | 
     seen = set(order)
     order += [k for k in range(len(ints) + len(fps)) if k not in seen]
     return order
+
+
+def _icall_params(an: "Analysis", arch: ArchInfo, site: int) -> list[str] | None:
+    """The integer argument registers an indirect call's known targets all take (None when they
+    differ, take floats, or are not known)."""
+    hit = getattr(an, "icalls", {}).get(site)
+    if not hit:
+        return None
+    lists = set()
+    for t in hit[0]:
+        f = an.functions.get(t)
+        if f is None or f.is_import or fp_params(an, arch, t):
+            return None
+        lists.add(tuple(_livein_arg_regs(an, arch, t)))
+    return list(lists.pop()) if len(lists) == 1 else None
 
 
 def _set_before_call(fn: IRFunction, argregs, uses: dict, params=()) -> list[str]:
@@ -569,6 +590,10 @@ def recover_calls(fn: IRFunction, an: "Analysis", arch: ArchInfo) -> IRFunction:
                         classes = [classes[k] for k in order] + classes[head:]
                     stack_offs = [rel for rel, _, _ in slots]
                     stack_sizes = [size for _, size, _ in slots]
+            elif tgt is None and _icall_params(an, arch, s.addr) is not None:
+                # an indirect call whose possible targets are known (a function-pointer variable,
+                # a virtual method): the arguments they take
+                selected = _icall_params(an, arch, s.addr)
             else:
                 if own is None:
                     own = _livein_arg_regs(an, arch, fn.addr)
