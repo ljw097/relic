@@ -332,6 +332,7 @@ class Structurer:
                 self.gotos.add(a)
                 kept.add(a)
                 tree.items.append(self._region(a, None, []))
+        _merge_goto_into_then(tree, _goto_targets(tree))
         _drop_fallthrough_gotos(tree, None)
         self.gotos = kept | _goto_targets(tree)
         return tree
@@ -800,6 +801,68 @@ def _drop_fallthrough_gotos(node, follow) -> None:
     elif isinstance(node, If):
         _drop_fallthrough_gotos(node.then, follow)
         _drop_fallthrough_gotos(node.els, follow)
+
+
+def _pure(c) -> bool:
+    """A condition that can be evaluated again with the same result (no calls)."""
+    from .ir import Call, Intrinsic
+    return not any(isinstance(x, (Call, Intrinsic)) for x in walk(c))
+
+
+def _label_index(seq, target) -> int | None:
+    """Index of the item of `seq` (a Seq) that is the labelled block `target`."""
+    for k, it in enumerate(seq.items):
+        if isinstance(it, Block) and not it.copy and it.addr == target:
+            return k
+    return None
+
+
+def _merge_goto_into_then(node, targets) -> None:
+    """`if (c1) { P; L: Q } else if (c2) goto L; else E` is
+    `if (c1 || c2) { if (c1) P; Q } else E` (c1 evaluated twice: it must be pure)."""
+    if isinstance(node, Seq):
+        for k, it in enumerate(node.items):
+            if isinstance(it, If):
+                node.items[k] = _merged(it, targets)
+            _merge_goto_into_then(node.items[k], targets)
+    elif isinstance(node, If):
+        for side in ("then", "els"):
+            v = getattr(node, side)
+            if isinstance(v, If):
+                setattr(node, side, _merged(v, targets))
+            _merge_goto_into_then(getattr(node, side), targets)
+    elif isinstance(node, Loop):
+        _merge_goto_into_then(node.body, targets)
+    elif isinstance(node, Switch):
+        for c in node.cases:
+            _merge_goto_into_then(c.body, targets)
+
+
+def _merged(it: If, targets):
+    els = it.els
+    rest = []
+    if isinstance(els, Seq):
+        items = list(els.items)
+        while items and isinstance(items[0], Block) and not items[0].stmts and items[0].addr not in targets:
+            items.pop(0)                        # (an empty block: nothing runs before the inner `if`)
+        if items and isinstance(items[0], If):
+            els, rest = items[0], items[1:]
+    if not isinstance(it.then, Seq) or not isinstance(els, If) or not _pure(it.cond) or not _pure(els.cond):
+        return it
+    for side, other, cond in (("then", "els", els.cond), ("els", "then", None)):
+        jump = getattr(els, side)
+        jump = jump.items[0] if isinstance(jump, Seq) and len(jump.items) == 1 else jump
+        if not (isinstance(jump, Jump1) and jump.kind == "goto"):
+            continue
+        k = _label_index(it.then, jump.addr)
+        if not k:                               # (k == 0: nothing to skip, the plain goto is fine)
+            continue
+        c2 = cond if cond is not None else _negate(els.cond)
+        e2 = getattr(els, other)
+        tail = ([e2] if e2 is not None else []) + rest
+        then = Seq([If(it.addr, it.cond, Seq(it.then.items[:k]), None)] + it.then.items[k:], it.then.end)
+        return If(it.addr, BinOp("||", it.cond, c2, 1), then, Seq(tail) if tail else None)
+    return it
 
 
 def _goto_targets(node) -> set[int]:
