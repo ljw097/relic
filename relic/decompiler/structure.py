@@ -22,6 +22,7 @@ EXIT = -1
 SMALL_TAIL = 3   # statements a block may have and still be duplicated instead of reached by goto
 DUP_BLOCKS = 6   # a tail region of at most this many blocks ...
 DUP_STMTS = 12   # ... and statements is copied rather than reached by goto
+RELAXED_JOIN = True
 
 
 # ------------------------------------------------------------------- AST nodes
@@ -652,8 +653,11 @@ class Structurer:
             # on) is then reached only through m, never also from inside a branch
             after = reach(m)
             return not (reach(t, m) & after) and not (reach(f, m) & after)
-        cands = [m for m in sorted(cands, key=self.rpo_index.__getitem__) if joins(m)]
-        return cands[0] if cands else None
+        order = sorted(cands, key=self.rpo_index.__getitem__)
+        strict = [m for m in order if joins(m)]
+        if strict:
+            return strict[0]
+        return order[0] if order and RELAXED_JOIN else None
 
     def _switch_index_via(self, term: IndirectJump, n: int | None = None):
         """The index of a jump through a variable holding the computed target (`v2 = base +
