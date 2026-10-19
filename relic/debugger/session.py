@@ -25,6 +25,7 @@ import threading
 import time
 from dataclasses import dataclass, field
 
+from ..sysenv import child_env
 from .mi import GdbMI, MIError
 
 # general-purpose registers shown first, per gdb architecture name prefix
@@ -355,6 +356,14 @@ class Session:
                 self.mi.command("-break-insert -t main")
                 return self.cont(timeout)
             return stop
+        main = self.an.function_by_name("main") if stop_at == "main" and self.an is not None else None
+        if main is not None:
+            # the analysis' main (a stripped program's too, which gdb knows no `main` symbol for):
+            # from the first instruction, where the load address is known, run to it
+            stop = self._run_and_wait('-interpreter-exec console "starti"', timeout)
+            if stop.get("reason", "").startswith("exited"):
+                return stop
+            return self.run_to(self.to_live(main.addr), timeout)
         if stop_at == "main":
             return self._run_and_wait("-exec-run --start", timeout)
         return self._run_and_wait('-interpreter-exec console "starti"', timeout)
@@ -408,7 +417,7 @@ class Session:
         cmd += [self.path, *self.args]
         stdin = open(t.stdin, "rb") if t.stdin else self._slave       # noqa: SIM115 - closed with qemu
         self.qemu = subprocess.Popen(cmd, stdin=stdin, stdout=self._slave, stderr=self._slave,
-                                     cwd=t.cwd or None, start_new_session=True)
+                                     cwd=t.cwd or None, env=child_env(), start_new_session=True)
         if t.stdin:
             stdin.close()
         return f"127.0.0.1:{port}"
@@ -426,8 +435,7 @@ class Session:
         wine, server = found
         port = _free_port()
         t = self.target
-        env = dict(os.environ, WINEDEBUG="-all")
-        env.update(t.env)
+        env = child_env({"WINEDEBUG": "-all", **t.env})
         # pipes, not the terminal: given a tty, wine plays a Windows console on it (escape codes,
         # Enter as \r)
         if t.stdin:

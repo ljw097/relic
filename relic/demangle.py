@@ -56,7 +56,8 @@ def demangle(name: str) -> str | None:
         return None
     tool = shutil.which("c++filt")
     if tool:
-        out = subprocess.run([tool, core], capture_output=True, text=True).stdout.strip()
+        from .sysenv import child_env
+        out = subprocess.run([tool, core], capture_output=True, text=True, env=child_env()).stdout.strip()
         return out if out and out != core else None
     return None
 
