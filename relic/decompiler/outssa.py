@@ -107,8 +107,37 @@ def _insert_copies(fn: IRFunction) -> list[Assign]:
     return copies
 
 
+def _values(fn: IRFunction) -> dict[Var, Var]:
+    """Variables defined once, by a copy of another defined once: the variable whose value they
+    hold. Two such variables with the same value do not interfere even where both are live."""
+    count: dict[Var, int] = {}
+    src: dict[Var, Var] = {}
+    for s in fn.stmts():
+        for d in stmt_defs(s):
+            if isinstance(d, Var):
+                count[d] = count.get(d, 0) + 1
+        if isinstance(s, Assign) and isinstance(s.dst, Var) and isinstance(s.src, Var):
+            src[s.dst] = s.src
+    val: dict[Var, Var] = {}
+
+    def value(v: Var, depth: int = 0) -> Var:
+        if v in val:
+            return val[v]
+        r = v
+        if count.get(v, 0) == 1 and v in src and depth < 64:
+            w = src[v]
+            if count.get(w, 0) <= 1:            # (entry values are never defined: also fixed)
+                r = value(w, depth + 1)
+        val[v] = r
+        return r
+    for v in count:
+        value(v)
+    return val
+
+
 def _interference(fn: IRFunction) -> dict[Var, set[Var]]:
-    """Variables simultaneously live at some definition point."""
+    """Variables simultaneously live at some definition point (holding different values)."""
+    values = _values(fn)
     succs = {a: [s for s in b.succs if s in fn.blocks] for a, b in fn.blocks.items()}
     gen: dict[int, set[Var]] = {}
     kill: dict[int, set[Var]] = {}
@@ -143,8 +172,9 @@ def _interference(fn: IRFunction) -> dict[Var, set[Var]]:
             skip = s.src if isinstance(s, Assign) and isinstance(s.src, Var) else None
             for d in defs:
                 graph.setdefault(d, set())
+                vd = values.get(d, d)
                 for v in live:
-                    if v != skip:
+                    if v != skip and values.get(v, v) != vd:
                         edge(d, v)
                 for d2 in defs:
                     edge(d, d2)
@@ -233,6 +263,9 @@ def out_of_ssa(fn: IRFunction) -> IRFunction:
                 s.dst = names[cls(s.dst)]
                 if s.src == s.dst:
                     continue  # coalesced copy
+                prev = kept[-1] if kept else None
+                if isinstance(s.src, Var) and isinstance(prev, Assign) and prev.dst == s.src and prev.src == s.dst:
+                    continue  # `a = b; b = a`: b holds that value already
             elif hasattr(s, "defs"):
                 s.defs = [(r, names[cls(v)] if isinstance(v, Var) else v) for r, v in s.defs]
             kept.append(s)

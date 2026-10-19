@@ -757,3 +757,116 @@ def drop_stack_pointer_chains(fn: IRFunction, frame: Frame) -> int:
     for b in fn.blocks.values():
         b.stmts = [s for s in b.stmts if not (isinstance(s, Assign) and s.dst in dead)]
     return len(dead)
+
+
+# ----------------------------------------------------------- unsigned <-> float conversions
+def _bare_value(e: Expr) -> Expr:
+    """`e` without the zero-extensions, truncations and bit extracts around it (`low64(zext128(x))`)."""
+    from .ir import Cast, Extract
+    while isinstance(e, (Cast, Extract)) and (not isinstance(e, Extract) or e.lo == 0):
+        e = e.a
+    return e
+
+
+def _is_conv(e: Expr, name: str, x: Expr | None = None) -> bool:
+    from .ir import Intrinsic
+    e = _bare_value(e)
+    return isinstance(e, Intrinsic) and e.name == name and (x is None or _bare_value(e.args[0]) == x)
+
+
+def fold_unsigned_conversions(an, fn: IRFunction) -> int:
+    """The compiler's code for conversions between 64-bit unsigned integers and floats, back to
+    one conversion (non-SSA input):
+
+        if (x < 0) { v = (double)(x >> 1 | x & 1); r = v + v; } else r = (double)x;
+                                                                ->  r = (double)(uint64_t)x
+        if (2^63 <= d) r = (int64_t)(d - 2^63) ^ 1 << 63; else r = (int64_t)d;
+                                                                ->  r = (uint64_t)d
+
+    on the branch's two sides ending in a `return` or in the same assignment.
+    """
+    from .ir import Cast, Intrinsic, Var, walk
+    done = 0
+    for a in list(fn.blocks.values()):
+        if a.addr not in fn.blocks or not a.stmts or not isinstance(a.stmts[-1], Branch):
+            continue
+        br = a.stmts[-1]
+        t, f = fn.blocks.get(br.true), fn.blocks.get(br.false)
+        if t is None or f is None or t is f or t.preds != [a.addr] or f.preds != [a.addr]:
+            continue
+        local = {s.dst: s.src for s in a.stmts + t.stmts if isinstance(s, Assign) and isinstance(s.dst, Var)}
+
+        def val(e):
+            e = _bare_value(e)
+            return _bare_value(local.get(e, e)) if isinstance(e, Var) else e
+        # the value each side ends with: a return's, or one variable both assign last
+        ends = []
+        for b in (t, f):
+            last = b.stmts[-1] if b.stmts else None
+            if isinstance(last, Return) and last.value is not None:
+                ends.append(("ret", None, last.value))
+            elif isinstance(last, Jump) or last is None or not isinstance(last, (Branch, Return)):
+                asg = [s for s in b.stmts if isinstance(s, Assign)]
+                if not asg or not isinstance(asg[-1].dst, Var):
+                    break
+                ends.append(("asg", asg[-1].dst, asg[-1].src))
+            else:
+                break
+        if len(ends) != 2 or ends[0][:2] != ends[1][:2] or t.succs != f.succs:
+            continue
+        tv, fv = ends[0][2], ends[1][2]
+        new = None
+        c = br.cond
+        if isinstance(c, BinOp) and c.op == "<s" and isinstance(c.b, Const) and c.b.value == 0:
+            x = _bare_value(c.a)
+            s = val(tv)
+            # (r = v + v of v = (double)(x >> 1 | x & 1))
+            if isinstance(s, BinOp) and s.op == "f+" and val(s.a) == val(s.b) and _is_conv(val(s.a), "sitofp") and \
+                    any(isinstance(n, BinOp) and n.op == ">>u" and _bare_value(n.a) == x and
+                        isinstance(n.b, Const) and n.b.value == 1 for n in walk(val(s.a))) and \
+                    _is_conv(fv, "sitofp", x):
+                conv = _bare_value(fv)
+                new = Intrinsic("uitofp", (x,), conv.bits)
+        elif isinstance(c, BinOp) and c.op == "f<=":
+            k, d = val(c.a), _bare_value(c.b)
+            s = val(tv)
+            big = _float_value(an, k)
+            if big is not None and big == 2.0 ** 63 and isinstance(s, BinOp) and s.op == "^" and \
+                    isinstance(s.b, Const) and s.b.value == 1 << 63 and _is_conv(fv, "fptosi", d):
+                inner = _bare_value(s.a)
+                if isinstance(inner, Intrinsic) and inner.name == "fptosi" and \
+                        isinstance(_bare_value(inner.args[0]), BinOp) and _bare_value(inner.args[0]).op == "f-":
+                    new = Intrinsic("fptoui", (d,), _bare_value(fv).bits)
+        if new is None:
+            continue
+        # the false side does it all now; the branch goes there unconditionally
+        last = f.stmts[-1]
+        if isinstance(last, Return):
+            last.value = new if new.bits == last.value.bits else Cast("zext", new, last.value.bits)
+        else:
+            asg = [s for s in f.stmts if isinstance(s, Assign)][-1]
+            asg.src = new if new.bits == asg.src.bits else Cast("zext", new, asg.src.bits)
+        a.stmts[-1] = Jump(br.addr, f.addr)
+        a.succs = [f.addr]
+        for s_addr in t.succs:
+            sb = fn.blocks.get(s_addr)
+            if sb is not None:
+                sb.preds = [p for p in sb.preds if p != t.addr]
+        del fn.blocks[t.addr]
+        done += 1
+    return done
+
+
+def _float_value(an, e: Expr) -> float | None:
+    """The float constant `e` is (a literal, or a load from read-only data)."""
+    import struct as _st
+
+    from .ir import Load
+    e = _bare_value(e)
+    if isinstance(e, Const) and e.bits in (32, 64):
+        return _st.unpack("<d" if e.bits == 64 else "<f", e.value.to_bytes(e.bits // 8, "little"))[0]
+    if isinstance(e, Load) and isinstance(e.addr, Const) and e.bits in (32, 64) and an is not None:
+        raw = an.bin.read(e.addr.value, e.bits // 8)
+        if raw and len(raw) == e.bits // 8:
+            return _st.unpack(("<" if an.bin.endian == "little" else ">") + ("d" if e.bits == 64 else "f"), raw)[0]
+    return None
