@@ -1258,7 +1258,11 @@ class CWriter:
         return f"[{recv} {' '.join(words)}]"
 
     def call(self, c: ir.Call) -> str:
-        name = self._callee_name(c) or f"(*{self.expr(c.target, PREC_UNARY)})"
+        target = c.target
+        if getattr(self.an.bin, "func_descriptors", None) and isinstance(target, Load) and \
+                isinstance(target.addr, (Load, Var, StackVar)):
+            target = target.addr                # (PowerPC64 ELFv1: through the function's descriptor)
+        name = self._callee_name(c) or f"(*{self.expr(target, PREC_UNARY)})"
         send = self._objc_send(name, c)
         if send is not None:
             return send

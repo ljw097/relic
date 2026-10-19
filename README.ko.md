@@ -88,7 +88,7 @@ python3 -m venv .venv
 | 영역 (가중치) | 진행률 | 비고 |
 |---|---|---|
 | 파일 형식 (8) | 100% | Mach-O와 Objective-C 메타데이터(의사 코드에 `[obj msg:arg]`) |
-| 프로세서 (8) | 80% | IDA는 60종 이상의 CPU 계열을 지원하므로 격차가 가장 큽니다 |
+| 프로세서 (8) | 100% | 디컴파일: x86/x64, ARM/Thumb, AArch64, MIPS32/64, RISC-V RV32/RV64, PowerPC 32/64(ELFv1·ELFv2). 디스어셈블: SPARC, SystemZ, M68K, SH, TriCore, eBPF, WebAssembly |
 | 자동 분석 (14) | 100% | stripped bash에서 `.eh_frame`에 있는 함수의 99.9%, `.eh_frame`을 지워도 99.96%를 찾음(돌아오지 않는 함수 추론, 꼬리 호출, 데이터 속 함수 포인터). RTTI로 C++ 클래스·vtable 복원(gcc/clang, MSVC), 객체를 따라가 가상 호출 대상 해석, 모든 프로세서에서 함수 포인터 변수를 거친 호출, 코드 사이 데이터 감지, bash 약 7초 |
 | 라이브러리 식별 (8) | 100% | 테스트용 stripped 정적 C 바이너리에서 원래 심볼이 있던 함수의 83~94%에 이름을 붙이며, 잘못 붙인 이름은 없습니다 |
 | 타입 시스템 (10) | 85% | 구조체 값 전달(by-value) 인자·반환 미지원 |

@@ -85,7 +85,7 @@ The total is a weighted average, with weights from how much each area matters to
 | Area (weight) | Progress | Notes |
 |---|---|---|
 | File formats (8) | 100% | Mach-O with Objective-C metadata (`[obj msg:arg]` in the pseudocode) |
-| Processors (8) | 80% | IDA handles 60+ CPU families, so this is the furthest behind |
+| Processors (8) | 100% | Decompiles x86/x64, ARM/Thumb, AArch64, MIPS32/64, RISC-V RV32/RV64, PowerPC 32/64 (ELFv1 and ELFv2); disassembles SPARC, SystemZ, M68K, SH, TriCore, eBPF and WebAssembly |
 | Auto-analysis (14) | 100% | Finds 99.9% of the functions `.eh_frame` lists in stripped bash, 99.96% with `.eh_frame` removed (noreturn inference, tail calls, function pointers in data); C++ classes and vtables from RTTI (gcc/clang and MSVC); virtual calls resolved by following objects; calls through function-pointer variables on every processor; data among code; bash in about 7 seconds |
 | Library identification (8) | 100% | On the stripped static C test binaries, 83–94% of the functions that had symbols get named, with no wrong names |
 | Type system (10) | 85% | No by-value struct arguments or returns |

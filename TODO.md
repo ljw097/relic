@@ -53,7 +53,7 @@
 - [x] RISC-V 링커 완화(relaxation) 모델링: `call` → `jal`/`c.j`, 주소를 만드는 auipc/lui 삭제(쓰는 명령의 기준 레지스터는 gp/tp로), TLS add 삭제, 정렬 nop 삭제
 - [x] GUI 시그니처 창(File ▸ Library signatures, `Shift+F5`): 세트 목록(라이브러리·버전·아키텍처·형식·시그니처 수), 이 바이너리에 맞는 세트, 세트별 이름 붙인 수, 적용·이름 되돌리기·파일 추가·툴체인에서 생성
 
-## P1 — 프로세서 100%까지 (README 80%)
+## P1 — 프로세서 100%까지 (README 100%)
 
 IDA의 60여 개 CPU 계열 전부가 아니라, 리버싱·포너블·펌웨어에서 실제로 만나는 계열을 기준으로 삼습니다.
 
@@ -61,8 +61,8 @@ IDA의 60여 개 CPU 계열 전부가 아니라, 리버싱·포너블·펌웨어
 - [x] MIPS32 little/big-endian(o32), MIPS64(n64: `d...` 명령, 32비트 연산의 부호 확장, `a4`-`a7` 인자, `.gpdword` 점프 테이블, `$t9`로 만드는 `_gp`), qemu로 디버깅
 - [x] RISC-V RV32GC(ILP32D): XLEN을 매개변수로 한 리프터(FPR은 64비트 그대로), non-PIC `lui` 점프 테이블·절대 주소 항목, fa0-fa7 다음의 double을 정수 레지스터 쌍(`a0:a1`)으로(피호출자·호출 지점·가변 인자의 짝수 정렬 쌍), `fsd` 뒤 두 `lw`로 읽는 반쪽, double 슬롯 안의 워드 접근(`((int *)&var)[1]`), qemu-riscv32 디버깅; RV32 libc가 없어 테스트는 자립형 바이너리·재배치 객체와 자체 최소 런타임(`tests/src/rv32rt.c`)으로 qemu에서 실행
 - [x] PowerPC 32비트(SysV, 빅 엔디언)·PowerPC64(ELFv2 리틀 엔디언): 리프터(명령 필드에서 직접 해독, CR 필드·record 형식·ctr·carry), PLT 호출 스텁(`.text`의 스텁, PIE는 호출자의 r30으로), ctr 점프 테이블, TOC·로컬 진입점, 스택 보호값(스레드 포인터), 부동소수점(FPR은 항상 double 형태, 단정밀도 연산·`0x43300000` 정수→double 관용구·VSX 스칼라·POWER9 `lxsd`), 위치로 정해지는 ELFv2 인자 순서, stripped `main`(r8의 시작 정보 블록), qemu 디버깅
-- [ ] PowerPC64 ELFv1(빅 엔디언, 함수 디스크립터 `.opd`)
-- [ ] 디스어셈블만: capstone이 아는 나머지(SPARC, SystemZ, M68K, SH, TriCore, BPF, WASM 등)
+- [x] PowerPC64 ELFv1(빅 엔디언, 함수 디스크립터 `.opd`): 심볼·진입점·함수 포인터가 가리키는 디스크립터를 코드 주소로(디스크립터는 `name_desc`), TOC는 디스크립터의 값, stripped도 디스크립터로 함수 찾기, 디스크립터를 거친 간접 호출 `(*fp)(a1)`(대상의 인자로). ELFv2 전역 진입점의 `r2` 설정에도 TOC 유지, 호출에 그대로 넘기는 인자 레지스터도 매개변수(그 뒤 레지스터가 읽힐 때)
+- [x] 디스어셈블만(함수 찾기·제어 흐름·리스팅, 디컴파일러는 "디스어셈블 전용"이라고 알림): SPARC/SPARC V9(지연 슬롯), SystemZ(비교 후 분기), M68K, SH(지연 슬롯), TriCore, eBPF(명령 단위 상대 오프셋), WebAssembly 모듈(로더: 코드 섹션 함수, export·`name` 섹션 이름, import 함수, `call printf`)
 
 ## P1 — 파일 포맷 100%까지 (README 100%)
 

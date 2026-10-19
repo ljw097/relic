@@ -128,3 +128,34 @@ def _lift(words: list[int], addr=0x1000):
 def test_lifter_semantics(words, expect):
     out = _lift(words)
     assert any(expect.replace(" ", "") in o.replace(" ", "") for o in out), out
+
+
+@pytest.mark.parametrize("abi", ["elfv1", "elfv2"])
+def test_ppc64_function_descriptors(abi, tmp_path):
+    """ELFv1: symbols, the entry point and function pointers name descriptors in `.opd` (code
+    address, TOC, environment). The functions are at the code addresses -- stripped, too -- and a
+    call through a function pointer (descriptor -> code) is `(*fp)(a1)` with the target's
+    arguments. ELFv2 for comparison (no descriptors, a global entry setting r2 from r12)."""
+    import os
+    import shutil
+    import subprocess
+    clang, lld = shutil.which("clang"), shutil.which("ld.lld")
+    if clang is None or lld is None:
+        pytest.skip("needs clang and ld.lld")
+    target = "powerpc64-linux-gnu" if abi == "elfv1" else "powerpc64le-linux-gnu"
+    out = str(tmp_path / "t")
+    subprocess.run([clang, f"--target={target}", f"-mabi={abi}", "-O2", "-ffreestanding", "-nostdlib",
+                    "-fuse-ld=lld", "-static", "-o", out,
+                    os.path.join(os.path.dirname(__file__), "src", "ppc64v1.c")], check=True)
+    an = analyze(out)
+    helper = an.function_by_name("helper")
+    assert helper is not None and an.bin.is_exec(helper.addr) and an.bin.is_exec(an.bin.entry)
+    code = decompile(an, helper).text
+    assert "int helper(int64_t a1, int a2)" in code and "(*fp)(a1)" in code, code
+    site = next(a for a in an.icalls if helper.block_at(a) is not None)
+    assert an.icalls[site] == (frozenset({an.function_by_name("square").addr}), True)
+    if abi == "elfv1":
+        assert an.name(an.bin.read_ptr(an.bin.name_to_addr["fp"])) == "square_desc"
+        subprocess.run([shutil.which("llvm-strip") or "strip", out], check=True)
+        stripped = analyze(out)
+        assert {f.addr for f in stripped.functions.values()} >= {helper.addr, an.function_by_name("square").addr}

@@ -1,10 +1,10 @@
 """Capstone wrapper that turns raw bytes into classified instructions."""
 from __future__ import annotations
 
-from dataclasses import dataclass, field
-
 import bisect
+import re
 import threading
+from dataclasses import dataclass, field
 
 import capstone as cs
 
@@ -98,6 +98,15 @@ def capstone_for(arch: str, endian: str = "little") -> cs.Cs:
         "riscv64": (cs.CS_ARCH_RISCV, cs.CS_MODE_RISCV64 | cs.CS_MODE_RISCVC),
         "ppc": (cs.CS_ARCH_PPC, cs.CS_MODE_32 | cs.CS_MODE_BIG_ENDIAN),
         "ppc64": (cs.CS_ARCH_PPC, cs.CS_MODE_64 | be),
+        # disassembly only
+        "sparc": (cs.CS_ARCH_SPARC, cs.CS_MODE_BIG_ENDIAN),
+        "sparc64": (cs.CS_ARCH_SPARC, cs.CS_MODE_BIG_ENDIAN | cs.CS_MODE_V9),
+        "s390x": (cs.CS_ARCH_SYSZ, cs.CS_MODE_BIG_ENDIAN),
+        "m68k": (cs.CS_ARCH_M68K, cs.CS_MODE_BIG_ENDIAN | cs.CS_MODE_M68K_040),
+        "sh": (cs.CS_ARCH_SH, cs.CS_MODE_SH4 | be),
+        "tricore": (cs.CS_ARCH_TRICORE, cs.CS_MODE_TRICORE_162),
+        "bpf": (cs.CS_ARCH_BPF, cs.CS_MODE_BPF_EXTENDED | be),
+        "wasm": (cs.CS_ARCH_WASM, 0),
     }
     if arch not in table:
         raise ValueError(f"unsupported architecture: {arch}")
@@ -109,6 +118,7 @@ def capstone_for(arch: str, endian: str = "little") -> cs.Cs:
     return md
 
 
+DISASM_ONLY = ("sparc", "sparc64", "s390x", "m68k", "sh", "tricore", "bpf", "wasm")
 _X86_CJMP = {"jo", "jno", "js", "jns", "je", "jne", "jb", "jae", "jbe", "ja", "jl", "jge", "jle", "jg",
              "jp", "jnp", "jcxz", "jecxz", "jrcxz", "loop", "loope", "loopne"}
 _HALT = {"hlt", "ud2", "int3", "brk", "udf", "ebreak"}
@@ -176,7 +186,7 @@ class Disassembler:
         from .extend import PROCESSORS
         self.custom = PROCESSORS.get(binary.arch)       # a plugin's processor module (relic.extend)
         self.md = capstone_for(binary.arch, binary.endian) if self.custom is None else None
-        self.delay_slots = binary.arch in ("mips", "mips64")
+        self.delay_slots = binary.arch in ("mips", "mips64", "sparc", "sparc64", "sh")
         self._cache: dict[int, Insn | None] = {}
         # capstone handles are not thread-safe: the GUI decodes while a background job (the
         # decompiler, the vulnerability scan) does
@@ -371,6 +381,9 @@ class Disassembler:
         if arch.startswith("ppc"):
             self._classify_ppc(c, i)
             return
+        if arch in DISASM_ONLY:
+            self._classify_other(c, i)
+            return
         if cs.CS_GRP_RET in groups or m in ("ret", "c.ret") or \
                 (arch.startswith("ppc") and m == "blr") or \
                 (arch.startswith("mips") and m == "jr" and c.op_str.strip() == "$ra") or \
@@ -410,6 +423,120 @@ class Disassembler:
                 v &= self._mask
                 if v > 0xFF and self.bin.is_mapped(v):
                     i.refs.append(v)
+
+    def _classify_other(self, c, i: Insn):
+        """Processors only disassembled (no lifter): returns, calls and jumps from the mnemonics,
+        branch targets from the immediate operands."""
+        arch = self.arch
+        m = c.mnemonic.split(",")[0]            # (SPARC `bne,a`: annulled delay slot)
+        ops = c.op_str.replace(" ", "")
+        groups = set(c.groups)
+        kind = None
+        if arch.startswith("sparc"):
+            if m in ("ret", "retl") or (m == "jmpl" and ops.startswith(("%i7+8", "%o7+8"))):
+                kind = RET
+            elif m == "call" or (m == "jmpl" and ops.endswith("%o7")):
+                kind = CALL
+            elif m in ("ba", "b", "jmp", "jmpl"):
+                kind = JMP
+            elif m.startswith(("b", "fb", "cb")) and m not in ("bn", "bset", "bclr", "btst", "btog"):
+                kind = CJMP
+        elif arch == "s390x":
+            if m in ("br", "bcr") and ops.endswith("%r14") and (m == "br" or ops.startswith("15,")):
+                kind = RET
+            elif m.startswith(("bras", "basr", "bas")):
+                kind = CALL
+            elif m in ("j", "jg", "br", "b") or (m in ("bc", "bcr", "brc", "brcl") and ops.startswith("15,")):
+                kind = JMP
+            elif m in ("bc", "bcr", "brc", "brcl") and ops.startswith("0,"):
+                kind = NORMAL                   # (never taken: a nop)
+            elif cs.CS_GRP_JUMP in groups or m.startswith("j") or m in ("bc", "bcr", "brc", "brcl", "brct",
+                                                                        "brctg", "bct", "bctg"):
+                kind = CJMP                     # (`jne`, `cijle` compare-and-branch, ...)
+        elif arch == "m68k":
+            if m in ("rts", "rte", "rtr", "rtd"):
+                kind = RET
+            elif m in ("jsr", "bsr", "bsr.w", "bsr.b", "bsr.l"):
+                kind = CALL
+            elif m.split(".")[0] in ("bra", "jmp"):
+                kind = JMP
+            elif m.startswith(("b", "db")) and m.split(".")[0] not in ("bchg", "bclr", "bset", "btst", "bfchg",
+                                                                        "bfclr", "bfset", "bftst", "bfextu",
+                                                                        "bfexts", "bfffo", "bfins", "bkpt"):
+                kind = CJMP
+        elif arch == "sh":
+            if m in ("rts", "rte"):
+                kind = RET
+            elif m in ("jsr", "bsr", "bsrf"):
+                kind = CALL
+            elif m in ("bra", "braf", "jmp"):
+                kind = JMP
+            elif m in ("bt", "bf", "bt/s", "bf/s"):
+                kind = CJMP
+        elif arch == "bpf":
+            if m == "exit":
+                kind = RET
+            elif m == "call":
+                kind = CALL
+            elif m == "ja":
+                kind = JMP
+            elif m.startswith("j"):
+                kind = CJMP
+        elif arch == "tricore":
+            if m in ("ret", "rfe"):
+                kind = RET
+            elif m.startswith(("call", "fcall", "jl")):
+                kind = CALL
+            elif m in ("j", "ja", "ji", "jli"):
+                kind = JMP
+            elif m.startswith("j") or m.startswith("loop"):
+                kind = CJMP
+        elif arch == "wasm":
+            if m == "return":
+                kind = RET
+            elif m == "call":
+                kind = CALL
+            elif m == "unreachable":
+                kind = HALT
+        if kind is None and arch not in ("bpf", "wasm"):     # (their group numbers mean other things)
+            if cs.CS_GRP_RET in groups:
+                kind = RET
+            elif cs.CS_GRP_CALL in groups:
+                kind = CALL
+            elif cs.CS_GRP_JUMP in groups:
+                kind = JMP
+        i.kind = kind or NORMAL
+        if arch == "wasm":
+            if m == "call":                     # (a function index, not an address)
+                try:
+                    idx = int(ops, 0)
+                except ValueError:
+                    idx = None
+                funcs = getattr(self.bin, "wasm_funcs", [])
+                i.target = funcs[idx] if idx is not None and 0 <= idx < len(funcs) and funcs[idx] else None
+            return
+        if arch == "bpf":
+            if i.kind in (JMP, CJMP):           # `goto +off`: in 8-byte instructions after this one
+                off = ops.rsplit(",", 1)[-1]
+                try:
+                    k = int(off, 0)
+                except ValueError:
+                    k = None
+                if k is not None and k >= 0x8000:
+                    k -= 0x10000                # (a 16-bit signed offset, printed unsigned)
+                i.target = (i.addr + 8 + 8 * k) & self._mask if k is not None else None
+            return
+        if i.kind in (CALL, JMP, CJMP):
+            imms = []
+            try:
+                imms = [op.imm for op in c.operands if op.type == OP_IMM]
+            except (cs.CsError, AttributeError):
+                imms = []
+            if arch == "m68k":                  # (`bne.b $100022`: the displacement is not an imm operand)
+                hexes = re.findall(r"\$([0-9a-fA-F]+)", c.op_str)
+                imms = [int(hexes[-1], 16)] if hexes and not c.op_str.startswith("#") else []
+            if imms:
+                i.target = imms[-1] & self._mask
 
     def _classify_ppc(self, c, i: Insn):
         """PowerPC control flow from the instruction word (capstone's simplified mnemonics hide

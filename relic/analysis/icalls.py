@@ -36,6 +36,18 @@ def _mem(op: str, addr: dict[str, int]) -> int | None:
         return None
 
 
+def _mem_base(op: str) -> str | None:
+    op = op.strip()
+    return op[:-1].partition("(")[2] if op.endswith(")") and "(" in op else None
+
+
+def _mem_disp(op: str) -> int | None:
+    try:
+        return int(op.strip().partition("(")[0] or "0", 0)
+    except ValueError:
+        return None
+
+
 def _reg(op: str) -> bool:
     return op.isalnum() and not op[:1].isdigit()
 
@@ -80,6 +92,7 @@ class SlotTargets:
             init = b.read_ptr(slot)
             if init and b.arch == "arm" and init not in self.funcs:
                 init &= ~1                              # (a Thumb function's address)
+            init = getattr(b, "func_descriptors", {}).get(init, init)     # (PowerPC64 ELFv1: a descriptor)
             complete = slot not in self.escaped
             if init:
                 if init in self.funcs:
@@ -181,6 +194,7 @@ class SlotTargets:
         toc = getattr(b, "ppc_toc", None)
         if toc is not None:
             addr["r2"] = toc
+        descs = getattr(b, "func_descriptors", None)
         for i in insns:
             ops = _ops(i)
             m = i.mnemonic.removeprefix("c.").split(".")[0]
@@ -200,6 +214,10 @@ class SlotTargets:
             if slots and m in self._LOADS and (word == 4 or not dst.startswith("w")):
                 loaded[dst] = slots[0]
                 faddr.pop(dst, None)
+                continue
+            if descs and m in self._LOADS and len(ops) == 2 and _mem_base(ops[1]) in loaded and \
+                    _mem_disp(ops[1]) == 0:
+                loaded[dst] = loaded[_mem_base(ops[1])]  # (ELFv1: the code address in the descriptor)
                 continue
             if slots and m in self._STORES:
                 v = faddr.get(dst)
@@ -222,8 +240,8 @@ class SlotTargets:
                     if ops[0] in d:
                         d["ctr"] = d[ops[0]]
                 continue
-            if not dst:
-                continue
+            if not dst or (dst == "r2" and toc is not None):
+                continue                        # (PowerPC64: r2 is the TOC throughout, however set)
             fn = next((r & ~1 for r in i.refs if (r & ~1) in self.funcs), None)
             new = None                  # the address this instruction puts in `dst`, if known
             if fn is None and i.refs:

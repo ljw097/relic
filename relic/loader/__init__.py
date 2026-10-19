@@ -32,6 +32,9 @@ def load_bytes(data: bytes, path: str = "<memory>", arch: str | None = None, bas
     if data[:4] == b"\x7fELF":
         from .elf import load_elf
         b = load_elf(path, data)
+    elif data[:4] == b"\0asm":
+        from .wasm import load_wasm
+        return load_wasm(path, data)
     elif _is_macho(data):
         from .macho import load_macho
         b = load_macho(path, data, arch)
