@@ -394,7 +394,9 @@ def test_static_mingw_binaries_get_library_names(arch, tmp_path):
     an = analyze(stripped, sigs=sigs)
     assert an.toolchain.compiler.startswith("MinGW GCC")
     names = set(an.lib_names.values())
-    assert {"__mingw_vfprintf", "__mingw_pformat", "_pei386_runtime_relocator", "fwrite"} <= names, sorted(names)
+    assert {"__mingw_vfprintf", "__mingw_pformat", "_pei386_runtime_relocator"} <= names, sorted(names)
+    # (`jmp [__imp_fwrite]`: an import thunk, named after its import before signatures run)
+    assert an.function_by_name("fwrite") is not None
     truth = {a: s.name for a, s in load(full).symbols.items()}
     p = libsigs._plain
     for a, n in an.lib_names.items():

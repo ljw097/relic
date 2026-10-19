@@ -202,3 +202,37 @@ def test_cross_function_pointer_variables(cc, tmp_path):
     assert sites == [(frozenset({die}), True), (frozenset({plain, loud}), True)]
     fatal = next(a for a, v in an.icalls.items() if v == (frozenset({die}), True) and f.block_at(a) is not None)
     assert not f.block_at(fatal).succs                     # (does not return: the block ends there)
+
+
+# stripped programs whose `main` is only found through the startup code: 32-bit PIE (`push` of the
+# GOT slot holding it) and PE (the call whose result the C runtime passes to `exit`)
+_MAIN_BUILDS = {
+    "x86-pie": ("gcc", ["-m32", "-fpie", "-pie"], "strip", "main"),
+    "mingw64": ("x86_64-w64-mingw32-gcc", [], "x86_64-w64-mingw32-strip", "main"),
+    "mingw32": ("i686-w64-mingw32-gcc", [], "i686-w64-mingw32-strip", "main"),
+    "mingw64-gui": ("x86_64-w64-mingw32-gcc", ["-mwindows"], "x86_64-w64-mingw32-strip", "main"),
+}
+
+
+@pytest.mark.parametrize("kind", sorted(_MAIN_BUILDS))
+def test_main_of_stripped_programs(kind, tmp_path):
+    from relic.loader import load
+    cc, flags, strip, sym = _MAIN_BUILDS[kind]
+    if shutil.which(cc) is None or shutil.which(strip) is None:
+        pytest.skip(f"needs {cc}")
+    ext = ".exe" if kind.startswith("mingw") else ""
+    full, stripped = str(tmp_path / f"hello{ext}"), str(tmp_path / f"stripped{ext}")
+    try:
+        subprocess.run([cc, "-O2", *flags, "-o", full, os.path.join(HERE, "src", "hello.c")], check=True,
+                       capture_output=True)
+    except subprocess.CalledProcessError as e:
+        pytest.skip(f"{cc} cannot build it here: {e.stderr[-200:]!r}")
+    subprocess.run([strip, "-o", stripped, full], check=True)
+    want = load(full).name_to_addr[sym]
+    an = analyze(stripped)
+    main = an.function_by_name("main")
+    assert main is not None and main.addr == want
+    if kind.startswith("mingw"):
+        # the import thunk it ends with is named after its import, and known not to return
+        ex = an.function_by_name("exit")
+        assert ex is not None and ex.noreturn and ex.library

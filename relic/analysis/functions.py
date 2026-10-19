@@ -172,6 +172,12 @@ class FunctionAnalyzer:
         self._eh_frame_seeds()
         self._data_pointer_seeds()
         self._code_data()
+        self._import_thunks()
+        if self.bin.format == "PE":                 # (its startup code calls `exit` through a thunk)
+            main = self._find_main()
+            if main is not None:
+                self._queue.append(main)
+                self._drain()
         self._infer_noreturn()
         self._scan_gaps()
         self._infer_noreturn()
@@ -208,6 +214,27 @@ class FunctionAnalyzer:
         except Exception:                       # noqa: BLE001 - malformed or unusual CFI: none
             return set()
         return out
+
+    def _import_thunks(self):
+        """A function that is only `jmp [import slot]` (PE: MinGW's and MSVC's import thunks) is
+        named after the import; when that one does not return, its callers end at the call."""
+        b = self.bin
+        stops = set()
+        for f in self.funcs.values():
+            if f.is_import or not f.name.startswith("sub_") or list(f.blocks) != [f.addr]:
+                continue
+            insns = f.blocks[f.addr].insns
+            i = insns[0] if len(insns) == 1 else None
+            imp = b.imports_by_got.get(i.mem_target) if i is not None and i.kind == JMP and i.mem_target else None
+            if imp is None or not imp.name:
+                continue
+            b.add_symbol(Symbol(imp.name, f.addr, 0, "func", "synthetic"), override=True)
+            f.name, f.library = imp.name, True          # (runtime glue, not the program's code)
+            if imp.name in NORETURN:
+                f.noreturn = True
+                stops.add(f.addr)
+        if stops:
+            self.reanalyze([f for f in self.funcs.values() if not f.is_import and (f.calls | f.tail_calls) & stops])
 
     def _infer_noreturn(self):
         """Functions that never return, from their code: no way out of them but calls of (or jumps
@@ -1335,9 +1362,15 @@ class FunctionAnalyzer:
         return sec.addr if sec is not None else None
 
     def _find_main(self) -> int | None:
-        """Recover `main` from the `__libc_start_main(main, ...)` call in `_start`."""
+        """Recover `main` from the `__libc_start_main(main, ...)` call in `_start` (PE: the call
+        whose result the C runtime's startup code hands to `exit`)."""
         b = self.bin
-        if b.format != "ELF" or "main" in b.name_to_addr:
+        if "main" in b.name_to_addr or any(f.name in ("main", "wmain", "WinMain", "wWinMain")
+                                           for f in self.funcs.values()):
+            return None
+        if b.format == "PE" and b.arch in ("x86", "x64"):
+            return self._pe_main()
+        if b.format != "ELF":
             return None
         start = self.funcs.get(b.entry)
         if start is None:
@@ -1362,6 +1395,93 @@ class FunctionAnalyzer:
                 pushes = [j for j in hist[:k] if j.mnemonic == "push"]
                 if pushes and pushes[-1].refs and b.is_exec(pushes[-1].refs[0]):
                     return self._name_main(pushes[-1].refs[0])
+                # PIE: `push dword ptr [ebx + k]`, the GOT slot holding main (ebx: the GOT pointer)
+                m = re.fullmatch(r"dword ptr \[ebx ([+-]) (0x[0-9a-f]+|\d+)\]", pushes[-1].op_str) if pushes else None
+                got = self._got_base()
+                if m and got is not None:
+                    cand = b.read_ptr(got + int(m.group(2), 0) * (1 if m.group(1) == "+" else -1))
+                    if cand and b.is_exec(cand):
+                        return self._name_main(cand)
+        return None
+
+    # (registers by their full names, `_full_reg`: x86's eax is "rax" here too)
+    _VOLATILE = {"x64": ("rax", "rcx", "rdx", "r8", "r9", "r10", "r11"), "x86": ("rax", "rcx", "rdx")}
+
+    def _pe_main(self) -> int | None:
+        """`main` of a stripped PE: in the startup code the entry point reaches (MinGW's
+        `__tmainCRTStartup`, MSVC's `invoke_main`), the function called whose result is passed
+        to `exit` -- followed through register copies and, for x86, the argument store."""
+        b = self.bin
+        x64 = b.arch == "x64"
+        ret = "rax"
+        full = self._full_reg
+        exits = ("exit", "_exit", "ExitProcess", "_cexit", "_Exit")
+        todo, seen = [(b.entry, 0)], set()
+        while todo:
+            a, depth = todo.pop(0)
+            f = self.funcs.get(a)
+            if f is None or f.is_import or a in seen:
+                continue
+            seen.add(a)
+            hit = self._result_to_exit(f, ret, full, exits, x64)
+            if hit is not None:
+                return self._name_main(hit)
+            if depth < 3:
+                todo += [(c, depth + 1) for c in sorted(f.calls | f.tail_calls)]
+        return None
+
+    def _result_to_exit(self, f: Function, ret: str, full, exits, x64: bool) -> int | None:
+        """The internal function whose result reaches a call of `exit` in `f`. Each path carries
+        which call's result each register (and, x86, the outgoing argument slot) holds; a join
+        keeps what all its ways agree on. (MSVC keeps main's result in a callee-saved register
+        across another call before `exit`.)"""
+        b = self.bin
+        volatile = set(self._VOLATILE["x64" if x64 else "x86"]) | {"[esp]"}
+        arg = "rcx" if x64 else "[esp]"
+
+        def loc(op: str) -> str:
+            return "[esp]" if op == "dword ptr [esp]" else full(op) if op and op[0].isalpha() and " " not in op \
+                else op
+
+        state: dict[int, dict[str, int]] = {f.addr: {}}
+        order = sorted(f.blocks)
+        for _ in range(3):                       # (loops: a few rounds settle it)
+            for a in order:
+                if a not in state:
+                    continue
+                held = dict(state[a])
+                for i in f.blocks[a].insns:
+                    if i.kind == CALL:
+                        callee = self.funcs.get(i.target) if i.target is not None else None
+                        imp = b.imports_by_got.get(i.mem_target) if i.mem_target else None
+                        name = callee.name if callee is not None else imp.name if imp else None
+                        if name in exits and arg in held:
+                            return held[arg]
+                        held = {k: v for k, v in held.items() if k not in volatile}
+                        if callee is not None and not callee.is_import and name not in exits:
+                            held[ret] = callee.addr
+                        continue
+                    ops = [o.strip() for o in i.op_str.split(",")]
+                    if i.mnemonic == "mov" and len(ops) == 2:
+                        dst, src = loc(ops[0]), loc(ops[1])
+                        if src in held:
+                            held[dst] = held[src]
+                        else:
+                            held.pop(dst, None)
+                    elif i.mnemonic == "push" and not x64:
+                        src = loc(ops[0])
+                        if src in held:
+                            held["[esp]"] = held[src]
+                        else:
+                            held.pop("[esp]", None)
+                    else:
+                        for r in i.regs_write:
+                            held.pop(full(r), None)
+                for s in f.blocks[a].succs:
+                    if s not in state:
+                        state[s] = dict(held)
+                    else:
+                        state[s] = {k: v for k, v in state[s].items() if held.get(k) == v}
         return None
 
     def add_function(self, addr: int, name: str | None = None) -> int:
