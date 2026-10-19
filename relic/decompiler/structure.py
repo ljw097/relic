@@ -290,18 +290,49 @@ class Structurer:
                 kind = "inf"   # endless: rendered while(1) with explicit break/continue
                 # leave to the exit most body blocks agree on (the first in layout order)
                 follow = exits[0] if exits else None
+            meet = self._exits_meet(body, exits)
+            if meet is not None and meet != follow:
+                # the loop's exits each run a few statements and then meet: leaving it is
+                # `{ ...; break; }` at each exit, and the code after the loop starts where they meet
+                kind, follow = "inf", meet
             out[h] = {"body": frozenset(body), "follow": follow, "kind": kind, "latch": latch}
         return out
+
+    def _exits_meet(self, body, exits):
+        """The block several exits of a loop all lead to, each through at most one small block
+        of its own (returns aside), or None."""
+        targets = set()
+        for e in dict.fromkeys(exits):
+            blk = self.blocks.get(e)
+            if blk is None:
+                return None
+            if _small_return(blk):
+                continue
+            stmts, term = _terminator(blk)
+            nxt = self.succ.get(e, [])
+            if len(self.pred.get(e, [])) == 1 and len(nxt) == 1 and nxt[0] not in body and \
+                    not isinstance(term, (Branch, IndirectJump, Return)) and len(stmts) <= DUP_STMTS:
+                targets.add(nxt[0])
+            else:
+                targets.add(e)
+        if len(targets) != 1 or len(set(exits)) < 2:
+            return None
+        m = targets.pop()
+        return m if m in self.blocks else None
 
     # -- code generation -----------------------------------------------------
     def run(self):
         tree = self._region(self.fn.addr, None, [])
         # safety net: anything structuring could not reach in-line is emitted under a
         # label so no code is ever silently dropped (guards against irreducible CFGs)
+        kept = set()
         for a in _rpo(self.fn.addr, lambda x: self.succ.get(x, [])):
             if a not in self.emitted:
                 self.gotos.add(a)
+                kept.add(a)
                 tree.items.append(self._region(a, None, []))
+        _drop_fallthrough_gotos(tree, None)
+        self.gotos = kept | _goto_targets(tree)
         return tree
 
     def _revisit(self, n, stops, ctx) -> Seq:
@@ -398,6 +429,9 @@ class Structurer:
         return seq
 
     def _goto(self, n):
+        blk = self.blocks.get(n)
+        if blk is not None and _small_return(blk):
+            return Ret(blk.stmts[0])                # (going to a bare `return x`: just return)
         self.gotos.add(n)
         return Jump1("goto", n)
 
@@ -621,15 +655,25 @@ class Structurer:
         cands = [m for m in sorted(cands, key=self.rpo_index.__getitem__) if joins(m)]
         return cands[0] if cands else None
 
-    def _switch_index_via(self, term: IndirectJump):
+    def _switch_index_via(self, term: IndirectJump, n: int | None = None):
         """The index of a jump through a variable holding the computed target (`v2 = base +
         table[v1]; goto *v2`): from its single definition, which is dropped when nothing else
         reads it (the switch shows the index instead)."""
         from .ir import StackVar, Var
         if not isinstance(term.expr, (Var, StackVar)):
             return None, 0
+        from .ir import Assign
         defs, uses = _var_defs_and_uses(self.fn)
         hit = defs.get(term.expr)
+        if hit is None and n is not None:
+            # defined more than once (two switches through the same variable): the definition in
+            # the jump's own block
+            blk = self.blocks.get(n)
+            d = next((x for x in reversed(blk.stmts) if isinstance(x, Assign) and x.dst == term.expr), None) \
+                if blk is not None else None
+            if d is not None:
+                idx, bias = _switch_index(d.src)
+                return (idx, bias) if idx is not None and term.expr not in set(walk(idx)) else (None, 0)
         if hit is None:
             return None, 0
         b, d = hit
@@ -647,7 +691,7 @@ class Structurer:
         inner = ctx + [c]
         idx, bias = _switch_index(term.expr)
         if idx is None:
-            idx, bias = self._switch_index_via(term)
+            idx, bias = self._switch_index_via(term, n)
         values: dict[int, list[int]] = {}
         for k, t in enumerate(term.table or term.targets):
             values.setdefault(t, []).append(k + bias)
@@ -672,14 +716,120 @@ class Structurer:
                                                       else self._goto(t))])
             else:
                 body = self._region(t, stops, inner)
-                last = body.items[-1] if body.items else None
-                if not isinstance(last, (Ret, Jump1)):
+                if not _ends(body):
                     nxt = targets[i + 1] if i + 1 < len(targets) else None
                     # fell off the end: into the next case (fall-through) or out of the switch
                     if not (nxt is not None and body.end == nxt):
                         body.items.append(Jump1("break"))
             cases.append(Case(t, labels, is_default, body))
         return Switch(n, idx if idx is not None else term.expr, cases), follow
+
+
+def _first_addr(node):
+    """The block control enters `node` at, if it is a labelled one."""
+    while isinstance(node, Seq):
+        if not node.items:
+            return None
+        node = node.items[0]
+    if isinstance(node, Block):
+        return None if node.copy else node.addr
+    if isinstance(node, Loop):
+        return node.header
+    return None
+
+
+def _tail_goto(node, target) -> bool:
+    """Whether every way through the end of `node` is a `goto target` (the plain last one)."""
+    node = _last(node)
+    return isinstance(node, Jump1) and node.kind == "goto" and node.addr == target
+
+
+def _strip_tail_goto(node, target) -> None:
+    """Remove `goto target` wherever it is the last thing done in `node` (inside `if`s, not loops)."""
+    while isinstance(node, Seq) and node.items:
+        last = node.items[-1]
+        if isinstance(last, Jump1) and last.kind == "goto" and last.addr == target:
+            node.items.pop()
+            return
+        if isinstance(last, If):
+            for side in (last.then, last.els):
+                if side is not None:
+                    _strip_tail_goto(side, target)
+            return
+        node = last if isinstance(last, Seq) else None
+
+
+def _drop_fallthrough_gotos(node, follow) -> None:
+    """A `goto L` at the end of an `if` branch whose `if` is followed by L anyway: dropped."""
+    if isinstance(node, Seq):
+        k = 0
+        while k < len(node.items):
+            it = node.items[k]
+            # `if (c) { T; goto L; } else { L: E }` is `if (c) { T } L: E`
+            for side, other, neg in (("then", "els", False), ("els", "then", True)):
+                if not isinstance(it, If) or it.els is None:
+                    break
+                first = _first_addr(getattr(it, other))
+                if first is not None and _tail_goto(getattr(it, side), first):
+                    _strip_tail_goto(getattr(it, side), first)
+                    body = getattr(it, other)
+                    keep = getattr(it, side)
+                    node.items[k] = If(it.addr, _negate(it.cond) if neg else it.cond, keep, None)
+                    node.items.insert(k + 1, body)
+                    it = node.items[k]
+                    break
+            k += 1
+        for k, it in enumerate(node.items):
+            nxt = _first_addr(Seq(node.items[k + 1:])) if k + 1 < len(node.items) else follow
+            if isinstance(it, If):
+                if nxt is not None:
+                    _strip_tail_goto(Seq([it]), nxt)
+                _drop_fallthrough_gotos(it.then, nxt)
+                _drop_fallthrough_gotos(it.els, nxt)
+            elif isinstance(it, Seq):
+                _drop_fallthrough_gotos(it, nxt)
+            elif isinstance(it, Loop):
+                _drop_fallthrough_gotos(it.body, None)
+            elif isinstance(it, Switch):
+                for c in it.cases:
+                    _drop_fallthrough_gotos(c.body, None)
+    elif isinstance(node, If):
+        _drop_fallthrough_gotos(node.then, follow)
+        _drop_fallthrough_gotos(node.els, follow)
+
+
+def _goto_targets(node) -> set[int]:
+    out = set()
+    if isinstance(node, Seq):
+        for it in node.items:
+            out |= _goto_targets(it)
+    elif isinstance(node, Jump1) and node.kind == "goto":
+        out.add(node.addr)
+    elif isinstance(node, If):
+        out |= _goto_targets(node.then) | _goto_targets(node.els)
+    elif isinstance(node, Loop):
+        out |= _goto_targets(node.body)
+    elif isinstance(node, Switch):
+        for c in node.cases:
+            out |= _goto_targets(c.body)
+    return out
+
+
+def _ends(node) -> bool:
+    """Control never runs off the end of `node` (it returns or jumps on every way)."""
+    node = _last(node)
+    if isinstance(node, If):
+        return node.els is not None and _ends(node.then) and _ends(node.els)
+    return isinstance(node, (Ret, Jump1))
+
+
+def _last(node):
+    """The last item of a sequence, looking into nested sequences."""
+    while isinstance(node, Seq):
+        if not node.items:
+            return None
+        node = node.items[-1]
+    return node
 
 
 def _var_defs_and_uses(fn: IRFunction):

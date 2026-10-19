@@ -24,7 +24,7 @@ from .ir import (Assign, BinOp, CallStmt, Cast, Const, Effect, Expr, Extract, In
 from .fp import FARITH, FCMP, FP_INTRINSICS
 from .fpconst import float_operands, is_float_expr
 from .sigs import base_name
-from .structure import Block, If, Jump1, Loop, Ret, Seq, Switch, _negate, case_labels
+from .structure import Block, If, Jump1, Loop, Ret, Seq, Switch, _last, _negate, case_labels
 from .vartypes import CType, infer_types, int_type, library_types, parse_ctype
 
 if TYPE_CHECKING:
@@ -38,6 +38,9 @@ def objc_method(name: str):
     import re
     m = re.fullmatch(r"([-+])\[([A-Za-z_$][\w$]*)(?:\([^)]*\))? ([^\]\s]+)\]", name)
     return (m.group(1), m.group(2), m.group(3)) if m else None
+
+
+_COPY = re.compile(r"([A-Za-z_]\w*) = ([A-Za-z_]\w*);")
 
 
 @dataclass
@@ -1298,6 +1301,10 @@ class CWriter:
         if note and addr not in self.commented:
             self.commented.add(addr)
             text = f"{text}  // {note}"
+        m = _COPY.fullmatch(text)
+        if m and self.out and self.out[-1].depth == depth and \
+                self.out[-1].text == f"{m.group(2)} = {m.group(1)};":
+            return                              # `a = b; b = a`: b holds that value already
         self.out.append(Line(text, addr, depth))
 
     def node(self, n, depth: int):
@@ -1381,6 +1388,9 @@ class CWriter:
             else:
                 self.emit("while (1) {", None, depth)
             self.node(_loop_body(body), depth + 1)
+            out = getattr(self, "out", None)
+            if out and out[-1].text == "continue;" and out[-1].depth == depth + 1:
+                out.pop()                       # (the end of the body continues anyway)
             self.emit(f"}} while ({self.expr(n.cond)});" if n.kind == "dowhile" else "}", None, depth)
         elif isinstance(n, Switch):
             self.emit(f"switch ({self.expr(_bare(n.expr))}) {{", self._term_addr(n.addr), depth)
@@ -1635,7 +1645,7 @@ def _tidy(items):
     """Drop an empty `else`, and an unreachable `break` right after a `return`."""
     out = []
     for it in items:
-        if out and isinstance(it, Jump1) and isinstance(out[-1], (Ret, Jump1)):
+        if out and isinstance(it, Jump1) and isinstance(_last(out[-1]), (Ret, Jump1)):
             continue
         out.append(it)
     return out
