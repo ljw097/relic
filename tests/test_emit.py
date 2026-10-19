@@ -68,7 +68,7 @@ def test_main(ans, variant):
     assert code.startswith("int main(int argc, ")
     assert "while (1) {" in code and "break;" in code
     assert "show_note(menu());" in code and "del_note(menu());" in code
-    assert "setvbuf(stdout, 0, 2, 0);" in code
+    assert "setvbuf(stdout, 0, _IONBF, 0);" in code
     assert "goto" not in code
 
 

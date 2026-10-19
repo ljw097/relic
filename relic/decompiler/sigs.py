@@ -65,7 +65,7 @@ SIGS: dict[str, Sig] = {
     "system": Sig(1, args="s"), "setvbuf": Sig(4, args="Fsin"), "setbuf": Sig(2, ret="void", args="Fs"),
     "fopen": Sig(2, ret="FILE *", args="ss"), "fclose": Sig(1, args="F"), "fflush": Sig(1, args="F"),
     "fgetc": Sig(1, args="F"), "getc": Sig(1, args="F"), "fputc": Sig(2, args="iF"),
-    "open": Sig(2, args="si"), "close": Sig(1, args="i"),
+    "open": Sig(2, args="si", variadic=True), "close": Sig(1, args="i"),
     "sleep": Sig(1, ret="unsigned"), "srand": Sig(1, ret="void"), "rand": Sig(0), "time": Sig(1, ret="time_t"),
     # _FORTIFY_SOURCE variants carry an extra leading flag / trailing object-size argument,
     # so the format index and arg count differ from the plain function
