@@ -107,13 +107,15 @@ class Analysis:
             if main is not None:
                 finder.add_function(main, "main")
         self._apply_func_edits(finder, load_project)
-        from .rtti import recover_classes, virtual_calls
+        from .rtti import object_calls, recover_classes
         self.classes = recover_classes(self, finder)      # C++ classes, vtables (names their methods)
-        self.icalls.update(virtual_calls(self, self.classes))
+        self.icalls.update(object_calls(self, self.classes))    # virtual calls whose objects are known
         self._fstarts = sorted(self.functions)
         report("data references", 0, force=True)
         from .constprop import propagate_refs
         propagate_refs(self)     # addresses built over several instructions (adrp + add, ...)
+        from .icalls import SlotTargets
+        self.icalls.update(SlotTargets(self.bin, self.functions).run(generic=True))
         report("strings", 0, force=True)
         self.strings = find_strings(self.bin)
         from .strings import String

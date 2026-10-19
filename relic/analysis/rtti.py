@@ -1,10 +1,14 @@
-"""C++ classes from Itanium RTTI (gcc, clang: ELF), stripped binaries included.
+"""C++ classes from RTTI, stripped binaries included: Itanium (gcc, clang: ELF) and MSVC (PE).
 
 A class's `typeinfo` object starts with a pointer into one of libstdc++'s typeinfo vtables -- the
 dynamic relocation naming `__class_type_info` (no bases), `__si_class_type_info` (one base) or
 `__vmi_class_type_info` (several) -- followed by its mangled name and its bases. A vtable is the
 offset to the top of the object, the typeinfo, then the virtual methods; classes with several
 bases have one per base, one after the other.
+
+MSVC: the word before a vtable points at its RTTICompleteObjectLocator, which gives the offset
+of that part of the object, the class's TypeDescriptor (its decorated name, `.?AVDog@@`) and its
+ClassHierarchyDescriptor (all its bases).
 
 Found: classes with their bases, vtables and virtual methods; names `typeinfo for X`,
 `vtable for X` and `X::vfuncN` (methods without a name of their own).
@@ -14,6 +18,8 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 
 from ..demangle import demangle
+from ..disasm import CALL as CALL_KIND
+from ..disasm import RET as RET_KIND
 from ..loader.base import Symbol
 
 _KINDS = {"_ZTVN10__cxxabiv117__class_type_infoE": "class", "_ZTVN10__cxxabiv120__si_class_type_infoE": "si",
@@ -26,6 +32,7 @@ class VTable:
     addr: int                    # its address point: the first virtual method's slot
     offset: int                  # offset to the top of the object (0 for the primary one)
     slots: list[int] = field(default_factory=list)      # method addresses (0: pure virtual)
+    start: int = 0               # where the vtable object starts (its RTTI header before `addr`)
 
 
 @dataclass
@@ -34,10 +41,16 @@ class CppClass:
     typeinfo: int
     bases: list[str] = field(default_factory=list)
     vtables: list[VTable] = field(default_factory=list)
+    offsets: dict[str, int] = field(default_factory=dict)  # base -> where it lies in the object
 
 
 def recover_classes(an, finder=None) -> dict[str, CppClass]:
     b = an.bin
+    if b.format == "PE":
+        classes = _msvc(an)
+        if classes:
+            _name(an, classes, finder, b.bits // 8)
+        return classes
     if b.format != "ELF":
         return {}
     ptr = b.bits // 8
@@ -69,18 +82,121 @@ def recover_classes(an, finder=None) -> dict[str, CppClass]:
         c = by_ti.get(ti)
         if c is None:
             continue
+        offs: list[int | None] = []
         if kind == "si":
             bases = [b.read_ptr(ti + 2 * ptr)]
+            offs = [0]
         elif kind == "vmi":
             n = b.read_int(ti + 2 * ptr + 4, 4) or 0
-            bases = [b.read_ptr(ti + 2 * ptr + 8 + 2 * ptr * k) for k in range(min(n, 64))]
+            bases, offs = [], []
+            for k in range(min(n, 64)):
+                e = ti + 2 * ptr + 8 + 2 * ptr * k
+                bases.append(b.read_ptr(e))
+                flags = b.read_int(e + ptr, ptr, signed=True) or 0
+                offs.append(None if flags & 1 else flags >> 8)        # (virtual bases: not fixed)
         else:
             bases = []
-        c.bases = [by_ti[t].name if t in by_ti else _external(b, t) for t in bases if t]
+        for t, o in zip(bases, offs):
+            if t:
+                name = by_ti[t].name if t in by_ti else _external(b, t)
+                c.bases.append(name)
+                if o is not None:
+                    c.offsets[name] = o
     _vtables(an, by_ti, inside, pure, ptr)
     classes = {c.name: c for c in by_ti.values()}
     _name(an, classes, finder, ptr)
     return classes
+
+
+def _msvc_name(decorated: str) -> str:
+    """`.?AVDog@@` -> `Dog`, `.?AVInner@Outer@@` -> `Outer::Inner` (templates left as they are)."""
+    core = decorated[4:] if decorated[:4] in (".?AV", ".?AU") else decorated
+    if "?$" in core or not core.endswith("@@"):
+        return core
+    return "::".join(reversed([p for p in core[:-2].split("@") if p]))
+
+
+def _msvc(an) -> dict[str, CppClass]:
+    b = an.bin
+    ptr = b.bits // 8
+    base = getattr(b, "image_base", None)
+    if base is None:
+        base = min(s.addr for s in b.sections if s.loaded) & ~0xFFFF
+    x64 = ptr == 8
+    rdata = [s for s in b.sections if s.loaded and not s.x and s.size and not b.is_writable(s.addr)]
+
+    def at(v: int) -> int:                  # an image-relative offset (x64) or an address (x86)
+        return base + v if x64 else v
+
+    def td_name(td: int) -> str | None:
+        n = b.read_cstring(td + 2 * ptr)
+        return n if n and n.startswith((".?AV", ".?AU")) else None
+
+    cols: dict[int, tuple[int, int, int]] = {}         # locator -> (offset, type descriptor, hierarchy)
+    for sec in rdata:
+        for a in range(sec.addr + (-sec.addr % 4), sec.end - 20, 4):
+            sig = b.read_int(a, 4)
+            if sig != (1 if x64 else 0):
+                continue
+            if x64 and b.read_int(a + 20, 4) != a - base:      # (pSelf: its own offset)
+                continue
+            td, chd = at(b.read_int(a + 12, 4) or 0), at(b.read_int(a + 16, 4) or 0)
+            if not b.is_mapped(td) or td_name(td) is None or not b.is_mapped(chd):
+                continue
+            cols[a] = (b.read_int(a + 4, 4) or 0, td, chd)
+    if not cols:
+        return {}
+    classes: dict[int, CppClass] = {}
+    for _off, td, chd in cols.values():
+        if td in classes:
+            continue
+        c = CppClass(_msvc_name(td_name(td)), td)
+        n = b.read_int(chd + 8, 4) or 0
+        arr = at(b.read_int(chd + 12, 4) or 0)
+        for k in range(1, min(n, 64)):           # (entry 0: the class itself)
+            bcd = at(b.read_int(arr + 4 * k, 4) or 0)
+            btd = at(b.read_int(bcd, 4) or 0)
+            name = td_name(btd) if b.is_mapped(btd) else None
+            if name and _msvc_name(name) not in c.bases:
+                c.bases.append(_msvc_name(name))        # (indirect ones too: `_direct` drops them)
+                if (b.read_int(bcd + 12, 4, signed=True) or 0) < 0:     # (pdisp -1: not a virtual base)
+                    c.offsets[_msvc_name(name)] = b.read_int(bcd + 8, 4, signed=True) or 0
+        classes[td] = c
+    # vtables: a pointer to a locator, then the methods
+    for sec in rdata:
+        for a in range(sec.addr + (-sec.addr % ptr), sec.end - ptr, ptr):
+            col = b.read_ptr(a)
+            if col not in cols:
+                continue
+            off, td, _ = cols[col]
+            vt = VTable(a + ptr, -off, start=a)
+            s = a + ptr
+            while s + ptr <= sec.end and s not in cols:
+                v = b.read_ptr(s) or 0
+                if not v or not b.is_exec(v) or b.read_ptr(s) in cols:
+                    break
+                vt.slots.append(v)
+                s += ptr
+            classes[td].vtables.append(vt)
+    for c in classes.values():
+        c.vtables.sort(key=lambda v: -v.offset)
+        c.bases = _direct(c.bases, classes)
+    return {c.name: c for c in classes.values()}
+
+
+def _direct(bases: list[str], classes: dict[int, CppClass]) -> list[str]:
+    """The hierarchy descriptor lists every base, indirect ones too: keep the direct ones -- those
+    no other listed base derives from."""
+    by_name = {c.name: c for c in classes.values()}
+    indirect = set()
+    for n in bases:
+        stack = list(by_name[n].bases) if n in by_name else []
+        while stack:
+            m = stack.pop()
+            if m not in indirect:
+                indirect.add(m)
+                stack.extend(by_name[m].bases if m in by_name else ())
+    return [n for n in bases if n not in indirect]
 
 
 def _external(b, ti: int) -> str:
@@ -109,7 +225,7 @@ def _vtables(an, by_ti: dict[int, CppClass], inside: set[int], pure: set[int], p
             if off > 0 or off < -0x100000 or off % ptr:
                 a += ptr
                 continue
-            vt = VTable(a + ptr, off)
+            vt = VTable(a + ptr, off, start=a - ptr)
             s = a + ptr
             while s + ptr <= sec.end:
                 v = b.read_ptr(s) or 0
@@ -151,7 +267,7 @@ def _name(an, classes: dict[str, CppClass], finder, ptr: int):
         symbol(f"typeinfo for {c.name}", c.typeinfo, 0)
         for vt in c.vtables:
             if vt.offset == 0:
-                symbol(f"vtable for {c.name}", vt.addr - 2 * ptr, (len(vt.slots) + 2) * ptr)
+                symbol(f"vtable for {c.name}", vt.start, vt.addr - vt.start + len(vt.slots) * ptr)
             for k, m in enumerate(vt.slots):
                 if m:
                     users.setdefault(m, []).append((c.name, k, vt.offset))
@@ -170,84 +286,339 @@ def _name(an, classes: dict[str, CppClass], finder, ptr: int):
         b.name_to_addr.setdefault(f.name, f.addr)
 
 
-def virtual_calls(an, classes: dict[str, CppClass]) -> dict[int, tuple[frozenset[int], bool]]:
-    """x86: calls of a virtual method through `this` in a virtual method (`mov rax, [rdi];
-    call [rax + 0x10]`): the method in that slot of its class and of every class derived from it."""
-    b = an.bin
-    if b.arch not in ("x64", "x86") or not classes:
-        return {}
-    ptr = b.bits // 8
-    this = "rdi" if b.arch == "x64" else None
-    if this is None:
-        return {}
-    derived: dict[str, set[str]] = {n: set() for n in classes}
-    for n in classes:
-        for a in _ancestors(n, classes):
-            if a in derived:
-                derived[a].add(n)
-    owners: dict[int, set[str]] = {}            # method -> classes with it in their primary vtable
-    for c in classes.values():
-        for vt in c.vtables:
-            if vt.offset == 0:
-                for m in vt.slots:
-                    if m:
-                        owners.setdefault(m, set()).add(c.name)
-    out = {}
-    for m, cls in owners.items():
-        f = an.functions.get(m)
-        if f is None:
-            continue
-        family = set().union(*(derived[n] for n in cls))
-        for site, slot in _this_calls(f, this, ptr):
-            targets = set()
-            for n in family:
-                vt = next((v for v in classes[n].vtables if v.offset == 0), None)
-                if vt is not None and slot < len(vt.slots) and vt.slots[slot]:
-                    targets.add(vt.slots[slot])
-            if targets:
-                out[site] = (frozenset(targets), False)
-    return out
+# ------------------------------------------------------------------ object types (x86)
+# The classes an object pointer may point to, followed through registers and stack slots in each
+# function: a constructor's object (a constructor stores a vtable in `[this]`), a vtable stored
+# into a fresh object (inlined construction), `__dynamic_cast`'s result (the target class and those
+# derived from it), what a function returns (its own objects, to its callers), `this` in a virtual
+# method (its classes and those derived from them). A virtual call
+# through such an object -- its vptr loaded, the slot read, called -- calls that slot's method of
+# those classes.
+
+_R64 = {f"e{r}": f"r{r}" for r in ("ax", "bx", "cx", "dx", "si", "di", "bp", "sp")}
+_R64.update({f"r{n}d": f"r{n}" for n in range(8, 16)})
+_SAVED = {("x64", False): {"rbx", "rbp", "rsp", "r12", "r13", "r14", "r15"},
+          ("x64", True): {"rbx", "rbp", "rsp", "rdi", "rsi", "r12", "r13", "r14", "r15"},
+          ("x86", True): {"ebx", "ebp", "esp", "esi", "edi"}, ("x86", False): {"ebx", "ebp", "esp", "esi", "edi"}}
 
 
-def _this_calls(f, this: str, ptr: int):
-    """(call site, vtable slot) of the calls through `this`'s vtable: `this` (and registers only
-    ever copied from it) never written in `f`."""
-    insns = [i for blk in f.blocks.values() for i in blk.insns]
-    writes: dict[str, list] = {}
-    for i in insns:
-        ops = [o.strip() for o in i.op_str.split(",")] if i.op_str else []
-        if ops and ops[0].isalnum() and i.mnemonic not in ("cmp", "test", "push", "call", "pop"):
-            writes.setdefault(ops[0], []).append((i.mnemonic, ops[1] if len(ops) > 1 else ""))
-    if this in writes:
-        return []
-    regs = {this} | {r for r, w in writes.items() if all(m == "mov" and src == this for m, src in w)}
-    out = []
-    for blk in f.blocks.values():
-        vptr: dict[str, bool] = {}
-        slot_in: dict[str, int] = {}
-        for i in blk.insns:
-            ops = [o.strip() for o in i.op_str.split(",")] if i.op_str else []
-            mem = ops[-1].split("[")[-1][:-1] if ops and ops[-1].endswith("]") else None
-            if i.mnemonic == "call" and i.target is None and ops:
-                if mem is not None:
-                    base, _, disp = mem.partition(" + ")
-                    if base in vptr and (disp == "" or disp[:1].isdigit()):
-                        out.append((i.addr, (int(disp, 0) if disp else 0) // ptr))
-                elif ops[0] in slot_in:
-                    out.append((i.addr, slot_in[ops[0]]))
-                vptr.clear(), slot_in.clear()
+class _Types:
+    """Values tracked: ("this",) a method's object; ("ptr", n) some pointer (a call's result);
+    ("addr", a) an address; ("ti", class) its typeinfo; ("obj", classes, static) an object of one of
+    `classes`, seen as a `static` (its base at some offset; None: the class itself);
+    ("vptr", classes, static, off) its vtable pointer plus `off`; ("fn", targets) a method."""
+
+    def __init__(self, an, classes: dict[str, CppClass]):
+        b = an.bin
+        self.an, self.b = an, b
+        self.ptr = b.bits // 8
+        self.x64 = b.arch == "x64"
+        pe = b.format == "PE"
+        self.this = {("x64", False): "rdi", ("x64", True): "rcx", ("x86", True): "ecx"}.get((b.arch, pe))
+        self.ret = "rax" if self.x64 else "eax"
+        self.saved = _SAVED.get((b.arch, pe), set())
+        self.classes = classes
+        self.vt: dict[int, str] = {}             # primary vtable address point -> class
+        self.ti: dict[int, str] = {c.typeinfo: c.name for c in classes.values()}
+        methods = set()
+        for c in classes.values():
+            for v in c.vtables:
+                methods.update(v.slots)
+                if v.offset == 0:
+                    self.vt[v.addr] = c.name
+        self.methods = methods                   # (destructors store vtables too: not constructors)
+        self.owners: dict[int, set[str]] = {}    # method -> classes with it in their primary vtable
+        for c in classes.values():
+            for v in c.vtables:
+                if v.offset == 0:
+                    for m in v.slots:
+                        if m:
+                            self.owners.setdefault(m, set()).add(c.name)
+        self.derived: dict[str, set[str]] = {n: {n} for n in classes}
+        for n in classes:
+            for a in _ancestors(n, classes):
+                if a in self.derived:
+                    self.derived[a].add(n)
+        self.ctors: dict[int, str] = {}          # function -> class whose vtable it stores in [this]
+        self.returns: dict[int, tuple] = {}      # function -> ("obj", classes, static) it returns
+        self.sites: dict[int, frozenset[int]] = {}
+        self.dyncast = {imp.addr for imp in b.imports if imp.name == "__dynamic_cast"}
+        self._tok = 0
+
+    def reg(self, r: str) -> str:
+        return _R64.get(r, r) if self.x64 else r
+
+    def offset_in(self, base: str, cls: str, depth: int = 0) -> int | None:
+        if base == cls:
+            return 0
+        c = self.classes.get(cls)
+        if c is None or depth > 16:
+            return None
+        if base in c.offsets:            # (MSVC lists every base with its offset, Itanium the direct ones)
+            return c.offsets[base]
+        for n in c.bases:
+            o = c.offsets.get(n)
+            sub = self.offset_in(base, n, depth + 1) if o is not None else None
+            if sub is not None:
+                return o + sub
+        return None
+
+    def slot(self, cls: frozenset[str], static: str | None, k: int) -> frozenset[int]:
+        out = set()
+        for n in cls:
+            c = self.classes.get(n)
+            off = 0 if static is None else self.offset_in(static, n)
+            if c is None or off is None:
                 continue
-            if i.mnemonic == "mov" and len(ops) == 2 and ops[0].isalnum() and mem is not None:
-                base, _, disp = mem.partition(" + ")
-                if base in regs and disp == "":
-                    vptr[ops[0]] = True
-                    slot_in.pop(ops[0], None)
+            vt = next((v for v in c.vtables if v.offset == -off), None)
+            if vt is not None and 0 <= k < len(vt.slots) and vt.slots[k]:
+                out.add(vt.slots[k])
+        return frozenset(out)
+
+    def run(self) -> dict[int, tuple[frozenset[int], bool]]:
+        funcs = [f for f in self.an.functions.values() if not f.is_import]
+        for _ in range(4):                       # constructors, then what functions return
+            before = (dict(self.ctors), dict(self.returns))
+            for f in funcs:
+                self.function(f)
+            if (self.ctors, self.returns) == before:
+                break
+        self.sites.clear()
+        for f in funcs:
+            self.function(f)
+        return {a: (t, False) for a, t in self.sites.items()}
+
+    def fresh(self):
+        self._tok += 1
+        return ("ptr", self._tok)
+
+    def function(self, f):
+        ends: dict[int, dict] = {}
+        rets: list = []
+        for a in sorted(f.blocks):
+            blk = f.blocks[a]
+            ins = [ends.get(p) for p in blk.preds]
+            st = None
+            if ins and all(x is not None for x in ins):
+                st = _join(ins)
+            elif a == f.addr:
+                st = {self.this: ("this",)}
+                if f.addr in self.owners:            # a virtual method: `this` is one of its classes
+                    st = {self.this: ("obj", frozenset().union(*(self.derived[n] for n in self.owners[f.addr])),
+                                      None)}
+            ends[a] = self.block(f, blk.insns, dict(st or {}), rets)
+        if rets and all(r is not None and r[0] in ("obj", "null") for r in rets) and any(r[0] == "obj" for r in rets):
+            rets = [r for r in rets if r[0] == "obj"]
+            statics = {r[2] for r in rets}
+            self.returns[f.addr] = ("obj", frozenset().union(*(r[1] for r in rets)),
+                                    statics.pop() if len(statics) == 1 else None)
+        else:
+            self.returns.pop(f.addr, None)
+
+    def construct(self, f, st: dict, base: str, a: int):
+        """A vtable address stored in an object's first word."""
+        if a not in self.vt:
+            return
+        cls = self.vt[a]
+        obj = st.get(base)
+        if obj == ("this",) and f.addr not in self.methods:
+            self.ctors[f.addr] = cls
+        new = ("obj", frozenset({cls}), None)
+        if obj is not None and obj[0] in ("ptr", "obj"):    # (a later store: a more derived class)
+            for k, v in list(st.items()):
+                if v == obj:
+                    st[k] = new
+        elif obj is None or obj[0] == "addr":
+            st[base] = new
+
+    def block(self, f, insns, st: dict, rets: list) -> dict:
+        ptr = self.ptr
+        for i in insns:
+            ops = [o.strip() for o in i.op_str.split(",")] if i.op_str else []
+            m = i.mnemonic
+            if i.kind == CALL_KIND:
+                self.call(i, ops, st)
+                continue
+            if i.kind == RET_KIND:
+                rets.append(st.get(self.ret))
+                continue
+            if len(ops) != 2:
+                if ops and _is_reg(ops[0]):
+                    st.pop(self.reg(ops[0]), None)
+                continue
+            dst, src = ops
+            mem_d, mem_s = _inner(dst), _inner(src)
+            word = (dst if mem_d is not None else src).startswith("qword" if self.x64 else "dword")
+            if m == "lea" and _is_reg(dst):
+                d = self.reg(dst)
+                v = None
+                if i.refs and ("rip" in src or not self.x64) and _base_disp(mem_s)[0] in (None, "rip"):
+                    r = i.refs[0]
+                    v = ("ti", self.ti[r]) if r in self.ti else ("addr", r)
+                elif mem_s is not None:
+                    base, disp = _base_disp(mem_s)
+                    bv = st.get(self.reg(base)) if base else None
+                    if bv and bv[0] == "addr" and disp is not None:
+                        v = ("addr", bv[1] + disp)
+                st.pop(d, None)
+                if v is not None:
+                    st[d] = v
+                continue
+            if m in ("movq", "movd") and dst.startswith("xmm") and _is_reg(src):
+                v = st.get(self.reg(src))
+                st.pop(dst, None)
+                if v is not None:
+                    st[dst] = v
+                continue
+            if m in ("punpcklqdq", "movlhps"):
+                continue                        # (the low qword stays)
+            if m in ("movups", "movaps", "movdqu", "movdqa") and mem_d is not None and src.startswith("xmm"):
+                base, disp = _base_disp(mem_d)
+                v = st.get(src)
+                if v and v[0] == "addr" and base and disp == 0:     # (the low qword: the first word)
+                    self.construct(f, st, self.reg(base), v[1])
+                continue
+            if m == "mov" and mem_d is not None:
+                if not word:
                     continue
-                if base in vptr and (disp == "" or disp[:1].isdigit()):
-                    slot_in[ops[0]] = (int(disp, 0) if disp else 0) // ptr
-                    vptr.pop(ops[0], None)
+                v = st.get(self.reg(src)) if _is_reg(src) else None
+                if v is None and src[:2] == "0x":
+                    v = ("addr", int(src, 16))           # (non-PIC: an address stored as is)
+                if _stack(mem_d):
+                    if v is not None:
+                        st[("slot", mem_d)] = v
+                    else:
+                        st.pop(("slot", mem_d), None)
                     continue
-            if ops and ops[0].isalnum():
-                vptr.pop(ops[0], None)
-                slot_in.pop(ops[0], None)
+                base, disp = _base_disp(mem_d)
+                if v is not None and v[0] == "addr" and base and disp == 0:
+                    self.construct(f, st, self.reg(base), v[1])
+                continue
+            if (m == "mov" and _is_reg(dst) and src == "0") or (m == "xor" and dst == src):
+                st[self.reg(dst)] = ("null",)
+                continue
+            if m == "mov" and _is_reg(dst):
+                d = self.reg(dst)
+                v = None
+                if _is_reg(src):
+                    v = st.get(self.reg(src))
+                elif mem_s is not None and word:
+                    if _stack(mem_s):
+                        v = st.get(("slot", mem_s))
+                    else:
+                        base, disp = _base_disp(mem_s)
+                        bv = st.get(self.reg(base)) if base else None
+                        if bv and bv[0] == "obj" and disp == 0:
+                            v = ("vptr", bv[1], bv[2], 0)
+                        elif bv and bv[0] == "vptr" and disp is not None:
+                            t = self.slot(bv[1], bv[2], (bv[3] + disp) // ptr)
+                            v = ("fn", t) if t else None
+                st.pop(d, None)
+                if v is not None:
+                    st[d] = v
+                continue
+            if m == "add" and _is_reg(dst) and src[:1].isdigit():
+                d = self.reg(dst)
+                v = st.get(d)
+                if v and v[0] == "vptr":
+                    st[d] = ("vptr", v[1], v[2], v[3] + int(src, 0))
+                elif v and v[0] == "addr":
+                    st[d] = ("addr", v[1] + int(src, 0))
+                else:
+                    st.pop(d, None)
+                continue
+            if _is_reg(dst) and m not in ("cmp", "test", "push"):
+                st.pop(self.reg(dst), None)
+        return st
+
+    def call(self, i, ops, st: dict):
+        ptr = self.ptr
+        targets = None
+        if i.target is None and ops:
+            op = ops[0]
+            inner = _inner(op)
+            if inner is not None:
+                base, disp = _base_disp(inner)
+                bv = st.get(self.reg(base)) if base else None
+                if bv and bv[0] == "vptr" and disp is not None:
+                    targets = self.slot(bv[1], bv[2], (bv[3] + disp) // ptr)
+            elif _is_reg(op):
+                v = st.get(self.reg(op))
+                if v and v[0] == "fn":
+                    targets = v[1]
+            if targets:
+                self.sites[i.addr] = targets
+        this = st.get(self.this)
+        ctor = self.ctors.get(i.target) if i.target is not None else None
+        result = None
+        if i.target in self.dyncast:                  # __dynamic_cast(obj, src type, dst type, hint)
+            dst = st.get("rdx" if self.x64 else None)
+            if dst and dst[0] == "ti":
+                result = ("obj", frozenset(self.derived.get(dst[1], {dst[1]})), dst[1])
+        elif i.target is not None and i.target in self.returns:
+            result = self.returns[i.target]
+        for k in list(st):
+            if isinstance(k, str) and k not in self.saved:
+                del st[k]
+        if ctor is not None and this is not None and this[0] == "ptr":
+            new = ("obj", frozenset({ctor}), None)
+            for k, v in list(st.items()):
+                if v == this:
+                    st[k] = new
+        st[self.ret] = result if result is not None else self.fresh()
+
+
+def _join(states: list[dict]) -> dict:
+    """What every way into a block agrees on; objects that may be of different classes on
+    different ways: of any of them."""
+    out = {}
+    for k, v in states[0].items():
+        vs = [x.get(k) for x in states]
+        if all(w == v for w in vs):
+            out[k] = v
+        elif all(w is not None and w[0] in ("obj", "null") for w in vs) and any(w[0] == "obj" for w in vs):
+            objs = [w for w in vs if w[0] == "obj"]      # (a null pointer on some way: no call through it)
+            statics = {w[2] for w in objs}
+            out[k] = ("obj", frozenset().union(*(w[1] for w in objs)), statics.pop() if len(statics) == 1 else None)
     return out
+
+
+def _is_reg(op: str) -> bool:
+    return op.isalnum() and not op[:1].isdigit()
+
+
+def _inner(op: str) -> str | None:
+    if not op.endswith("]") or "[" not in op:
+        return None
+    return op.split("[", 1)[1][:-1]
+
+
+def _stack(inner: str) -> bool:
+    base, disp = _base_disp(inner)
+    return base in ("rbp", "rsp", "ebp", "esp") and disp is not None
+
+
+def _base_disp(inner: str) -> tuple[str | None, int | None]:
+    """`rax + 0x10` -> ("rax", 16); `rbp - 8` -> ("rbp", -8); anything with an index -> (None, None)."""
+    parts = inner.split()
+    if not parts or "*" in inner or "rip" in parts:
+        return None, None
+    base = parts[0] if _is_reg(parts[0]) else None
+    if len(parts) == 1:
+        return base, 0
+    if len(parts) == 3 and parts[1] in "+-" and parts[2][:1].isdigit():
+        try:
+            v = int(parts[2], 0)
+        except ValueError:
+            return None, None
+        return base, v if parts[1] == "+" else -v
+    return None, None
+
+
+def object_calls(an, classes: dict[str, CppClass]) -> dict[int, tuple[frozenset[int], bool]]:
+    if an.bin.arch not in ("x64", "x86") or not classes:
+        return {}
+    t = _Types(an, classes)
+    if t.this is None:
+        return {}
+    return t.run()

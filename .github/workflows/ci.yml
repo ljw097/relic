@@ -98,6 +98,7 @@ jobs:
           pytest -q -rs tests/test_flow.py -k "a64 or arm or thumb or mips or rv64 or rv32 or ppc"
           pytest -q -rs tests/test_floats.py -k "a64 or arm or thumb or rv64 or rv32 or ppc"
           pytest -q -rs tests/test_libsigs.py -k cross
+          pytest -q -rs tests/test_autoanalysis.py -k cross
           pytest -q -rs tests/test_debug_targets.py -k qemu
       - uses: actions/upload-artifact@v4
         with:

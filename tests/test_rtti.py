@@ -13,14 +13,15 @@ from relic.analysis import analyze
 HERE = os.path.dirname(__file__)
 
 
-@pytest.fixture(scope="module", params=["plain", "stripped"])
+@pytest.fixture(scope="module", params=["plain", "stripped", "O0-stripped"])
 def classes(request, tmp_path_factory):
     cxx = shutil.which("g++")
     if cxx is None:
         pytest.skip("needs g++")
     out = str(tmp_path_factory.mktemp("rtti") / "classes")
-    subprocess.run([cxx, "-O2", "-o", out, os.path.join(HERE, "src", "classes.cpp")], check=True)
-    if request.param == "stripped":
+    opt = "-O0" if request.param.startswith("O0") else "-O2"
+    subprocess.run([cxx, opt, "-o", out, os.path.join(HERE, "src", "classes.cpp")], check=True)
+    if request.param.endswith("stripped"):
         subprocess.run(["strip", out], check=True)
     return request.param, out
 
@@ -33,6 +34,7 @@ def test_class_hierarchy(classes):
     assert cl["Dog"].bases == ["Animal"] and cl["Parrot"].bases == ["Bird", "Named"]
     assert [vt.offset for vt in cl["Parrot"].vtables] == [0, -8]      # (Named's part of a Parrot)
     assert len(cl["Dog"].vtables[0].slots) == 5                       # 2 destructors, sound, legs, speak
+    assert cl["Parrot"].offsets == {"Bird": 0, "Named": 8}
     dog, bird, parrot = (cl[n].vtables[0].slots for n in ("Dog", "Bird", "Parrot"))
     assert dog[4] == bird[4] == parrot[4]                             # speak(): Animal's, inherited
     assert parrot[3] == bird[3] != dog[3]                             # legs(): Bird's override
@@ -44,7 +46,7 @@ def test_stripped_names(classes):
     an = analyze(path)
     cl = an.classes
     if kind != "stripped":
-        return
+        return       # (-O0: no identical code folded, so the inherited methods are told apart less)
     assert an.functions[cl["Dog"].vtables[0].slots[2]].name == "Dog::vfunc2"
     assert an.functions[cl["Dog"].vtables[0].slots[4]].name == "Animal::vfunc4"      # (shared: the base's)
     assert an.functions[cl["Parrot"].vtables[0].slots[3]].name == "Bird::vfunc3"
@@ -57,7 +59,7 @@ def test_virtual_call_through_this(classes):
     an = analyze(path)
     speak = an.functions[an.classes["Dog"].vtables[0].slots[4]]
     sites = [(a, t) for a, (t, _) in an.icalls.items() if speak.block_at(a) is not None]
-    assert len(sites) == 1
+    assert len(sites) == 1, sites
     want = {an.classes[n].vtables[0].slots[2] for n in ("Dog", "Bird", "Parrot")}
     assert sites[0][1] == want
     assert all(any(x.frm == sites[0][0] for x in an.xrefs_to[t]) for t in want)
@@ -68,3 +70,61 @@ def test_cli(classes, capsys):
     main(["classes", path, "--no-sigs"])
     out = capsys.readouterr().out
     assert "class Parrot : Bird, Named" in out and "pure virtual" not in out.split("class Dog")[1].split("class")[0]
+
+
+@pytest.fixture(scope="module", params=["x86_64", "i686"])
+def msvc(request, tmp_path_factory):
+    """tests/src/classes_msvc.cpp built for MSVC's C++ ABI (PE, MSVC RTTI) by clang and lld-link."""
+    clang, link = shutil.which("clang"), shutil.which("lld-link")
+    if clang is None or link is None:
+        pytest.skip("needs clang and lld-link")
+    d = tmp_path_factory.mktemp("msvc")
+    target = f"--target={request.param}-pc-windows-msvc"
+    subprocess.run([clang, "-x", "c++", target, "-O2", "-fno-exceptions", "-c", "-o", str(d / "cls.obj"),
+                    os.path.join(HERE, "src", "classes_msvc.cpp")], check=True)
+    subprocess.run([clang, target, '-DSYM="??_7type_info@@6B@"', "-c", "-o", str(d / "ti.obj"),
+                    os.path.join(HERE, "src", "msvc_typeinfo.c")], check=True)
+    out = str(d / "cls.exe")
+    subprocess.run([link, f"/out:{out}", "/entry:mainCRTStartup", "/subsystem:console", "/nodefaultlib",
+                    str(d / "cls.obj"), str(d / "ti.obj")], check=True)
+    return request.param, out
+
+
+def test_msvc_classes(msvc):
+    arch, path = msvc
+    an = analyze(path)
+    cl = an.classes
+    ptr = 8 if arch == "x86_64" else 4
+    assert {"Dog", "Bird", "Parrot"} <= set(cl)
+    assert cl["Dog"].bases == ["Animal"] and cl["Parrot"].bases == ["Bird", "Named"]
+    assert [vt.offset for vt in cl["Parrot"].vtables] == [0, -ptr]
+    dog, bird, parrot = (cl[n].vtables[0].slots for n in ("Dog", "Bird", "Parrot"))
+    assert dog[3] == bird[3] == parrot[3] and parrot[2] == bird[2] != dog[2]
+    assert an.functions[dog[1]].name == "Dog::vfunc1"
+    assert an.name(cl["Dog"].vtables[0].addr - ptr) == "vtable for Dog"      # (from its locator pointer)
+    # speak() calls sound() (slot 1) through `this` (rcx / ecx)
+    speak = an.functions[dog[3]]
+    sites = [t for a, (t, _) in an.icalls.items() if speak.block_at(a) is not None]
+    assert sites == [frozenset(cl[n].vtables[0].slots[1] for n in ("Dog", "Bird", "Parrot"))]
+    # the entry point: make()'s object (constructed in place) -- speak(), legs(), the destructor
+    entry = an.functions[an.bin.entry]
+    calls = sorted((t for a, (t, _) in an.icalls.items() if entry.block_at(a) is not None), key=len)
+    assert frozenset({dog[3]}) in calls and frozenset({dog[2], bird[2]}) in calls
+
+
+def test_virtual_calls_on_objects(classes):
+    """main: `make()` returns a Dog, a Bird or a Parrot (what it constructs, through constructors
+    at -O0, vtables stored in place at -O2) -- its speak() and destructor calls; the result of
+    `dynamic_cast<const Named *>` -- Named's name() in a Parrot: the thunk of its second vtable."""
+    _, path = classes
+    an = analyze(path)
+    cl = an.classes
+    main = an.function_by_name("main")
+    got = sorted((t for a, (t, _) in an.icalls.items() if main.block_at(a) is not None), key=len)
+    slots = {n: cl[n].vtables[0].slots for n in ("Dog", "Bird", "Parrot")}
+    speak = frozenset({slots["Dog"][4]})
+    deleting = frozenset(slots[n][1] for n in slots)            # (the deleting destructors)
+    name = cl["Parrot"].vtables[1].slots[0]
+    assert speak in got and deleting in got
+    own = {v.slots[0] for v in cl["Named"].vtables[:1]}         # (Named's own, when it has a vtable: -O0)
+    assert any(name in t and t <= {name} | own for t in got)
