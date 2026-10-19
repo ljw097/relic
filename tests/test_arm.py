@@ -106,3 +106,24 @@ def test_listing_shows_literal_pools_and_inline_tables(vuln_arm, flow_thumb_O2):
     assert [ln.target for ln in cases] == targets
     addrs = [ln.addr for ln in function_lines(an, f) if ln.kind == "insn"]
     assert addrs == sorted(addrs)
+
+
+@pytest.mark.parametrize("mode", ["-marm", "-mthumb"])
+def test_literal_pool_after_a_call_is_data(tmp_path, mode):
+    import os
+    import shutil
+    import subprocess
+    cc = shutil.which("arm-linux-gnueabihf-gcc")
+    if cc is None:
+        pytest.skip("needs arm-linux-gnueabihf-gcc")
+    out = str(tmp_path / "armpool")
+    subprocess.run([cc, mode, "-O2", "-o", out, os.path.join(os.path.dirname(__file__), "src", "armpool.c")],
+                   check=True)
+    a = analyze(out)
+    f = a.function_by_name("check")
+    # `bl fatal` is followed by the words its `ldr rX, [pc, #k]` loads: data, not instructions
+    last = max(f.blocks.values(), key=lambda b: b.addr)
+    code = [i.mnemonic for i in last.insns if i.mnemonic != "nop"]     # (Thumb: padding to the pool)
+    assert code[-1] == "bl" and not last.succs
+    assert a.code_data.get(last.end) == ["array", "dword", 1]
+    assert 'fatal("too big: a long message here");' in decompile(a, f).text

@@ -115,6 +115,8 @@ class Function:
 
 
 _ENDBR = (b"\xf3\x0f\x1e\xfa", b"\xf3\x0f\x1e\xfb")
+# ARM / Thumb pc-relative load: its literal pool word is data, never code
+_ARM_LITERAL = re.compile(r"\[pc, #(-?(?:0x[0-9a-f]+|\d+))\]$")
 
 
 def _def_size(d: list, word: int) -> int:
@@ -147,6 +149,7 @@ class FunctionAnalyzer:
         self.generic_icalls: dict = {}       # the same for other processors, once their loads have addresses
         self._code_refs: dict[int, int | str] = {}   # x86: code-section address the code reads -> size / "string"
         self.code_data: dict[int, list] = {}         # data found among code: addr -> definition (data_defs form)
+        self.pools: dict[int, int] = {}              # ARM: literal pool word -> size (what `ldr rX, [pc, #k]` reads)
 
     # ------------------------------------------------------------- driver
     def run(self) -> dict[int, Function]:
@@ -443,7 +446,7 @@ class FunctionAnalyzer:
         return out
 
     # ---------------------------------------------------------- one function
-    def _analyze(self, start: int):
+    def _analyze(self, start: int, again: bool = False):
         f = Function(start, self._name(start))
         self.funcs[start] = f
         insns: dict[int, Insn] = {}
@@ -459,10 +462,14 @@ class FunctionAnalyzer:
                     break
                 if a != start and a in self._fde and self.prev.get(a) is not None and a not in leaders:
                     break               # (falling into the next function: unwind info starts one here)
+                if a in self.pools and a != start:
+                    break               # ARM: a literal pool (after a call that does not come back)
                 i = self.dis.decode(a)
                 if i is None:
                     break
                 insns[a] = i
+                if self.dis.md_thumb is not None and i.mnemonic.startswith(("ldr", "vldr")):
+                    self._literal(i)
                 nxt = i.end
                 if self.dis.md_thumb is not None:
                     self._hint_modes(i)
@@ -548,6 +555,8 @@ class FunctionAnalyzer:
                         self._queue.append(r)
                 self.prev[nxt] = a
                 a = nxt
+        if not again and any(p in insns for p in self.pools):
+            return self._analyze(start, True)       # (a pool read only after flow ran into it)
         self._build_blocks(f, insns, leaders, edges)
 
     def _build_blocks(self, f: Function, insns: dict[int, Insn], leaders: set[int], edges: dict[int, list[int]]):
@@ -571,6 +580,21 @@ class FunctionAnalyzer:
                 f.blocks[s].preds.append(b.addr)
 
     # ------------------------------------------------------------- helpers
+    def _literal(self, i: Insn):
+        """Record the literal pool word an ARM / Thumb pc-relative load reads, as data among code."""
+        m = _ARM_LITERAL.search(i.op_str)
+        if m is None:
+            return
+        a = ((i.addr + (4 if i.thumb else 8)) & ~3) + int(m.group(1), 0)
+        wide = i.mnemonic.startswith("ldrd") or (i.mnemonic.startswith("vldr") and i.op_str.startswith("d"))
+        n = 8 if wide else 4
+        if not self.bin.is_exec(a) or self.pools.get(a, 0) >= n:
+            return
+        self.pools[a] = n
+        if wide:
+            self.pools[a + 4] = 4
+        self.code_data.setdefault(a, ["array", "dword", n // 4])
+
     def _hint_modes(self, i: Insn):
         """ARM interworking: successors run in the instruction set of `i`, except a `blx label`."""
         self.dis.hint(i.end, i.thumb)
