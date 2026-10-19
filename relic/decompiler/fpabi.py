@@ -198,12 +198,16 @@ def _fp_return(an, func, arch) -> int | None:
         xmm_w += [64 for r in xr if r == "whole"]
     int_r = [r for r in ir_ if r != "none"]
     ppc_whole = arch.name.startswith("ppc") and any(r == "whole" for r in xr)
-    if int_r and not xmm_w and not ppc_whole:
-        return None                             # callers use the integer result
     try:
         fn = _lifted(an, func)
     except Exception:
         return None
+    if int_r and not xmm_w and not ppc_whole:
+        # callers use the integer result -- unless the function never writes it: a caller that
+        # knows so (gcc's -fipa-ra) keeps its own value there across the call
+        if not ("whole" in xr and not any(isinstance(d, Reg) and d.name == arch.ret
+                                          for s in fn.stmts() for d in stmt_defs(s))):
+            return None
     # the function must leave a float in xmm0 on every return path, written after any write of
     # the integer result register (callers handing xmm0 straight to another call show no read:
     # their calls' arguments are not known yet)

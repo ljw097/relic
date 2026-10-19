@@ -40,6 +40,43 @@ def objc_method(name: str):
     return (m.group(1), m.group(2), m.group(3)) if m else None
 
 
+# SSE / AVX instructions the lifter keeps as intrinsics: the names of Intel's C intrinsics
+_SSE = {"padd": "add_epi", "psub": "sub_epi", "padds": "adds_epi", "paddus": "adds_epu", "psubs": "subs_epi",
+        "psubus": "subs_epu", "pcmpeq": "cmpeq_epi", "pcmpgt": "cmpgt_epi", "pmaxs": "max_epi", "pmins": "min_epi",
+        "pmaxu": "max_epu", "pminu": "min_epu", "pavg": "avg_epu", "pabs": "abs_epi", "psrl": "srli_epi",
+        "psll": "slli_epi", "psra": "srai_epi", "punpckl": "unpacklo_epi", "punpckh": "unpackhi_epi"}
+_SSE_WIDTH = {"b": "8", "w": "16", "d": "32", "q": "64", "bw": "8", "wd": "16", "dq": "32", "qdq": "64"}
+_SSE_FIXED = {"pand": "and_si", "por": "or_si", "pxor": "xor_si", "pandn": "andnot_si", "pmovmskb": "movemask_epi8",
+              "psrldq": "srli_si", "pslldq": "slli_si", "pmullw": "mullo_epi16", "pmulld": "mullo_epi32",
+              "pmulhw": "mulhi_epi16", "pmulhuw": "mulhi_epu16", "pmuludq": "mul_epu32", "pmaddwd": "madd_epi16",
+              "psadbw": "sad_epu8", "pshufd": "shuffle_epi32", "pshufb": "shuffle_epi8", "ptest": "testz_si",
+              "packsswb": "packs_epi16", "packssdw": "packs_epi32", "packuswb": "packus_epi16",
+              "pshuflw": "shufflelo_epi16", "pshufhw": "shufflehi_epi16", "palignr": "alignr_epi8",
+              "movmskps": "movemask_ps", "movmskpd": "movemask_pd", "shufps": "shuffle_ps", "shufpd": "shuffle_pd",
+              "unpcklps": "unpacklo_ps", "unpckhps": "unpackhi_ps", "unpcklpd": "unpacklo_pd",
+              "unpckhpd": "unpackhi_pd", "andps": "and_ps", "andpd": "and_pd", "orps": "or_ps", "orpd": "or_pd",
+              "xorps": "xor_ps", "xorpd": "xor_pd", "andnps": "andnot_ps", "andnpd": "andnot_pd"}
+for _op in ("add", "sub", "mul", "div", "min", "max", "sqrt"):
+    _SSE_FIXED[_op + "ps"], _SSE_FIXED[_op + "pd"] = f"{_op}_ps", f"{_op}_pd"
+
+
+def _sse_name(m: str, bits: int) -> str | None:
+    """`paddd` -> `_mm_add_epi32`, `vpaddd` on 256 bits -> `_mm256_add_epi32`; None if not one."""
+    core = m[1:] if m.startswith("v") and len(m) > 3 else m
+    name = _SSE_FIXED.get(core)
+    if name is None:
+        for stem in sorted(_SSE, key=len, reverse=True):
+            if core.startswith(stem) and core[len(stem):] in _SSE_WIDTH:
+                name = _SSE[stem] + _SSE_WIDTH[core[len(stem):]]
+                break
+    if name is None:
+        return None
+    prefix = "_mm256_" if bits == 256 else "_mm_"
+    if name.endswith("_si"):
+        name += "256" if bits == 256 else "128"
+    return prefix + name
+
+
 _COPY = re.compile(r"([A-Za-z_]\w*) = ([A-Za-z_]\w*);")
 
 
@@ -885,6 +922,12 @@ class CWriter:
         x = e.args[0]
         if e.name in ("sitofp", "uitofp"):
             t = "double" if e.bits == 64 else "float"
+            if e.name == "sitofp" and isinstance(x, Cast) and x.kind == "zext" and x.a.bits < x.bits:
+                # a zero-extended narrower integer converted as a signed wider one: an unsigned one
+                inner = self.expr(_bare(x.a), PREC_UNARY)
+                if not self._unsigned(x.a):
+                    inner = f"({int_type(x.a.bits, True)}){inner}"
+                return f"({t}){inner}", PREC_UNARY
             inner = self.expr(_bare(x), PREC_UNARY)
             if e.name == "uitofp" and not self._unsigned(x):
                 inner = f"({int_type(x.bits, True)}){inner}"
@@ -995,7 +1038,8 @@ class CWriter:
         if isinstance(e, Intrinsic) and (e.name in self._FCASTS or e.name in FP_INTRINSICS):
             return self._fintrinsic(e)
         if isinstance(e, Intrinsic):
-            return f"__{e.name}({', '.join(self.expr(a) for a in e.args)})", PREC_POSTFIX
+            name = _sse_name(e.name, e.bits) or f"__{e.name}"
+            return f"{name}({', '.join(self.expr(a) for a in e.args)})", PREC_POSTFIX
         if isinstance(e, ir.Call):
             return self.call(e), PREC_POSTFIX
         return str(e), PREC_POSTFIX
@@ -1075,6 +1119,8 @@ class CWriter:
                 ptr = self._scaled(b, a)
                 if ptr is not None:
                     a, b = b, ptr
+                elif self._ptr_size(b) > 1:     # (a byte offset that is not a whole element)
+                    return f"(char *){self.expr(b, PREC_UNARY)} + {self.expr(a, p + 1)}", p
             elif self._ptr_size(a) > 1:   # byte offset that is not a whole element
                 return f"(char *){self.expr(a, PREC_UNARY)} {op} {self.expr(b, p + 1)}", p
         if e.op == "+" and isinstance(b, Const) and b.signed < 0 and b.bits >= 8:
@@ -1086,7 +1132,8 @@ class CWriter:
         return f"{self.expr(a, p)} {op} {self.expr(b, p + 1)}", p
 
     _SIZES = {"char": 1, "unsigned char": 1, "short": 2, "unsigned short": 2, "int": 4, "unsigned int": 4,
-              "int64_t": 8, "uint64_t": 8, "float": 4, "double": 8}
+              "int64_t": 8, "uint64_t": 8, "float": 4, "double": 8, "bool": 1, "__int128": 16,
+              "unsigned __int128": 16}
 
     def _struct_ptr(self, e: Expr) -> bool:
         if isinstance(e, (Var, StackVar)):
@@ -1112,10 +1159,13 @@ class CWriter:
             return off if size == 1 else None
         if isinstance(off, Const) and off.value % size == 0:
             return Const(off.value // size, off.bits)
-        if isinstance(off, BinOp) and off.op == "*" and isinstance(off.b, Const) and off.b.value == size:
-            return off.a
-        if isinstance(off, BinOp) and off.op == "<<" and isinstance(off.b, Const) and 1 << off.b.value == size:
-            return off.a
+        if isinstance(off, BinOp) and off.op == "*" and isinstance(off.b, Const) and off.b.value % size == 0:
+            k = off.b.value // size
+            return off.a if k == 1 else BinOp("*", off.a, Const(k, off.b.bits), off.bits)
+        if isinstance(off, BinOp) and off.op == "<<" and isinstance(off.b, Const) and \
+                (1 << off.b.value) % size == 0:
+            k = off.b.value - (size.bit_length() - 1)
+            return off.a if k == 0 else BinOp("<<", off.a, Const(k, off.b.bits), off.bits)
         return None
 
     def _unsigned(self, e: Expr) -> bool:

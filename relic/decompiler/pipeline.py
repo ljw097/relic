@@ -150,6 +150,9 @@ def prepare(an: "Analysis", func: "Function") -> Prepared:
             narrow(fn, sext_params=set(sext_params))
             _fold_pass(fn)
     _dce(fn)
+    from .cleanup import fold_unsigned_conversions
+    if fold_unsigned_conversions(an, fn):       # `(double)(uint64_t)x` from the compiler's two-way code
+        _dce(fn)
     fold_short_circuits(fn)
     st = Structurer(fn)
     tree = st.run()

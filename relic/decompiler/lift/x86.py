@@ -458,6 +458,35 @@ class X86Lifter:
     _i_vmovss = _i_movss
     _i_vmovsd = _i_movsd
 
+    def _half(self, i, ops, high: bool):
+        """`movlps` / `movhps` (`..pd`): the low / high 64 bits of an xmm register to or from memory."""
+        if len(ops) != 2:
+            raise LiftError("movhps")
+        dst, src = ops
+        if self._xmm(src) and dst.type == OP_MEM:
+            v = self.read(src)
+            if high:
+                v = BinOp(">>u", v, Const(64, 8), 128)
+            self.write(dst, self.resize(v, 64))
+        elif self._xmm(dst) and src.type == OP_MEM:
+            old = self.read(dst)
+            new = Cast("zext", Load(self.addr_of(src), 64), 128)
+            keep = Const(((1 << 64) - 1) << (0 if high else 64), 128)
+            if high:
+                new = BinOp("<<", new, Const(64, 8), 128)
+            self.write_reg(i.cs.reg_name(dst.reg), BinOp("|", BinOp("&", old, keep, 128), new, 128))
+        else:
+            raise LiftError("movhps")
+
+    def _i_movlps(self, i, ops):
+        self._half(i, ops, False)
+
+    def _i_movhps(self, i, ops):
+        self._half(i, ops, True)
+
+    _i_movlpd = _i_vmovlps = _i_vmovlpd = _i_movlps
+    _i_movhpd = _i_vmovhps = _i_vmovhpd = _i_movhps
+
     def _farith(self, ops, op: str, w: int):
         a, b = (ops[1], ops[2]) if len(ops) == 3 else (ops[0], ops[1])       # AVX: dst, src1, src2
         self._fdst(ops[0], BinOp(op, self._fsrc(a, w), self._fsrc(b, w), w))
