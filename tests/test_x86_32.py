@@ -36,7 +36,7 @@ def test_stack_parameters_are_named(an32):
 def test_realigned_main(an32):
     code = _c(an32, "main")
     assert code.startswith("int main(int argc, ")
-    assert "setvbuf(stdout, 0, 2, 0);" in code        # through the GOT slot
+    assert "setvbuf(stdout, 0, _IONBF, 0);" in code        # through the GOT slot
     assert "show_note(" in code and "del_note(" in code and "classify(atoi(argv[1]))" in code
     assert "esp" not in code                          # stack bookkeeping is gone
     assert "stack realigned" in code

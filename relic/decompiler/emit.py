@@ -77,6 +77,9 @@ def _sse_name(m: str, bits: int) -> str | None:
     return prefix + name
 
 
+_NUMBER_TYPES = ("size_t", "ssize_t", "int", "unsigned int", "long", "unsigned long", "off_t", "socklen_t",
+                 "mode_t", "pid_t", "uid_t", "gid_t", "useconds_t", "time_t")
+_OPEN_MODE = {"open": 2, "open64": 2, "openat": 3, "__open_2": 2}     # their (variadic) mode argument
 _COPY = re.compile(r"([A-Za-z_]\w*) = ([A-Za-z_]\w*);")
 
 
@@ -673,18 +676,24 @@ class CWriter:
             n = short_name(n)
         return base_name(n) if n else None
 
+    def _user_format(self, c: Const) -> str | None:
+        """The number as the user chose to show it (H / R / B on the number), keyed by the value as shown."""
+        if not self.an.num_formats:
+            return None
+        v = c.value
+        nums = self.an.num_formats.get(self.p.fn.addr, {})
+        shown = c.signed if c.bits >= 8 and v >> (c.bits - 1) and c.signed > -0x10000 else v
+        fmt = nums.get(str(shown)) or nums.get(str(v))
+        if fmt is None:
+            return None
+        from ..numfmt import format_number
+        return format_number(v, fmt, c.bits)
+
     def const(self, c: Const) -> str:
         v = c.value
-        fmt = None
-        if self.an.num_formats:                   # the user's choice (H / R / B on the number), keyed
-            nums = self.an.num_formats.get(self.p.fn.addr, {})          # by the value as shown
-            shown = c.signed if c.bits >= 8 and v >> (c.bits - 1) and c.signed > -0x10000 else v
-            fmt = nums.get(str(shown)) or nums.get(str(v))
-        if fmt is not None:
-            from ..numfmt import format_number
-            text = format_number(v, fmt, c.bits)
-            if text is not None:
-                return text
+        text = self._user_format(c)
+        if text is not None:
+            return text
         if c.bits == self.ptr_bits and v and self.an.bin.is_mapped(v):
             lit = self.string(v)
             if lit is not None:
@@ -1280,12 +1289,29 @@ class CWriter:
                 if lit is not None:
                     args.append(lit)
                     continue
+            if isinstance(_bare(a), Const) and self._user_format(_bare(a)) is not None:
+                args.append(self._user_format(_bare(a)))        # (the user's choice wins)
+                continue
             ptype = self._param_type(c, k)
             if ptype is not None and ptype.startswith("enum ") and isinstance(_bare(a), Const):
                 text = self.enum_value(self.an.enum(ptype[5:]), _bare(a).value, _bare(a).bits)
                 if text is not None:                    # `set_mode(MODE_A | MODE_C)`
                     args.append(text)
                     continue
+            if isinstance(_bare(a), Const) and ptype is None:
+                from .consts import constant_name
+                text = constant_name(name, k, _bare(a).value, _bare(a).bits, self.an.bin.arch)
+                if text is not None:                    # `mmap(0, n, PROT_READ | PROT_WRITE, ...)`
+                    args.append(text)
+                    continue
+            ty = arg_type(sig, k) if sig is not None else None
+            if isinstance(_bare(a), Const) and (ty == "mode_t" or k == _OPEN_MODE.get(base_name(name or ""))):
+                args.append(f"0{_bare(a).value & 0o7777:o}")      # (file permissions: `0644`)
+                continue
+            if isinstance(_bare(a), Const) and ty in _NUMBER_TYPES:
+                cv = _bare(a)                       # (a size or a count, never an address)
+                args.append(number(cv.signed if ty not in ("size_t", "unsigned int", "unsigned long") else cv.value))
+                continue
             args.append(self.expr(_bare(a)))
         return f"{name}({', '.join(args)})"
 
@@ -1293,7 +1319,12 @@ class CWriter:
         """The type the user gave (or a header declared for) parameter `k` of the function called."""
         if not isinstance(c.target, Const) or c.target.value not in self.an.functions:
             return None
-        return self.an.var_types.get(c.target.value, {}).get(f"a{k + 1}")
+        t = self.an.var_types.get(c.target.value, {}).get(f"a{k + 1}")
+        if t is None:                   # (a library function a header declared: its prototype)
+            proto = self.an.user_types.get("prototypes", {}).get(base_name(self._callee_name(c) or ""))
+            params = proto.get("params", []) if proto else []
+            t = params[k] if k < len(params) and params[k].startswith("enum ") else None
+        return t
 
     # --------------------------------------------------------- statements
     def stmt(self, s) -> str | None:

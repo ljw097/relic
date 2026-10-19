@@ -83,7 +83,7 @@ def test_decompile_vuln_menu_main(request, variant):
     assert 'puts("1. add");' in code and '__isoc99_scanf("%d", &var_' in code and "exit(1);" in code
     assert "__asm" not in code and "goto" not in code and "(*" not in code
     code = _c(an, "main")
-    assert code.startswith("int main(int argc, ") and "while (1) {" in code and "setvbuf(stdout, 0, 2, 0)" in code
+    assert code.startswith("int main(int argc, ") and "while (1) {" in code and "setvbuf(stdout, 0, _IONBF, 0)" in code
     assert "sp - " not in code and "(int64_t)" not in code, code
 
 

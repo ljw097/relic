@@ -713,7 +713,7 @@ class Analysis:
         HeaderError (a ValueError) with the line for what cannot be parsed; nothing changes then.
         Returns what was imported: {"structs": [...], "enums": [...], "typedefs": [...],
         "functions": [...]}."""
-        from ..decompiler.cheader import Model, declaration, parse, struct_layout
+        from ..decompiler.cheader import CType, Model, declaration, parse, struct_layout
         from ..decompiler.vartypes import parse_ctype
         model = Model.for_binary(self.bin)
         headers = list(self.user_types.get("headers", []))
@@ -727,9 +727,20 @@ class Analysis:
         headers.append(text)
         self.user_types["headers"] = headers
         self.user_types["enums"] = {n: dict(v) for n, v in h.enums.items() if not n.startswith("__anon")}
+        # `#define MODE_A 1`, `#define MODE_B 2`: the constants sharing a prefix are an enum `MODE`,
+        # the type of a parameter named after it (`int set_mode(int mode)`), or for `Y` to apply
+        groups: dict[str, dict[str, int]] = {}
+        for dname, v in h.defines.items():
+            cut = dname.find("_", 1)
+            if 0 < cut < len(dname) - 1:
+                groups.setdefault(dname[:cut], {})[dname] = v
+        for prefix, vals in groups.items():
+            if len(vals) >= 2 and prefix not in self.user_types["enums"]:
+                self.user_types["enums"][prefix] = vals
         self.user_types["typedefs"] = {n: t.spell() for n, t in h.typedefs.items()}
         self.user_types["bare"] = sorted(h.bare)
-        out = {"structs": [], "enums": sorted(n for n in set(h.enums) - before[1] if not n.startswith("__anon")),
+        new_enums = (set(h.enums) - before[1]) | {g for g, v in groups.items() if len(v) >= 2 and g not in h.enums}
+        out = {"structs": [], "enums": sorted(n for n in new_enums if not n.startswith("__anon")),
                "typedefs": sorted(set(h.typedefs) - before[2]), "functions": [], "imports": []}
         for key, agg in h.aggregates.items():
             if not agg.complete or agg.name.startswith("__anon"):
@@ -761,7 +772,11 @@ class Analysis:
         from ..decompiler.sigs import sig_of
         protos = dict(self.user_types.get("prototypes", {}))
         formats = dict(self.user_types.get("formats", {}))
+        enum_names = set(self.user_types["enums"])
         for name, proto in h.prototypes.items():
+            # an integer parameter named after a group of #defines (`mode` / MODE_*) takes it as its enum
+            proto.params = [(n, CType(f"enum {n.upper()}", 0) if not t.ptr and n and n.upper() in enum_names and
+                             t.base in _INT_BASES and n.upper() not in h.enums else t) for n, t in proto.params]
             params = [t.spell() for _, t in proto.params]
             sig = sig_of(params, proto.ret.spell(), proto.variadic, [n for n, _ in proto.params])
             if sig.fmt is not None:
@@ -1012,6 +1027,10 @@ class Analysis:
         if not isinstance(data, dict) or "renames" not in data and "structs" not in data:
             raise ValueError(f"{path}: not a relic project file")
         return merge(self, data, theirs, force)
+
+
+_INT_BASES = ("int", "unsigned int", "long", "unsigned long", "short", "unsigned short", "char", "unsigned char",
+              "long long", "unsigned long long", "int32_t", "uint32_t", "int64_t", "uint64_t", "size_t")
 
 
 def _undoable(method):

@@ -349,9 +349,9 @@ def test_cli(types_O0, tmp_path):
 # --------------------------------------------------------------- library prototypes
 def test_bundled_prototypes_shape_library_calls(libcalls_O1):
     an = analyze(libcalls_O1)
-    assert "socket(2, 1, 0)" in _c(an, "serve") and "listen(" in _c(an, "serve")
+    assert "socket(AF_INET, SOCK_STREAM, 0)" in _c(an, "serve") and "listen(" in _c(an, "serve")
     assert re.search(r"bind\(\w+, &\w+, 16\)", _c(an, "serve"))
-    assert "mmap(0, a1, 3, 34, -1, 0)" in _c(an, "region")          # an `int` parameter: -1
+    assert "mmap(0, a1, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0)" in _c(an, "region")  # -1: an `int`
     assert "strtoul(a1, " in _c(an, "parse_num") and ", 16)" in _c(an, "parse_num")
     assert 'execl("/bin/sh", "sh", "-c", "id", 0)' in _c(an, "shell")   # variadic: what was set
     assert re.search(r"getline\(\w+, &\w+, stdin\)", _c(an, "main"))
@@ -370,3 +370,45 @@ def test_header_prototype_of_a_variadic_wrapper(libcalls_O1, tmp_path):
     assert "log_msg(2, a1);" in code and 'log_msg(1, "user %s\\n", a1);' in code
     found = [v for v in an.vulns() if v.func == "shell" and v.kind == "format-string"]
     assert found and "log_msg()" in found[0].message
+
+
+@pytest.fixture(scope="module")
+def consts_O1(tmp_path_factory):
+    cc = shutil.which("gcc")
+    if cc is None or not sys.platform.startswith("linux"):
+        pytest.skip("needs gcc on Linux")
+    out = str(tmp_path_factory.mktemp("consts") / "consts")
+    subprocess.run([cc, "-O1", "-w", "-o", out, os.path.join(HERE, "src", "consts.c")], check=True)
+    return out
+
+
+def test_libc_flag_arguments_print_as_constants(consts_O1):
+    an = analyze(consts_O1)
+    assert "mmap(0, 0x1000, PROT_READ | PROT_WRITE | PROT_EXEC, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0)" in _c(an, "map")
+    assert "open(a1, O_WRONLY | O_CREAT | O_TRUNC, 0644)" in _c(an, "create")     # the mode in octal
+    assert "lseek(a1, 0, SEEK_END)" in _c(an, "rewind_fd")
+
+
+def test_define_groups_become_enums(consts_O1):
+    an = analyze(consts_O1)
+    got = an.import_header("#define MODE_READ 1\n#define MODE_WRITE 2\n#define MODE_EXEC 4\n#define LONE 7\n"
+                           "int set_mode(int mode);\n")
+    assert got["enums"] == ["MODE"]                     # a prefix shared by two or more; LONE stays a define
+    assert _c(an, "set_mode").startswith("int set_mode(enum MODE a1)")
+    assert "set_mode(MODE_READ | MODE_EXEC)" in _c(an, "main")
+
+
+MS_BITS = """
+struct s { char a; int b : 3; char c : 2; short d : 4; int e : 5; long long f : 7; char g; };
+struct t { char a : 3; char : 0; char b : 2; int c : 30; int d : 4; };
+"""
+
+
+def test_microsoft_bitfield_layout():
+    # sizes checked against gcc (System V) and x86_64-w64-mingw32-gcc (Microsoft's layout)
+    sysv, ms = parse(MS_BITS, Model()), parse(MS_BITS, Model(8, 4, 2, 8, 8, True))
+    assert sysv.aggregates["struct s"].size == 8 and ms.aggregates["struct s"].size == 32
+    assert [m.offset for m in ms.aggregates["struct s"].members] == [0, 4, 8, 10, 12, 16, 24]
+    assert sysv.aggregates["struct t"].size == 12 and ms.aggregates["struct t"].size == 12
+    named = [(m.offset, m.bit) for m in ms.aggregates["struct t"].members if m.name]
+    assert named == [(0, 0), (1, 8), (4, 32), (8, 64)]

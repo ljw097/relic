@@ -31,14 +31,15 @@ class Model:
     wchar: int = 4
     align8: int = 8             # alignment of 8-byte scalars inside structs (i386 SysV: 4)
     long_double: int = 16
+    ms_bitfields: bool = False  # Microsoft's bit-field layout (Windows): see _Parser._layout
 
     @staticmethod
     def for_binary(b) -> "Model":
         if b.bits == 32:
             x86, win = b.arch == "x86", b.format in ("PE", "COFF")
-            return Model(4, 4, 2 if win else 4, 4 if x86 and not win else 8, 12 if x86 and not win else 8)
+            return Model(4, 4, 2 if win else 4, 4 if x86 and not win else 8, 12 if x86 and not win else 8, win)
         if b.format in ("PE", "COFF"):
-            return Model(8, 4, 2, 8, 8)
+            return Model(8, 4, 2, 8, 8, True)
         return Model()
 
 
@@ -563,6 +564,43 @@ class _Parser:
         self.fail(f"{b!r} has no known size")
 
     def _layout(self, agg: Aggregate):
+        if self.m.ms_bitfields and agg.kind != "union" and any(m.width is not None for m in agg.members):
+            return self._ms_layout(agg)
+        self._sysv_layout(agg)
+
+    def _ms_layout(self, agg: Aggregate):
+        """Microsoft's layout: adjacent bit-fields share a storage unit only while their declared
+        types have the same size and they fit; the unit (the whole of it) is then taken up, a type
+        of another size starts a new one at its alignment, a zero-width bit-field ends the run.
+        Every bit-field counts for the alignment, named or not."""
+        pos, align, size = 0, 1, 0              # (pos: bits)
+        run = None                              # (start bit, unit bits, bits used) of the current unit
+        for m in agg.members:
+            s, a = self.size_align(m.type)
+            align = max(align, a)
+            if m.width is not None:
+                if m.width == 0:
+                    run = None
+                    continue
+                if run is None or run[1] != s * 8 or run[2] + m.width > run[1]:
+                    start = ((pos + 7) // 8 + a - 1) // a * a * 8
+                    run = (start, s * 8, 0)
+                m.bit = run[0] + run[2]
+                m.offset = run[0] // 8
+                run = (run[0], run[1], run[2] + m.width)
+                pos = run[0] + run[1]
+                size = pos // 8
+                continue
+            run = None
+            off = ((pos + 7) // 8 + a - 1) // a * a
+            m.offset = off
+            pos = (off + s) * 8
+            size = off + s
+        agg.size = (size + align - 1) // align * align
+        agg.align = align
+        agg.complete = True
+
+    def _sysv_layout(self, agg: Aggregate):
         """System V layout. Bit-fields are packed into containers of their declared type: one that
         does not fit the container at the last boundary of its type's alignment starts at the next
         boundary, a zero-width one moves to the next boundary; unnamed ones do not add to the
