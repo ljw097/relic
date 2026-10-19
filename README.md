@@ -80,13 +80,13 @@ Roughly, here's what works:
 ### Where it stands against IDA
 
 These numbers are eyeballed. Read them as "the share of what IDA does in that area that Relic does about as well."
-The total is a weighted average, with weights from how much each area matters to me when I'm actually reversing. Right now it's **about 86%**.
+The total is a weighted average, with weights from how much each area matters to me when I'm actually reversing. Right now it's **about 87%**.
 
 | Area (weight) | Progress | Notes |
 |---|---|---|
 | File formats (8) | 100% | Mach-O with Objective-C metadata (`[obj msg:arg]` in the pseudocode) |
 | Processors (8) | 80% | IDA handles 60+ CPU families, so this is the furthest behind |
-| Auto-analysis (14) | 92% | Finds 99.9% of the functions `.eh_frame` lists in stripped bash, and 99.96% with `.eh_frame` removed (noreturn inference, tail calls, function pointers in data); calls through function-pointer variables resolved; bash in about 7 seconds; no C++ virtual call targets yet |
+| Auto-analysis (14) | 95% | Finds 99.9% of the functions `.eh_frame` lists in stripped bash, and 99.96% with `.eh_frame` removed (noreturn inference, tail calls, function pointers in data); calls through function-pointer variables resolved; bash in about 7 seconds; C++ classes and vtables from RTTI; virtual calls only resolved through `this` |
 | Library identification (8) | 100% | On the stripped static C test binaries, 83–94% of the functions that had symbols get named, with no wrong names |
 | Type system (10) | 85% | No by-value struct arguments or returns |
 | Decompiler (20) | 52% | Too many gotos left, no x87 floating point or SIMD |
@@ -111,6 +111,7 @@ relic decompile ./chall main
 relic vulns     ./chall              # likely bugs
 relic strings   ./chall -g bin/sh    # filter by substring, case-insensitive
 relic xrefs     ./chall menu         # what references this address
+relic classes   ./app                # C++ classes from RTTI: bases, vtables, virtual methods
 ```
 
 Less frequent, but handy to know about:

@@ -30,6 +30,7 @@ class Analysis:
         self.dis = Disassembler(binary)
         self.functions: dict[int, Function] = {}
         self.icalls: dict[int, tuple] = {}      # indirect call -> (possible targets, whether all)
+        self.classes: dict = {}                 # C++ class name -> rtti.CppClass
         self.strings: list[String] = []
         self.xrefs_to: dict[int, list[Xref]] = defaultdict(list)
         self.xrefs_from: dict[int, list[Xref]] = defaultdict(list)
@@ -105,6 +106,9 @@ class Analysis:
             if main is not None:
                 finder.add_function(main, "main")
         self._apply_func_edits(finder, load_project)
+        from .rtti import recover_classes, virtual_calls
+        self.classes = recover_classes(self, finder)      # C++ classes, vtables (names their methods)
+        self.icalls.update(virtual_calls(self, self.classes))
         self._fstarts = sorted(self.functions)
         report("data references", 0, force=True)
         from .constprop import propagate_refs
