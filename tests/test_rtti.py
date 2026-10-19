@@ -68,3 +68,39 @@ def test_cli(classes, capsys):
     main(["classes", path, "--no-sigs"])
     out = capsys.readouterr().out
     assert "class Parrot : Bird, Named" in out and "pure virtual" not in out.split("class Dog")[1].split("class")[0]
+
+
+@pytest.fixture(scope="module", params=["x86_64", "i686"])
+def msvc(request, tmp_path_factory):
+    """tests/src/classes_msvc.cpp built for MSVC's C++ ABI (PE, MSVC RTTI) by clang and lld-link."""
+    clang, link = shutil.which("clang"), shutil.which("lld-link")
+    if clang is None or link is None:
+        pytest.skip("needs clang and lld-link")
+    d = tmp_path_factory.mktemp("msvc")
+    target = f"--target={request.param}-pc-windows-msvc"
+    subprocess.run([clang, "-x", "c++", target, "-O2", "-fno-exceptions", "-c", "-o", str(d / "cls.obj"),
+                    os.path.join(HERE, "src", "classes_msvc.cpp")], check=True)
+    subprocess.run([clang, target, '-DSYM="??_7type_info@@6B@"', "-c", "-o", str(d / "ti.obj"),
+                    os.path.join(HERE, "src", "msvc_typeinfo.c")], check=True)
+    out = str(d / "cls.exe")
+    subprocess.run([link, f"/out:{out}", "/entry:mainCRTStartup", "/subsystem:console", "/nodefaultlib",
+                    str(d / "cls.obj"), str(d / "ti.obj")], check=True)
+    return request.param, out
+
+
+def test_msvc_classes(msvc):
+    arch, path = msvc
+    an = analyze(path)
+    cl = an.classes
+    ptr = 8 if arch == "x86_64" else 4
+    assert {"Dog", "Bird", "Parrot"} <= set(cl)
+    assert cl["Dog"].bases == ["Animal"] and cl["Parrot"].bases == ["Bird", "Named"]
+    assert [vt.offset for vt in cl["Parrot"].vtables] == [0, -ptr]
+    dog, bird, parrot = (cl[n].vtables[0].slots for n in ("Dog", "Bird", "Parrot"))
+    assert dog[3] == bird[3] == parrot[3] and parrot[2] == bird[2] != dog[2]
+    assert an.functions[dog[1]].name == "Dog::vfunc1"
+    assert an.name(cl["Dog"].vtables[0].addr - ptr) == "vtable for Dog"      # (from its locator pointer)
+    # speak() calls sound() (slot 1) through `this` (rcx / ecx)
+    speak = an.functions[dog[3]]
+    sites = [t for a, (t, _) in an.icalls.items() if speak.block_at(a) is not None]
+    assert sites == [frozenset(cl[n].vtables[0].slots[1] for n in ("Dog", "Bird", "Parrot"))]

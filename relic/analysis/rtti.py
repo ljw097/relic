@@ -1,10 +1,14 @@
-"""C++ classes from Itanium RTTI (gcc, clang: ELF), stripped binaries included.
+"""C++ classes from RTTI, stripped binaries included: Itanium (gcc, clang: ELF) and MSVC (PE).
 
 A class's `typeinfo` object starts with a pointer into one of libstdc++'s typeinfo vtables -- the
 dynamic relocation naming `__class_type_info` (no bases), `__si_class_type_info` (one base) or
 `__vmi_class_type_info` (several) -- followed by its mangled name and its bases. A vtable is the
 offset to the top of the object, the typeinfo, then the virtual methods; classes with several
 bases have one per base, one after the other.
+
+MSVC: the word before a vtable points at its RTTICompleteObjectLocator, which gives the offset
+of that part of the object, the class's TypeDescriptor (its decorated name, `.?AVDog@@`) and its
+ClassHierarchyDescriptor (all its bases).
 
 Found: classes with their bases, vtables and virtual methods; names `typeinfo for X`,
 `vtable for X` and `X::vfuncN` (methods without a name of their own).
@@ -26,6 +30,7 @@ class VTable:
     addr: int                    # its address point: the first virtual method's slot
     offset: int                  # offset to the top of the object (0 for the primary one)
     slots: list[int] = field(default_factory=list)      # method addresses (0: pure virtual)
+    start: int = 0               # where the vtable object starts (its RTTI header before `addr`)
 
 
 @dataclass
@@ -38,6 +43,11 @@ class CppClass:
 
 def recover_classes(an, finder=None) -> dict[str, CppClass]:
     b = an.bin
+    if b.format == "PE":
+        classes = _msvc(an)
+        if classes:
+            _name(an, classes, finder, b.bits // 8)
+        return classes
     if b.format != "ELF":
         return {}
     ptr = b.bits // 8
@@ -83,6 +93,95 @@ def recover_classes(an, finder=None) -> dict[str, CppClass]:
     return classes
 
 
+def _msvc_name(decorated: str) -> str:
+    """`.?AVDog@@` -> `Dog`, `.?AVInner@Outer@@` -> `Outer::Inner` (templates left as they are)."""
+    core = decorated[4:] if decorated[:4] in (".?AV", ".?AU") else decorated
+    if "?$" in core or not core.endswith("@@"):
+        return core
+    return "::".join(reversed([p for p in core[:-2].split("@") if p]))
+
+
+def _msvc(an) -> dict[str, CppClass]:
+    b = an.bin
+    ptr = b.bits // 8
+    base = getattr(b, "image_base", None)
+    if base is None:
+        base = min(s.addr for s in b.sections if s.loaded) & ~0xFFFF
+    x64 = ptr == 8
+    rdata = [s for s in b.sections if s.loaded and not s.x and s.size and not b.is_writable(s.addr)]
+
+    def at(v: int) -> int:                  # an image-relative offset (x64) or an address (x86)
+        return base + v if x64 else v
+
+    def td_name(td: int) -> str | None:
+        n = b.read_cstring(td + 2 * ptr)
+        return n if n and n.startswith((".?AV", ".?AU")) else None
+
+    cols: dict[int, tuple[int, int, int]] = {}         # locator -> (offset, type descriptor, hierarchy)
+    for sec in rdata:
+        for a in range(sec.addr + (-sec.addr % 4), sec.end - 20, 4):
+            sig = b.read_int(a, 4)
+            if sig != (1 if x64 else 0):
+                continue
+            if x64 and b.read_int(a + 20, 4) != a - base:      # (pSelf: its own offset)
+                continue
+            td, chd = at(b.read_int(a + 12, 4) or 0), at(b.read_int(a + 16, 4) or 0)
+            if not b.is_mapped(td) or td_name(td) is None or not b.is_mapped(chd):
+                continue
+            cols[a] = (b.read_int(a + 4, 4) or 0, td, chd)
+    if not cols:
+        return {}
+    classes: dict[int, CppClass] = {}
+    for _off, td, chd in cols.values():
+        if td in classes:
+            continue
+        c = CppClass(_msvc_name(td_name(td)), td)
+        n = b.read_int(chd + 8, 4) or 0
+        arr = at(b.read_int(chd + 12, 4) or 0)
+        for k in range(1, min(n, 64)):           # (entry 0: the class itself)
+            bcd = at(b.read_int(arr + 4 * k, 4) or 0)
+            btd = at(b.read_int(bcd, 4) or 0)
+            name = td_name(btd) if b.is_mapped(btd) else None
+            if name and _msvc_name(name) not in c.bases:
+                c.bases.append(_msvc_name(name))        # (indirect ones too: `_direct` drops them)
+        classes[td] = c
+    # vtables: a pointer to a locator, then the methods
+    for sec in rdata:
+        for a in range(sec.addr + (-sec.addr % ptr), sec.end - ptr, ptr):
+            col = b.read_ptr(a)
+            if col not in cols:
+                continue
+            off, td, _ = cols[col]
+            vt = VTable(a + ptr, -off, start=a)
+            s = a + ptr
+            while s + ptr <= sec.end and s not in cols:
+                v = b.read_ptr(s) or 0
+                if not v or not b.is_exec(v) or b.read_ptr(s) in cols:
+                    break
+                vt.slots.append(v)
+                s += ptr
+            classes[td].vtables.append(vt)
+    for c in classes.values():
+        c.vtables.sort(key=lambda v: -v.offset)
+        c.bases = _direct(c.bases, classes)
+    return {c.name: c for c in classes.values()}
+
+
+def _direct(bases: list[str], classes: dict[int, CppClass]) -> list[str]:
+    """The hierarchy descriptor lists every base, indirect ones too: keep the direct ones -- those
+    no other listed base derives from."""
+    by_name = {c.name: c for c in classes.values()}
+    indirect = set()
+    for n in bases:
+        stack = list(by_name[n].bases) if n in by_name else []
+        while stack:
+            m = stack.pop()
+            if m not in indirect:
+                indirect.add(m)
+                stack.extend(by_name[m].bases if m in by_name else ())
+    return [n for n in bases if n not in indirect]
+
+
 def _external(b, ti: int) -> str:
     """A base class whose typeinfo lives in a library: the name of the symbol its pointer binds."""
     for r in getattr(b, "relocs", ()):
@@ -109,7 +208,7 @@ def _vtables(an, by_ti: dict[int, CppClass], inside: set[int], pure: set[int], p
             if off > 0 or off < -0x100000 or off % ptr:
                 a += ptr
                 continue
-            vt = VTable(a + ptr, off)
+            vt = VTable(a + ptr, off, start=a - ptr)
             s = a + ptr
             while s + ptr <= sec.end:
                 v = b.read_ptr(s) or 0
@@ -151,7 +250,7 @@ def _name(an, classes: dict[str, CppClass], finder, ptr: int):
         symbol(f"typeinfo for {c.name}", c.typeinfo, 0)
         for vt in c.vtables:
             if vt.offset == 0:
-                symbol(f"vtable for {c.name}", vt.addr - 2 * ptr, (len(vt.slots) + 2) * ptr)
+                symbol(f"vtable for {c.name}", vt.start, vt.addr - vt.start + len(vt.slots) * ptr)
             for k, m in enumerate(vt.slots):
                 if m:
                     users.setdefault(m, []).append((c.name, k, vt.offset))
@@ -177,7 +276,7 @@ def virtual_calls(an, classes: dict[str, CppClass]) -> dict[int, tuple[frozenset
     if b.arch not in ("x64", "x86") or not classes:
         return {}
     ptr = b.bits // 8
-    this = "rdi" if b.arch == "x64" else None
+    this = {("x64", False): "rdi", ("x64", True): "rcx", ("x86", True): "ecx"}.get((b.arch, b.format == "PE"))
     if this is None:
         return {}
     derived: dict[str, set[str]] = {n: set() for n in classes}
