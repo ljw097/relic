@@ -92,7 +92,7 @@ IDA의 60여 개 CPU 계열 전부가 아니라, 리버싱·포너블·펌웨어
 - [x] 추적: 명령 단위 추적 기록(Debug ▸ Trace instructions), 리스팅에 실행된 명령 표시
 - [x] Windows(PE) 대상: Windows의 gdbserver.exe로 원격, Linux에서는 wine으로 자동 실행(win32·win64, 입출력·환경 변수·DLL 모듈)
 
-## P1 — 자동 분석 100%까지 (README 90%)
+## P1 — 자동 분석 100%까지 (README 92%)
 
 기준: stripped 실제 바이너리(coreutils·grep·gzip·bash)에서 `.eh_frame`의 함수 진입점을 정답으로 한 함수 찾기 재현율, 해석되지 않은 간접 점프 수.
 
@@ -102,7 +102,8 @@ IDA의 60여 개 CPU 계열 전부가 아니라, 리버싱·포너블·펌웨어
 - [x] 레지스터를 거친 꼬리 호출: 에필로그 뒤 `jmp rax`(함수 포인터), import를 담아 둔 레지스터(`jmp rbx` = objc_msgSend), 식으로 전달된 인자
 - [x] 돌아오지 않는 내부 함수 추론(`.eh_frame` 없는 바이너리): 나가는 길이 돌아오지 않는 호출뿐인 함수(고정점), 그 전에 분석한 호출자는 다시 분석. `error(0이 아닌 상태, ...)`, `__longjmp_chk`. 꼬리 호출: `endbr64` 대상, 에필로그 뒤·프레임 없는 래퍼에서 정렬된 주소로의 `jmp`. `.eh_frame`을 지운 bash 재현율 99.96%(다른 함수로 흘러든 함수 140 → 1: 데이터 변수에 담긴 핸들러 호출), gzip·grep·ls 100%
 - [x] 데이터 속 함수 포인터(콜백 표·구조체 초기값): PIE의 RELATIVE 재배치 대상(CET 바이너리는 `endbr64`로 시작하는 것). x86-64 PIC의 즉치 상수는 주소로 보지 않음(`lea [rip+…]`만)
-- [ ] 간접 호출 지점의 대상(가상 함수 테이블 슬롯·함수 포인터 변수 → 호출 대상)
+- [x] 함수 포인터 변수를 거친 간접 호출의 대상(x86): 변수의 초기값 + 코드가 저장하는 함수(`lea rcx, [rip+f]; mov [rip+slot], rcx`), 주소가 다른 데로 새거나 모르는 값이 저장되면 "그 밖에도". xref·리스팅(`; → print_and_abort`), 대상이 전부 돌아오지 않으면 호출도 돌아오지 않음(gnulib `obstack_alloc_failed_handler`: ls·grep의 흘러든 함수 2 → 0)
+- [ ] 간접 호출 대상: C++ 가상 함수 호출(`mov rax, [rdi]; call [rax+0x10]` → 객체의 vtable), x86 외 아키텍처
 - [ ] 코드 사이 데이터 감지(ARM 리터럴 풀 밖, 손으로 쓴 어셈블리)
 - [x] 큰 바이너리 분석 속도: x86는 capstone `disasm_lite` + Intel 문법 연산자 텍스트 파싱(주소가 든 것만), 상세 정보는 처음 쓸 때 디코드. bash 함수 찾기 34초 → 7초
 

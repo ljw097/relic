@@ -65,6 +65,10 @@ def comment(an: Analysis, i: Insn) -> str:
         n = an.call_name(i)
         if n:
             parts.append(n)
+    icall = an.icalls.get(i.addr) if i.kind == CALL and i.target is None else None
+    if icall is not None:                   # (through a function-pointer variable)
+        names = ", ".join(sorted(an.label(t) for t in icall[0]))
+        parts.append(f"→ {names}" if icall[1] else f"→ {names}, ...")
     seen = set()
     for r in i.refs:
         if r in seen or r == i.target:

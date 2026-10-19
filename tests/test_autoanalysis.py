@@ -138,3 +138,17 @@ def test_functions_without_unwind_info(noeh):
     assert an.functions[syms["fatal"]].noreturn and an.functions[syms["usage"]].noreturn
     assert not an.functions[syms["parse"]].noreturn and not an.functions[syms["main"]].noreturn
     assert syms["change_case"] in an.functions[syms["upcase"]].tail_calls
+
+
+def test_calls_through_function_pointer_variables(noeh):
+    """A variable's targets: its initial value and the functions the code stores to it. A call
+    through one holding only a function that does not return does not return either."""
+    syms, path = noeh
+    an = analyze(path)
+    checked = an.functions[syms["checked"]]
+    sites = {a: v for a, v in an.icalls.items() if checked.block_at(a) is not None}
+    assert sorted(sites.values(), key=len) == [
+        (frozenset({syms["die_cb"]}), True), (frozenset({syms["log_plain"], syms["log_loud"]}), True)]
+    fatal = next(a for a, (t, _) in sites.items() if syms["die_cb"] in t)
+    assert not checked.block_at(fatal).succs                     # (the call ends its block)
+    assert any(x.frm == fatal for x in an.xrefs_to[syms["die_cb"]])

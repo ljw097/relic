@@ -86,7 +86,7 @@ The total is a weighted average, with weights from how much each area matters to
 |---|---|---|
 | File formats (8) | 100% | Mach-O with Objective-C metadata (`[obj msg:arg]` in the pseudocode) |
 | Processors (8) | 80% | IDA handles 60+ CPU families, so this is the furthest behind |
-| Auto-analysis (14) | 90% | Finds 99.9% of the functions `.eh_frame` lists in stripped bash, and 99.96% with `.eh_frame` removed (noreturn inference, tail calls, function pointers in data); bash in about 7 seconds; indirect call sites not yet resolved |
+| Auto-analysis (14) | 92% | Finds 99.9% of the functions `.eh_frame` lists in stripped bash, and 99.96% with `.eh_frame` removed (noreturn inference, tail calls, function pointers in data); calls through function-pointer variables resolved; bash in about 7 seconds; no C++ virtual call targets yet |
 | Library identification (8) | 100% | On the stripped static C test binaries, 83–94% of the functions that had symbols get named, with no wrong names |
 | Type system (10) | 85% | No by-value struct arguments or returns |
 | Decompiler (20) | 52% | Too many gotos left, no x87 floating point or SIMD |

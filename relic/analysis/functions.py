@@ -127,6 +127,7 @@ class FunctionAnalyzer:
         self.prev: dict[int, int] = {}  # insn addr -> previous insn addr on fallthrough
         self._queue: list[int] = []
         self._fde: set[int] = set()     # ELF: function starts `.eh_frame` describes
+        self.icalls: dict[int, tuple[frozenset[int], bool]] = {}   # indirect call -> (targets, all of them)
 
     # ------------------------------------------------------------- driver
     def run(self) -> dict[int, Function]:
@@ -190,7 +191,9 @@ class FunctionAnalyzer:
         to) functions that do not return -- `exit`, `abort`, others found here -- or no way out at
         all. Their callers, analyzed before this was known, ran on past such calls into whatever
         follows (often the next function); they are analyzed again, until nothing changes."""
+        from .icalls import SlotTargets
         while True:
+            self.icalls = SlotTargets(self.bin, self.funcs).run()
             new: set[int] = set()
             changed = True
             while changed:
@@ -202,7 +205,9 @@ class FunctionAnalyzer:
                         changed = True
             if not new:
                 return
-            redo = [f for f in self.funcs.values() if not f.is_import and (f.calls | f.tail_calls) & new]
+            sites = {a for a, (t, _) in self.icalls.items() if t & new}
+            redo = [f for f in self.funcs.values() if not f.is_import and
+                    ((f.calls | f.tail_calls) & new or sites and self._has_site(f, sites))]
             for f in redo:
                 for blk in f.blocks.values():
                     for i in blk.insns:
@@ -214,6 +219,10 @@ class FunctionAnalyzer:
                 g = self.funcs[f.addr]
                 g.name, g.noreturn, g.library = f.name, f.noreturn, f.library
             self._drain()
+
+    @staticmethod
+    def _has_site(f: Function, sites: set[int]) -> bool:
+        return any(i.addr in sites for blk in f.blocks.values() for i in blk.insns)
 
     def _calls_noreturn(self, i: Insn) -> bool:
         if i.kind == CALL:
@@ -491,6 +500,11 @@ class FunctionAnalyzer:
         return None
 
     def _is_noreturn_call(self, i: Insn) -> bool:
+        icall = self.icalls.get(i.addr) if i.target is None else None
+        if icall is not None and icall[1]:          # (through a variable holding only such functions)
+            fns = [self.funcs.get(t) for t in icall[0]]
+            if all(fn is not None and fn.noreturn for fn in fns):
+                return True
         if i.target is None and i.mem_target is None and i.mnemonic == "jalr" and self.dis.delay_slots:
             i.mem_target = self._mips_call_slot(i)
         tgt = i.target

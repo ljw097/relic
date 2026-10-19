@@ -29,6 +29,7 @@ class Analysis:
         self.bin = binary
         self.dis = Disassembler(binary)
         self.functions: dict[int, Function] = {}
+        self.icalls: dict[int, tuple] = {}      # indirect call -> (possible targets, whether all)
         self.strings: list[String] = []
         self.xrefs_to: dict[int, list[Xref]] = defaultdict(list)
         self.xrefs_from: dict[int, list[Xref]] = defaultdict(list)
@@ -137,6 +138,7 @@ class Analysis:
     def _find_functions(self, noreturn: set[int] = frozenset()) -> FunctionAnalyzer:
         finder = FunctionAnalyzer(self.bin, self.dis, noreturn)
         self.functions = finder.run()
+        self.icalls = finder.icalls
         return finder
 
     def _library_names(self, finder: FunctionAnalyzer | None = None) -> set[int]:
@@ -389,6 +391,9 @@ class Analysis:
             for jmp, targets in f.jump_tables.items():
                 for t in set(targets):
                     self._add_xref(Xref(jmp, t, "jmp"))
+        for site, (targets, _) in self.icalls.items():      # (through function-pointer variables)
+            for t in targets:
+                self._add_xref(Xref(site, t, "call"))
 
     def _add_xref(self, x: Xref):
         self.xrefs_to[x.to].append(x)
