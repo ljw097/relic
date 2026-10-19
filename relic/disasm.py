@@ -31,10 +31,19 @@ class Insn:
     refs: list[int] = field(default_factory=list)  # data addresses referenced
     mem_target: int | None = None  # `call/jmp [mem]`: address of the pointer slot
     _regs: tuple | None = field(default=None, repr=False, compare=False)    # (read, write), on first use
-    cs: object = field(default=None, repr=False, compare=False)  # underlying capstone insn (detail available)
+    _cs: object = field(default=None, repr=False, compare=False)  # underlying capstone insn (detail available)
     cond: bool = False  # ARM: executes only when its condition holds
     thumb: bool = False  # ARM: decoded as Thumb
     delay: bool = False  # MIPS: in the delay slot of the branch before it (runs before the branch takes effect)
+    _dis: object = field(default=None, repr=False, compare=False)  # decodes `cs` on first use
+
+    @property
+    def cs(self):
+        """The capstone instruction (operand detail): decoded again on first use for instructions
+        found by a lightweight decode."""
+        if self._cs is None and self._dis is not None:
+            self._cs = self._dis._full(self)
+        return self._cs
 
     @property
     def end(self) -> int:
@@ -103,6 +112,59 @@ def capstone_for(arch: str, endian: str = "little") -> cs.Cs:
 _X86_CJMP = {"jo", "jno", "js", "jns", "je", "jne", "jb", "jae", "jbe", "ja", "jl", "jge", "jle", "jg",
              "jp", "jnp", "jcxz", "jecxz", "jrcxz", "loop", "loope", "loopne"}
 _HALT = {"hlt", "ud2", "int3", "brk", "udf", "ebreak"}
+
+
+def _x86_operands(op_str: str) -> list[tuple] | None:
+    """The immediates and memory operands of capstone's Intel-syntax text, as ("imm", value) and
+    ("mem", base, index, disp) -- what classification needs, without capstone's (costly) operand
+    detail. None for text it does not take."""
+    out = []
+    for op in op_str.split(", "):
+        k = op.find("[")
+        if k < 0:
+            if op[:1] in "0123456789-":
+                try:
+                    out.append(("imm", int(op, 0)))
+                except ValueError:
+                    return None
+            continue
+        if not op.endswith("]"):
+            return None
+        base = index = ""
+        disp, sign = 0, 1
+        for t in op[k + 1:-1].split(" "):
+            if t == "+":
+                sign = 1
+            elif t == "-":
+                sign = -1
+            elif "*" in t:
+                index = t
+            elif t[:1].isdigit():
+                try:
+                    disp += sign * int(t, 0)
+                except ValueError:
+                    return None
+            elif t.isalnum():
+                if base:
+                    index = t           # (`[rdx + rdi]`: scale 1)
+                else:
+                    base = t
+            else:
+                return None
+        out.append(("mem", base, index, disp))
+    return out
+
+
+def _x86_cs_operands(c) -> list[tuple]:
+    out = []
+    for op in c.operands:
+        if op.type == OP_IMM:
+            out.append(("imm", op.imm))
+        elif op.type == OP_MEM:
+            mm = op.mem
+            base = "rip" if mm.base == cs.x86.X86_REG_RIP else c.reg_name(mm.base) if mm.base else ""
+            out.append(("mem", base, c.reg_name(mm.index) if mm.index else "", mm.disp))
+    return out
 
 
 class Disassembler:
@@ -180,13 +242,22 @@ class Disassembler:
         """Decode the instruction at `addr` and the few after it in one capstone call (an
         instruction decodes the same however it is reached, so they are cached for later)."""
         first = None
-        for c in self.md.disasm(self.bin.read(addr, 16 * self.RUN), addr, self.RUN):
-            if first is not None and not (self.bin.is_exec(c.address) or self.bin.format == "RAW"):
+        code = self.bin.read(addr, 16 * self.RUN)
+        lite = self.arch in ("x86", "x64")
+        run = self.md.disasm_lite(code, addr, self.RUN) if lite else \
+            ((c.address, c.size, c.mnemonic, c.op_str, c) for c in self.md.disasm(code, addr, self.RUN))
+        for c in run:
+            a, size, mnem, ops = c[:4]
+            if first is not None and not (self.bin.is_exec(a) or self.bin.format == "RAW"):
                 break                              # (decode() answers None outside code)
-            i = self._cache.get(c.address)
-            if i is None and c.address not in self._cache:
-                i = self._convert(c)
-                self._cache[c.address] = i
+            i = self._cache.get(a)
+            if i is None and a not in self._cache:
+                if lite:        # (capstone's operand detail only when it is needed)
+                    i = Insn(a, size, mnem, ops, code[a - addr:a - addr + size], _dis=self)
+                    self._classify_x86(i)
+                else:
+                    i = self._convert(c[4])
+                self._cache[a] = i
             if first is None:
                 first = i
             if i is not None and i.kind in (JMP, RET):
@@ -220,15 +291,20 @@ class Disassembler:
 
     # ------------------------------------------------------------- classify
     def _convert(self, c, thumb: bool = False) -> Insn:
-        i = Insn(c.address, c.size, c.mnemonic, c.op_str, bytes(c.bytes), cs=c, thumb=thumb)
+        i = Insn(c.address, c.size, c.mnemonic, c.op_str, bytes(c.bytes), _cs=c, thumb=thumb)
         if self.arch in ("x86", "x64"):
-            self._classify_x86(c, i)
+            self._classify_x86(i)
         else:
             self._classify_generic(c, i)
         return i
 
-    def _classify_x86(self, c, i: Insn):
-        m = c.mnemonic
+    def _full(self, i: Insn):
+        with self._lock:
+            md = self.md_thumb if i.thumb else self.md
+            return next(md.disasm(i.raw, i.addr, 1), None)
+
+    def _classify_x86(self, i: Insn):
+        m = i.mnemonic
         for p in ("notrack ", "bnd ", "rep ", "repne "):
             if m.startswith(p) and m[len(p):] in ("jmp", "call", "ret"):
                 m = m[len(p):]
@@ -242,25 +318,31 @@ class Disassembler:
             i.kind = RET
         elif m in _HALT:
             i.kind = HALT
-        nxt = c.address + c.size
-        for op in c.operands:
-            if op.type == OP_IMM:
+        if "[" not in i.op_str and "0x" not in i.op_str:
+            return                      # (no address in it)
+        ops = _x86_operands(i.op_str)
+        if ops is None:                 # (an operand the text parse does not take: capstone's detail)
+            ops = _x86_cs_operands(i.cs)
+        nxt = i.end
+        for op in ops:
+            if op[0] == "imm":
+                imm = op[1]
                 if i.kind in (CALL, JMP, CJMP):
-                    i.target = op.imm & self._mask
-                elif self.bin.is_mapped(op.imm & self._mask) and op.imm > 0xFF:
-                    i.refs.append(op.imm & self._mask)
-            elif op.type == OP_MEM:
-                mm = op.mem
+                    i.target = imm & self._mask
+                elif imm > 0xFF and self.bin.is_mapped(imm & self._mask):
+                    i.refs.append(imm & self._mask)
+            else:
+                _, base, index, disp = op
                 addr = None
-                if mm.base == cs.x86.X86_REG_RIP:
-                    addr = (nxt + mm.disp) & self._mask
-                elif mm.base == 0 and mm.index == 0:
-                    addr = mm.disp & self._mask
-                elif mm.disp > 0xFFFF and self.bin.is_mapped(mm.disp & self._mask):
-                    addr = mm.disp & self._mask  # table[reg*8]
+                if base == "rip":
+                    addr = (nxt + disp) & self._mask
+                elif not base and not index:
+                    addr = disp & self._mask
+                elif disp > 0xFFFF and self.bin.is_mapped(disp & self._mask):
+                    addr = disp & self._mask  # table[reg*8]
                 if addr is not None:
                     i.refs.append(addr)
-                    if i.kind in (CALL, JMP) and mm.index == 0:
+                    if i.kind in (CALL, JMP) and not index:
                         i.mem_target = addr
 
     def _classify_generic(self, c, i: Insn):
