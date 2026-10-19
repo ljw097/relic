@@ -7,13 +7,13 @@ GUI는 PySide6, 명령어 디코딩은 capstone을 쓰고, 그 위의 분석·�
 
 목표는 IDA Pro + Hex-Rays 수준이고, 가능하면 그 이상입니다. 아직 갈 길이 멀지만 x86-64나 ARM 바이너리를 열어
 함수를 훑어보고, 이름을 붙이고, 의사 코드를 읽고, 디버거로 오버플로 오프셋을 재는 데는 지금도 충분히 쓸 만합니다.
-현재 버전은 [0.1.0 베타](https://github.com/ljw097/relic/releases/tag/v0.1.0)입니다.
+현재 버전은 [1.0.0](https://github.com/ljw097/relic/releases/tag/v1.0.0)입니다.
 
 ![Relic 디버거: vuln()에서 gets() 직후에 멈춘 화면. 입력한 AAAA…가 레지스터와 스택 telescope에 보인다](docs/screenshots/debugger.png)
 
 ## 설치
 
-[릴리스 페이지](https://github.com/ljw097/relic/releases/tag/v0.3.0)에서 자기 운영체제에 맞는 실행 파일을 받아
+[릴리스 페이지](https://github.com/ljw097/relic/releases/tag/v1.0.0)에서 자기 운영체제에 맞는 실행 파일을 받아
 실행하면 됩니다. 따로 설치할 것은 없습니다.
 
 - **Windows**: `relic-<버전>-windows-x86_64.exe`
@@ -28,7 +28,7 @@ Python 3.10 이상이 있다면 릴리스 페이지의 wheel로 패키지로 설
 
 ```sh
 python3 -m venv .venv
-.venv/bin/pip install https://github.com/ljw097/relic/releases/download/v0.3.0/relic_re-0.3.0-py3-none-any.whl
+.venv/bin/pip install https://github.com/ljw097/relic/releases/download/v1.0.0/relic_re-1.0.0-py3-none-any.whl
 .venv/bin/relic
 ```
 
@@ -83,7 +83,7 @@ python3 -m venv .venv
 
 정밀하게 잰 값이 아니라 어림값입니다. 각 영역에서 "IDA가 하는 일 중 Relic이 비슷한 수준으로 하는 비율"로 읽어 주세요.
 전체 값은 영역별 가중 평균이며, 가중치는 실제 리버싱에서 각 영역이 차지하는 비중을 제 기준으로 정했습니다.
-현재 **약 88%**입니다.
+현재 **약 91%**입니다.
 
 | 영역 (가중치) | 진행률 | 비고 |
 |---|---|---|
@@ -91,8 +91,8 @@ python3 -m venv .venv
 | 프로세서 (8) | 100% | 디컴파일: x86/x64, ARM/Thumb, AArch64, MIPS32/64, RISC-V RV32/RV64, PowerPC 32/64(ELFv1·ELFv2). 디스어셈블: SPARC, SystemZ, M68K, SH, TriCore, eBPF, WebAssembly |
 | 자동 분석 (14) | 100% | stripped bash에서 `.eh_frame`에 있는 함수의 99.9%, `.eh_frame`을 지워도 99.96%를 찾음(돌아오지 않는 함수 추론, 꼬리 호출, 데이터 속 함수 포인터). RTTI로 C++ 클래스·vtable 복원(gcc/clang, MSVC), 객체를 따라가 가상 호출 대상 해석, 모든 프로세서에서 함수 포인터 변수를 거친 호출, 코드 사이 데이터 감지, bash 약 7초 |
 | 라이브러리 식별 (8) | 100% | 테스트용 stripped 정적 C 바이너리에서 원래 심볼이 있던 함수의 83~94%에 이름을 붙이며, 잘못 붙인 이름은 없습니다 |
-| 타입 시스템 (10) | 85% | 구조체 값 전달(by-value) 인자·반환 미지원 |
-| 디컴파일러 (20) | 52% | goto가 아직 많고, x87 부동소수점과 SIMD는 미지원 |
+| 타입 시스템 (10) | 90% | libc 플래그 인자를 헤더 상수 이름으로(`PROT_READ \| PROT_WRITE`), 헤더의 `#define` 묶음은 열거형으로, PE는 Microsoft 비트필드 레이아웃. 구조체 값 전달(by-value) 인자·반환 미지원 |
+| 디컴파일러 (20) | 60% | goto는 벤치마크 시작 때의 절반, 남은 것은 대부분 큰 상태 기계 함수(gnulib `quotearg`, gzip deflate). SSE/AVX는 Intel intrinsic으로. x87 부동소수점 미지원 |
 | 대화형 UI (12) | 100% | |
 | 스크립팅·확장 (8) | 100% | |
 | 디버거 (7) | 100% | Windows(PE) 프로그램은 wine에서 Windows용 gdbserver.exe로 |

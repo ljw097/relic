@@ -7,13 +7,13 @@ The GUI is PySide6 and disassembly comes from capstone; the analysis, decompiler
 
 I'll admit the goal is ambitious: as good as IDA Pro + Hex-Rays, and better where I can manage it.
 There's a long way to go, but opening an x86-64 or ARM binary, browsing functions, naming things, reading pseudocode
-and measuring an overflow offset in the debugger all work fine today. The current release is [0.1.0 beta](https://github.com/ljw097/relic/releases/tag/v0.1.0).
+and measuring an overflow offset in the debugger all work fine today. The current release is [1.0.0](https://github.com/ljw097/relic/releases/tag/v1.0.0).
 
 ![The Relic debugger stopped in vuln() right after gets(): the AAAA… input shows up in the registers and the stack telescope](docs/screenshots/debugger.png)
 
 ## Installing
 
-Download the executable for your system from the [release page](https://github.com/ljw097/relic/releases/tag/v0.3.0)
+Download the executable for your system from the [release page](https://github.com/ljw097/relic/releases/tag/v1.0.0)
 and start it; there is nothing to install:
 
 - **Windows**: `relic-<version>-windows-x86_64.exe`
@@ -28,7 +28,7 @@ With Python 3.10+, the wheel on the release page installs the same thing as a pa
 
 ```sh
 python3 -m venv .venv
-.venv/bin/pip install https://github.com/ljw097/relic/releases/download/v0.3.0/relic_re-0.3.0-py3-none-any.whl
+.venv/bin/pip install https://github.com/ljw097/relic/releases/download/v1.0.0/relic_re-1.0.0-py3-none-any.whl
 .venv/bin/relic
 ```
 
@@ -80,7 +80,7 @@ Roughly, here's what works:
 ### Where it stands against IDA
 
 These numbers are eyeballed. Read them as "the share of what IDA does in that area that Relic does about as well."
-The total is a weighted average, with weights from how much each area matters to me when I'm actually reversing. Right now it's **about 89%**.
+The total is a weighted average, with weights from how much each area matters to me when I'm actually reversing. Right now it's **about 91%**.
 
 | Area (weight) | Progress | Notes |
 |---|---|---|
@@ -89,7 +89,7 @@ The total is a weighted average, with weights from how much each area matters to
 | Auto-analysis (14) | 100% | Finds 99.9% of the functions `.eh_frame` lists in stripped bash, 99.96% with `.eh_frame` removed (noreturn inference, tail calls, function pointers in data); C++ classes and vtables from RTTI (gcc/clang and MSVC); virtual calls resolved by following objects; calls through function-pointer variables on every processor; data among code; bash in about 7 seconds |
 | Library identification (8) | 100% | On the stripped static C test binaries, 83–94% of the functions that had symbols get named, with no wrong names |
 | Type system (10) | 90% | libc flag arguments print as their constants (`PROT_READ \| PROT_WRITE`), `#define` groups from headers become enums, Microsoft bit-field layout on PE; no by-value struct arguments or returns |
-| Decompiler (20) | 52% | Too many gotos left, no x87 floating point |
+| Decompiler (20) | 60% | Gotos are down to half of where the benchmark started; most of what's left is in big state machines (gnulib `quotearg`, gzip's deflate). SSE/AVX as Intel intrinsics; no x87 floating point |
 | Interactive UI (12) | 100% | |
 | Scripting & extensions (8) | 100% | |
 | Debugger (7) | 100% | Windows (PE) programs run under wine with Windows' own gdbserver.exe |

@@ -10,11 +10,11 @@ on:
       version:
         description: "Version (must equal pyproject.toml's)"
         required: true
-        default: "0.3.0"
+        default: "1.0.0"
       prerelease:
         description: "Mark as a pre-release (beta)"
         type: boolean
-        default: true
+        default: false
 
 permissions:
   contents: write

@@ -239,6 +239,8 @@ def _run_tree(tree, oracle, limit=60, tables=None):
     def ev(c):
         if isinstance(c, Var):
             a = int(c.name[1:], 16)
+            if a not in val:                # (an empty block the tree dropped: its test alone)
+                val[a] = oracle(a, seen.get(a, 0) + 1)
             return _choice(a, val[a], tables)
         if isinstance(c, Const):
             return bool(c.value)
@@ -437,3 +439,21 @@ def test_switch_through_a_variable_shows_the_index():
     assert sw.expr == i
     assert sorted(v for c in sw.cases for v in c.values) == [0, 1, 2]
     assert len(st.hidden) == 1                       # the target computation is left out
+
+
+def test_goto_from_else_if_into_the_then_branch_merges_the_conditions():
+    """`if (c1) { P; L: Q } else if (c2) goto L; else E` becomes
+    `if (c1 || c2) { if (c1) P; Q } else E`: no goto (cat's locale charset check)."""
+    chain = [0x130 + 0x10 * k for k in range(8)]            # Q: too long to copy
+    edges = {0x100: [0x110, 0x120], 0x110: [0x130], 0x120: [0x130, 0x200], 0x200: [0x300], 0x300: []}
+    edges.update({a: [b] for a, b in zip(chain, chain[1:])})
+    edges[chain[-1]] = [0x300]
+    fn = _cfg(edges, 0x100)
+    fn.blocks[0x120].stmts.pop(0)                           # (only the test: nothing before c2)
+    st = Structurer(fn)
+    tree = st.run()
+    assert not st.gotos
+    assert "c100 || c120" in to_pseudocode(fn).replace("_0", "")
+    for oracle in _oracles():
+        cfg = [a for a in _run_cfg(fn, oracle) if a != 0x120]
+        assert _run_tree(tree, oracle, tables=_tables(fn)) == cfg
