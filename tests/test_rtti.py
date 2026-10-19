@@ -128,3 +128,57 @@ def test_virtual_calls_on_objects(classes):
     assert speak in got and deleting in got
     own = {v.slots[0] for v in cl["Named"].vtables[:1]}         # (Named's own, when it has a vtable: -O0)
     assert any(name in t and t <= {name} | own for t in got)
+
+
+def test_virtual_calls_on_arguments(classes):
+    """show(const Animal *a), only ever called with make()'s object: a->sound(), a->legs()."""
+    _, path = classes
+    an = analyze(path)
+    slots = {n: an.classes[n].vtables[0].slots for n in ("Dog", "Bird", "Parrot")}
+    main = an.function_by_name("main")
+    speak = an.functions[slots["Dog"][4]]
+    rest = {}
+    for a, (t, _) in an.icalls.items():
+        f = an.function_at(a)
+        if f is not main and f is not speak:
+            rest.setdefault(f.addr, set()).add(t)
+    sound = frozenset(slots[n][2] for n in slots)
+    legs = frozenset(slots[n][3] for n in slots)
+    assert any(ts == {sound, legs} for ts in rest.values()), rest
+
+
+@pytest.fixture(scope="module", params=["O0", "O2"])
+def a64(request, tmp_path_factory):
+    """tests/src/classes.cpp for AArch64, stripped: by aarch64-linux-gnu-g++, or by clang against
+    the cross C++ runtime library."""
+    d = tmp_path_factory.mktemp("a64")
+    out = str(d / "classes")
+    src = os.path.join(HERE, "src", "classes.cpp")
+    gxx = shutil.which("aarch64-linux-gnu-g++")
+    gcc, clang = shutil.which("aarch64-linux-gnu-gcc"), shutil.which("clang++")
+    lib = "/usr/aarch64-linux-gnu/lib/libstdc++.so.6"
+    if gxx:
+        subprocess.run([gxx, f"-{request.param}", "-o", out, src], check=True)
+    elif gcc and clang and os.path.exists(lib):
+        subprocess.run([clang, "--target=aarch64-linux-gnu", f"-{request.param}", "-c", "-o", out + ".o", src],
+                       check=True)
+        subprocess.run([gcc, "-o", out, out + ".o", lib], check=True)
+    else:
+        pytest.skip("needs an AArch64 C++ compiler")
+    subprocess.run([shutil.which("aarch64-linux-gnu-strip") or "strip", out], check=True)
+    return out
+
+
+def test_a64_virtual_calls(a64):
+    """AArch64: the same classes, and main's calls -- make()'s object (constructors at -O0, vtables
+    stored in place, two at once by `stp`, at -O2), the dynamic_cast result -- and show()'s."""
+    an = analyze(a64)
+    cl = an.classes
+    assert cl["Parrot"].bases == ["Bird", "Named"] and [v.offset for v in cl["Parrot"].vtables] == [0, -8]
+    slots = {n: cl[n].vtables[0].slots for n in ("Dog", "Bird", "Parrot")}
+    main = an.function_by_name("main")
+    got = [t for a, (t, _) in an.icalls.items() if main.block_at(a) is not None]
+    assert frozenset({slots["Dog"][4]}) in got and frozenset(slots[n][1] for n in slots) in got
+    assert any(cl["Parrot"].vtables[1].slots[0] in t for t in got)
+    sound = frozenset(slots[n][2] for n in slots)
+    assert sum(t == sound for _, (t, _) in an.icalls.items()) >= 2          # (show() and speak())

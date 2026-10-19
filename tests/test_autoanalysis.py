@@ -200,3 +200,5 @@ def test_cross_function_pointer_variables(cc, tmp_path):
     sites = sorted((v for a, v in an.icalls.items() if f.block_at(a) is not None), key=lambda v: len(v[0]))
     die, plain, loud = (sym[n] & ~1 for n in ("die_cb", "log_plain", "log_loud"))
     assert sites == [(frozenset({die}), True), (frozenset({plain, loud}), True)]
+    fatal = next(a for a, v in an.icalls.items() if v == (frozenset({die}), True) and f.block_at(a) is not None)
+    assert not f.block_at(fatal).succs                     # (does not return: the block ends there)

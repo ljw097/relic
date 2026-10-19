@@ -13,7 +13,7 @@ and measuring an overflow offset in the debugger all work fine today. The curren
 
 ## Installing
 
-Download the executable for your system from the [release page](https://github.com/ljw097/relic/releases/tag/v0.2.0)
+Download the executable for your system from the [release page](https://github.com/ljw097/relic/releases/tag/v0.3.0)
 and start it; there is nothing to install:
 
 - **Windows**: `relic-<version>-windows-x86_64.exe`
@@ -28,7 +28,7 @@ With Python 3.10+, the wheel on the release page installs the same thing as a pa
 
 ```sh
 python3 -m venv .venv
-.venv/bin/pip install https://github.com/ljw097/relic/releases/download/v0.2.0/relic_re-0.2.0-py3-none-any.whl
+.venv/bin/pip install https://github.com/ljw097/relic/releases/download/v0.3.0/relic_re-0.3.0-py3-none-any.whl
 .venv/bin/relic
 ```
 

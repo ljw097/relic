@@ -87,6 +87,7 @@ jobs:
           sudo apt-get install -y -q gcc-mips-linux-gnu gcc-mips64el-linux-gnuabi64 || true
           sudo apt-get install -y -q gcc-powerpc-linux-gnu gcc-powerpc64le-linux-gnu || true
           sudo apt-get install -y -q gcc-riscv64-linux-gnu || sudo apt-get install -y -q gcc-14-riscv64-linux-gnu
+          sudo apt-get install -y -q g++-aarch64-linux-gnu || true     # C++ classes (RTTI) on AArch64
           sudo apt-get install -y -q qemu-user        # runs the recompiled MIPS / AArch64 / ARM / RISC-V pseudocode
           sudo apt-get install -y -q gdb-multiarch    # debugs them under qemu-user's gdb stub
           ls /usr/bin/aarch64-linux-gnu-gcc* /usr/bin/arm-linux-gnueabihf-gcc*
@@ -99,6 +100,7 @@ jobs:
           pytest -q -rs tests/test_floats.py -k "a64 or arm or thumb or rv64 or rv32 or ppc"
           pytest -q -rs tests/test_libsigs.py -k cross
           pytest -q -rs tests/test_autoanalysis.py -k cross
+          pytest -q -rs tests/test_rtti.py -k a64
           pytest -q -rs tests/test_debug_targets.py -k qemu
       - uses: actions/upload-artifact@v4
         with:

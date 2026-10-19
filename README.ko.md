@@ -13,7 +13,7 @@ GUI는 PySide6, 명령어 디코딩은 capstone을 쓰고, 그 위의 분석·�
 
 ## 설치
 
-[릴리스 페이지](https://github.com/ljw097/relic/releases/tag/v0.2.0)에서 자기 운영체제에 맞는 실행 파일을 받아
+[릴리스 페이지](https://github.com/ljw097/relic/releases/tag/v0.3.0)에서 자기 운영체제에 맞는 실행 파일을 받아
 실행하면 됩니다. 따로 설치할 것은 없습니다.
 
 - **Windows**: `relic-<버전>-windows-x86_64.exe`
@@ -28,7 +28,7 @@ Python 3.10 이상이 있다면 릴리스 페이지의 wheel로 패키지로 설
 
 ```sh
 python3 -m venv .venv
-.venv/bin/pip install https://github.com/ljw097/relic/releases/download/v0.2.0/relic_re-0.2.0-py3-none-any.whl
+.venv/bin/pip install https://github.com/ljw097/relic/releases/download/v0.3.0/relic_re-0.3.0-py3-none-any.whl
 .venv/bin/relic
 ```
 

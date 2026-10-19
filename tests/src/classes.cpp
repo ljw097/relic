@@ -1,7 +1,9 @@
 // C++ classes for RTTI recovery: single inheritance, multiple inheritance, an abstract base with a
 // pure virtual method, a virtual destructor, a class nobody constructs outside its factory.
-#include <cstdio>
-#include <cstdlib>
+// (no headers: builds for other processors with only the C++ runtime library at hand)
+extern "C" int printf(const char *, ...);
+extern "C" int atoi(const char *);
+namespace std { using ::printf; using ::atoi; }
 
 struct Animal {
     virtual ~Animal() {}

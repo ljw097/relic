@@ -144,6 +144,7 @@ class FunctionAnalyzer:
         self._queue: list[int] = []
         self._fde: set[int] = set()     # ELF: function starts `.eh_frame` describes
         self.icalls: dict[int, tuple[frozenset[int], bool]] = {}   # indirect call -> (targets, all of them)
+        self.generic_icalls: dict = {}       # the same for other processors, once their loads have addresses
         self._code_refs: dict[int, int | str] = {}   # x86: code-section address the code reads -> size / "string"
         self.code_data: dict[int, list] = {}         # data found among code: addr -> definition (data_defs form)
 
@@ -212,7 +213,7 @@ class FunctionAnalyzer:
         follows (often the next function); they are analyzed again, until nothing changes."""
         from .icalls import SlotTargets
         while True:
-            self.icalls = SlotTargets(self.bin, self.funcs).run()
+            self.icalls = {**self.generic_icalls, **SlotTargets(self.bin, self.funcs).run()}
             new: set[int] = set()
             changed = True
             while changed:
@@ -227,17 +228,21 @@ class FunctionAnalyzer:
             sites = {a for a, (t, _) in self.icalls.items() if t & new}
             redo = [f for f in self.funcs.values() if not f.is_import and
                     ((f.calls | f.tail_calls) & new or sites and self._has_site(f, sites))]
-            for f in redo:
-                for blk in f.blocks.values():
-                    for i in blk.insns:
-                        self.prev.pop(i.end, None)
-                del self.funcs[f.addr]
-                if self.dis.md_thumb is not None and f.addr in f.blocks:
-                    self.dis.hint(f.addr, f.blocks[f.addr].insns[0].thumb)
-                self._analyze(f.addr)
-                g = self.funcs[f.addr]
-                g.name, g.noreturn, g.library = f.name, f.noreturn, f.library
-            self._drain()
+            self.reanalyze(redo)
+
+    def reanalyze(self, funcs: list[Function]):
+        """Analyse these functions again (keeping their names), and what they newly reach."""
+        for f in funcs:
+            for blk in f.blocks.values():
+                for i in blk.insns:
+                    self.prev.pop(i.end, None)
+            del self.funcs[f.addr]
+            if self.dis.md_thumb is not None and f.addr in f.blocks:
+                self.dis.hint(f.addr, f.blocks[f.addr].insns[0].thumb)
+            self._analyze(f.addr)
+            g = self.funcs[f.addr]
+            g.name, g.noreturn, g.library = f.name, f.noreturn, f.library
+        self._drain()
 
     @staticmethod
     def _has_site(f: Function, sites: set[int]) -> bool:
