@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import bisect
+import re
 from dataclasses import dataclass, field
 
 from ..disasm import CALL, CJMP, HALT, JMP, RET, Disassembler, Insn
@@ -116,6 +117,21 @@ class Function:
 _ENDBR = (b"\xf3\x0f\x1e\xfa", b"\xf3\x0f\x1e\xfb")
 
 
+def _def_size(d: list, word: int) -> int:
+    if d[0] == "string":
+        return d[1]
+    return {"byte": 1, "word": 2, "dword": 4, "qword": 8}[d[1]] * d[2]
+
+
+def _c_string(b: Binary, a: int) -> str | None:
+    """The printable NUL-terminated text (4 characters or more) at `a`, if that is what is there."""
+    raw = b.read(a, 256) or b""
+    n = raw.find(b"\0")
+    if n < 4 or not all(32 <= c < 127 or c in (9, 10, 13) for c in raw[:n]):
+        return None
+    return raw[:n].decode("latin-1")
+
+
 class FunctionAnalyzer:
     MAX_INSNS = 200_000
 
@@ -128,6 +144,8 @@ class FunctionAnalyzer:
         self._queue: list[int] = []
         self._fde: set[int] = set()     # ELF: function starts `.eh_frame` describes
         self.icalls: dict[int, tuple[frozenset[int], bool]] = {}   # indirect call -> (targets, all of them)
+        self._code_refs: dict[int, int | str] = {}   # x86: code-section address the code reads -> size / "string"
+        self.code_data: dict[int, list] = {}         # data found among code: addr -> definition (data_defs form)
 
     # ------------------------------------------------------------- driver
     def run(self) -> dict[int, Function]:
@@ -149,6 +167,7 @@ class FunctionAnalyzer:
             self._drain()
         self._eh_frame_seeds()
         self._data_pointer_seeds()
+        self._code_data()
         self._infer_noreturn()
         self._scan_gaps()
         self._infer_noreturn()
@@ -305,6 +324,79 @@ class FunctionAnalyzer:
                 self._queue.append(a)
         self._drain()
 
+    _WIDTH = {"byte": 1, "word": 2, "dword": 4, "qword": 8, "xmmword": 16, "ymmword": 32, "tbyte": 10}
+
+    def _x86_code_refs(self, i: Insn):
+        """Addresses in code sections this instruction reads or writes (not a branch, not `lea`):
+        data, not code -- and with how wide the access is; a C string `lea` points at."""
+        from ..disasm import _x86_operands
+        b = self.bin
+        if i.kind in (CALL, JMP, CJMP):
+            return
+        if i.mnemonic == "lea" or "[" not in i.op_str:
+            for r in i.refs:
+                if b.is_exec(r) and r not in self.funcs:
+                    if _c_string(b, r):
+                        self._code_refs[r] = "string"
+                    elif i.mnemonic == "lea" and not self._looks_like_code(r):
+                        self._code_refs.setdefault(r, 1)        # (the start of some data)
+            return
+        for op in _x86_operands(i.op_str) or ():
+            if op[0] != "mem" or op[2]:
+                continue
+            a = (i.end + op[3]) if op[1] in ("rip", "eip") else op[3] if not op[1] else None
+            if a is None:
+                continue
+            a &= (1 << b.bits) - 1
+            if b.is_exec(a) and a not in self.funcs:
+                m = re.search(r"(\w+) ptr", i.op_str)
+                word = self._WIDTH.get(m.group(1), b.bits // 8) if m else b.bits // 8
+                self._code_refs.setdefault(a, word)
+
+    def _code_data(self):
+        """Data among code (x86: hand-written assembly, data a compiler put in `.text`): what the
+        code reads there -- strings, tables of function pointers (their functions are found), runs
+        of values up to the next thing the code refers to or the next function."""
+        b = self.bin
+        if not self._code_refs:
+            return
+        inside = self._covered()
+        word = b.bits // 8
+        stops = sorted(set(self._code_refs) | set(self.funcs) |
+                       {blk.addr for f in self.funcs.values() if not f.is_import for blk in f.blocks.values()})
+        for a, kind in sorted(self._code_refs.items()):
+            if inside(a) or a in self.code_data:
+                continue
+            sec = b.section_at(a)
+            k = bisect.bisect_right(stops, a)
+            end = min(stops[k] if k < len(stops) else sec.end, sec.end, a + 0x1000)
+            if kind == "string":
+                n = len(_c_string(b, a)) + 1
+                self.code_data[a] = ["string", min(n, end - a)]
+                continue
+            if kind == word:                # (a table of function pointers?)
+                ptrs = []
+                for p in range(a, end - word + 1, word):
+                    v = b.read_ptr(p)
+                    if not v or not b.is_exec(v) or not self._looks_like_code(v):
+                        break
+                    ptrs.append(v)
+                if ptrs:
+                    self.code_data[a] = ["array", {4: "dword", 8: "qword"}[word], len(ptrs)]
+                    self._queue.extend(ptrs)
+                    continue
+            # values up to the next reference -- not into what looks like the start of a function
+            e = a + kind
+            while e < end:
+                if e % 16 == 0 and b.read(e, 4) in _ENDBR + (b"\x55\x48\x89\xe5",):
+                    break
+                e += kind
+            e = min(e, end)
+            name = {1: "byte", 2: "word", 4: "dword", 8: "qword"}.get(kind, "byte")
+            n = (e - a) // (kind if name != "byte" or kind == 1 else 1)
+            self.code_data[a] = ["array", name, max(n, 1)] if name != "byte" or kind == 1 else ["array", "byte", e - a]
+        self._drain()
+
     def _drain(self):
         while self._queue:
             report("functions", len(self.funcs))
@@ -354,6 +446,7 @@ class FunctionAnalyzer:
         edges: dict[int, list[int]] = {}  # terminator addr -> successors
         work = [start]
         pic = self.dis.arch == "x64" and getattr(self.bin, "elf_type", None) == "ET_DYN"
+        x86 = self.dis.arch in ("x64", "x86")
         while work and len(insns) < self.MAX_INSNS:
             a = work.pop()
             while a not in insns:
@@ -440,10 +533,13 @@ class FunctionAnalyzer:
                 # function pointers taken by address -- not on ARM (its immediates are offsets and
                 # masks, addresses come from literal pools) nor from AArch64 `adr` (local labels
                 # such as a jump table's base; function pointers come from `adrp` + `add`)
+                if x86 and i.refs:
+                    self._x86_code_refs(i)
                 # (x86-64 PIC takes addresses `rip`-relative: its immediates are numbers, not addresses)
                 for r in (i.refs if self.dis.md_thumb is None and i.mnemonic != "adr" and
                           not (pic and not (i.mnemonic == "lea" and "rip" in i.op_str)) else ()):
-                    if r not in self.funcs and self.bin.is_exec(r) and r != start and self._looks_like_code(r):
+                    if r not in self.funcs and self.bin.is_exec(r) and r != start and r not in self._code_refs \
+                            and self._looks_like_code(r):
                         self._queue.append(r)
                 self.prev[nxt] = a
                 a = nxt
@@ -1275,6 +1371,9 @@ class FunctionAnalyzer:
             for f in self.funcs.values():
                 if not f.is_import:
                     cover.add_blocks(f, sec)
+            for a, d in self.code_data.items():         # (data among code: no function starts there)
+                if sec.contains(a):
+                    cover.add(a, a + _def_size(d, self.bin.bits // 8))
             known = set(self.funcs)
             pos = sec.addr
             while True:

@@ -90,7 +90,7 @@ def window(an: "Analysis", addr: int) -> tuple[int, int] | None:
 def region_lines(an: "Analysis", start: int, end: int) -> list[Line]:
     """The items from `start` to `end`, one line each (and a label line before named or
     referenced addresses)."""
-    defs = an.data_defs
+    defs = {**getattr(an, "code_data", {}), **an.data_defs}      # (the user's definitions win)
     stops = set(defs) | {s.addr for s in an.strings if start <= s.addr < end}
     stops |= {a for a in an.bin.symbols if start <= a < end}
     stops |= {a for a in an.xrefs_to if start <= a < end}

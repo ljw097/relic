@@ -92,7 +92,7 @@ IDA의 60여 개 CPU 계열 전부가 아니라, 리버싱·포너블·펌웨어
 - [x] 추적: 명령 단위 추적 기록(Debug ▸ Trace instructions), 리스팅에 실행된 명령 표시
 - [x] Windows(PE) 대상: Windows의 gdbserver.exe로 원격, Linux에서는 wine으로 자동 실행(win32·win64, 입출력·환경 변수·DLL 모듈)
 
-## P1 — 자동 분석 100%까지 (README 95%)
+## P1 — 자동 분석 100%까지 (README 97%)
 
 기준: stripped 실제 바이너리(coreutils·grep·gzip·bash)에서 `.eh_frame`의 함수 진입점을 정답으로 한 함수 찾기 재현율, 해석되지 않은 간접 점프 수.
 
@@ -106,7 +106,7 @@ IDA의 60여 개 CPU 계열 전부가 아니라, 리버싱·포너블·펌웨어
 - [x] C++ 클래스(Itanium RTTI, ELF): typeinfo(`__class_type_info`/`__si_`/`__vmi_` 재배치)로 클래스·기반 클래스, 데이터에서 vtable(기반마다 하나), 가상 메서드 이름(`Dog::vfunc2`, 여럿이 공유하면 공통 기반 클래스, 두 번째 vtable은 `Parrot::thunk8_vfunc0`), `typeinfo for X`·`vtable for X`, `relic classes`
 - [x] 가상 메서드 안의 `this`를 거친 가상 호출(x86-64): 그 슬롯의, 클래스와 파생 클래스들의 메서드(클래스 계층 분석) → xref·리스팅
 - [ ] 간접 호출 대상: `this`가 아닌 객체의 가상 호출(타입 전파), MSVC RTTI(PE), x86 외 아키텍처
-- [ ] 코드 사이 데이터 감지(ARM 리터럴 풀 밖, 손으로 쓴 어셈블리)
+- [x] 코드 사이 데이터 감지(x86, 손으로 쓴 어셈블리·`.text` 속 데이터): 코드가 읽고 쓰는 `.text` 주소(접근 폭으로 dword/qword 배열), `lea`가 가리키는 C 문자열(함수가 아님 → 문자열 목록·의사 코드), 코드 포인터가 이어지는 표(그 함수들을 찾음). 함수 찾기·틈 스캔이 그 안에서 함수를 만들지 않고, 리스팅은 `db "..."`/`dd`/`dq offset`으로
 - [x] 큰 바이너리 분석 속도: x86는 capstone `disasm_lite` + Intel 문법 연산자 텍스트 파싱(주소가 든 것만), 상세 정보는 처음 쓸 때 디코드. bash 함수 찾기 34초 → 7초
 
 ## P1 — 타입 시스템 100%까지 (README 85%)

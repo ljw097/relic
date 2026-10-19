@@ -152,3 +152,30 @@ def test_calls_through_function_pointer_variables(noeh):
     fatal = next(a for a, (t, _) in sites.items() if syms["die_cb"] in t)
     assert not checked.block_at(fatal).succs                     # (the call ends its block)
     assert any(x.frm == fatal for x in an.xrefs_to[syms["die_cb"]])
+
+
+def test_data_among_code(tmp_path):
+    """What the code reads in `.text` is data: a string (not a function), numbers, a table of
+    function pointers -- whose functions are found."""
+    import platform
+    cc = shutil.which("gcc")
+    if cc is None or platform.machine() not in ("x86_64", "AMD64"):
+        pytest.skip("needs gcc for x86-64")
+    out = str(tmp_path / "datacode")
+    subprocess.run([cc, "-o", out, os.path.join(HERE, "src", "datacode.S")],
+                   check=True, capture_output=True)
+    subprocess.run(["strip", out], check=True)
+    an = analyze(out)
+    main = an.function_by_name("main")
+    lea = next(i for i in main.insns() if i.mnemonic == "lea")
+    msg = lea.refs[0]
+    assert an.code_data[msg] == ["string", 16] and msg not in an.functions
+    assert 'puts("hello from text")' in decompile(an, main).text
+    kinds = sorted(d[:2] for a, d in an.code_data.items() if a != msg)
+    assert kinds == [["array", "byte"], ["array", "dword"], ["array", "qword"]]
+    table = next(a for a, d in an.code_data.items() if d[:2] == ["array", "qword"])
+    ptrs = [an.bin.read_ptr(table + 8 * k) for k in range(an.code_data[table][2])]
+    assert len(ptrs) == 2 and all(p in an.functions for p in ptrs)
+    from relic.datalist import region_lines, window
+    text = "\n".join(f"{ln.mnemonic} {ln.operands}" for ln in region_lines(an, *window(an, msg)))
+    assert 'db "hello from text", 0' in text and "dd 2, 3, 4" in text
