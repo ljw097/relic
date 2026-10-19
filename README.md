@@ -80,13 +80,13 @@ Roughly, here's what works:
 ### Where it stands against IDA
 
 These numbers are eyeballed. Read them as "the share of what IDA does in that area that Relic does about as well."
-The total is a weighted average, with weights from how much each area matters to me when I'm actually reversing. Right now it's **about 87%**.
+The total is a weighted average, with weights from how much each area matters to me when I'm actually reversing. Right now it's **about 88%**.
 
 | Area (weight) | Progress | Notes |
 |---|---|---|
 | File formats (8) | 100% | Mach-O with Objective-C metadata (`[obj msg:arg]` in the pseudocode) |
 | Processors (8) | 80% | IDA handles 60+ CPU families, so this is the furthest behind |
-| Auto-analysis (14) | 97% | Finds 99.9% of the functions `.eh_frame` lists in stripped bash, and 99.96% with `.eh_frame` removed (noreturn inference, tail calls, function pointers in data); calls through function-pointer variables resolved; bash in about 7 seconds; C++ classes and vtables from RTTI; data among code; virtual calls only resolved through `this` |
+| Auto-analysis (14) | 100% | Finds 99.9% of the functions `.eh_frame` lists in stripped bash, 99.96% with `.eh_frame` removed (noreturn inference, tail calls, function pointers in data); C++ classes and vtables from RTTI (gcc/clang and MSVC); virtual calls resolved by following objects; calls through function-pointer variables on every processor; data among code; bash in about 7 seconds |
 | Library identification (8) | 100% | On the stripped static C test binaries, 83–94% of the functions that had symbols get named, with no wrong names |
 | Type system (10) | 85% | No by-value struct arguments or returns |
 | Decompiler (20) | 52% | Too many gotos left, no x87 floating point or SIMD |
