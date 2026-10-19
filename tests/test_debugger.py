@@ -199,3 +199,62 @@ def test_set_register_and_write_memory(vuln64):
         assert st.get("reason") == "exited" and int(st["exit-code"], 8) == 10
     finally:
         s.close()
+
+
+def test_child_env_undoes_the_bundles_library_path(monkeypatch):
+    """The stand-alone executables point LD_LIBRARY_PATH at their bundled libraries; gdb and
+    the other programs Relic starts get the original value back (or none)."""
+    import sys
+
+    from relic.sysenv import child_env
+    monkeypatch.setenv("LD_LIBRARY_PATH", "/tmp/_MEIxyz")
+    monkeypatch.delenv("LD_LIBRARY_PATH_ORIG", raising=False)
+    assert child_env()["LD_LIBRARY_PATH"] == "/tmp/_MEIxyz"        # (run from source: as it is)
+    monkeypatch.setattr(sys, "frozen", True, raising=False)
+    assert "LD_LIBRARY_PATH" not in child_env({"TERM": "dumb"})
+    monkeypatch.setenv("LD_LIBRARY_PATH_ORIG", "/opt/lib")
+    env = child_env()
+    assert env["LD_LIBRARY_PATH"] == "/opt/lib" and "LD_LIBRARY_PATH_ORIG" not in env
+
+
+@pytest.mark.skipif(shutil.which("gdb") is None or not os.path.exists("/proc"), reason="needs gdb on Linux")
+def test_gdb_starts_from_a_bundle_with_its_own_libstdcxx(monkeypatch, tmp_path):
+    """The 1.0.0 Linux executable: its older libstdc++ on LD_LIBRARY_PATH made the system gdb
+    die at once ("gdb exited"). A broken library there stands in for it."""
+    import sys
+
+    from relic.debugger.mi import GdbMI, MIError
+    (tmp_path / "libstdc++.so.6").write_bytes(b"not a library")
+    monkeypatch.setenv("LD_LIBRARY_PATH", str(tmp_path))
+    monkeypatch.delenv("LD_LIBRARY_PATH_ORIG", raising=False)
+    g = GdbMI()                                      # from source: the path is kept, gdb cannot start
+    try:
+        with pytest.raises(MIError, match="gdb exited: .*libstdc"):  # (and says why)
+            g.command("-gdb-version", timeout=20)
+    finally:
+        g.close()
+    monkeypatch.setattr(sys, "frozen", True, raising=False)
+    g = GdbMI()
+    try:
+        assert "GNU gdb" in g.command("-gdb-version", timeout=20).text
+    finally:
+        g.close()
+
+
+@pytest.mark.skipif(shutil.which("gdb") is None or shutil.which("gcc") is None, reason="needs gdb and gcc")
+@pytest.mark.parametrize("pie", [True, False])
+def test_start_at_main_of_a_stripped_program(tmp_path, pie):
+    """gdb knows no `main` in a stripped program (`-exec-run --start` ran it to the end): the
+    analysis' main is where it stops."""
+    from relic.debugger import Session
+    out = str(tmp_path / "hello")
+    subprocess.run(["gcc", "-O2", "-s", "-pie" if pie else "-no-pie", "-o", out,
+                    os.path.join(os.path.dirname(__file__), "src", "hello.c")], check=True)
+    an = analyze(out)
+    s = Session(out, analysis=an)
+    try:
+        st = s.start("main")
+        assert st.get("reason") == "breakpoint-hit", st
+        assert s.to_static(s.pc) == an.function_by_name("main").addr
+    finally:
+        s.close()

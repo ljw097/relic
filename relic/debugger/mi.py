@@ -12,12 +12,14 @@ to a callback, and the last `*stopped` is kept so callers can wait for it.
 """
 from __future__ import annotations
 
-import os
+import collections
 import queue
 import shutil
 import subprocess
 import threading
 from dataclasses import dataclass, field
+
+from ..sysenv import child_env
 
 
 class MIError(Exception):
@@ -161,7 +163,7 @@ class GdbMI:
         exe = gdb or find_gdb()
         if exe is None:
             raise FileNotFoundError("gdb not found (install gdb or gdb-multiarch)")
-        env = dict(os.environ, TERM="dumb", LC_ALL="C.UTF-8")
+        env = child_env({"TERM": "dumb", "LC_ALL": "C.UTF-8"})
         self.proc = subprocess.Popen([exe, "--interpreter=mi3", "-q", "-nx"], stdin=subprocess.PIPE,
                                      stdout=subprocess.PIPE, stderr=subprocess.STDOUT, env=env,
                                      text=True, encoding="utf-8", errors="replace", bufsize=1)
@@ -175,12 +177,15 @@ class GdbMI:
         self.stopped = threading.Event()
         self.last_stop: Record | None = None
         self.exited = False
+        self._tail: collections.deque = collections.deque(maxlen=4)   # gdb's last words, for errors
         self._reader = threading.Thread(target=self._read, daemon=True)
         self._reader.start()
 
     # reader thread
     def _read(self):
         for line in self.proc.stdout:
+            if line.strip() and line.strip() != "(gdb)":
+                self._tail.append(line.strip())
             try:
                 r = parse_record(line)
             except (ValueError, IndexError):
@@ -211,7 +216,12 @@ class GdbMI:
         self.exited = True
         self.stopped.set()
         for q in list(self._waiting.values()):
-            q.put(Record("result", "error", {"msg": "gdb exited"}))
+            q.put(Record("result", "error", {"msg": self.exit_message()}))
+
+    def exit_message(self) -> str:
+        """"gdb exited", with what it printed last when that was not MI (a loader error, a crash)."""
+        plain = [t for t in self._tail if t[:1] not in "^*+=~@&" and not t[:1].isdigit()]
+        return "gdb exited: " + " / ".join(plain) if plain else "gdb exited"
 
     def command(self, cmd: str, timeout: float = 30.0) -> Record:
         """Send one MI command and wait for its result record (raises MIError on ^error)."""
