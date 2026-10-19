@@ -19,6 +19,8 @@ from dataclasses import dataclass, field
 
 from ..demangle import demangle
 from ..disasm import CALL as CALL_KIND
+from ..disasm import CJMP as CJMP_KIND
+from ..disasm import JMP as JMP_KIND
 from ..disasm import RET as RET_KIND
 from ..loader.base import Symbol
 
@@ -314,9 +316,12 @@ class _Types:
         self.ptr = b.bits // 8
         self.x64 = b.arch == "x64"
         pe = b.format == "PE"
-        self.this = {("x64", False): "rdi", ("x64", True): "rcx", ("x86", True): "ecx"}.get((b.arch, pe))
-        self.ret = "rax" if self.x64 else "eax"
-        self.saved = _SAVED.get((b.arch, pe), set())
+        self.a64 = b.arch == "arm64"
+        self.this = {("x64", False): "rdi", ("x64", True): "rcx", ("x86", True): "ecx",
+                     ("arm64", False): "x0", ("arm64", True): "x0"}.get((b.arch, pe))
+        self.ret = "x0" if self.a64 else "rax" if self.x64 else "eax"
+        self.saved = _SAVED.get((b.arch, pe), set()) if not self.a64 else \
+            {f"x{n}" for n in range(19, 30)} | {"sp"}
         self.classes = classes
         self.vt: dict[int, str] = {}             # primary vtable address point -> class
         self.ti: dict[int, str] = {c.typeinfo: c.name for c in classes.values()}
@@ -344,8 +349,26 @@ class _Types:
         self.sites: dict[int, frozenset[int]] = {}
         self.dyncast = {imp.addr for imp in b.imports if imp.name == "__dynamic_cast"}
         self._tok = 0
+        # arguments: the objects every call of a function passes it (functions only called directly)
+        self.argregs = {("x64", False): ["rdi", "rsi", "rdx", "rcx", "r8", "r9"],
+                        ("x64", True): ["rcx", "rdx", "r8", "r9"], ("x86", True): ["ecx"]}.get((b.arch, pe), [])
+        if self.a64:
+            self.argregs = [f"x{n}" for n in range(8)]
+        self.params: dict[int, dict[str, tuple]] = {}
+        self._passed: dict[int, list[tuple]] = {}
+        taken = {m for c in classes.values() for v in c.vtables for m in v.slots}
+        taken |= {r.addend or 0 for r in getattr(b, "relocs", ())}
+        for f in an.functions.values():
+            taken |= f.tail_calls
+            for blk in f.blocks.values():
+                for i in blk.insns:
+                    if i.kind != CALL_KIND:
+                        taken.update(i.refs)
+        self.taken = taken
 
     def reg(self, r: str) -> str:
+        if self.a64:
+            return "x" + r[1:] if r[:1] == "w" and r[1:].isdigit() else r
         return _R64.get(r, r) if self.x64 else r
 
     def offset_in(self, base: str, cls: str, depth: int = 0) -> int | None:
@@ -377,16 +400,33 @@ class _Types:
 
     def run(self) -> dict[int, tuple[frozenset[int], bool]]:
         funcs = [f for f in self.an.functions.values() if not f.is_import]
-        for _ in range(4):                       # constructors, then what functions return
-            before = (dict(self.ctors), dict(self.returns))
+        for _ in range(6):                       # constructors, then what functions return and are passed
+            before = (dict(self.ctors), dict(self.returns), dict(self.params))
+            self._passed = {}
             for f in funcs:
                 self.function(f)
-            if (self.ctors, self.returns) == before:
+            self._params(funcs)
+            if (self.ctors, self.returns, self.params) == before:
                 break
         self.sites.clear()
         for f in funcs:
             self.function(f)
         return {a: (t, False) for a, t in self.sites.items()}
+
+    def _params(self, funcs):
+        params = {}
+        for f in funcs:
+            sites = self._passed.get(f.addr)
+            if not sites or len(sites) != len(f.callers) or f.addr in self.taken:
+                continue
+            got = {}
+            for k, r in enumerate(self.argregs):
+                v = _merge_objs([s[k] for s in sites])
+                if v is not None:
+                    got[r] = v
+            if got:
+                params[f.addr] = got
+        self.params = params
 
     def fresh(self):
         self._tok += 1
@@ -406,20 +446,31 @@ class _Types:
                 if f.addr in self.owners:            # a virtual method: `this` is one of its classes
                     st = {self.this: ("obj", frozenset().union(*(self.derived[n] for n in self.owners[f.addr])),
                                       None)}
+                st.update(self.params.get(f.addr, {}))
             ends[a] = self.block(f, blk.insns, dict(st or {}), rets)
-        if rets and all(r is not None and r[0] in ("obj", "null") for r in rets) and any(r[0] == "obj" for r in rets):
-            rets = [r for r in rets if r[0] == "obj"]
-            statics = {r[2] for r in rets}
-            self.returns[f.addr] = ("obj", frozenset().union(*(r[1] for r in rets)),
-                                    statics.pop() if len(statics) == 1 else None)
+        v = _merge_objs(rets) if rets else None
+        if v is not None:
+            self.returns[f.addr] = v
         else:
             self.returns.pop(f.addr, None)
 
-    def construct(self, f, st: dict, base: str, a: int):
-        """A vtable address stored in an object's first word."""
-        if a not in self.vt:
+    def construct(self, f, st: dict, base: str, a):
+        """A vtable address (or one of several) stored in an object's first word."""
+        addrs = a if isinstance(a, frozenset) else {a}
+        found = {self.vt[x] for x in addrs if x in self.vt}
+        if not found or len(found) != len(addrs):
             return
-        cls = self.vt[a]
+        if len(found) > 1:
+            obj = st.get(base)
+            new = ("obj", frozenset(found), None)
+            if obj is not None and obj[0] in ("ptr", "obj"):
+                for k, v in list(st.items()):
+                    if v == obj:
+                        st[k] = new
+            else:
+                st[base] = new
+            return
+        cls = found.pop()
         obj = st.get(base)
         if obj == ("this",) and f.addr not in self.methods:
             self.ctors[f.addr] = cls
@@ -432,6 +483,8 @@ class _Types:
             st[base] = new
 
     def block(self, f, insns, st: dict, rets: list) -> dict:
+        if self.a64:
+            return self.block_a64(f, insns, st, rets)
         ptr = self.ptr
         for i in insns:
             ops = [o.strip() for o in i.op_str.split(",")] if i.op_str else []
@@ -531,6 +584,76 @@ class _Types:
                 st.pop(self.reg(dst), None)
         return st
 
+    def block_a64(self, f, insns, st: dict, rets: list) -> dict:
+        """AArch64: `adrp` + `add` (constant propagation gave the `add` its address), `ldr`/`str`
+        (`stp` of two vtables: the first one is the object's), `mov` copies, `[sp, #n]` slots."""
+        ptr = self.ptr
+        for i in insns:
+            ops = _a64_ops(i.op_str)
+            m = i.mnemonic
+            if i.kind == CALL_KIND:
+                self.call(i, ops, st)
+                continue
+            if i.kind == RET_KIND:
+                rets.append(st.get(self.ret))
+                continue
+            if not ops or i.kind in (CJMP_KIND, JMP_KIND):     # (`cbz x0, ...` reads x0)
+                continue
+            dst = self.reg(ops[0]) if _is_reg(ops[0]) else None
+            if m in ("ldr", "ldur") and len(ops) == 2 and dst and dst.startswith("x"):
+                base, disp = _a64_mem(ops[1])
+                v = None
+                if base in ("sp", "x29") and disp is not None:
+                    v = st.get(("slot", f"{base} + {disp}"))
+                elif base is not None and disp is not None:
+                    bv = st.get(self.reg(base))
+                    if bv and bv[0] == "obj" and disp == 0:
+                        v = ("vptr", bv[1], bv[2], 0)
+                    elif bv and bv[0] == "vptr":
+                        t = self.slot(bv[1], bv[2], (bv[3] + disp) // ptr)
+                        v = ("fn", t) if t else None
+                st.pop(dst, None)
+                if v is not None:
+                    st[dst] = v
+                continue
+            if m in ("str", "stur", "stp") and len(ops) >= 2:
+                src = self.reg(ops[0])
+                base, disp = _a64_mem(ops[-1])
+                v = st.get(src)
+                if base in ("sp", "x29") and disp is not None and m != "stp":
+                    if v is not None:
+                        st[("slot", f"{base} + {disp}")] = v
+                    else:
+                        st.pop(("slot", f"{base} + {disp}"), None)
+                elif base is not None and disp == 0 and v is not None and v[0] in ("addr", "addrs"):
+                    self.construct(f, st, self.reg(base), v[1])
+                continue
+            if dst is None or m in ("cmp", "cmn", "tst"):
+                continue
+            v = None
+            if m == "mov" and len(ops) == 2 and _is_reg(ops[1]):
+                v = st.get(self.reg(ops[1]))
+                if ops[1] in ("xzr", "wzr"):
+                    v = ("null",)
+            elif m == "mov" and len(ops) == 2 and ops[1] == "#0":
+                v = ("null",)
+            elif m == "add" and len(ops) == 3 and ops[2].startswith("#"):
+                src = st.get(self.reg(ops[1]))
+                k = int(ops[2][1:], 0)
+                if i.refs and (src is None or src[0] != "vptr"):
+                    r = i.refs[-1]
+                    v = ("ti", self.ti[r]) if r in self.ti else ("addr", r)
+                elif src and src[0] == "addr":
+                    v = ("addr", src[1] + k)
+                elif src and src[0] == "vptr":
+                    v = ("vptr", src[1], src[2], src[3] + k)
+            elif m == "adr" and i.refs:
+                v = ("addr", i.refs[0])
+            st.pop(dst, None)
+            if v is not None:
+                st[dst] = v
+        return st
+
     def call(self, i, ops, st: dict):
         ptr = self.ptr
         targets = None
@@ -548,11 +671,13 @@ class _Types:
                     targets = v[1]
             if targets:
                 self.sites[i.addr] = targets
+        if i.target is not None:
+            self._passed.setdefault(i.target, []).append(tuple(st.get(r) for r in self.argregs))
         this = st.get(self.this)
         ctor = self.ctors.get(i.target) if i.target is not None else None
         result = None
         if i.target in self.dyncast:                  # __dynamic_cast(obj, src type, dst type, hint)
-            dst = st.get("rdx" if self.x64 else None)
+            dst = st.get("x2" if self.a64 else "rdx" if self.x64 else None)
             if dst and dst[0] == "ti":
                 result = ("obj", frozenset(self.derived.get(dst[1], {dst[1]})), dst[1])
         elif i.target is not None and i.target in self.returns:
@@ -576,11 +701,56 @@ def _join(states: list[dict]) -> dict:
         vs = [x.get(k) for x in states]
         if all(w == v for w in vs):
             out[k] = v
-        elif all(w is not None and w[0] in ("obj", "null") for w in vs) and any(w[0] == "obj" for w in vs):
-            objs = [w for w in vs if w[0] == "obj"]      # (a null pointer on some way: no call through it)
-            statics = {w[2] for w in objs}
-            out[k] = ("obj", frozenset().union(*(w[1] for w in objs)), statics.pop() if len(statics) == 1 else None)
+        elif all(w is not None and w[0] in ("addr", "addrs") for w in vs):
+            out[k] = ("addrs", frozenset().union(*({w[1]} if w[0] == "addr" else w[1] for w in vs)))
+        elif _merge_objs(vs) is not None:
+            out[k] = _merge_objs(vs)
     return out
+
+
+def _merge_objs(vs: list) -> tuple | None:
+    """Objects (or null pointers -- no call goes through them) from several ways: an object of
+    any of their classes; None when some way has something else."""
+    if not all(v is not None and v[0] in ("obj", "null") for v in vs):
+        return None
+    objs = [v for v in vs if v[0] == "obj"]
+    if not objs:
+        return None
+    statics = {v[2] for v in objs}
+    return "obj", frozenset().union(*(v[1] for v in objs)), statics.pop() if len(statics) == 1 else None
+
+
+def _a64_ops(text: str) -> list[str]:
+    """Operands, a bracketed address kept whole: `x8, [x0, #8]` -> ["x8", "[x0, #8]"]."""
+    out, depth, cur = [], 0, ""
+    for ch in text:
+        if ch == "[":
+            depth += 1
+        elif ch == "]":
+            depth -= 1
+        if ch == "," and depth == 0:
+            out.append(cur.strip())
+            cur = ""
+        else:
+            cur += ch
+    if cur.strip():
+        out.append(cur.strip())
+    return out
+
+
+def _a64_mem(op: str) -> tuple[str | None, int | None]:
+    """`[x0, #8]` -> ("x0", 8); `[sp]` -> ("sp", 0); pre/post-indexed and register offsets: None."""
+    if not op.startswith("[") or not op.endswith("]"):
+        return None, None
+    parts = [p.strip() for p in op[1:-1].split(",")]
+    if len(parts) == 1:
+        return parts[0], 0
+    if len(parts) == 2 and parts[1].startswith("#"):
+        try:
+            return parts[0], int(parts[1][1:], 0)
+        except ValueError:
+            return None, None
+    return None, None
 
 
 def _is_reg(op: str) -> bool:
@@ -616,7 +786,7 @@ def _base_disp(inner: str) -> tuple[str | None, int | None]:
 
 
 def object_calls(an, classes: dict[str, CppClass]) -> dict[int, tuple[frozenset[int], bool]]:
-    if an.bin.arch not in ("x64", "x86") or not classes:
+    if an.bin.arch not in ("x64", "x86", "arm64") or not classes:
         return {}
     t = _Types(an, classes)
     if t.this is None:

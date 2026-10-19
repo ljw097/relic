@@ -106,7 +106,8 @@ IDA의 60여 개 CPU 계열 전부가 아니라, 리버싱·포너블·펌웨어
 - [x] C++ 클래스(Itanium RTTI, ELF): typeinfo(`__class_type_info`/`__si_`/`__vmi_` 재배치)로 클래스·기반 클래스, 데이터에서 vtable(기반마다 하나), 가상 메서드 이름(`Dog::vfunc2`, 여럿이 공유하면 공통 기반 클래스, 두 번째 vtable은 `Parrot::thunk8_vfunc0`), `typeinfo for X`·`vtable for X`, `relic classes`
 - [x] C++ 클래스(MSVC RTTI, PE x64·x86): vtable 앞 워드의 RTTICompleteObjectLocator(서명, x64는 자기 오프셋), TypeDescriptor(`.?AVDog@@` → `Dog`, 중첩 이름 `Outer::Inner`), ClassHierarchyDescriptor(기반 클래스·오프셋, 간접 기반 제외)
 - [x] 가상 호출 대상(x86, 객체 타입 전파): 레지스터·스택 슬롯으로 객체를 따라가 — 생성자(`[this]`에 vtable을 넣는 함수, 가상 소멸자 제외) 호출, 그 자리 vtable 저장(인라인 생성, SSE 두 워드 저장 포함), `__dynamic_cast` 결과(대상 클래스와 파생: 기반 오프셋으로 그 부분 객체의 vtable → thunk), 함수가 돌려주는 클래스 집합(함수 간 고정점, null 경로 무시), 가상 메서드의 `this`(그 클래스들과 파생) — vptr 로드·`add`·슬롯 로드·호출 → 그 슬롯의 메서드들. -O0·-O2, Itanium·MSVC(`rcx`/`ecx`)
-- [x] 함수 포인터 변수를 거친 호출 — x86 외(ARM·AArch64·MIPS·RISC-V·PowerPC 32/64): 레지스터 호출(`blr`/`blx`/`jalr`/`bctrl`)의 레지스터가 변수에서 읽힌 것. 여러 명령으로 만든 주소(`adrp`/`add`, `lis`/`addi`, `auipc`/`addi`, PowerPC TOC)를 블록 안·선행 블록이 일치하는 블록으로 따라감, Thumb 비트, GOT 슬롯은 변수 아님
+- [x] 가상 호출: 인자로 받은 객체(모든 호출 지점이 같은 객체를 넘기는, 직접 호출만 되는 함수의 인자 — 함수 간 고정점), AArch64(`adrp`+`add`, `str`/`stp`로 vtable 저장, `ldr`·`blr`, `[sp, #n]`)
+- [x] 함수 포인터 변수를 거친 호출 — x86 외(ARM·AArch64·MIPS·RISC-V·PowerPC 32/64): 레지스터 호출(`blr`/`blx`/`jalr`/`bctrl`)의 레지스터가 변수에서 읽힌 것. 여러 명령으로 만든 주소(`adrp`/`add`, `lis`/`addi`, `auipc`/`addi`, PowerPC TOC)를 블록 안·선행 블록이 일치하는 블록으로 따라감, Thumb 비트, GOT 슬롯은 변수 아님. 대상이 전부 돌아오지 않으면 호출도 돌아오지 않음(그 함수들을 다시 분석)
 - [x] 코드 사이 데이터 감지(x86, 손으로 쓴 어셈블리·`.text` 속 데이터): 코드가 읽고 쓰는 `.text` 주소(접근 폭으로 dword/qword 배열), `lea`가 가리키는 C 문자열(함수가 아님 → 문자열 목록·의사 코드), 코드 포인터가 이어지는 표(그 함수들을 찾음). 함수 찾기·틈 스캔이 그 안에서 함수를 만들지 않고, 리스팅은 `db "..."`/`dd`/`dq offset`으로
 - [x] 큰 바이너리 분석 속도: x86는 capstone `disasm_lite` + Intel 문법 연산자 텍스트 파싱(주소가 든 것만), 상세 정보는 처음 쓸 때 디코드. bash 함수 찾기 34초 → 7초
 

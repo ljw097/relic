@@ -109,13 +109,29 @@ class Analysis:
         self._apply_func_edits(finder, load_project)
         from .rtti import object_calls, recover_classes
         self.classes = recover_classes(self, finder)      # C++ classes, vtables (names their methods)
-        self.icalls.update(object_calls(self, self.classes))    # virtual calls whose objects are known
         self._fstarts = sorted(self.functions)
         report("data references", 0, force=True)
         from .constprop import propagate_refs
         propagate_refs(self)     # addresses built over several instructions (adrp + add, ...)
         from .icalls import SlotTargets
-        self.icalls.update(SlotTargets(self.bin, self.functions).run(generic=True))
+        generic = SlotTargets(self.bin, self.functions).run(generic=True)
+        self.icalls.update(generic)
+        stops = {a for a, (ts, c) in generic.items()
+                 if c and all(t in self.functions and self.functions[t].noreturn for t in ts)}
+        if stops:
+            # calls through variables holding only functions that do not return: they end their
+            # blocks -- the functions with such calls are found again knowing that
+            finder.generic_icalls = generic
+            finder.icalls = {**finder.icalls, **generic}
+            finder.reanalyze([f for f in list(self.functions.values())
+                              if not f.is_import and finder._has_site(f, stops)])
+            finder._infer_noreturn()
+            finder._link()
+            propagate_refs(self)
+            self.icalls.update(finder.icalls)
+            self.icalls.update(SlotTargets(self.bin, self.functions).run(generic=True))
+            self._fstarts = sorted(self.functions)
+        self.icalls.update(object_calls(self, self.classes))    # virtual calls whose objects are known
         report("strings", 0, force=True)
         self.strings = find_strings(self.bin)
         from .strings import String
