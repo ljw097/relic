@@ -21,10 +21,10 @@ permissions:
 
 jobs:
   check:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
         with:
           python-version: "3.12"
       - name: Check the version
@@ -44,7 +44,7 @@ jobs:
           /tmp/v/bin/pip install dist/*.whl
           /tmp/v/bin/relic info /bin/ls
           /tmp/v/bin/relic decompile /bin/true > /dev/null
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v6
         with:
           name: python
           path: dist/*
@@ -65,8 +65,8 @@ jobs:
             asset: relic-${{ inputs.version }}-macos-x86_64
     runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
         with:
           python-version: "3.12"
       - name: Install
@@ -100,7 +100,7 @@ jobs:
             --osx-bundle-identifier io.github.ljw097.relic packaging/relic_app.py
           ./dist/Relic.app/Contents/MacOS/Relic info ./dist/Relic.app/Contents/MacOS/Relic | head -3
           mkdir out && ditto -c -k --keepParent dist/Relic.app "out/${{ matrix.asset }}.zip"
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v6
         with:
           name: ${{ matrix.asset }}
           path: out/*
@@ -109,10 +109,10 @@ jobs:
     needs: [check, executable]
     # (publish with what was built: a missing runner image must not hold the others back)
     if: ${{ !cancelled() && needs.check.result == 'success' }}
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/download-artifact@v4
+      - uses: actions/checkout@v5
+      - uses: actions/download-artifact@v7
         with:
           path: assets
           merge-multiple: true
