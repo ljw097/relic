@@ -184,3 +184,31 @@ def test_cli_history(copies):
     assert code == 0 and analyze(an.bin.path).renames == {}
     code, out = relic("checkout", "7")
     assert code != 0 and "no such version" in out
+
+
+def test_unreadable_project_file_is_kept_not_fatal(vuln64, tmp_path):
+    """A project file that does not parse: the binary opens without it, and the next save keeps
+    it as FILE.bak instead of overwriting it."""
+    path = tmp_path / "vuln64"
+    shutil.copy(vuln64, path)
+    proj = tmp_path / "vuln64.relic.json"
+    for bad in ('{"renames": {"0x1": "x"', '{"renames": {"main": "x"}}', '[1, 2]',
+                '{"renames": {}, "patches": {"0x1": 3}, "function_edits": []}'):
+        proj.write_text(bad)
+        an = analyze(str(path))
+        assert an.project_error and "unreadable project file" in an.project_error
+        assert an.function_by_name("main") is not None
+    an.rename(an.function_by_name("main").addr, "entry_point")
+    an.save_project()
+    assert (tmp_path / "vuln64.relic.json.bak").read_text().startswith('{"renames": {}, "patches"')
+    again = analyze(str(path))
+    assert again.project_error is None and again.function_by_name("entry_point") is not None
+
+
+def test_cli_warns_about_an_unreadable_project_file(vuln64, tmp_path):
+    path = tmp_path / "vuln64"
+    shutil.copy(vuln64, path)
+    (tmp_path / "vuln64.relic.json").write_text("{oops")
+    r = subprocess.run([sys.executable, "-m", "relic", "funcs", str(path)], capture_output=True, text=True)
+    assert r.returncode == 0 and "main" in r.stdout
+    assert "unreadable project file" in r.stderr

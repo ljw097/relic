@@ -403,6 +403,8 @@ class FunctionAnalyzer:
             if inside(a) or a in self.code_data:
                 continue
             sec = b.section_at(a)
+            if sec is None:
+                continue
             k = bisect.bisect_right(stops, a)
             end = min(stops[k] if k < len(stops) else sec.end, sec.end, a + 0x1000)
             if kind == "string":
@@ -466,7 +468,7 @@ class FunctionAnalyzer:
             sec = b.section(sec_name)
             if sec is None:
                 continue
-            for off in range(0, sec.size, b.bits // 8):
+            for off in range(0, b.file_end(sec) - sec.addr, b.bits // 8):
                 a = b.read_ptr(sec.addr + off)
                 if a and b.is_exec(a):
                     out.append(a)
@@ -714,7 +716,13 @@ class FunctionAnalyzer:
             i = self.dis.decode(a)
             if i is None:
                 return False
-            if k < 8 and (i.mnemonic in self._EPILOGUE or i.mnemonic == "add" and i.op_str.startswith(sp + ",")):
+            if k < 8 and i.mnemonic == "add" and i.op_str.startswith(sp + ","):
+                p = self.prev.get(a)
+                q = self.dis.decode(p) if p is not None else None
+                if q is not None and q.mnemonic == "call":
+                    return False                # (cdecl: the call's arguments popped, not the frame)
+                return True
+            if k < 8 and i.mnemonic in self._EPILOGUE:
                 return True
             if i.mnemonic in ("push", "call", "enter") or sp in i.op_str:
                 return False

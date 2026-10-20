@@ -22,6 +22,15 @@ def load(path: str, arch: str | None = None, base: int | str = 0) -> Binary:
 
 
 def load_bytes(data: bytes, path: str = "<memory>", arch: str | None = None, base: int | str = 0) -> Binary:
+    try:
+        return _load_bytes(data, path, arch, base)
+    except (OSError, ValueError):
+        raise
+    except Exception as e:  # noqa: BLE001 - the format libraries' own errors on a malformed file
+        raise ValueError(f"malformed or truncated file ({type(e).__name__}: {e})") from e
+
+
+def _load_bytes(data: bytes, path: str, arch: str | None, base: int | str) -> Binary:
     from ..extend import LOADERS
     for ld in LOADERS:                       # plugins' loaders first (relic.extend)
         if ld.detect(data, path):

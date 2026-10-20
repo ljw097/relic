@@ -5,7 +5,7 @@ import bisect
 import io
 
 import capstone as cs
-from elftools.elf.dynamic import DynamicSection
+from elftools.elf.dynamic import DynamicSection, DynamicSegment
 from elftools.elf.elffile import ELFFile
 from elftools.elf.descriptions import describe_reloc_type
 from elftools.elf.relocation import RelocationSection
@@ -36,6 +36,10 @@ def load_elf(path: str, data: bytes) -> Binary:
     b = Binary(path, data)
     b.format = "ELF"
     elf = ELFFile(io.BytesIO(data))
+    if elf["e_type"] != "ET_REL" and not _sections_ok(elf, len(data)):
+        # stripped or corrupted section headers (sstrip, anti-analysis): the kernel loads by the
+        # program headers alone, so do we
+        elf = ELFFile(io.BytesIO(_without_sections(data, elf)))
     arch = MACHINES.get(elf["e_machine"], ("unknown", elf.elfclass))[0]
     if arch == "mips" and elf.elfclass == 64:
         arch = "mips64"
@@ -85,6 +89,14 @@ def load_elf(path: str, data: bytes) -> Binary:
     if not b.segments:  # relocatable object: lay sections out as-is
         for s in b.sections:
             s.addr = s.addr or 0
+    dyn_seg = next((seg for seg in elf.iter_segments() if isinstance(seg, DynamicSegment)), None)
+    if not b.sections and b.segments:  # no section headers: a section per loaded segment
+        b.info["sections"] = "section headers missing or corrupt: using the program headers"
+        for k, seg in enumerate(b.segments):
+            sec = Section(f"LOAD{k}", seg.addr, seg.memsz, seg.offset, seg.r, seg.w, seg.x, seg.filesz > 0)
+            b.sections.append(sec)
+        if dyn_seg is not None:
+            _dynamic_symbols(b, dyn_seg, arch)
 
     # symbols
     for sec in elf.iter_sections():
@@ -122,20 +134,23 @@ def load_elf(path: str, data: bytes) -> Binary:
 
     # dynamic info
     b.dynamic = {}
-    for sec in elf.iter_sections():
-        if isinstance(sec, DynamicSection):
-            for tag in sec.iter_tags():
-                if tag.entry.d_tag == "DT_NEEDED":
-                    b.libraries.append(tag.needed)
-                elif tag.entry.d_tag == "DT_RPATH":
-                    b.dynamic["RPATH"] = tag.rpath
-                elif tag.entry.d_tag == "DT_RUNPATH":
-                    b.dynamic["RUNPATH"] = tag.runpath
-                else:
-                    b.dynamic[tag.entry.d_tag] = tag.entry.d_val
+    dyn_tables = [sec for sec in elf.iter_sections() if isinstance(sec, DynamicSection)]
+    if not dyn_tables and dyn_seg is not None:
+        dyn_tables = [dyn_seg]
+    for sec in dyn_tables:
+        for tag in sec.iter_tags():
+            if tag.entry.d_tag == "DT_NEEDED":
+                b.libraries.append(tag.needed)
+            elif tag.entry.d_tag == "DT_RPATH":
+                b.dynamic["RPATH"] = tag.rpath
+            elif tag.entry.d_tag == "DT_RUNPATH":
+                b.dynamic["RUNPATH"] = tag.runpath
+            else:
+                b.dynamic[tag.entry.d_tag] = tag.entry.d_val
 
     # relocations -> GOT slot names
     got_names: dict[int, str] = {}
+    tables = []                                 # (relocations, their symbol table)
     for sec in elf.iter_sections():
         if not isinstance(sec, RelocationSection):
             continue
@@ -143,9 +158,16 @@ def load_elf(path: str, data: bytes) -> Binary:
             symtab = elf.get_section(sec["sh_link"])
         except Exception:
             symtab = None
+        tables.append((sec, symtab if isinstance(symtab, SymbolTableSection) else None))
+    if not tables and dyn_seg is not None:      # (no section headers: the dynamic segment's tables)
+        try:
+            tables = [(t, dyn_seg) for t in dyn_seg.get_relocation_tables().values()]
+        except Exception:
+            tables = []
+    for sec, symtab in tables:
         for rel in sec.iter_relocations():
             name = ""
-            if symtab is not None and isinstance(symtab, SymbolTableSection) and rel["r_info_sym"]:
+            if symtab is not None and rel["r_info_sym"]:
                 try:
                     name = symtab.get_symbol(rel["r_info_sym"]).name.split("@")[0]
                 except Exception:
@@ -173,6 +195,57 @@ def load_elf(path: str, data: bytes) -> Binary:
     _resolve_plt(b, got_names)
     b._finalize()
     return b
+
+
+def _sections_ok(elf: ELFFile, size: int) -> bool:
+    """The section header table is inside the file and readable."""
+    try:
+        n, off, ent = elf["e_shnum"], elf["e_shoff"], elf["e_shentsize"]
+        if n and off + n * ent > size:
+            return False
+        if n and elf._get_section_header(elf.get_shstrndx())["sh_type"] != "SHT_STRTAB":
+            return False                        # (the names would be garbage)
+        return all(sec.header is not None for sec in elf.iter_sections())     # (parses each, names too)
+    except Exception:  # noqa: BLE001 - pyelftools raises many kinds on a bad table
+        return False
+
+
+def _without_sections(data: bytes, elf: ELFFile) -> bytes:
+    """`data` with e_shoff / e_shnum / e_shstrndx zeroed: pyelftools then reads no sections."""
+    import struct
+    end = "<" if elf.little_endian else ">"
+    d = bytearray(data)
+    if elf.elfclass == 64:
+        struct.pack_into(end + "Q", d, 0x28, 0)
+        struct.pack_into(end + "H", d, 0x3C, 0)
+        struct.pack_into(end + "H", d, 0x3E, 0)
+    else:
+        struct.pack_into(end + "I", d, 0x20, 0)
+        struct.pack_into(end + "H", d, 0x30, 0)
+        struct.pack_into(end + "H", d, 0x32, 0)
+    return bytes(d)
+
+
+def _dynamic_symbols(b: Binary, dyn, arch: str):
+    """Defined dynamic symbols (exports) from the dynamic segment, for a file without sections."""
+    try:
+        syms = list(dyn.iter_symbols())
+    except Exception:  # noqa: BLE001 - no / broken DT_SYMTAB, DT_HASH
+        return
+    for sym in syms:
+        t = sym["st_info"]["type"]
+        kind = {"STT_FUNC": "func", "STT_OBJECT": "object", "STT_GNU_IFUNC": "func"}.get(t)
+        if kind is None or not sym.name or sym["st_shndx"] == "SHN_UNDEF" or not sym["st_value"]:
+            continue
+        addr = sym["st_value"]
+        if arch == "arm" and kind == "func":
+            if addr & 1:
+                b.thumb_code.add(addr & ~1)
+            addr &= ~1
+        s = Symbol(sym.name.split("@")[0], addr, sym["st_size"], kind, "dynsym")
+        b.add_symbol(s)
+        if sym["st_info"]["bind"] in ("STB_GLOBAL", "STB_WEAK"):
+            b.exports.append(s)
 
 
 def _ppc64_descriptors(b: Binary):
@@ -352,9 +425,14 @@ def _resolve_plt(b: Binary, got_names: dict[int, str]):
     gotplt = next((s for s in b.sections if s.name == ".got.plt"), None) or \
         next((s for s in b.sections if s.name == ".got"), None)
     found: dict[int, str] = {}
+    # no section headers: PLT stubs are wherever the code segment has 16-aligned `jmp [GOT slot]`s
+    no_shdrs = not plt_secs and all(s.name.startswith("LOAD") for s in b.sections)
+    if no_shdrs:
+        plt_secs = [s for s in b.sections if s.x and s.loaded]
     if b.arch in ("x64", "x86"):
         md = cs.Cs(cs.CS_ARCH_X86, cs.CS_MODE_64 if b.arch == "x64" else cs.CS_MODE_32)
         md.detail = True
+        md.skipdata = no_shdrs
         for sec in plt_secs:
             code = b.data[sec.offset:sec.offset + sec.size]
             for insn in md.disasm(code, sec.addr):
@@ -374,8 +452,14 @@ def _resolve_plt(b: Binary, got_names: dict[int, str]):
                 if slot is None or slot not in got_names:
                     continue
                 stub = insn.address
+                if no_shdrs:
+                    if b.read(stub - 4, 4) in (b"\xf3\x0f\x1e\xfa", b"\xf3\x0f\x1e\xfb"):
+                        stub -= 4               # (endbr64 / endbr32 first)
+                    if stub % 16:
+                        continue
                 # stub start: entries are 16-byte aligned on x86
-                stub -= (stub - sec.addr) % 16 if sec.size % 16 == 0 else 0
+                elif sec.size % 16 == 0:
+                    stub -= (stub - sec.addr) % 16
                 found.setdefault(stub, got_names[slot])
                 b.imports.append(Import(got_names[slot], stub, slot))
     elif b.arch == "arm64":

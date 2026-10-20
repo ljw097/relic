@@ -187,8 +187,11 @@ def _elf_file(b: "Binary"):
 def _elf_comment(b: "Binary") -> bytes:
     """`.comment` (not loaded: it is not part of the image)."""
     elf = _elf_file(b)
-    sec = elf.get_section_by_name(".comment") if elf is not None else None
-    return sec.data() if sec is not None else b""
+    try:
+        sec = elf.get_section_by_name(".comment") if elf is not None else None
+        return sec.data() if sec is not None else b""
+    except Exception:  # noqa: BLE001 - corrupt section headers: nothing to read
+        return b""
 
 
 def _elf(b: "Binary", tc: Toolchain) -> None:

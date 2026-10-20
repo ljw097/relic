@@ -234,7 +234,7 @@ class Session:
         self._tty_reader = threading.Thread(target=self._read_tty, daemon=True)
         self._tty_reader.start()
         try:
-            self.mi.command(f'-file-exec-and-symbols "{self.path}"')
+            self.mi.command(f'-file-exec-and-symbols "{_mi_quote(self.path)}"')
         except MIError as e:
             self.close()
             raise DebugError(str(e)) from None
@@ -1131,7 +1131,9 @@ def describe_stop(stop: dict) -> str:
 
 
 def _quote(a: str) -> str:
-    return a if re.fullmatch(r"[\w./:=+-]+", a) else '"' + a.replace("\\", "\\\\").replace('"', '\\"') + '"'
+    """An argument for the shell gdb starts the program through: in single quotes, where `$`,
+    backticks and backslashes stay as they are (`%7$p` reaches the program as typed)."""
+    return a if re.fullmatch(r"[\w./:=+-]+", a) else "'" + a.replace("'", "'\\''") + "'"
 
 
 __all__ = ["DebugError", "Frame", "Mapping", "Module", "Session", "Target", "TeleRow", "Thread", "describe_stop",

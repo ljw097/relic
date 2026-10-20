@@ -258,3 +258,13 @@ def test_start_at_main_of_a_stripped_program(tmp_path, pie):
         assert s.to_static(s.pc) == an.function_by_name("main").addr
     finally:
         s.close()
+
+
+def test_program_arguments_reach_the_program_as_typed():
+    """gdb starts the program through a shell: `$`, backticks and quotes must not be expanded
+    (`%7$p` is a format-string payload, not `%7` and a variable)."""
+    from relic.debugger.session import _quote
+    args = ["%7$p", "a$HOME", "`echo pwn`", "$(id)", "it's", "back\\slash", "two words", "", 'say "hi"', "plain"]
+    r = subprocess.run(["sh", "-c", "printf '[%s]\\n' " + " ".join(_quote(a) for a in args)],
+                       capture_output=True, text=True, check=True)
+    assert r.stdout.splitlines() == [f"[{a}]" for a in args]

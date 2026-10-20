@@ -771,6 +771,8 @@ class MainWindow(QMainWindow):
             self._track(self.vulns_thread, "vulns scan")
             self.vulns_thread.start()
         self.statusBar().showMessage(f"{len(an.functions)} functions, {len(an.strings)} strings", 5000)
+        if an.project_error:
+            QMessageBox.warning(self, "Project file", an.project_error)
         main = an.function_by_name("main")
         start = main.addr if main else an.bin.entry
         self._update_actions()
