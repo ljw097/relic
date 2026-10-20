@@ -15,6 +15,8 @@ from ...disasm import OP_IMM, OP_MEM, OP_REG, Insn
 from ..ir import (Assign, BinOp, Branch, Call, CallStmt, Cast, Const, Effect, Expr, Extract, IndirectJump,
                   Intrinsic, Ite, Jump, Load, Reg, Return, Stmt, Store, UnOp, Unknown, mask)
 
+from .x87 import X87Mixin, is_x87
+
 if TYPE_CHECKING:
     from ...analysis import Analysis
     from ...analysis.functions import Function
@@ -114,7 +116,7 @@ def mentions(e: Expr, r: Reg) -> bool:
     return False
 
 
-class X86Lifter:
+class X86Lifter(X87Mixin):
     def __init__(self, an: Analysis):
         self.an = an
         self.bits = an.bin.bits
@@ -145,6 +147,8 @@ class X86Lifter:
         return t
 
     def full(self, name: str) -> Reg:
+        if name not in self.regs:
+            raise LiftError(f"register {name}")      # (`pop ss`: an instruction left opaque)
         f, _, _ = self.regs[name]
         return Reg(f, self._full_bits(f))
 
@@ -228,6 +232,8 @@ class X86Lifter:
         if op.type == OP_IMM:
             return Const(op.imm, op.size * 8 or self.bits)
         if op.type == OP_MEM:
+            if op.size == 2 and self.x87_control_word(op):
+                return Const(0x37F, 16)        # the default x87 control word (lift/x87.py)
             return Load(self.addr_of(op), op.size * 8)
         raise LiftError("operand type")
 
@@ -235,6 +241,8 @@ class X86Lifter:
         if op.type == OP_REG:
             self.write_reg(self.insn.cs.reg_name(op.reg), v)
         elif op.type == OP_MEM:
+            if op.size == 2 and self.x87_control_word(op):
+                return
             self.emit(Store(self.insn.addr, self.addr_of(op), self.resize(v, op.size * 8)))
         else:
             raise LiftError("write to immediate")
@@ -287,7 +295,9 @@ class X86Lifter:
                     return self._rep(i, p.strip(), m)
         try:
             handler = getattr(self, "_i_" + m, None)
-            if handler is not None:
+            if is_x87(m):
+                self.lift_x87(i, m)
+            elif handler is not None:
                 handler(i, i.cs.operands)
             elif m in _NOPS:
                 pass
@@ -384,6 +394,12 @@ class X86Lifter:
         else:
             self.write(ops[0], v)
             self.assign(self.sp, BinOp("+", self.sp, Const(self.word, self.bits), self.bits))
+
+    def _i_sahf(self, i, ops):
+        # AH -> SF ZF - AF - PF - CF (bits 7, 6, 2, 0): after `fnstsw ax`, the x87 condition codes
+        ah = self.read_reg("ah")
+        for f, bit in ((CF, 0), (PF, 2), (ZF, 6), (SF, 7)):
+            self.assign(f, Cast("low", BinOp(">>", ah, Const(bit, 8), 8), 1))
 
     def _i_leave(self, i, ops):
         self.assign(self.sp, self.bp)

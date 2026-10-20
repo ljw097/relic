@@ -25,7 +25,8 @@ FP_ARGS = {"x64-sysv": tuple(f"xmm{k}" for k in range(8)), "x64-win": tuple(f"xm
            "riscv64-lp64d": tuple(f"fa{k}" for k in range(8)),
            "riscv32-ilp32d": tuple(f"fa{k}" for k in range(8)),
            "ppc32-sysv": tuple(f"f{k}" for k in range(1, 9)),
-           "ppc64-elfv2": tuple(f"f{k}" for k in range(1, 14))}
+           "ppc64-elfv2": tuple(f"f{k}" for k in range(1, 14)),
+           "x86-cdecl": ()}             # (on the stack; a result in x87_0)
 FP_RET = "xmm0"                  # x86-64; AArch64 returns floats in v0 (see fp_ret_reg)
 
 
@@ -38,6 +39,8 @@ def fp_ret_reg(arch: ArchInfo) -> str:
         return "fa0"
     if arch.name.startswith("ppc"):
         return "f1"
+    if arch.name == "x86-cdecl":
+        return "x87_0"                   # the bottom of the x87 stack (lift/x87.py)
     return FP_RET
 
 
@@ -54,13 +57,13 @@ def fp_part(name: str) -> tuple[str, int, int | None]:
 
 
 def reg_bits(name: str) -> int:
-    """Width of a full FP register: ARM `d` and RISC-V `fa` 64, SSE / AArch64 128."""
-    return 64 if name[:1] in ("d", "f") else 128
+    """Width of a full FP register: ARM `d`, RISC-V `fa` and x87 64, SSE / AArch64 128."""
+    return 64 if name[:1] in ("d", "f") or name.startswith("x87_") else 128
 
 
 def is_fp_reg(name: str) -> bool:
     """An SSE / SIMD-and-FP register (`xmm3`, AArch64 `v3`, ARM VFP `d3` / `s5`, RISC-V `fa3`)."""
-    return name.startswith("xmm") or name[:1] in ("v", "d", "s", "f") and name[1:].isdigit() or \
+    return name.startswith(("xmm", "x87_")) or name[:1] in ("v", "d", "s", "f") and name[1:].isdigit() or \
         name[:2] in ("fa", "ft", "fs") and name[2:].isdigit()
 FLOAT_CONVS = "eEfFgGaA"
 # libc functions taking / returning floating point: argument codes `d` double, `f` float
@@ -180,7 +183,7 @@ def set_fp_returns(an: "Analysis", func: "Function", fn: IRFunction) -> int | No
         ppc = an.bin.arch.startswith("ppc")
         for s in fn.stmts():
             if isinstance(s, Return) and s.value is None:
-                if ppc and w == 32:                      # a float result is the double form's value
+                if (ppc or reg.startswith("x87_")) and w == 32:     # a float result is the double form's value
                     from .ir import Intrinsic
                     s.value = Intrinsic("fpconv", (Reg(reg, 64),), 32)
                 else:
@@ -190,6 +193,8 @@ def set_fp_returns(an: "Analysis", func: "Function", fn: IRFunction) -> int | No
 
 def _fp_return(an, func, arch) -> int | None:
     from .cleanup import _lifted, result_reads
+    if arch.name == "x86-cdecl":
+        return _x87_return(an, func, arch)
     xr = result_reads(an, func, fp_ret_reg(arch))
     ir_ = result_reads(an, func, arch.ret)
     xmm_w = [r for r in xr if isinstance(r, int)]
@@ -219,6 +224,71 @@ def _fp_return(an, func, arch) -> int | None:
     if ppc_whole and not last:
         return 64          # PowerPC: callers read f1 (its double form), the callee only passes one on
     return last or None
+
+
+def _x87_return(an, func, arch) -> int | None:
+    """x87: a function returns a float exactly when it leaves one value on the stack at every
+    `ret` (the ABI hands back an empty stack otherwise) -- or tail-calls one that does. A float
+    when callers store it as one (`fstp dword`) or its values are float arithmetic, else a double."""
+    from ..disasm import RET
+    from .cleanup import result_reads
+    from .lift.x87 import depths
+    try:
+        d = depths(an, func)
+    except Exception:  # noqa: BLE001 - no x87 summary for a function that does not decode
+        return None
+    exits = [d.get(i.addr) for b in func.blocks.values() for i in b.insns if i.kind == RET]
+    tails = [an.functions.get(t) for t in getattr(func, "tail_calls", ())]
+    if not exits and not tails:
+        return None
+    if any(x != 1 for x in exits):
+        return None
+    if any(t is None or t.is_import and ret_bits_of(an.name(t.addr)) is None or
+           not t.is_import and fp_return(an, t) is None for t in tails):
+        return None
+    reads = [r for r in result_reads(an, func, fp_ret_reg(arch)) if isinstance(r, int)]
+    if reads and all(r == 32 for r in reads) or not reads and _x87_float_result(an, func, arch):
+        return 32
+    return 64
+
+
+def _x87_float_result(an, func, arch) -> bool:
+    """x87: every value the function returns is float arithmetic (fp.as_float) -- a `float`
+    function, whose result the stack holds at its own precision as for any other."""
+    import copy
+
+    from .cleanup import _lifted
+    from .fp import as_float
+    from .ir import Phi, Var, rebuild
+    from .passes import optimize
+    from .ssa import to_ssa
+    fn = copy.deepcopy(_lifted(an, func))
+    for s in fn.stmts():
+        if isinstance(s, Return):
+            s.value = Reg(fp_ret_reg(arch), 64)
+    try:
+        fn = optimize(to_ssa(fn, arch), arch)
+    except Exception:  # noqa: BLE001 - no evidence from a function that does not optimise
+        return False
+    defs = {s.dst: s.src for s in fn.stmts() if isinstance(s, Assign) and isinstance(s.dst, Var)}
+
+    def expand(e, depth):
+        if isinstance(e, Var) and e in defs and not isinstance(defs[e], Phi) and depth < 8:
+            return expand(defs[e], depth + 1)
+        kids = children(e)
+        if not kids:
+            return e
+        return rebuild(e, tuple(expand(k, depth) for k in kids))
+
+    def values(e, seen):
+        if isinstance(e, Var) and isinstance(defs.get(e), Phi):
+            if e in seen:
+                return []
+            seen.add(e)
+            return [x for _, v in defs[e].sources for x in values(v, seen)]
+        return [expand(e, 0)]
+    outs = [x for s in fn.stmts() if isinstance(s, Return) and s.value is not None for x in values(s.value, set())]
+    return bool(outs) and all(as_float(x) is not None for x in outs)
 
 
 def _last_writes(an, fn: IRFunction, arch: ArchInfo) -> int | None:
@@ -459,9 +529,10 @@ def join_pair_params(fn, pairs: list[str]):
         b.stmts = [s for s in stmts if s is not None]
 
 
-def arg_classes(sig, fmt: str | None, fsig=None, scan: bool = False) -> list[str] | None:
+def arg_classes(sig, fmt: str | None, fsig=None, scan: bool = False, wide: bool = False) -> list[str] | None:
     """`i` / `d` / `f` per argument of a libc call, in order: the signature's fixed arguments and,
-    for printf-style formats, one per conversion (`%f` and friends take a double)."""
+    for printf-style formats, one per conversion (`%f` and friends take a double). With `wide`,
+    `q` for a 64-bit integer conversion (`%lld`, `%jd`: two words on a 32-bit stack)."""
     if fsig is not None:
         return ["d" if ch == "d" else "f" if ch == "f" else "i" for ch in fsig[0]]
     if sig is None:
@@ -477,7 +548,8 @@ def arg_classes(sig, fmt: str | None, fsig=None, scan: bool = False) -> list[str
         if conv == "%":
             continue
         out += ["i"] * ((m.group(2) == "*") + (m.group(4) == "*"))
-        out.append("d" if conv in FLOAT_CONVS and not scan else "i")
+        wide_int = wide and not scan and m.group(5) in ("ll", "j") and conv in "diouxX"
+        out.append("d" if conv in FLOAT_CONVS and not scan else "q" if wide_int else "i")
     return out
 
 

@@ -26,7 +26,9 @@ def _c(an, name):
     return decompile(an, an.function_by_name(name)).text
 
 
-@pytest.fixture(scope="module", params=["floats_O0", "floats_O2", "floats_a64_O0", "floats_a64_O2",
+@pytest.fixture(scope="module", params=["floats_O0", "floats_O2", "floats32_O0", "floats32_O2", "floats32_i386_O2",
+                                        "floats_a64_O0",
+                                        "floats_a64_O2",
                                         "floats_arm_O0", "floats_arm_O2", "floats_thumb_O2", "floats_rv64_O0",
                                         "floats_rv64_O2", "floats_rv32_O0", "floats_rv32_O2", "floats_ppc_O0",
                                         "floats_ppc_O2", "floats_ppc64_O0", "floats_ppc64_O2"])
@@ -57,6 +59,8 @@ def test_signatures(an):
     # integer parameters first, then the float ones (the registers do not say how C interleaved them)
     if a.bin.arch == "ppc64":                    # ELFv2 places arguments by position: the C order
         assert re.fullmatch(rf"double mix\((int|int64_t) a1, double a2, {f_} a3, {long_} a4\)", sig["mix"]), sig
+    elif a.bin.arch == "x86":                    # cdecl: every argument on the stack, in C order
+        assert sig["mix"] == "double mix(int a1, double a2, float a3, int a4)", sig
     else:
         assert re.fullmatch(rf"double mix\(int a1, {long_} a2, double a3, {f_} a4\)", sig["mix"]), sig
 
@@ -112,7 +116,7 @@ def test_call_arguments_and_results(an):
     text = _c(a, "main")
     assert "poly(2.0)" in text or re.search(r"poly\(v\d+\)", text), text
     assert "scale(2.0f, 3.0f)" in text, text
-    mix = r"mix\(3, 1\.5, 0\.25f?, 10\)" if a.bin.arch == "ppc64" else \
+    mix = r"mix\(3, 1\.5, 0\.25f?, 10\)" if a.bin.arch in ("ppc64", "x86") else \
         r"mix\(3, 10, 1\.5, 0\.25f?\)" if a.bin.arch == "ppc" else r"mix\(3, 10, 1\.5, 0\.25f\)"
     assert re.search(mix, text), text
     assert "to_long(3.7)" in text, text
@@ -212,7 +216,9 @@ def test_recompiled_pseudocode_matches(an, tmp_path):
             pytest.skip("no riscv64-linux-gnu-gcc / qemu-riscv32 to run the pseudocode")
         run, static = [qemu], RV32_RUN
     else:
-        cc, static = shutil.which("gcc"), []
+        # x86-32: x87 arithmetic, with C's rules for its excess precision (a double variable or
+        # result is rounded to a double, as the original's stores to memory round it)
+        cc, static = shutil.which("gcc"), ["-m32", "-fexcess-precision=standard"] if a.bin.arch == "x86" else []
     if cc is None:
         pytest.skip("no C compiler")
     code = "\n\n".join(_c(a, f) for f in FUNCS)
@@ -299,6 +305,14 @@ def test_optimisation_preserves_meaning(an, fname):
         m.regs.update({k: 0 for k in ("rax", "rdi", "rsi", "rbp", "x0", "x29", "x30", "r0", "r11", "lr")},
                       rsp=0x7FFF0000, sp=0x7FFF0000, r1=0x7FFF0000)
         m.write(0x7FFF0000, 0xDEAD0000, 8)
+        if a.bin.arch == "x86":                     # cdecl: every argument on the stack
+            m.regs["esp"] = 0x7FFF0000
+            off = 4
+            for v in args:
+                w = 32 if fname == "scale" else 64
+                m.write(0x7FFF0000 + off, from_float(v, w), w // 8)
+                off += w // 8
+            args = []
         for k, v in enumerate(args):
             w = 32 if fname == "scale" else 64
             bits = from_float(v, w)

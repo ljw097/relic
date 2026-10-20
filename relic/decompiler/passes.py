@@ -383,6 +383,11 @@ def _simp_node(e: Expr) -> Expr:
     elif isinstance(e, Cast) and e.kind == "low" and isinstance(e.a, Cast) and e.bits <= e.a.a.bits:
         # low_n(cast_m(x)) == low_n(x) when x is at least n bits wide
         return Cast("low", e.a.a, e.bits)
+    elif isinstance(e, Cast) and e.kind == "low" and isinstance(e.a, Ite) and \
+            (isinstance(e.a.a, Const) or isinstance(e.a.b, Const)):
+        # low_n(c ? K : x) == c ? low_n(K) : low_n(x) (`setcc al; cmov eax, edx; movzx eax, al`)
+        lo = lambda x: _simp_node(_fold_node(Cast("low", x, e.bits)))
+        return Ite(e.a.cond, lo(e.a.a), lo(e.a.b), e.bits)
     return e
 
 

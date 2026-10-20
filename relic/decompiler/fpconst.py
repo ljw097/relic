@@ -195,3 +195,26 @@ def float_pointees(fn: IRFunction, ftypes: dict[str, int], is_addr=lambda v: Fal
                     out[q] = out[p]
                     changed = True
     return out
+
+
+def narrow_x87(fn: IRFunction) -> bool:
+    """32-bit x86 (x87): float arithmetic shows as doubles of widened floats, rounded once on the
+    way out -- `(float)((double)a * (double)b + 1.5)` is `a * b + 1.5f`, a comparison of two
+    widened floats compares the floats. See fp.as_float."""
+    from .fp import FCMP, as_float
+    from .ir import Intrinsic, transform
+    from .passes import _rewrite
+
+    def node(e: Expr) -> Expr:
+        if isinstance(e, Intrinsic) and e.name in ("fpconv", "fptosi", "fptoui") and e.args[0].bits == 64 and \
+                (e.name != "fpconv" or e.bits == 32):
+            x = as_float(e.args[0])
+            if x is not None:
+                return x if e.name == "fpconv" else Intrinsic(e.name, (x,), e.bits)
+        if isinstance(e, BinOp) and e.op in FCMP and e.a.bits == 64:
+            a, b = as_float(e.a), as_float(e.b)
+            if a is not None and b is not None:
+                return BinOp(e.op, a, b, 1)
+        return e
+    return _rewrite(fn, lambda e: transform(e, node))
+

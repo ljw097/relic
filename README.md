@@ -89,7 +89,7 @@ The total is a weighted average, with weights from how much each area matters to
 | Auto-analysis (14) | 100% | Finds 99.9% of the functions `.eh_frame` lists in stripped bash, 99.96% with `.eh_frame` removed (noreturn inference, tail calls, function pointers in data); C++ classes and vtables from RTTI (gcc/clang and MSVC); virtual calls resolved by following objects; calls through function-pointer variables on every processor; data among code; bash in about 7 seconds |
 | Library identification (8) | 100% | On the stripped static C test binaries, 83–94% of the functions that had symbols get named, with no wrong names |
 | Type system (10) | 90% | libc flag arguments print as their constants (`PROT_READ \| PROT_WRITE`), `#define` groups from headers become enums, Microsoft bit-field layout on PE; no by-value struct arguments or returns |
-| Decompiler (20) | 60% | Gotos are down to half of where the benchmark started; most of what's left is in big state machines (gnulib `quotearg`, gzip's deflate). SSE/AVX as Intel intrinsics; no x87 floating point |
+| Decompiler (20) | 60% | Gotos are down to half of where the benchmark started; most of what's left is in big state machines (gnulib `quotearg`, gzip's deflate). SSE/AVX as Intel intrinsics; x87 floating point on 32-bit x86, except `long double` |
 | Interactive UI (12) | 100% | |
 | Scripting & extensions (8) | 100% | |
 | Debugger (7) | 100% | Windows (PE) programs run under wine with Windows' own gdbserver.exe |
