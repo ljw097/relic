@@ -146,6 +146,17 @@ class Binary:
                 return s
         return None
 
+    def file_end(self, sec: Section) -> int:
+        """Where the bytes the file holds for `sec` end: a scan of the section stops there, not
+        at a virtual size a malformed (or .bss-padded) header makes huge."""
+        if not sec.loaded:
+            return sec.addr
+        end = min(sec.end, sec.addr + max(len(self.data) - sec.offset, 0))
+        seg = self.segment_at(sec.addr)
+        if seg is not None:
+            end = min(end, seg.addr + seg.filesz)
+        return max(end, sec.addr)
+
     def is_mapped(self, addr: int) -> bool:
         return self.segment_at(addr) is not None
 

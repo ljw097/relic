@@ -152,7 +152,10 @@ def _analyze(args):
         sys.exit(f"relic: {args.file}: {e}")
     an = Analysis(b)
     an.sig_paths = [] if getattr(args, "no_sigs", False) else getattr(args, "sigs", None)
-    return an.run()
+    an.run()
+    if an.project_error:
+        print(f"relic: warning: {an.project_error}", file=sys.stderr)
+    return an
 
 
 def _where(an, text, default=None) -> int:

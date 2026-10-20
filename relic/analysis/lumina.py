@@ -167,6 +167,9 @@ def pull(an: "Analysis", store: Store, overwrite: bool = False) -> dict:
         if fp is not None:
             by_fp.setdefault(fp, []).append(f)
     found = store.get(sorted(by_fp))
+    if not isinstance(found, dict):
+        found = {}
+    found = {fp: e for fp, e in found.items() if fp in by_fp and _valid_entry(e)}
     applied = []
     for fp, e in found.items():
         for f in by_fp.get(fp, ()):
@@ -190,6 +193,28 @@ def pull(an: "Analysis", store: Store, overwrite: bool = False) -> dict:
     return {"applied": sorted(applied), "matched": len(found)}
 
 
+def _valid_entry(e) -> bool:
+    """An entry from a store (another analyst's, or a server's) has the shape `metadata` gives:
+    strings where strings go, hex offsets for comments."""
+    if not isinstance(e, dict):
+        return False
+    for key in ("name", "rcomment"):
+        if e.get(key) is not None and not isinstance(e[key], str):
+            return False
+    for key in ("comments", "var_names", "var_types"):
+        v = e.get(key)
+        if v is None:
+            continue
+        if not isinstance(v, dict) or not all(isinstance(k, str) and isinstance(x, str) for k, x in v.items()):
+            return False
+    try:
+        for off in (e.get("comments") or {}):
+            int(off, 16)
+    except ValueError:
+        return False
+    return True
+
+
 # ------------------------------------------------------------------ server
 def serve(path: str, host: str = "127.0.0.1", port: int = 8765, ready=None):
     """A store for a team: POST /get {"keys": [...]}, POST /put {"functions": {...}}, backed by
@@ -207,12 +232,17 @@ def serve(path: str, host: str = "127.0.0.1", port: int = 8765, ready=None):
         def do_POST(self):
             try:
                 n = int(self.headers.get("Content-Length") or 0)
-                if n > 64 << 20:
-                    raise ValueError("request too large")
+                if n < 0 or n > 64 << 20:
+                    raise ValueError("bad Content-Length" if n < 0 else "request too large")
                 body = json.loads(self.rfile.read(n).decode() or "{}")
+                if not isinstance(body, dict):
+                    raise ValueError("the request must be a JSON object")
                 with lock:
                     if self.path == "/get":
-                        keys = [k for k in body.get("keys", []) if isinstance(k, str)]
+                        keys = body.get("keys", [])
+                        if not isinstance(keys, list):
+                            raise ValueError("keys must be a list")
+                        keys = [k for k in keys if isinstance(k, str)]
                         out = {"functions": store.get(keys)}
                     elif self.path == "/put":
                         funcs = body.get("functions", {})
@@ -225,7 +255,7 @@ def serve(path: str, host: str = "127.0.0.1", port: int = 8765, ready=None):
                         return
                 data = json.dumps(out).encode()
                 self.send_response(200)
-            except (ValueError, json.JSONDecodeError) as e:
+            except (ValueError, UnicodeDecodeError) as e:
                 data = json.dumps({"error": str(e)}).encode()
                 self.send_response(400)
             self.send_header("Content-Type", "application/json")

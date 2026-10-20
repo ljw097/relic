@@ -9,6 +9,7 @@ import threading
 
 from relic.analysis import analyze
 from relic.analysis.lumina import Store, fingerprint, serve
+from relic.analysis.lumina import pull as lumina_pull
 
 HERE = os.path.dirname(__file__)
 
@@ -88,3 +89,41 @@ def test_cli(vuln64, vuln64_stripped, tmp_path):
     r = subprocess.run([sys.executable, "-m", "relic", "lumina", "pull", str(path), "--store", str(bad)],
                        capture_output=True, text=True, cwd=os.path.dirname(HERE))
     assert r.returncode != 0 and "not a lumina store" in r.stderr
+
+
+def test_server_rejects_malformed_requests(tmp_path):
+    import socket
+    ready = threading.Event()
+    box = {}
+
+    def started(server):
+        box["server"] = server
+        ready.set()
+    threading.Thread(target=serve, args=(str(tmp_path / "team.json"), "127.0.0.1", 0, started), daemon=True).start()
+    assert ready.wait(10)
+    port = box["server"].server_address[1]
+    try:
+        # (a negative length once read to EOF: the request hung, its memory unbounded)
+        for length, body in ((b"-1", b"x" * 100), (b"2", b"[]"), (b"11", b'{"keys": 5}'), (b"2", b"\xff\xfe")):
+            with socket.create_connection(("127.0.0.1", port), timeout=10) as s:
+                s.sendall(b"POST /get HTTP/1.1\r\nContent-Length: " + length + b"\r\n\r\n" + body)
+                assert s.recv(64).split(b"\r\n")[0].endswith(b"400 Bad Request")
+    finally:
+        box["server"].shutdown()
+
+
+def test_pull_skips_malformed_entries(vuln64_stripped):
+    an = analyze(vuln64_stripped)
+    f = next(f for f in an.functions.values() if fingerprint(an, f))
+    fp = fingerprint(an, f)
+
+    class Remote:
+        def __init__(self, entry):
+            self.entry = entry
+
+        def get(self, keys):
+            return {fp: self.entry, "not-asked": {"name": "x"}}
+    for junk in ({"name": "a", "comments": {"zz": "x"}}, {"name": 5}, ["a"], {"var_types": {"a1": 3}}):
+        assert lumina_pull(an, Remote(junk)) == {"applied": [], "matched": 0}
+    got = lumina_pull(an, Remote({"name": "named_by_pull"}))
+    assert got["matched"] == 1 and an.renames[f.addr] == "named_by_pull"

@@ -123,7 +123,7 @@ def _msvc(an) -> dict[str, CppClass]:
     ptr = b.bits // 8
     base = getattr(b, "image_base", None)
     if base is None:
-        base = min(s.addr for s in b.sections if s.loaded) & ~0xFFFF
+        base = min((s.addr for s in b.sections if s.loaded), default=0) & ~0xFFFF
     x64 = ptr == 8
     rdata = [s for s in b.sections if s.loaded and not s.x and s.size and not b.is_writable(s.addr)]
 
@@ -136,7 +136,7 @@ def _msvc(an) -> dict[str, CppClass]:
 
     cols: dict[int, tuple[int, int, int]] = {}         # locator -> (offset, type descriptor, hierarchy)
     for sec in rdata:
-        for a in range(sec.addr + (-sec.addr % 4), sec.end - 20, 4):
+        for a in range(sec.addr + (-sec.addr % 4), b.file_end(sec) - 20, 4):
             sig = b.read_int(a, 4)
             if sig != (1 if x64 else 0):
                 continue
@@ -166,7 +166,7 @@ def _msvc(an) -> dict[str, CppClass]:
         classes[td] = c
     # vtables: a pointer to a locator, then the methods
     for sec in rdata:
-        for a in range(sec.addr + (-sec.addr % ptr), sec.end - ptr, ptr):
+        for a in range(sec.addr + (-sec.addr % ptr), b.file_end(sec) - ptr, ptr):
             col = b.read_ptr(a)
             if col not in cols:
                 continue

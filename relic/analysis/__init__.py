@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import bisect
+import contextlib
 import copy
 import functools
 import json
@@ -84,6 +85,7 @@ class Analysis:
         self.lib_names: dict[int, str] = {}
         self.lib_sources: dict[int, str] = {}       # ... and the signature set (label) that named it
         self._toolchain = None
+        self.project_error: str | None = None       # why the project file did not load
 
     # ------------------------------------------------------------------ run
     def run(self, load_project: bool = True) -> "Analysis":
@@ -154,7 +156,7 @@ class Analysis:
             try:
                 with open(self.project_path) as fp:
                     edits = {int(a, 16): v for a, v in json.load(fp).get("function_edits", {}).items()}
-            except (OSError, ValueError):
+            except (OSError, ValueError, TypeError, AttributeError):
                 edits = {}
         for a, what in sorted(edits.items()):
             if what == "create" and a not in self.functions and self.bin.is_exec(a & ~1):
@@ -341,11 +343,11 @@ class Analysis:
         try:
             with open(path) as fp:
                 saved = json.load(fp).get("patches", {})
-        except (OSError, ValueError):
+            saved = [(int(a, 16), bytes.fromhex(p["old"]), bytes.fromhex(p["new"])) for a, p in saved.items()]
+        except (OSError, ValueError, TypeError, AttributeError, KeyError):
             return
         from ..patch import PatchError, write
-        for a, p in saved.items():
-            addr, old, new = int(a, 16), bytes.fromhex(p["old"]), bytes.fromhex(p["new"])
+        for addr, old, new in saved:
             if self.bin.read(addr, len(old)) != old or addr in self.patches:
                 continue
             try:
@@ -966,19 +968,42 @@ class Analysis:
             data["snapshots"] = self.snapshots
         if self.history:
             data["history"] = self.history
-        with open(path or self.project_path, "w") as fp:
-            json.dump(data, fp, indent=2)
+        path = path or self.project_path
+        tmp = path + ".tmp"
+        try:
+            with open(tmp, "w") as fp:              # (a failed write leaves the old file whole)
+                json.dump(data, fp, indent=2)
+        except BaseException:
+            with contextlib.suppress(OSError):
+                os.remove(tmp)
+            raise
+        if self.project_error and path == self.project_path and os.path.exists(path):
+            os.replace(path, path + ".bak")          # (the file that did not load: kept, not lost)
+            self.project_error = None
+        os.replace(tmp, path)
 
     def load_project(self, path: str | None = None) -> bool:
+        """Read the annotations from the project file. A file that does not parse is left alone
+        (`project_error` says why; the next save keeps it as FILE.bak) and the binary opens
+        without it."""
         path = path or self.project_path
         if not os.path.exists(path):
             return False
-        with open(path) as fp:
-            data = json.load(fp)
-        from .project import notes_from_json
-        notes_from_json(self, data)
-        self.snapshots = dict(data.get("snapshots", {}))
-        self.history = list(data.get("history", []))
+        from .project import notes_from_json, notes_to_json
+        before = notes_to_json(self)
+        try:
+            with open(path) as fp:
+                data = json.load(fp)
+            if not isinstance(data, dict):
+                raise ValueError("not a JSON object")
+            notes_from_json(self, data)
+            snapshots, history = dict(data.get("snapshots", {})), list(data.get("history", []))
+        except (ValueError, TypeError, AttributeError, KeyError) as e:
+            notes_from_json(self, before)
+            self.project_error = f"{path}: unreadable project file, not loaded ({type(e).__name__}: {e})"
+            return False
+        self.snapshots, self.history = snapshots, history
+        self.project_error = None
         return True
 
     # ------------------------------------------------------------ snapshots
