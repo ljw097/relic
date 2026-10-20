@@ -50,6 +50,8 @@ def _parser() -> argparse.ArgumentParser:
         s.add_argument("--sigs", action="append", metavar="FILE.sig",
                        help="library signature file to name functions with (repeatable)")
         s.add_argument("--no-sigs", action="store_true", help="name no functions by library signatures")
+        s.add_argument("--no-auto-names", action="store_true",
+                       help="show generated names (sub_XXXX, v1, a1) instead of names suggested from the code")
         return s
 
     add("info", "file headers, sections and libraries")
@@ -152,6 +154,7 @@ def _analyze(args):
         sys.exit(f"relic: {args.file}: {e}")
     an = Analysis(b)
     an.sig_paths = [] if getattr(args, "no_sigs", False) else getattr(args, "sigs", None)
+    an.auto_names = not getattr(args, "no_auto_names", False)
     an.run()
     if an.project_error:
         print(f"relic: warning: {an.project_error}", file=sys.stderr)
@@ -214,6 +217,8 @@ def cmd_funcs(args):
         flags = " [import]" if f.is_import else (" [noreturn]" if f.noreturn else "")
         if f.library:
             flags += " [lib]"
+        if f.addr in an.auto_func_names and f.addr not in an.renames:
+            flags += f" [auto: {an.auto_func_reasons[f.addr]}]"
         print(f"{f.addr:#18x}  {f.size:6} {len(f.blocks):6} {len(f.calls):5}  {an.name(f.addr)}{flags}")
 
 

@@ -69,6 +69,12 @@ Roughly, here's what works:
   toolchains you have installed (`relic sigs build --system`).
 - **Decompiler**: recovers structs from memory access patterns, and you can assign types yourself (`Y`). Floating point, libc and Windows API
   prototypes, and C header import are in. There are tests that recompile the output and check it behaves like the original.
+- **Automatic names**: a stripped binary's `sub_XXXX` functions are named from what their code shows -- the name an
+  `assert()` passes (`table_insert`), a log message naming its function (`"shell_getc: ..."`), `xmalloc`, `usage`,
+  `fatal`, `j_puts` thunks -- and the decompiler's variables from how they are used: `fd = open(path, ...)`,
+  `len = strlen(str)`, `FILE *fp`, `home = getenv("HOME")`, loop counters `i`, `j`, `count++`, `lines =
+  count_lines(...)`. Your own names always win; `relic funcs` says why each name was given, View > Automatic names
+  (or `--no-auto-names`) shows the generated ones.
 - **GUI**: most of what your hands know from IDA is there (names, comments, xrefs, search, bookmarks, byte patching, undo),
   and the shortcuts match IDA's wherever I could make them.
 - **Debugger**: gdb (via GDB/MI) underneath, with a pwndbg feel on top. Local, gdbserver, qemu-user and attaching to a running process

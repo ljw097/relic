@@ -26,6 +26,10 @@ class Xref:
 
 
 class Analysis:
+    # default for `auto_names`; RELIC_AUTO_NAMES=0 turns it off (the test suite does: its
+    # expectations are written in the generated names)
+    AUTO_NAMES = os.environ.get("RELIC_AUTO_NAMES", "1") != "0"
+
     def __init__(self, binary: Binary):
         self.bin = binary
         self.dis = Disassembler(binary)
@@ -86,6 +90,9 @@ class Analysis:
         self.lib_sources: dict[int, str] = {}       # ... and the signature set (label) that named it
         self._toolchain = None
         self.project_error: str | None = None       # why the project file did not load
+        # readable names the analysis suggests: variables by what the code does with them
+        # (decompiler/varnames.py), functions without a symbol (analysis/autoname.py)
+        self.auto_names = Analysis.AUTO_NAMES
 
     # ------------------------------------------------------------------ run
     def run(self, load_project: bool = True) -> "Analysis":
@@ -146,6 +153,10 @@ class Analysis:
         self._build_xrefs()
         if load_project:
             self.load_project()
+        self.auto_func_names, self.auto_func_reasons = {}, {}
+        if self.auto_names:
+            from .autoname import auto_names
+            self.auto_func_names, self.auto_func_reasons = auto_names(self)
         return self
 
     def _apply_func_edits(self, finder: FunctionAnalyzer, from_project: bool = False):
@@ -481,6 +492,8 @@ class Analysis:
             return self.renames[addr]
         f = self.functions.get(addr)
         n = f.name if f is not None else self.bin.name_of(addr)
+        if n and n.startswith("sub_") and addr in self.__dict__.get("auto_func_names", {}):
+            return self.auto_func_names[addr]          # (analysis/autoname.py: what its code shows)
         if n and n.startswith("_Z"):
             from ..demangle import demangle
             return demangle(n) or n
@@ -578,6 +591,15 @@ class Analysis:
             self.renames[addr] = name
         else:
             self.renames.pop(addr, None)
+
+    def set_auto_names(self, on: bool):
+        """Show names suggested from the code (functions without a symbol, decompiler variables), or
+        the generated ones (`sub_XXXX`, `v1`). The user's names are kept either way."""
+        self.auto_names = on
+        self.auto_func_names, self.auto_func_reasons = {}, {}
+        if on:
+            from .autoname import auto_names
+            self.auto_func_names, self.auto_func_reasons = auto_names(self)
 
     def rename_var(self, func: int, generated: str, name: str):
         """Name a decompiler variable (`v3`, `a1`, `var_c`) of the function at `func`; empty resets."""

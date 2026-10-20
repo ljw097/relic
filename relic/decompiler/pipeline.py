@@ -120,6 +120,8 @@ def prepare(an: "Analysis", func: "Function") -> Prepared:
             from .calls import stack_param_slots
             params += [frame.slots[first + rel].name() if first + rel in frame.slots else f"arg_{first + rel:x}"
                        for rel, _, _ in stack_param_slots(an, arch, func.addr)]
+    from .cleanup import fold_param_spills
+    fold_param_spills(fn, params)           # -O0: `var_1c = argc` once on entry, then var_1c read
     narrow_library_results(fn)
     from .calls import narrow_call_args
     narrow_call_args(an, arch, fn)

@@ -49,7 +49,8 @@ def test_checksum(ans, variant):
     assert code.startswith("int checksum(char *a1)")
     assert ("while (" in code or "for (" in code) and "> 100000" in code and "0x1337" in code
     if variant == "vuln64":                        # -O0 keeps the source's counted loop
-        assert "for (var_10 = 0; var_20[var_10] != 0; var_10++) {" in code
+        # (the parameter itself, not the stack slot -O0 copies it to on entry)
+        assert "for (var_10 = 0; a1[var_10] != 0; var_10++) {" in code
     assert "goto" not in code
 
 
@@ -74,7 +75,7 @@ def test_main(ans, variant):
 
 def test_short_circuit_condition(ans):
     code = _c(ans["vuln64"], "show_note")
-    assert "if (var_c >= 0 && var_c <= 15 && notes[var_c] != 0) {" in code
+    assert "if (a1 >= 0 && a1 <= 15 && notes[a1] != 0) {" in code
 
 
 @pytest.mark.parametrize("variant", VARIANTS)

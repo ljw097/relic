@@ -536,6 +536,11 @@ class MainWindow(QMainWindow):
                              lambda on: self.set_appearance(theme="light" if on else "dark"), False)
         self.light_act.setCheckable(True)
         self.light_act.setChecked(current_theme() == "light")
+        self.auto_names_act = act(m, "&Automatic names", None, self.set_auto_names, False)
+        self.auto_names_act.setCheckable(True)
+        self.auto_names_act.setChecked(self.auto_names_on())
+        self.auto_names_act.setToolTip("Name stripped functions and decompiler variables from what the code "
+                                       "does (assert() and log messages, xmalloc, fd, len, i...)")
         act(m, "Zoom &in", ("Ctrl+=", "Ctrl++"), lambda: self.set_appearance(size=font_size() + 1), False)
         act(m, "Zoom &out", "Ctrl+-", lambda: self.set_appearance(size=font_size() - 1), False)
         act(m, "&Reset zoom", "Ctrl+0", lambda: self.set_appearance(size=DEFAULT_FONT_SIZE), False)
@@ -749,6 +754,8 @@ class MainWindow(QMainWindow):
     def set_analysis(self, an: Analysis, extra: dict | None = None):
         extra = extra or {}
         self.an = an
+        if an.auto_names != self.auto_names_on():
+            an.set_auto_names(self.auto_names_on())
         from ..scripting import namespace
         self.pyconsole.set_namespace(namespace(an, self))
         self.back.clear()
@@ -1580,6 +1587,26 @@ class MainWindow(QMainWindow):
             self.an.rename_field(struct, field, name)
         self._after_edit()
         return True
+
+    def auto_names_on(self) -> bool:
+        return str(self.settings().value("auto_names", "true")).lower() != "false"
+
+    def set_auto_names(self, on: bool):
+        """View > Automatic names: suggested names for stripped functions and variables, or the
+        generated ones."""
+        self.settings().setValue("auto_names", "true" if on else "false")
+        if self.an is None:
+            return
+        self.an.set_auto_names(on)
+        self._fill_functions()
+        self._fill_names()
+        keep = self.cur
+        self.disasm.reload()
+        self.graph.reload()
+        self.decomp.invalidate(reload=self.tabs.currentIndex() == self.TAB_DECOMP)
+        if keep is not None:
+            self.disasm.goto(keep)
+            self.graph.goto(keep)
 
     def rename(self, addr: int, name: str):
         if name and any(c.isspace() for c in name):

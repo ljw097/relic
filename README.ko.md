@@ -71,6 +71,11 @@ python3 -m venv .venv
 - **디컴파일러**: 메모리 접근 패턴으로 구조체를 복원하고, 사용자가 타입을 지정할 수도 있습니다(`Y`).
   부동소수점 연산, libc·Windows API 함수 원형, C 헤더 가져오기를 지원합니다.
   테스트에서는 디컴파일 결과를 다시 컴파일해 원본과 같은 결과를 내는지 확인합니다.
+- **자동 이름**: stripped 바이너리의 `sub_XXXX` 함수에 코드가 보여 주는 이름을 붙입니다. `assert()`가 넘기는 함수 이름
+  (`table_insert`), 자기 이름을 담은 로그 메시지(`"shell_getc: ..."`), `xmalloc`, `usage`, `fatal`, `j_puts` 같은 썽크.
+  디컴파일러 변수도 쓰임새로 이름을 붙입니다: `fd = open(path, ...)`, `len = strlen(str)`, `FILE *fp`,
+  `home = getenv("HOME")`, 루프 카운터 `i`·`j`, `count++`, `lines = count_lines(...)`. 사용자가 붙인 이름이 항상 우선이고,
+  `relic funcs`가 이름을 붙인 이유를 보여 줍니다. View ▸ Automatic names(또는 `--no-auto-names`)로 생성된 이름을 볼 수 있습니다.
 - **GUI**: 이름 변경, 주석, xref, 검색, 북마크, 바이트 패치, 되돌리기 등 IDA에서 자주 쓰는 기능을 갖췄고,
   단축키도 가능한 한 IDA와 같게 맞췄습니다.
 - **디버거**: gdb(GDB/MI)를 백엔드로 쓰고, 화면은 pwndbg와 비슷하게 구성했습니다. 로컬 실행, gdbserver 원격 연결,

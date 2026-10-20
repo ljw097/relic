@@ -442,6 +442,69 @@ def forward_local_constants(fn: IRFunction) -> bool:
     return changed
 
 
+def fold_param_spills(fn: IRFunction, params: list[str]) -> bool:
+    """-O0 copies every parameter into a stack slot on entry (`var_1c = argc`) and reads it from
+    there. A slot written once, in the entry block, with a parameter (or its low part) the code
+    then never reads otherwise -- and whose address is never taken -- is that parameter."""
+    from .ir import Cast, StackAddr, StackVar, Var, children, map_stmt, rebuild, walk
+    entry = fn.blocks.get(fn.addr)
+    if entry is None or not params:
+        return False
+    names = set(params)
+    writes: dict[str, int] = {}
+    taken = set()
+    reads: dict[str, int] = {}
+    for st in fn.stmts():
+        if isinstance(st, Assign) and isinstance(st.dst, (StackVar, Var)):
+            writes[st.dst.name] = writes.get(st.dst.name, 0) + 1
+        for e in stmt_exprs(st):
+            for x in walk(e):
+                if isinstance(x, StackAddr):
+                    taken.add(x.name)
+                elif isinstance(x, (Var, StackVar)) and x.name in names:
+                    reads[x.name] = reads.get(x.name, 0) + 1
+    subst: dict[tuple[str, int], Expr] = {}
+    drop = set()
+    for st in entry.stmts:
+        if not (isinstance(st, Assign) and isinstance(st.dst, StackVar)):
+            continue
+        src = st.src
+        p = src.a if isinstance(src, Cast) and src.kind == "low" else src
+        if not isinstance(p, (Var, StackVar)) or p.name not in names or writes.get(p.name) or \
+                reads.get(p.name) != 1 or writes.get(st.dst.name) != 1 or st.dst.name in taken:
+            continue
+        subst[(st.dst.name, st.dst.bits)] = src
+        drop.add(id(st))
+    if not subst:
+        return False
+
+    def rw(e):
+        if isinstance(e, StackVar) and (e.name, e.bits) in subst:
+            return subst[(e.name, e.bits)]
+        kids = children(e)
+        if not kids:
+            return e
+        new = tuple(rw(x) for x in kids)
+        return rebuild(e, new) if any(a is not b for a, b in zip(new, kids)) else e
+    # (a slot read at another width than it was written is left alone)
+    widths = {}
+    for st in fn.stmts():
+        for e in stmt_exprs(st):
+            for x in walk(e):
+                if isinstance(x, StackVar) and any(x.name == n for n, _ in subst):
+                    widths.setdefault(x.name, set()).add(x.bits)
+    subst = {(n, b): v for (n, b), v in subst.items() if widths.get(n, {b}) == {b}}
+    drop = {id(st) for st in entry.stmts if isinstance(st, Assign) and isinstance(st.dst, StackVar)
+            and (st.dst.name, st.dst.bits) in subst and id(st) in drop}
+    if not subst:
+        return False
+    for b in fn.blocks.values():
+        b.stmts = [st for st in b.stmts if id(st) not in drop]
+        for st in b.stmts:
+            map_stmt(st, rw)
+    return True
+
+
 def drop_dead_locals(fn: IRFunction) -> bool:
     """Writes of a stack variable that no later read sees, for variables whose address is never
     taken (a spill gcc leaves just before releasing the space: `fst dword [esp]; add esp, 4`)."""
