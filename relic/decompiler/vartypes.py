@@ -16,7 +16,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
-from .ir import (Assign, BinOp, Call, CallStmt, Cast, Const, Expr, IRFunction, Ite, Load, Return, StackVar,
+from .ir import (Assign, BinOp, Call, CallStmt, Cast, Const, Expr, IRFunction, Ite, Load, Return, StackAddr, StackVar,
                  Store, UnOp, Var, children, map_stmt, stmt_defs, stmt_exprs, transform, walk)
 
 if TYPE_CHECKING:
@@ -303,8 +303,8 @@ def _addr_base(a: Expr, is_addr=lambda v: False):
     if isinstance(a, BinOp) and a.op == "-" and isinstance(a.b, Const) and isinstance(a.a, (Var, StackVar)):
         return a.a
     if isinstance(a, BinOp) and a.op == "+":
-        if any(isinstance(x, Const) and is_addr(x.value) for x in (a.a, a.b)):
-            return None
+        if any(isinstance(x, Const) and is_addr(x.value) or isinstance(x, StackAddr) for x in (a.a, a.b)):
+            return None                         # (a global or stack array indexed by v)
         for x in (a.a, a.b):
             if isinstance(x, (Var, StackVar)):
                 return x

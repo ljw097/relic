@@ -71,6 +71,11 @@ python3 -m venv .venv
 - **디컴파일러**: 메모리 접근 패턴으로 구조체를 복원하고, 사용자가 타입을 지정할 수도 있습니다(`Y`).
   부동소수점 연산, libc·Windows API 함수 원형, C 헤더 가져오기를 지원합니다.
   테스트에서는 디컴파일 결과를 다시 컴파일해 원본과 같은 결과를 내는지 확인합니다.
+- **자동 이름**: stripped 바이너리의 `sub_XXXX` 함수에 코드가 보여 주는 이름을 붙입니다. `assert()`가 넘기는 함수 이름
+  (`table_insert`), 자기 이름을 담은 로그 메시지(`"shell_getc: ..."`), `xmalloc`, `usage`, `fatal`, `j_puts` 같은 썽크.
+  디컴파일러 변수도 쓰임새로 이름을 붙입니다: `fd = open(path, ...)`, `len = strlen(str)`, `FILE *fp`,
+  `home = getenv("HOME")`, 루프 카운터 `i`·`j`, `count++`, `lines = count_lines(...)`. 사용자가 붙인 이름이 항상 우선이고,
+  `relic funcs`가 이름을 붙인 이유를 보여 줍니다. View ▸ Automatic names(또는 `--no-auto-names`)로 생성된 이름을 볼 수 있습니다.
 - **GUI**: 이름 변경, 주석, xref, 검색, 북마크, 바이트 패치, 되돌리기 등 IDA에서 자주 쓰는 기능을 갖췄고,
   단축키도 가능한 한 IDA와 같게 맞췄습니다.
 - **디버거**: gdb(GDB/MI)를 백엔드로 쓰고, 화면은 pwndbg와 비슷하게 구성했습니다. 로컬 실행, gdbserver 원격 연결,
@@ -92,7 +97,7 @@ python3 -m venv .venv
 | 자동 분석 (14) | 100% | stripped bash에서 `.eh_frame`에 있는 함수의 99.9%, `.eh_frame`을 지워도 99.96%를 찾음(돌아오지 않는 함수 추론, 꼬리 호출, 데이터 속 함수 포인터). RTTI로 C++ 클래스·vtable 복원(gcc/clang, MSVC), 객체를 따라가 가상 호출 대상 해석, 모든 프로세서에서 함수 포인터 변수를 거친 호출, 코드 사이 데이터 감지, bash 약 7초 |
 | 라이브러리 식별 (8) | 100% | 테스트용 stripped 정적 C 바이너리에서 원래 심볼이 있던 함수의 83~94%에 이름을 붙이며, 잘못 붙인 이름은 없습니다 |
 | 타입 시스템 (10) | 90% | libc 플래그 인자를 헤더 상수 이름으로(`PROT_READ \| PROT_WRITE`), 헤더의 `#define` 묶음은 열거형으로, PE는 Microsoft 비트필드 레이아웃. 구조체 값 전달(by-value) 인자·반환 미지원 |
-| 디컴파일러 (20) | 60% | goto는 벤치마크 시작 때의 절반, 남은 것은 대부분 큰 상태 기계 함수(gnulib `quotearg`, gzip deflate). SSE/AVX는 Intel intrinsic으로. x87 부동소수점 미지원 |
+| 디컴파일러 (20) | 60% | goto는 벤치마크 시작 때의 절반, 남은 것은 대부분 큰 상태 기계 함수(gnulib `quotearg`, gzip deflate). SSE/AVX는 Intel intrinsic으로. x87 부동소수점은 32비트 x86에서 지원(`long double` 제외) |
 | 대화형 UI (12) | 100% | |
 | 스크립팅·확장 (8) | 100% | |
 | 디버거 (7) | 100% | Windows(PE) 프로그램은 wine에서 Windows용 gdbserver.exe로 |

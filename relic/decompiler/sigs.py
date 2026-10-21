@@ -119,7 +119,10 @@ def lookup(name: str | None, an=None) -> Sig | None:
         proto = an.user_types.get("prototypes", {}).get(base)
         if proto is not None:
             return sig_of(proto["params"], proto["ret"], proto.get("variadic", False), proto.get("names", ()))
-    return SIGS.get(base) or bundled().get(base)
+    sig = SIGS.get(base) or bundled().get(base)
+    if sig is None and base.startswith("j_") and len(base) > 2:
+        return lookup(base[2:], an)             # a jump thunk (analysis/autoname.py) takes what its target does
+    return sig
 
 
 def sig_of(params: list[str], ret: str, variadic: bool, names=()) -> Sig:

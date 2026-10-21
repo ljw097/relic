@@ -249,6 +249,11 @@ class CWriter:
                     if v.bits == self.ptr_bits and (cur is None or not cur.ptr):
                         self.types[v.name] = rt
                         self._spread_user_types([v.name])
+        # readable names for what the code shows the variables are (varnames.py); the user's win
+        self.auto: dict[str, str] = {}
+        if getattr(an, "auto_names", True):
+            from .varnames import suggest
+            self.auto = suggest(self)
 
     def _spread_user_types(self, names: list[str]):
         """Plain copies of these variables (`var_c = a1` at -O0) and variables they are copied
@@ -662,7 +667,7 @@ class CWriter:
             base, _, rest = field.partition(".")
             return f"{self.vname(base)}.{rest}"
         gen = self.names.get(name, name)
-        shown = self.user.get(gen, gen)
+        shown = self.user.get(gen) or self.__dict__.get("auto", {}).get(gen, gen)
         self.shown[shown] = gen
         return shown
 

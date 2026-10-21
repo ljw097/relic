@@ -53,6 +53,10 @@ def prepare(an: "Analysis", func: "Function") -> Prepared:
         if pairs:
             join_pair_params(fn, pairs)
     from .cleanup import stack_guards
+    if arch.name == "x86-cdecl":
+        from .calls import merge_word_copies
+        if merge_word_copies(fn, arch):
+            _dce(fn)
     frame = analyze_frame(fn, arch, stack_guards(an))
     hide_canary(fn, frame)
     from .fpabi import fp_params, fp_return
@@ -68,16 +72,18 @@ def prepare(an: "Analysis", func: "Function") -> Prepared:
         drop_return_values(fn)
     rewrite_locals(fn, frame)
     drop_stack_pointer_chains(fn, frame)
+    from .cleanup import drop_dead_locals
+    drop_dead_locals(fn)
     _dce(fn)
     fn = out_of_ssa(fn)
     forward_empty_blocks(fn)
     if arch.name == "x86-cdecl":
         # stack parameters: [esp_0 + 4], [esp_0 + 8], ... are a1, a2, ...
-        from .calls import stack_param_count
+        from .calls import stack_param_slots
         word = arch.bits // 8
-        n = stack_param_count(an, arch, func.addr)
-        params = [frame.slots[o].name() if o in frame.slots else f"arg_{o:x}"
-                  for o in range(word, word * (n + 1), word)]
+        # (a double takes two words: one parameter)
+        params = [frame.slots[word + rel].name() if word + rel in frame.slots else f"arg_{word + rel:x}"
+                  for rel, _, _ in stack_param_slots(an, arch, func.addr)]
     elif (an.name(func.addr) or "") == "main":
         # main(argc, argv, envp): an unused argc before a used argv is still the first parameter
         from .calls import int_arg_regs, livein_regs
@@ -103,7 +109,7 @@ def prepare(an: "Analysis", func: "Function") -> Prepared:
         order = positional_order(arch, ints, fpl)
         if order is not None:                   # PowerPC64: in the order C had them
             params = [params[k] for k in order] + fints
-        from .calls import param_base, stack_param_count, stack_params_used
+        from .calls import param_base, stack_params_used
         if stack_params_used(arch):
             # parameters past the registers, on the stack (above the return address on x86-64,
             # and past Win64's home space for the four register parameters)
@@ -114,6 +120,8 @@ def prepare(an: "Analysis", func: "Function") -> Prepared:
             from .calls import stack_param_slots
             params += [frame.slots[first + rel].name() if first + rel in frame.slots else f"arg_{first + rel:x}"
                        for rel, _, _ in stack_param_slots(an, arch, func.addr)]
+    from .cleanup import fold_param_spills
+    fold_param_spills(fn, params)           # -O0: `var_1c = argc` once on entry, then var_1c read
     narrow_library_results(fn)
     from .calls import narrow_call_args
     narrow_call_args(an, arch, fn)
@@ -140,7 +148,15 @@ def prepare(an: "Analysis", func: "Function") -> Prepared:
     if arch.name.startswith("riscv"):
         propagate_ro_loads(an, fn)          # `fld` of a constant into a register used several times
     fold_float_constants(an, fn)
+    if arch.name == "x86-cdecl":
+        from .cleanup import drop_dead_locals, forward_local_constants
+        if forward_local_constants(fn):         # x87 code keeps the constants of a call sequence in the frame
+            drop_dead_locals(fn)
+            _dce(fn)
     inline_single_use(fn)
+    if arch.name == "x86-cdecl":
+        from .fpconst import narrow_x87
+        narrow_x87(fn)      # x87: float arithmetic computed as doubles of floats
     _fold_pass(fn)          # constants exposed by narrowing and inlining
     sext_params = frozenset(int_arg_regs(arch)) if sext_ints(arch) else frozenset()
     if recover_division(fn, sext_params):       # magic-number multiplies -> x / c, x % c

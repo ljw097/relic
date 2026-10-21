@@ -7,6 +7,10 @@ import subprocess
 
 import pytest
 
+# expectations are written in the generated names (`sub_XXXX`, `a1`, `v1`); tests of the names the
+# analysis suggests turn them on themselves (tests/test_autonames.py)
+os.environ["RELIC_AUTO_NAMES"] = "0"
+
 HERE = os.path.dirname(__file__)
 SRC = os.path.join(HERE, "src", "vuln.c")
 FLOW_SRC = os.path.join(HERE, "src", "flow.c")
@@ -90,6 +94,14 @@ VARIANTS = {
     # floating point (SSE scalar)
     "floats_O0": ["-O0", "-no-pie", "-fno-stack-protector"],
     "floats_O2": ["-O2", "-no-pie", "-fno-stack-protector", "-fno-tree-vectorize"],
+    # names the analysis suggests (tests/test_autonames.py; built stripped too)
+    "autonames_O0": ["-O0", "-fno-stack-protector"],
+    "autonames_O2": ["-O2", "-fno-stack-protector"],
+    # x86-32: floating point on the x87 stack (skipped where no -m32 toolchain is installed)
+    "floats32_O0": ["-m32", "-O0", "-no-pie", "-fno-stack-protector"],
+    "floats32_O2": ["-m32", "-O2", "-no-pie", "-fno-stack-protector", "-fno-tree-vectorize"],
+    # (an i386 has no fcomi: comparisons go through fnstsw ax / sahf)
+    "floats32_i386_O2": ["-m32", "-march=i386", "-O2", "-no-pie", "-fno-stack-protector", "-fno-tree-vectorize"],
     "floats_a64_O0": ["-O0"],
     "floats_arm_O0": ["-O0", "-marm"],
     "floats_arm_O2": ["-O2", "-marm", "-fno-tree-vectorize"],
@@ -123,7 +135,9 @@ COMPILERS = {"vuln64_pe": "x86_64-w64-mingw32-gcc", "vuln32_pe": "i686-w64-mingw
                                                        "floats_arm_O2", "floats_thumb_O2")}}
 SOURCES = {"structs_O0": os.path.join(HERE, "src", "structs.c"), "structs_O2": os.path.join(HERE, "src", "structs.c"),
            **{n: os.path.join(HERE, "src", "libtypes.c") for n in ("libtypes_O0", "libtypes_O2")},
-           **{n: os.path.join(HERE, "src", "floats.c") for n in ("floats_O0", "floats_O2", "floats_a64_O0",
+           **{n: os.path.join(HERE, "src", "autonames.c") for n in ("autonames_O0", "autonames_O2")},
+           **{n: os.path.join(HERE, "src", "floats.c") for n in ("floats_O0", "floats_O2", "floats32_O0",
+                                                                "floats32_O2", "floats32_i386_O2", "floats_a64_O0",
                                                                 "floats_a64_O2", "floats_arm_O0", "floats_arm_O2",
                                                                 "floats_thumb_O2", "floats_rv64_O0",
                                                                 "floats_rv64_O2", "floats_rv32_O0", "floats_rv32_O2",
@@ -141,7 +155,9 @@ SOURCES = {"structs_O0": os.path.join(HERE, "src", "structs.c"), "structs_O2": o
 
 
 # libraries go after the source: linkers drop the ones nothing before them uses
-LIBS = {n: ["-lm"] for n in ("floats_O0", "floats_O2", "floats_a64_O0", "floats_a64_O2", "floats_arm_O0",
+LIBS = {n: ["-lm"] for n in ("floats_O0", "floats_O2", "floats32_O0", "floats32_O2", "floats32_i386_O2",
+                              "floats_a64_O0",
+                              "floats_a64_O2", "floats_arm_O0",
                               "floats_arm_O2", "floats_thumb_O2", "floats_rv64_O0", "floats_rv64_O2",
                               "floats_ppc_O0", "floats_ppc_O2", "floats_ppc64_O0", "floats_ppc64_O2")}
 
@@ -244,6 +260,11 @@ vuln_mips_stripped = _fixture("vuln_mips_stripped")
 structs_O0 = _fixture("structs_O0")
 floats_O0 = _fixture("floats_O0")
 floats_O2 = _fixture("floats_O2")
+autonames_O0_stripped = _fixture("autonames_O0_stripped")
+autonames_O2_stripped = _fixture("autonames_O2_stripped")
+floats32_O0 = _fixture("floats32_O0")
+floats32_O2 = _fixture("floats32_O2")
+floats32_i386_O2 = _fixture("floats32_i386_O2")
 floats_a64_O0 = _fixture("floats_a64_O0")
 floats_a64_O2 = _fixture("floats_a64_O2")
 floats_arm_O0 = _fixture("floats_arm_O0")

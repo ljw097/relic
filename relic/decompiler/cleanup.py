@@ -162,6 +162,10 @@ def _read_form(e: Expr, reg: str):
         return e.bits
     if isinstance(e, Extract) and isinstance(e.a, Reg) and e.a.name == reg:
         return "whole"
+    from .ir import Intrinsic
+    if isinstance(e, Intrinsic) and e.name == "fpconv" and e.bits == 32 and reg.startswith("x87_") and \
+            isinstance(e.args[0], Reg) and e.args[0].name == reg:
+        return 32                       # (an x87 register holds a float result as a double)
     if isinstance(e, Reg) and e.name == reg:
         return "whole"
     forms = [f for f in (_read_form(k, reg) for k in children(e)) if f is not None]
@@ -350,6 +354,204 @@ def rewrite_locals(fn: IRFunction, frame: Frame) -> None:
             map_stmt(s, rw)
             out.append(s)
         b.stmts = out
+
+
+def forward_local_constants(fn: IRFunction) -> bool:
+    """A stack variable read after it was given a constant in the same block (and not written
+    since) is that constant: 32-bit x86 parks the constants of a call sequence in the frame
+    (`fst dword [ebp-0x60]` ... `fld dword [ebp-0x60]`). A variable whose address escapes (is
+    used other than to load or store it) loses its value at a call or a store through a pointer."""
+    from .ir import Call, Const, Reg, StackAddr, StackVar, Store, Var, children, map_stmt, rebuild, walk
+
+    def direct(e):                          # `[&var]:n` -> (var, n)
+        return (e.addr.name, e.bits) if isinstance(e, Load) and isinstance(e.addr, StackAddr) else None
+    escaped: set[str] = set()
+
+    def scan(e, as_addr=False):
+        if isinstance(e, StackAddr) and not as_addr:
+            escaped.add(e.name)
+        for k in children(e):
+            scan(k, isinstance(e, Load) and k is e.addr)
+    for st in fn.stmts():
+        for e in stmt_exprs(st):
+            scan(e, isinstance(st, Store) and e is st.dst)
+    # a pointer into the frame reaches the slots above it too
+    floor = min((x.offset for st in fn.stmts() for e in stmt_exprs(st) for x in walk(e)
+                 if isinstance(x, StackAddr) and x.name in escaped), default=None)
+    offsets = {x.name: x.offset for st in fn.stmts() for e in stmt_exprs(st) for x in walk(e)
+               if isinstance(x, (StackVar, StackAddr))}
+    if floor is not None:
+        escaped |= {n for n, o in offsets.items() if o >= floor}
+    defs = {st.dst: st.src for st in fn.stmts() if isinstance(st, Assign) and isinstance(st.dst, Var)}
+
+    def constant(e, depth=0):
+        """`e` with its variables' constant definitions put in, if nothing else is in it."""
+        if isinstance(e, Var):
+            return constant(defs[e], depth + 1) if e in defs and depth < 4 else None
+        if isinstance(e, (Reg, Load, StackVar, StackAddr, Call)):
+            return None
+        kids = children(e)
+        if not kids:
+            return e if isinstance(e, Const) else None
+        new = [constant(k, depth) for k in kids]
+        return None if any(k is None for k in new) else rebuild(e, tuple(new))
+    changed = False
+    for b in fn.blocks.values():
+        known: dict[tuple[str, int], Expr] = {}
+
+        def sub(e):
+            key = (e.name, e.bits) if isinstance(e, StackVar) else direct(e)
+            return known.get(key, e) if key is not None else e
+
+        def rw(e):
+            if known and (isinstance(e, (StackVar, Load))):
+                r = sub(e)
+                if r is not e:
+                    return r
+            kids = children(e)
+            if not kids:
+                return e
+            new = tuple(rw(k) for k in kids)
+            return rebuild(e, new) if any(x is not y for x, y in zip(new, kids)) else e
+        for st in b.stmts:
+            if known:
+                if isinstance(st, Store):
+                    v = rw(st.src)
+                    if v is not st.src:
+                        st.src, changed = v, True
+                else:
+                    before = stmt_exprs(st)
+                    map_stmt(st, rw)
+                    changed |= any(x is not y for x, y in zip(stmt_exprs(st), before))
+            if isinstance(st, Assign) and isinstance(st.dst, Var):
+                defs[st.dst] = st.src           # (as rewritten: a constant forwarded into it)
+            key = None
+            if isinstance(st, Assign) and isinstance(st.dst, StackVar):
+                key = (st.dst.name, st.dst.bits)
+            elif isinstance(st, Store) and isinstance(st.dst, StackAddr):
+                key = (st.dst.name, st.bits)
+            if key is not None:
+                for k in [k for k in known if k[0] == key[0]]:
+                    del known[k]
+                v = constant(st.src)
+                if v is not None:
+                    known[key] = v
+            elif isinstance(st, (CallStmt, Store)) or not isinstance(st, (Assign, Branch, Jump, Return)):
+                for k in [k for k in known if k[0] in escaped]:
+                    del known[k]
+    return changed
+
+
+def fold_param_spills(fn: IRFunction, params: list[str]) -> bool:
+    """-O0 copies every parameter into a stack slot on entry (`var_1c = argc`) and reads it from
+    there. A slot written once, in the entry block, with a parameter (or its low part) the code
+    then never reads otherwise -- and whose address is never taken -- is that parameter."""
+    from .ir import Cast, StackAddr, StackVar, Var, children, map_stmt, rebuild, walk
+    entry = fn.blocks.get(fn.addr)
+    if entry is None or not params:
+        return False
+    names = set(params)
+    writes: dict[str, int] = {}
+    taken = set()
+    reads: dict[str, int] = {}
+    for st in fn.stmts():
+        if isinstance(st, Assign) and isinstance(st.dst, (StackVar, Var)):
+            writes[st.dst.name] = writes.get(st.dst.name, 0) + 1
+        for e in stmt_exprs(st):
+            for x in walk(e):
+                if isinstance(x, StackAddr):
+                    taken.add(x.name)
+                elif isinstance(x, (Var, StackVar)) and x.name in names:
+                    reads[x.name] = reads.get(x.name, 0) + 1
+    subst: dict[tuple[str, int], Expr] = {}
+    drop = set()
+    for st in entry.stmts:
+        if not (isinstance(st, Assign) and isinstance(st.dst, StackVar)):
+            continue
+        src = st.src
+        p = src.a if isinstance(src, Cast) and src.kind == "low" else src
+        if not isinstance(p, (Var, StackVar)) or p.name not in names or writes.get(p.name) or \
+                reads.get(p.name) != 1 or writes.get(st.dst.name) != 1 or st.dst.name in taken:
+            continue
+        subst[(st.dst.name, st.dst.bits)] = src
+        drop.add(id(st))
+    if not subst:
+        return False
+
+    def rw(e):
+        if isinstance(e, StackVar) and (e.name, e.bits) in subst:
+            return subst[(e.name, e.bits)]
+        kids = children(e)
+        if not kids:
+            return e
+        new = tuple(rw(x) for x in kids)
+        return rebuild(e, new) if any(a is not b for a, b in zip(new, kids)) else e
+    # (a slot read at another width than it was written is left alone)
+    widths = {}
+    for st in fn.stmts():
+        for e in stmt_exprs(st):
+            for x in walk(e):
+                if isinstance(x, StackVar) and any(x.name == n for n, _ in subst):
+                    widths.setdefault(x.name, set()).add(x.bits)
+    subst = {(n, b): v for (n, b), v in subst.items() if widths.get(n, {b}) == {b}}
+    drop = {id(st) for st in entry.stmts if isinstance(st, Assign) and isinstance(st.dst, StackVar)
+            and (st.dst.name, st.dst.bits) in subst and id(st) in drop}
+    if not subst:
+        return False
+    for b in fn.blocks.values():
+        b.stmts = [st for st in b.stmts if id(st) not in drop]
+        for st in b.stmts:
+            map_stmt(st, rw)
+    return True
+
+
+def drop_dead_locals(fn: IRFunction) -> bool:
+    """Writes of a stack variable that no later read sees, for variables whose address is never
+    taken (a spill gcc leaves just before releasing the space: `fst dword [esp]; add esp, 4`)."""
+    from .ir import StackAddr, StackVar, walk
+    addrs = [x for s in fn.stmts() for e in stmt_exprs(s) for x in walk(e) if isinstance(x, StackAddr)]
+    taken = {x.name for x in addrs}
+    # (a pointer into the frame reaches the slots above it: only those below every one are known)
+    floor = min((x.offset for x in addrs), default=None)
+    taken |= {x.name for s in fn.stmts() for e in stmt_exprs(s) for x in walk(e)
+              if isinstance(x, StackVar) and floor is not None and x.offset >= floor}
+
+    def reads(s) -> set[str]:
+        return {x.name for e in stmt_exprs(s) for x in walk(e) if isinstance(x, StackVar)}
+
+    def kills(s) -> str | None:
+        return s.dst.name if isinstance(s, Assign) and isinstance(s.dst, StackVar) and s.dst.name not in taken \
+            and (floor is None or s.dst.offset < floor) else None
+    live_in: dict[int, set[str]] = {a: set() for a in fn.blocks}
+    for _ in range(len(fn.blocks) + 2):         # (backward liveness to a fixed point)
+        moved = False
+        for a, b in fn.blocks.items():
+            live = set().union(*(live_in.get(t, set()) for t in b.succs)) if b.succs else set()
+            for s in reversed(b.stmts):
+                k = kills(s)
+                if k is not None:
+                    live.discard(k)
+                live |= reads(s)
+            if live != live_in[a]:
+                live_in[a] = live
+                moved = True
+        if not moved:
+            break
+    changed = False
+    for b in fn.blocks.values():
+        live = set().union(*(live_in.get(t, set()) for t in b.succs)) if b.succs else set()
+        keep = []
+        for s in reversed(b.stmts):
+            k = kills(s)
+            if k is not None and k not in live:
+                changed = True
+                continue
+            if k is not None:
+                live.discard(k)
+            live |= reads(s)
+            keep.append(s)
+        b.stmts = keep[::-1]
+    return changed
 
 
 # --------------------------------------------------------------- CFG tidying

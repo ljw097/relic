@@ -217,9 +217,9 @@ def test_calls_are_marked(vuln64):
 
 
 def test_unknown_instructions_are_kept():
-    # cpuid is an Effect; an x87 instruction (fld1) has no model and stays as Unknown
-    an = Analysis(load_bytes(bytes.fromhex("0fa2d9e8c3"), "<snippet>", "x64", 0x1000)).run()
+    # cpuid is an Effect; an x87 instruction without a model (fxam) stays as Unknown
+    an = Analysis(load_bytes(bytes.fromhex("0fa2d9e5c3"), "<snippet>", "x64", 0x1000)).run()
     fn = lift(an, an.functions[0x1000])
-    assert [u.text for u in fn.unknowns()] == ["fld1"]
+    assert [u.text for u in fn.unknowns()] == ["fxam"]
     assert isinstance(fn.unknowns()[0], Unknown)
-    assert 'cpuid()' in str(fn) and '__asm("fld1")' in str(fn)
+    assert 'cpuid()' in str(fn) and '__asm("fxam")' in str(fn)

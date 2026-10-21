@@ -392,6 +392,8 @@ def stack_param_count(an: "Analysis", arch: ArchInfo, target: int) -> int:
                         off = frame.offset_of(k.addr)
                         if off is not None and off >= base and off % word == 0:
                             floats[(off - base) // word - shadow] = k.bits
+    if word == 4:
+        _paired_doubles(ssa, frame, base, word, floats, loaded)
     top = max(0, top - shadow)
     an.__dict__.setdefault("_stack_param_floats", {})[target] = floats
     # the parameters as slots: a double on a 32-bit target spans two words
@@ -404,6 +406,91 @@ def stack_param_count(an: "Analysis", arch: ArchInfo, target: int) -> int:
     an.__dict__.setdefault("_stack_param_slots", {})[target] = slots
     cache[target] = top
     return top
+
+
+def _paired_doubles(ssa, frame, base: int, word: int, floats: dict, loaded):
+    """32-bit x86 at -O0: a double parameter copied word by word into a local that is then read
+    whole as a float (`mov eax, [ebp+8]; mov [ebp-16], eax; mov eax, [ebp+12]; mov [ebp-12], eax;
+    fld qword [ebp-16]`) -- the two words are one double."""
+    from .fpconst import float_operands
+    from .ir import Load, Store
+    copies: dict[int, int] = {}            # local offset -> parameter word stored there
+    for st in ssa.stmts():
+        if isinstance(st, Store) and st.bits == 32:
+            src = loaded(st.src)
+            dst = frame.offset_of(st.dst)
+            if isinstance(src, Load) and src.bits == 32 and dst is not None and dst < 0:
+                off = frame.offset_of(src.addr)
+                if off is not None and off >= base and (off - base) % word == 0:
+                    copies[dst] = (off - base) // word
+    if not copies:
+        return
+    wide = set()                           # locals read whole as a double
+    for st in ssa.stmts():
+        for e in stmt_exprs(st):
+            for x in walk(e):
+                for k in float_operands(x):
+                    k = loaded(k)
+                    if isinstance(k, Load) and k.bits == 64:
+                        o = frame.offset_of(k.addr)
+                        if o is not None:
+                            wide.add(o)
+    for o in wide:
+        w = copies.get(o)
+        if w is not None and copies.get(o + 4) == w + 1:
+            floats.setdefault(w, 64)
+
+
+def merge_word_copies(fn: IRFunction, arch: ArchInfo) -> int:
+    """32-bit x86: a double copied word by word between stack slots (`[ebp-16] = [ebp+8];
+    [ebp-12] = [ebp+12]`) and then read whole as a double is one 64-bit copy. How many merged."""
+    from .fpconst import float_operands
+    from .ir import Load, Store
+    from .stack import Frame, _build_spoff
+    frame = Frame(arch, _build_spoff(fn, arch))
+    defs = {st.dst: st.src for st in fn.stmts() if isinstance(st, Assign) and isinstance(st.dst, Var)}
+    load = lambda e: defs.get(e, e) if isinstance(e, Var) else e
+    wide = set()
+    for st in fn.stmts():
+        for e in stmt_exprs(st):
+            for x in walk(e):
+                for k in float_operands(x):
+                    k = load(k)
+                    if isinstance(k, Load) and k.bits == 64:
+                        o = frame.offset_of(k.addr)
+                        if o is not None:
+                            wide.add(o)
+    if not wide:
+        return 0
+    n = 0
+    for b in fn.blocks.values():
+        first: dict[int, tuple[int, int]] = {}      # destination offset -> (statement index, source offset)
+        drop = set()
+        for k, st in enumerate(b.stmts):
+            if isinstance(st, CallStmt):
+                first.clear()
+                continue
+            if not isinstance(st, Store):
+                continue
+            dst = frame.offset_of(st.dst)
+            v = load(st.src)
+            src = frame.offset_of(v.addr) if isinstance(v, Load) and st.bits == 32 else None
+            if dst is not None and src is not None and first.get(dst - 4, (0, None))[1] == src - 4:
+                j, _ = first.pop(dst - 4)
+                lo = b.stmts[j]
+                b.stmts[j] = Store(lo.addr, lo.dst, Load(load(lo.src).addr, 64))
+                drop.add(k)
+                n += 1
+                continue
+            # any other store over a slot recorded so far ends that pair
+            near = lambda x, o: x is not None and o - 8 < x < o + 8
+            for o in [o for o in first if dst is None or near(dst, o) or near(src, o)]:
+                del first[o]
+            if dst is not None and src is not None and dst in wide:
+                first[dst] = (k, src)
+        if drop:
+            b.stmts = [t for k, t in enumerate(b.stmts) if k not in drop]
+    return n
 
 
 def stack_param_slots(an: "Analysis", arch: ArchInfo, target: int) -> list[tuple[int, int, int | None]]:
@@ -454,11 +541,13 @@ def _arg_stores(b, k: int, frame, base: int, word: int) -> dict[int, int]:
 
 
 def _recover_cdecl(fn: IRFunction, an: "Analysis", arch: ArchInfo):
-    """Arguments of x86-32 calls: the values stored at [esp], [esp+4], ... before the call."""
-    from .ir import Store
+    """Arguments of x86-32 calls: the values stored at [esp], [esp+4], ... before the call -- a
+    word each, a double two (one 64-bit store, or its two halves)."""
+    from .ir import BinOp, Load, Store
     from .stack import Frame, _build_spoff
     frame = Frame(arch, _build_spoff(fn, arch))
     word = arch.bits // 8
+    defs = {t.dst: t.src for t in fn.stmts() if isinstance(t, Assign) and isinstance(t.dst, Var)}
     for b in fn.blocks.values():
         consumed: set[int] = set()
         for k, s in enumerate(b.stmts):
@@ -481,39 +570,78 @@ def _recover_cdecl(fn: IRFunction, an: "Analysis", arch: ArchInfo):
                     off = frame.offset_of(t.dst)
                     if off is not None and off >= base and (off - base) % word == 0 and off not in stores:
                         stores[off] = j
-            tgt = s.call.target.value if isinstance(s.call.target, Const) else None
-            sig = lookup(s.name or (an.name(tgt) if tgt is not None else None), an)
-            if sig is not None and sig.variadic:
-                sig = None                       # (how many follow the fixed ones: the stores say)
-            f = an.functions.get(tgt) if tgt is not None else None
-            if sig is not None:
-                fmt_val = b.stmts[stores[base + sig.fmt * word]].src \
-                    if sig.fmt is not None and base + sig.fmt * word in stores else None
-                n = arg_count(sig, _read_format(an, fmt_val))
-            elif f is not None and not f.is_import:
-                n = stack_param_count(an, arch, tgt)
-            else:
-                n = 0
-                while base + n * word in stores:
-                    n += 1
-            idx = [stores.get(base + a * word) for a in range(n)]
-            from .ir import BinOp, Load
-            args = []
-            for a, i in enumerate(idx):
-                if i is not None:
-                    args.append(b.stmts[i].src)
-                elif s.tail:
+            slots = _cdecl_slots(an, arch, s, b, stores, base)
+            args, fargs, idx = [], [], []
+            for rel, size, fw in slots:
+                j = stores.get(base + rel)
+                if j is None:
+                    if not s.tail:
+                        break
                     # passed straight through: the caller's own parameter slot, unchanged
-                    delta = base + a * word - sp_off
-                    args.append(Load(BinOp("+", sp, Const(delta, arch.bits), arch.bits), arch.bits))
+                    delta = base + rel - sp_off
+                    v = Load(BinOp("+", sp, Const(delta, arch.bits), arch.bits), size * 8)
                 else:
-                    break
-            idx = [i for i in idx[:len(args)] if i is not None]
-            s.call = Call(s.call.target, tuple(args), s.call.bits)
+                    v = b.stmts[j].src
+                    idx.append(j)
+                    if size == 8 and v.bits == 32:            # a double stored as two words
+                        j2 = stores.get(base + rel + 4)
+                        if j2 is None:
+                            break
+                        idx.append(j2)
+                        v = _pair_value(v, b.stmts[j2].src, defs)
+                if fw:
+                    fargs.append((len(args), fw))
+                    if fw == 32 and v.bits == 32:
+                        pass
+                    elif fw == 32:
+                        v = Cast("low", v, 32)
+                args.append(v)
+            s.call = Call(s.call.target, tuple(args), s.call.bits, tuple(fargs))
             s.uses = []          # the stack pointer only located the arguments
             consumed |= set(idx)
         if consumed:
             b.stmts = [t for j, t in enumerate(b.stmts) if j not in consumed]
+
+
+def _cdecl_slots(an: "Analysis", arch: ArchInfo, s: CallStmt, b, stores: dict, base: int) -> list[tuple]:
+    """(offset from the first argument, size in bytes, float width or None) of each argument of
+    an x86-32 call: from the callee's own parameters, the libc signature (and format string), or
+    -- for a call to an unknown function -- the stores before it."""
+    from .fpabi import arg_classes
+    word = arch.bits // 8
+    tgt = s.call.target.value if isinstance(s.call.target, Const) else None
+    name = s.name or (an.name(tgt) if tgt is not None else None)
+    f = an.functions.get(tgt) if tgt is not None else None
+    sig = lookup(name, an)
+    fsig = fp_sig(name)
+    classes = None
+    if fsig is not None:
+        classes = arg_classes(None, None, fsig)
+    elif sig is not None:
+        fmt = None
+        if sig.fmt is not None and base + sig.fmt * word in stores:
+            fmt = _read_format(an, b.stmts[stores[base + sig.fmt * word]].src)
+        if not sig.variadic or fmt is not None:
+            classes = arg_classes(sig, fmt, scan="scanf" in (name or ""), wide=True)
+            if not sig.variadic or fmt is None:
+                classes = classes[:arg_count(sig, fmt)]
+    elif f is not None and not f.is_import:
+        return stack_param_slots(an, arch, tgt)
+    if classes is not None:
+        out, off = [], 0
+        for c in classes:
+            size = 8 if c in "dq" else word
+            out.append((off, size, 64 if c == "d" else 32 if c == "f" else None))
+            off += size
+        return out
+    # unknown callee: as many as were stored, a 64-bit store taking two words
+    out, off = [], 0
+    while base + off in stores:
+        st = b.stmts[stores[base + off]]
+        size = 8 if st.src.bits == 64 else word
+        out.append((off, size, None))
+        off += size
+    return out
 
 
 def recover_calls(fn: IRFunction, an: "Analysis", arch: ArchInfo) -> IRFunction:

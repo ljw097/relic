@@ -160,6 +160,40 @@ def apply_fintrinsic(name: str, args: list[int], bits: int) -> int:
     return from_float(r, bits)
 
 
+def as_float(e: Expr) -> Expr | None:
+    """`e`, a double computed from floats only (floats widened, constants a float holds exactly),
+    as the float expression it evaluates: x87 code computes float arithmetic at its own precision
+    and rounds when the result is stored -- as C does where FLT_EVAL_METHOD is 2. None when some
+    operand is a genuine double (or `e` has no float value in it at all)."""
+    from .ir import Intrinsic, Ite
+    found = [False]
+
+    def go(x: Expr) -> Expr | None:
+        if x.bits != 64:
+            return None
+        if isinstance(x, Intrinsic) and x.name == "fpconv" and x.args[0].bits == 32:
+            found[0] = True
+            return x.args[0]
+        if isinstance(x, Const):
+            v = to_float(x.value, 64)
+            return Const(from_float(v, 32), 32) if math.isnan(v) or to_float(from_float(v, 32), 32) == v else None
+        if isinstance(x, BinOp) and x.op in FARITH:
+            a, b = go(x.a), go(x.b)
+            return BinOp(x.op, a, b, 32) if a is not None and b is not None else None
+        if isinstance(x, UnOp) and x.op == "fneg":
+            a = go(x.a)
+            return UnOp("fneg", a, 32) if a is not None else None
+        if isinstance(x, Intrinsic) and x.name in ("sqrt", "fabs") and len(x.args) == 1:
+            a = go(x.args[0])
+            return Intrinsic(x.name + "f", (a,), 32) if a is not None else None
+        if isinstance(x, Ite):
+            a, b = go(x.a), go(x.b)
+            return Ite(x.cond, a, b, 32) if a is not None and b is not None else None
+        return None
+    r = go(e)
+    return r if found[0] else None
+
+
 FP_INTRINSICS = ("sqrt", "sqrtf", "fabs", "fabsf", "floor", "floorf", "ceil", "ceilf", "trunc", "truncf",
                  "rint", "rintf", "round", "roundf", "fma", "fmaf", "fmax", "fmaxf", "fmin", "fminf")
 
@@ -175,8 +209,11 @@ def literal(v: int, bits: int) -> str:
         # the shortest decimal that reads back as the same single
         for p in range(1, 10):
             s = f"{x:.{p}g}"
-            if struct.unpack("<f", struct.pack("<f", float(s)))[0] == x:
-                break
+            try:
+                if struct.unpack("<f", struct.pack("<f", float(s)))[0] == x:
+                    break
+            except OverflowError:       # (rounded past FLT_MAX: more digits)
+                continue
     else:
         s = repr(x)
     if "e" not in s and "." not in s and "n" not in s:

@@ -7,25 +7,25 @@ on:
 
 jobs:
   lint:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
         with:
           python-version: "3.13"
       - run: pip install ruff
       - run: ruff check .
 
   test:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     needs: test-cross
     strategy:
       fail-fast: false
       matrix:
         python: ["3.10", "3.12", "3.13"]
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
         with:
           python-version: ${{ matrix.python }}
           cache: pip
@@ -37,7 +37,7 @@ jobs:
         run: pip install -e '.[dev]'
       # ARM / AArch64 samples built by the cross job: the recompile harness runs their
       # pseudocode here, where the host -m32 toolchain is
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v7
         with:
           name: cross-samples
           path: tests/bins
@@ -48,10 +48,10 @@ jobs:
 
   # Windows (PE) debugging: wine runs Windows' own gdbserver.exe (from gdb-mingw-w64-target)
   test-wine:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
         with:
           python-version: "3.13"
           cache: pip
@@ -70,10 +70,10 @@ jobs:
   # the ARM cross compilers cannot be installed next to gcc-multilib on the runner image,
   # so the ARM / AArch64 samples are built (and their own tests run) in a job of their own
   test-cross:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
         with:
           python-version: "3.13"
           cache: pip
@@ -102,7 +102,7 @@ jobs:
           pytest -q -rs tests/test_autoanalysis.py -k cross
           pytest -q -rs tests/test_rtti.py -k a64
           pytest -q -rs tests/test_debug_targets.py -k qemu
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v6
         with:
           name: cross-samples
           path: |

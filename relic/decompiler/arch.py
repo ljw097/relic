@@ -38,7 +38,8 @@ X64_WIN = ArchInfo(
 X86_CDECL = ArchInfo(
     "x86-cdecl", 32, "esp", "eax",
     call_reads=("esp", "ecx", "edx"),  # ecx/edx: thiscall / fastcall
-    call_clobbers=("eax", "ecx", "edx", *FLAGS),
+    # (the x87 stack is empty at a call; a float result comes back in x87_0)
+    call_clobbers=("eax", "ecx", "edx", *FLAGS, *(f"x87_{k}" for k in range(8))),
     syscall_reads=("eax", "ebx", "ecx", "edx", "esi", "edi", "ebp"),
     syscall_clobbers=("eax",),
 )
