@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "relic-re"
-version = "1.1.0"
+version = "1.1.1"
 description = "Relic - a GUI decompiler & disassembler for reverse engineering and pwnable"
 readme = "README.md"
 license = "MIT"
