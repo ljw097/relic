@@ -1589,7 +1589,9 @@ class MainWindow(QMainWindow):
         return True
 
     def auto_names_on(self) -> bool:
-        return str(self.settings().value("auto_names", "true")).lower() != "false"
+        # (until the menu sets it: RELIC_AUTO_NAMES, as on the command line)
+        default = "true" if Analysis.AUTO_NAMES else "false"
+        return str(self.settings().value("auto_names", default)).lower() != "false"
 
     def set_auto_names(self, on: bool):
         """View > Automatic names: suggested names for stripped functions and variables, or the

@@ -153,10 +153,7 @@ class Analysis:
         self._build_xrefs()
         if load_project:
             self.load_project()
-        self.auto_func_names, self.auto_func_reasons = {}, {}
-        if self.auto_names:
-            from .autoname import auto_names
-            self.auto_func_names, self.auto_func_reasons = auto_names(self)
+        self.set_auto_names(self.auto_names)
         return self
 
     def _apply_func_edits(self, finder: FunctionAnalyzer, from_project: bool = False):
