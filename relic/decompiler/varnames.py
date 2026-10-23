@@ -127,10 +127,10 @@ KEYWORDS = frozenset(("auto break case char const continue default do double els
                       "typedef union unsigned void volatile while bool true false main argc argv envp NULL "
                       "self _cmd this").split())
 
-# internal function names saying what they return: `get_config` -> `config`
-_VERB = re.compile(r"^(?:get|create|new|alloc|make|read|load|open|find|lookup|parse|build|init|fetch|copy|count|"
-                   r"compute|calc|calculate|"
-                   r"dup|clone)_?(?=[A-Za-z])", re.I)
+# internal function names saying what they return: `get_config` -> `config`, `readHeader` -> `header`
+# (the verb a word of its own: `initialize_table`, `calculate_sum`, `newton` say nothing)
+_VERB = re.compile(r"^(?i:get|create|new|alloc|make|read|load|open|find|lookup|parse|build|init|fetch|copy|count|"
+                   r"compute|calc|calculate|dup|clone)(?:_(?=[A-Za-z])|(?=[A-Z]))")
 _LOOP_NAMES = ("i", "j", "k", "l", "m")
 
 
@@ -225,6 +225,7 @@ def suggest(w: "CWriter") -> dict[str, str]:
     # one name per variable, never one already in use
     taken = set(KEYWORDS) | set(w.names.values()) | set(w.user.values()) | set(params)
     taken |= {f.name for f in an.functions.values()} | set(an.renames.values()) | set(an.bin.name_to_addr)
+    taken |= set(getattr(an, "auto_func_names", {}).values())
     out: dict[str, str] = {}
     order = sorted(votes, key=lambda g: -max(s for s, _ in votes[g]))
     for g in order:

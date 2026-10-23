@@ -290,3 +290,18 @@ def test_cancel_during_struct_recovery_caches_nothing(vuln64, monkeypatch):
     assert all(v is not None for v in an.__dict__.get("_structs", {}).values())
     text = _c(an, "add_note")
     assert "struct s_notes {" in text and "->f_8 = " in text, text
+
+
+def test_structs_pointing_at_each_other_are_declared_once():
+    """A node pointing to its list and the list back to the node (A -> B -> A): both are recorded
+    for declaration, once, inner first -- the walk stops at the cycle instead of recursing."""
+    from types import SimpleNamespace
+
+    from relic.decompiler.structs import Field, Struct, StructView
+    a, b = Struct("s_node", ("var", 0, "a1")), Struct("s_list", ("var", 0, "a2"))
+    a.fields[0] = Field(0, 64, name="f_0", child=b)
+    b.fields[8] = Field(8, 64, name="f_8", child=a)
+    view = object.__new__(StructView)
+    view.an, view.used = SimpleNamespace(struct_names={}), []
+    view._use(a)
+    assert [s.name for s in view.used] == ["s_list", "s_node"]

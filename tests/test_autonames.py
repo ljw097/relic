@@ -56,6 +56,18 @@ def test_names_reach_callers_and_listings(stripped):
         assert 'j_puts(' in main                # (a thunk takes its target's signature: one argument)
 
 
+def test_assert_name_without_decompiling(autonames_O0_stripped, autonames_O2_stripped, monkeypatch):
+    """x86-64 sets the assert's arguments in the call's own block: read there, not by decompiling
+    the function (and every callee it reaches: half a minute on gdb)."""
+    from relic.analysis import autoname
+
+    def fail(an, f):
+        raise AssertionError("decompiled")
+    monkeypatch.setattr(autoname, "_assert_args_decompiled", fail)
+    for path in (autonames_O0_stripped, autonames_O2_stripped):
+        assert _named(_analyze(path)).get("table_insert") == "assert() names it"
+
+
 def test_off_and_user_names_win(autonames_O0_stripped):
     an = _analyze(autonames_O0_stripped, on=False)
     assert not an.auto_func_names and not any(f.name == "xmalloc" for f in an.functions.values())
@@ -93,6 +105,16 @@ def test_variables_are_named_by_their_use(autonames_O0_stripped):
     t = decompile(an, next(f for f in an.functions.values() if not f.is_import and "strlen" in
                            {an.call_name(i) for b in f.blocks.values() for i in b.insns})).text
     assert re.search(r"total \+= strlen\(", t), t
+
+
+def test_callee_verbs_are_words():
+    """`get_config` / `readHeader` say what they return; `initialize_table` and `calculate_sum`
+    do not start with `init` and `calc` as words of their own."""
+    from relic.decompiler.varnames import _VERB
+    rest = lambda name: name[m.end():] if (m := _VERB.match(name)) else None
+    assert rest("get_config") == "config" and rest("readHeader") == "Header" and rest("calc_total") == "total"
+    assert rest("calculate_sum") == "sum"
+    assert rest("initialize_table") is None and rest("newton_step") is None and rest("copyright") is None
 
 
 def test_variable_names_never_collide(autonames_O0_stripped):

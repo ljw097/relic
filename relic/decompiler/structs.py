@@ -799,20 +799,23 @@ class StructView:
             return self.find(t[7:].rstrip(" *")) if t.startswith("struct ") and t.count("*") == 1 else None
         return f.child
 
-    def _use(self, st: Struct):
+    def _use(self, st: Struct, _open: set | None = None):
         """Record a struct shown, and those its fields point to (declared before it). A struct the
         user named keeps its layout in the project, so types that name it work in a new session."""
         if st in self.used:
             return
+        # (the structs being recorded: a cycle -- A points to B, B back to A -- ends there)
+        _open = set() if _open is None else _open
+        _open |= {id(st), st.name}
         d = self.an.struct_names.get(st.name)
         if d is not None:
             d["layout"] = {f"{o:#x}": [f.bits, f.ctype] + ([f.count if f.count is not None else -1] if f.array else [])
                            for o, f in sorted(st.fields.items())}
         for f in st.fields.values():
             c = self.child(st, f)
-            if c is not None and c is not st and c not in self.used and \
+            if c is not None and id(c) not in _open and c.name not in _open and c not in self.used and \
                     all(c.name != u.name for u in self.used):
-                self._use(c)
+                self._use(c, _open)
         if st not in self.used:
             self.used.append(st)
 

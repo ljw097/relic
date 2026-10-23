@@ -1401,3 +1401,20 @@ def test_starts_empty_and_opens_a_dropped_file(app, vuln64, tmp_path):
     assert w.wait() and w.an is not None and w.an.function_by_name("main") is not None
     w.dirty = False
     w.close()
+
+
+def test_automatic_names_menu_follows_the_environment_then_the_setting(win, monkeypatch):
+    """View > Automatic names starts as RELIC_AUTO_NAMES says (off in the test suite) until the
+    menu sets it; toggling renames stripped functions and variables in place."""
+    from relic.analysis import Analysis
+    s = win.settings()
+    s.remove("auto_names")
+    assert win.auto_names_on() is Analysis.AUTO_NAMES is False
+    assert win.an.auto_names is False
+    monkeypatch.setattr(Analysis, "AUTO_NAMES", True)
+    assert win.auto_names_on()
+    win.set_auto_names(False)
+    assert not win.auto_names_on() and not win.an.auto_names
+    win.set_auto_names(True)
+    assert win.auto_names_on() and win.an.auto_names
+    s.remove("auto_names")

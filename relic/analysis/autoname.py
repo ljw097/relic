@@ -74,9 +74,8 @@ def auto_names(an: "Analysis") -> tuple[dict[int, str], dict[int, str]]:
 
     # assert(): the function's own name, as the compiler passed it
     for f in unnamed:
-        hits = [c for c in calls[f.addr] if c in ASSERTS]
-        if hits:
-            n = _assert_name(an, f, hits)
+        if any(c in ASSERTS for c in calls[f.addr]):
+            n = _assert_name(an, f)
             if n:
                 give(f, n, "assert() names it", exact=True)
     # a message naming its function
@@ -132,29 +131,82 @@ def _looks_like_function(ident: str) -> bool:
     return "_" in ident.strip("_") or bool(re.search(r"[a-z][A-Z]", ident))
 
 
-def _assert_name(an: "Analysis", f: "Function", hits: list[str]) -> str | None:
-    """The function-name argument of the assert call in `f` (from the decompiler's recovered
-    call arguments: any architecture, any calling convention)."""
+def _assert_name(an: "Analysis", f: "Function") -> str | None:
+    """The function-name argument of the assert call in `f`: the constant its argument register
+    is set to in the call's block, else from the decompiler's recovered call arguments (any
+    architecture, any calling convention -- but a whole decompilation, with its callees')."""
+    texts = _assert_args_in_block(an, f)
+    if texts is None:
+        texts = _assert_args_decompiled(an, f)
+    found = {n for n in map(_function_of, texts) if n}
+    return found.pop() if len(found) == 1 else None
+
+
+def _assert_args_in_block(an: "Analysis", f: "Function") -> list[str] | None:
+    """The function-name strings handed to the assert calls of `f`, from the constants the
+    argument registers hold in each call's own block (`lea rcx, [rip + __func__]`; AArch64's
+    `adrp` + `add` folded). None when a call's argument is not found that way."""
+    from ..decompiler.arch import arch_for
+    from ..decompiler.calls import int_arg_regs
+    from ..decompiler.cleanup import _lifted
+    from ..decompiler.ir import Assign, CallStmt, Const, Reg, Unknown, stmt_defs, transform
+    from ..decompiler.passes import _fold_node
+    try:
+        regs = int_arg_regs(arch_for(an.bin))
+        fn = _lifted(an, f)
+    except Exception:  # noqa: BLE001 - not liftable here: the decompiler's turn
+        return None
+    texts = []
+    for b in fn.blocks.values():
+        known: dict[str, int] = {}               # register -> the constant it holds here
+        for s in b.stmts:
+            if isinstance(s, Assign) and isinstance(s.dst, Reg):
+                v = transform(s.src, lambda e: _fold_node(Const(known[e.name], e.bits))
+                              if isinstance(e, Reg) and e.name in known else _fold_node(e))
+                if isinstance(v, Const):
+                    known[s.dst.name] = v.value
+                else:
+                    known.pop(s.dst.name, None)
+            elif isinstance(s, CallStmt):
+                k = ASSERTS.get(_callee(an, s))
+                if k is not None:
+                    if k >= len(regs) or regs[k] not in known:
+                        return None
+                    texts.append(an.bin.read_cstring(known[regs[k]], 300) or "")
+                known.clear()
+            elif isinstance(s, Unknown):
+                known.clear()                   # (an instruction not lifted: it may write any register)
+            else:
+                for d in stmt_defs(s):
+                    if isinstance(d, Reg):
+                        known.pop(d.name, None)
+    return texts
+
+
+def _assert_args_decompiled(an: "Analysis", f: "Function") -> list[str]:
     try:
         from ..decompiler.cleanup import cached_ir
         from ..decompiler.ir import CallStmt, Const
-        from ..decompiler.sigs import base_name
         fn = cached_ir(an, f)
     except Exception:  # noqa: BLE001 - no name from a function the decompiler cannot read
-        return None
-    found = set()
+        return []
+    texts = []
     for s in fn.stmts():
         if not isinstance(s, CallStmt):
             continue
-        name = base_name(s.name or (an.name(s.call.target.value) if isinstance(s.call.target, Const) else "") or "")
-        k = ASSERTS.get(name)
+        k = ASSERTS.get(_callee(an, s))
         if k is None or k >= len(s.call.args) or not isinstance(s.call.args[k], Const):
             continue
-        text = an.bin.read_cstring(s.call.args[k].value, 300)
-        n = _function_of(text) if text else None
-        if n:
-            found.add(n)
-    return found.pop() if len(found) == 1 else None
+        texts.append(an.bin.read_cstring(s.call.args[k].value, 300) or "")
+    return texts
+
+
+def _callee(an: "Analysis", s) -> str:
+    """The callee of a CallStmt, without decorations (`puts@plt`, `__imp_puts`: `puts`)."""
+    from ..decompiler.ir import Const
+    from ..decompiler.sigs import base_name
+    t = s.call.target
+    return base_name(s.name or (an.name(t.value) if isinstance(t, Const) else "") or "")
 
 
 def _function_of(text: str) -> str | None:
