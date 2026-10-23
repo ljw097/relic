@@ -124,10 +124,25 @@ _X86_CJMP = {"jo", "jno", "js", "jns", "je", "jne", "jb", "jae", "jbe", "ja", "j
 _HALT = {"hlt", "ud2", "int3", "brk", "udf", "ebreak"}
 
 
-def _x86_operands(op_str: str) -> list[tuple] | None:
+_X86_OPERANDS: dict[str, tuple | None] = {}
+
+
+def _x86_operands(op_str: str) -> tuple | None:
     """The immediates and memory operands of capstone's Intel-syntax text, as ("imm", value) and
     ("mem", base, index, disp) -- what classification needs, without capstone's (costly) operand
     detail. None for text it does not take."""
+    # (the same text parses the same: most operand texts recur -- `rbp, rsp`, a stack slot)
+    try:
+        return _X86_OPERANDS[op_str]
+    except KeyError:
+        pass
+    if len(_X86_OPERANDS) > 1 << 20:
+        _X86_OPERANDS.clear()
+    out = _X86_OPERANDS[op_str] = _parse_x86_operands(op_str)
+    return out
+
+
+def _parse_x86_operands(op_str: str) -> tuple | None:
     out = []
     for op in op_str.split(", "):
         k = op.find("[")
@@ -162,7 +177,7 @@ def _x86_operands(op_str: str) -> list[tuple] | None:
             else:
                 return None
         out.append(("mem", base, index, disp))
-    return out
+    return tuple(out)
 
 
 def _x86_cs_operands(c) -> list[tuple]:

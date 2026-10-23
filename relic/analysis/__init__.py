@@ -420,14 +420,20 @@ class Analysis:
 
     def _build_xrefs(self):
         total = len(self.functions)
+        to, frm = self.xrefs_to, self.xrefs_from        # (_add_xref, inlined: one per reference)
         for k, f in enumerate(self.functions.values()):
             report("xrefs", k, total)
             for blk in f.blocks.values():
                 for i in blk.insns:
-                    if i.kind in (CALL, JMP, CJMP) and i.target is not None:
-                        self._add_xref(Xref(i.addr, i.target, "call" if i.kind == CALL else "jmp"))
+                    kind = i.kind
+                    if i.target is not None and kind in (CALL, JMP, CJMP):
+                        x = Xref(i.addr, i.target, "call" if kind == CALL else "jmp")
+                        to[x.to].append(x)
+                        frm[x.frm].append(x)
                     for r in i.refs:
-                        self._add_xref(Xref(i.addr, r, "data"))
+                        x = Xref(i.addr, r, "data")
+                        to[r].append(x)
+                        frm[x.frm].append(x)
             for jmp, targets in f.jump_tables.items():
                 for t in set(targets):
                     self._add_xref(Xref(jmp, t, "jmp"))
