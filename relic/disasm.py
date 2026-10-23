@@ -315,9 +315,10 @@ class Disassembler:
 
     def _classify_x86(self, i: Insn):
         m = i.mnemonic
-        for p in ("notrack ", "bnd ", "rep ", "repne "):
-            if m.startswith(p) and m[len(p):] in ("jmp", "call", "ret"):
-                m = m[len(p):]
+        if " " in m:                    # (a prefix: every one ends in a space)
+            for p in ("notrack ", "bnd ", "rep ", "repne "):
+                if m.startswith(p) and m[len(p):] in ("jmp", "call", "ret"):
+                    m = m[len(p):]
         if m == "call":
             i.kind = CALL
         elif m == "jmp" or m == "ljmp":

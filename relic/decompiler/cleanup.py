@@ -522,33 +522,33 @@ def drop_dead_locals(fn: IRFunction) -> bool:
     def kills(s) -> str | None:
         return s.dst.name if isinstance(s, Assign) and isinstance(s.dst, StackVar) and s.dst.name not in taken \
             and (floor is None or s.dst.offset < floor) else None
+    # (each statement's kill and reads, once: the fixed point goes over every block many times)
+    effect = {a: [(kills(s), reads(s)) for s in reversed(b.stmts)] for a, b in fn.blocks.items()}
     live_in: dict[int, set[str]] = {a: set() for a in fn.blocks}
     for _ in range(len(fn.blocks) + 2):         # (backward liveness to a fixed point)
         moved = False
         for a, b in fn.blocks.items():
             live = set().union(*(live_in.get(t, set()) for t in b.succs)) if b.succs else set()
-            for s in reversed(b.stmts):
-                k = kills(s)
+            for k, r in effect[a]:
                 if k is not None:
                     live.discard(k)
-                live |= reads(s)
+                live |= r
             if live != live_in[a]:
                 live_in[a] = live
                 moved = True
         if not moved:
             break
     changed = False
-    for b in fn.blocks.values():
+    for a, b in fn.blocks.items():
         live = set().union(*(live_in.get(t, set()) for t in b.succs)) if b.succs else set()
         keep = []
-        for s in reversed(b.stmts):
-            k = kills(s)
+        for s, (k, r) in zip(reversed(b.stmts), effect[a]):
             if k is not None and k not in live:
                 changed = True
                 continue
             if k is not None:
                 live.discard(k)
-            live |= reads(s)
+            live |= r
             keep.append(s)
         b.stmts = keep[::-1]
     return changed

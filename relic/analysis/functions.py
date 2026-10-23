@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import bisect
+import itertools
 import re
 from dataclasses import dataclass, field
 
@@ -62,16 +63,20 @@ class _Cover:
 
     def next_gap(self, pos: int, end: int) -> tuple[int, int] | None:
         """The first uncovered range [s, e) at or after `pos`, before `end`."""
-        i = bisect.bisect_right(self.starts, pos) - 1
-        if i >= 0 and self.ends[i] > pos:
-            pos = self.ends[i]
-            i += 1
-        else:
-            i += 1
-        if pos >= end:
-            return None
-        e = self.starts[i] if i < len(self.starts) else end
-        return (pos, min(e, end)) if pos < min(e, end) else self.next_gap(min(e, end), end) if e < end else None
+        starts, ends = self.starts, self.ends
+        while True:                 # (a loop: the gap scan asks millions of times)
+            i = bisect.bisect_right(starts, pos)
+            if i and ends[i - 1] > pos:
+                pos = ends[i - 1]
+            if pos >= end:
+                return None
+            e = starts[i] if i < len(starts) else end
+            stop = e if e < end else end
+            if pos < stop:
+                return (pos, stop)
+            if e >= end:
+                return None
+            pos = stop
 
 
 def _fragment(name: str) -> bool:
@@ -109,8 +114,10 @@ class Function:
 
     def block_at(self, addr: int) -> Block | None:
         for b in self.blocks.values():
-            if b.addr <= addr < b.end:
-                return b
+            if b.addr <= addr:
+                last = b.insns[-1] if b.insns else None       # (Block.end, inlined: a hot path)
+                if addr < (last.addr + last.size if last is not None else b.addr):
+                    return b
         return None
 
 
@@ -1519,6 +1526,17 @@ class FunctionAnalyzer:
             return
         prologues = (b"\xf3\x0f\x1e\xfa", b"\xf3\x0f\x1e\xfb", b"\x55\x48\x89\xe5", b"\x55\x89\xe5")
         tried: set[int] = set()
+        if self.dis.arch in ("arm", "arm64"):
+            probe = self._arm_gap_function
+        elif self.dis.arch in ("mips", "mips64"):
+            probe = self._mips_gap_function
+        elif self.dis.arch.startswith("riscv"):
+            probe = self._riscv_gap_function
+        elif self.dis.arch in ("ppc", "ppc64"):
+            probe = self._ppc_gap_function
+        else:
+            probe = lambda s, e: self._gap_function(s, e, prologues)
+        probed: dict = {}
         for sec in self.bin.exec_sections:
             if sec.name in (".plt", ".plt.sec", ".plt.got", ".init", ".fini"):
                 continue
@@ -1531,7 +1549,9 @@ class FunctionAnalyzer:
             for a, d in self.code_data.items():         # (data among code: no function starts there)
                 if sec.contains(a):
                     cover.add(a, a + _def_size(d, self.bin.bits // 8))
-            known = set(self.funcs)
+            # (the scan only adds functions, and a dict keeps insertion order: those found by a
+            # drain are the last ones)
+            known = len(self.funcs)
             pos = sec.addr
             while True:
                 checkpoint()
@@ -1539,16 +1559,11 @@ class FunctionAnalyzer:
                 if gap is None:
                     break
                 s, e = gap
-                if self.dis.arch in ("arm", "arm64"):
-                    start = self._arm_gap_function(s, e)
-                elif self.dis.arch in ("mips", "mips64"):
-                    start = self._mips_gap_function(s, e)
-                elif self.dis.arch.startswith("riscv"):
-                    start = self._riscv_gap_function(s, e)
-                elif self.dis.arch in ("ppc", "ppc64"):
-                    start = self._ppc_gap_function(s, e)
-                else:
-                    start = self._gap_function(s, e, prologues)
+                # a gap is probed from its bytes alone: one already probed (scanning resumes before
+                # it after every function found) gives the same start
+                start = probed.get(gap, probed)
+                if start is probed:
+                    start = probed[gap] = probe(s, e)
                 if start is None or start in tried:
                     pos = e
                     continue
@@ -1557,8 +1572,8 @@ class FunctionAnalyzer:
                 self._drain()
                 # only the functions just found change what is covered; gaps before this one can
                 # shrink too (a new function's callees), so scanning resumes from the earliest
-                new = [self.funcs[a] for a in set(self.funcs) - known]
-                known.update(a for a in self.funcs)
+                new = list(itertools.islice(reversed(self.funcs.values()), len(self.funcs) - known))
+                known = len(self.funcs)
                 lo = min((b.addr for f in new if not f.is_import for b in f.blocks.values()
                           if sec.contains(b.addr)), default=s)
                 for f in new:

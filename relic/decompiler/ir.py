@@ -258,31 +258,35 @@ def children(e: Expr) -> tuple[Expr, ...]:
     return kids(e)
 
 
+# kinds without sub-expressions, and how to rebuild the others with new ones (on the exact type)
+_LEAVES = frozenset((Const, Reg, Var, StackVar, StackAddr))
+_REBUILD = {
+    Load: lambda e, k: Load(k[0], e.bits),
+    UnOp: lambda e, k: UnOp(e.op, k[0], e.bits),
+    Cast: lambda e, k: Cast(e.kind, k[0], e.bits),
+    Extract: lambda e, k: Extract(k[0], e.lo, e.bits),
+    BinOp: lambda e, k: BinOp(e.op, k[0], k[1], e.bits),
+    Ite: lambda e, k: Ite(k[0], k[1], k[2], e.bits),
+    Intrinsic: lambda e, k: Intrinsic(e.name, tuple(k), e.bits),
+    Call: lambda e, k: Call(k[0], tuple(k[1:]), e.bits, e.fargs),
+    Phi: lambda e, k: Phi(tuple((a, x) for (a, _), x in zip(e.sources, k)), e.bits),
+}
+
+
 def rebuild(e: Expr, kids: tuple[Expr, ...]) -> Expr:
-    if isinstance(e, Load):
-        return Load(kids[0], e.bits)
-    if isinstance(e, UnOp):
-        return UnOp(e.op, kids[0], e.bits)
-    if isinstance(e, Cast):
-        return Cast(e.kind, kids[0], e.bits)
-    if isinstance(e, Extract):
-        return Extract(kids[0], e.lo, e.bits)
-    if isinstance(e, BinOp):
-        return BinOp(e.op, kids[0], kids[1], e.bits)
-    if isinstance(e, Ite):
-        return Ite(kids[0], kids[1], kids[2], e.bits)
-    if isinstance(e, Intrinsic):
-        return Intrinsic(e.name, tuple(kids), e.bits)
-    if isinstance(e, Call):
-        return Call(kids[0], tuple(kids[1:]), e.bits, e.fargs)
-    if isinstance(e, Phi):
-        return Phi(tuple((a, k) for (a, _), k in zip(e.sources, kids)), e.bits)
-    return e
+    r = _REBUILD.get(type(e))
+    return r(e, kids) if r is not None else e
 
 
 def transform(e: Expr, f) -> Expr:
     """Rebuild `e` bottom-up, applying `f` to every node after its children."""
-    kids = children(e)
+    t = type(e)
+    if t in _LEAVES:                         # (most nodes: no children to rebuild)
+        return f(e)
+    kids = _KIDS.get(t)
+    if kids is None:
+        raise TypeError(e)
+    kids = kids(e)
     if kids:
         new, changed = [], False
         for k in kids:                       # (no generator and zip per node: this is a hot path)
@@ -290,19 +294,43 @@ def transform(e: Expr, f) -> Expr:
             new.append(x)
             changed = changed or x is not k
         if changed:
-            e = rebuild(e, tuple(new))
+            e = _REBUILD[t](e, tuple(new))
     return f(e)
 
 
 def walk(e: Expr):
     """`e` and every sub-expression, in pre-order (an explicit stack, not nested generators)."""
     stack = [e]
+    pop, push, leaves, table = stack.pop, stack.extend, _LEAVES, _KIDS
     while stack:
-        x = stack.pop()
+        x = pop()
         yield x
-        kids = children(x)
+        t = type(x)
+        if t in leaves:
+            continue
+        kids = table.get(t)
+        if kids is None:
+            raise TypeError(x)
+        kids = kids(x)
         if kids:
-            stack.extend(kids[::-1])
+            push(kids[::-1])
+
+
+def has(e: Expr, types) -> bool:
+    """Whether `e` or a sub-expression is an instance of `types` (`walk` without a generator)."""
+    stack = [e]
+    pop, push, leaves, table = stack.pop, stack.extend, _LEAVES, _KIDS
+    while stack:
+        x = pop()
+        if isinstance(x, types):
+            return True
+        t = type(x)
+        if t not in leaves:
+            kids = table.get(t)
+            if kids is None:
+                raise TypeError(x)
+            push(kids(x))
+    return False
 
 
 def size(e: Expr) -> int:
@@ -370,15 +398,32 @@ class IRBlock:
     preds: list[int] = field(default_factory=list)
 
 
+_STMT_SLOTS: dict[type, tuple[str, ...]] = {}
+
+
 def copy_stmt(s: Stmt) -> Stmt:
     """A statement to change independently of `s`: its own containers (`uses`, `defs`, jump
     tables), the same immutable expressions."""
-    c = copy.copy(s)
-    for cls in type(s).__mro__:
-        for name in getattr(cls, "__slots__", ()):
+    t = type(s)
+    names = _STMT_SLOTS.get(t)
+    if names is None:
+        names = _STMT_SLOTS[t] = tuple(n for cls in t.__mro__ for n in getattr(cls, "__slots__", ()))
+    if hasattr(s, "__dict__"):              # (not a slots class: the general copy)
+        c = copy.copy(s)
+        for name in names:
             v = getattr(s, name, None)
             if isinstance(v, (list, dict, set)):
                 setattr(c, name, type(v)(v))
+        return c
+    c = object.__new__(t)                   # (copy.copy of a slots dataclass, without copyreg)
+    for name in names:
+        try:
+            v = getattr(s, name)
+        except AttributeError:
+            continue                        # (an unset slot stays unset)
+        if isinstance(v, (list, dict, set)):
+            v = type(v)(v)
+        object.__setattr__(c, name, v)
     return c
 
 
