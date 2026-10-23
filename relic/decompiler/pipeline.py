@@ -9,7 +9,9 @@
 """
 from __future__ import annotations
 
+import contextlib
 import copy
+from contextvars import ContextVar
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
@@ -41,6 +43,41 @@ class Prepared:
     ret_bits: int | None = None   # width of the result, when known
     ret_float: bool = False       # the result is a float / double (in xmm0)
     hidden: frozenset = frozenset()   # ids of statements the structurer made redundant
+
+
+# functions prepared for another one's struct scan (structs._scan_function), kept for their own
+# decompilation while `prepared_once` is in effect (in this thread only): function -> Prepared
+_KEPT: ContextVar[dict | None] = ContextVar("relic_prepared_once", default=None)
+KEEP_MAX = 256
+
+
+@contextlib.contextmanager
+def prepared_once():
+    """Decompiling many functions in a row, nothing editing the analysis meanwhile (`relic
+    decompile --all`, the C export): a function prepared for another one's struct scan is not
+    prepared again for its own pseudocode (the same steps on the same analysis give the same
+    result). The GUI does not use it: the user may edit between two decompilations."""
+    token = _KEPT.set({})
+    try:
+        yield
+    finally:
+        _KEPT.reset(token)
+
+
+def keep_prepared(func_addr: int, prep: Prepared) -> None:
+    kept = _KEPT.get()
+    if kept is None:
+        return
+    kept[func_addr] = prep
+    while len(kept) > KEEP_MAX:                 # (the oldest goes: it is prepared again if needed)
+        del kept[next(iter(kept))]
+
+
+def prepared(an: "Analysis", func: "Function") -> Prepared:
+    """`prepare(an, func)`, or the one a struct scan kept (see prepared_once), used once."""
+    kept = _KEPT.get()
+    prep = kept.pop(func.addr, None) if kept else None
+    return prep if prep is not None else prepare(an, func)
 
 
 def prepare(an: "Analysis", func: "Function") -> Prepared:

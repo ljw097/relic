@@ -408,10 +408,11 @@ def _add_arrays(st: Struct, arrays: dict[int, int]):
 def _scan_function(an: "Analysis", f) -> dict[tuple, _Use]:
     cache = an.__dict__.setdefault("_struct_scan", {})
     if f.addr not in cache:
-        from .pipeline import prepare
+        from .pipeline import keep_prepared, prepare
         try:
             prep = prepare(an, f)
             cache[f.addr] = scan(prep.fn, f.addr, prep.arch.bits, an.name)
+            keep_prepared(f.addr, prep)         # (scan only reads it: its own pseudocode may use it)
         except Cancelled:
             raise                 # not a function that fails: nothing is cached
         except Exception:  # noqa: BLE001 - a function that does not decompile adds nothing

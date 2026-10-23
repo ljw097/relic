@@ -1743,8 +1743,8 @@ def _tidy(items):
 
 # ----------------------------------------------------------------- entry
 def decompile(an: "Analysis", func: "Function") -> Decompiled:
-    from .pipeline import prepare
-    prep = prepare(an, func)
+    from .pipeline import prepared
+    prep = prepared(an, func)
     w = CWriter(an, prep)
     lines = w.render()
     from ..extend import DECOMPILE_HOOKS

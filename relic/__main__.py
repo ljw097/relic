@@ -454,13 +454,12 @@ def cmd_types(args):
 
 
 def cmd_decompile(args):
-    from .decompiler.emit import decompile
     an = _analyze(args)
     list(_import_headers(an, args.header))
     if args.all and args.output:
         from .decompiler.export import export_c
         with open(args.output, "w") as fp:
-            res = export_c(an, fp)
+            res = export_c(an, fp, batch=True)
         print(f"{args.output}: {res['functions']} functions, {res['structs']} structs"
               + (f", {len(res['failed'])} not decompiled" if res["failed"] else ""))
         return
@@ -473,6 +472,13 @@ def cmd_decompile(args):
         if f.is_import:
             sys.exit(f"relic: {an.name(f.addr)} is an imported function")
         funcs = [f]
+    from .decompiler.pipeline import prepared_once
+    with prepared_once():
+        _print_decompiled(an, funcs, args)
+
+
+def _print_decompiled(an, funcs, args):
+    from .decompiler.emit import decompile
     for k, f in enumerate(funcs):
         try:
             d = decompile(an, f)
