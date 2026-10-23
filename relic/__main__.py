@@ -480,17 +480,24 @@ def cmd_decompile(args):
 def _print_decompiled(an, funcs, args):
     from .decompiler.emit import decompile
     for k, f in enumerate(funcs):
+        d = None
         try:
             d = decompile(an, f)
         except NotImplementedError as e:
             sys.exit(f"relic: {e}")
+        except Exception as e:  # noqa: BLE001 - one function does not stop the others (as in the C export)
+            why = f"{an.name(f.addr) or f.name} @ {f.addr:#x}: not decompiled ({type(e).__name__}: {e})"
+            if len(funcs) == 1:
+                sys.exit(f"relic: {why}")
+            failed = f"// {why}"
         if k:
             print()
         if args.output:
             with open(args.output, "a" if k else "w") as fp:
-                fp.write(d.text + "\n\n")
-            continue
-        if args.addrs:
+                fp.write((d.text if d is not None else failed) + "\n\n")
+        elif d is None:
+            print(failed)
+        elif args.addrs:
             for ln in d.lines:
                 tag = f"{ln.addr:8x}" if ln.addr is not None else " " * 8
                 print(f"{tag}  {'    ' * ln.depth}{ln.text}".rstrip())

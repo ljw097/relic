@@ -20,6 +20,9 @@ def decompile_ir(an, func, optimize: bool = True):
     from .passes import _dce
     from .passes import optimize as run_passes
     from .ssa import to_ssa
+    if func.addr not in func.blocks:
+        # (a symbol on data among code: MinGW's `__CTOR_LIST__` in .text)
+        raise ValueError(f"no instructions at {func.addr:#x} (its bytes do not decode)")
     if not optimize:
         return lift(an, func)
     try:
