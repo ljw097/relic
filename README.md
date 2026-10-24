@@ -7,13 +7,13 @@ The GUI is PySide6 and disassembly comes from capstone; the analysis, decompiler
 
 I'll admit the goal is ambitious: as good as IDA Pro + Hex-Rays, and better where I can manage it.
 There's a long way to go, but opening an x86-64 or ARM binary, browsing functions, naming things, reading pseudocode
-and measuring an overflow offset in the debugger all work fine today. The current release is [1.1.1](https://github.com/ljw097/relic/releases/tag/v1.1.1).
+and measuring an overflow offset in the debugger all work fine today. The current release is [1.1.2](https://github.com/ljw097/relic/releases/tag/v1.1.2).
 
 ![The Relic debugger stopped in vuln() right after gets(): the AAAA… input shows up in the registers and the stack telescope](docs/screenshots/debugger.png)
 
 ## Installing
 
-Download the executable for your system from the [release page](https://github.com/ljw097/relic/releases/tag/v1.1.1)
+Download the executable for your system from the [release page](https://github.com/ljw097/relic/releases/tag/v1.1.2)
 and start it; there is nothing to install:
 
 - **Windows**: `relic-<version>-windows-x86_64.exe`
@@ -28,7 +28,7 @@ With Python 3.10+, the wheel on the release page installs the same thing as a pa
 
 ```sh
 python3 -m venv .venv
-.venv/bin/pip install https://github.com/ljw097/relic/releases/download/v1.1.1/relic_re-1.1.1-py3-none-any.whl
+.venv/bin/pip install https://github.com/ljw097/relic/releases/download/v1.1.2/relic_re-1.1.2-py3-none-any.whl
 .venv/bin/relic
 ```
 
