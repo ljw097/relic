@@ -51,3 +51,30 @@ def test_cli_writes_a_c_file(vuln64, tmp_path):
     subprocess.run([sys.executable, "-m", "relic", "decompile", vuln64, "main", "-o", str(one)], check=True,
                    capture_output=True, cwd=os.path.dirname(HERE))
     assert one.read_text().startswith("int main(")
+
+
+def test_batch_export_reuses_preparations_and_writes_the_same(structs_O2, vuln64):
+    """`batch`: a function prepared for another one's struct scan is not prepared again for its own
+    pseudocode -- the same file, fewer preparations; nothing is kept once it is over."""
+    import relic.decompiler.pipeline as pipeline
+    for path in (structs_O2, vuln64):
+        texts, counts = [], []
+        for batch in (False, True):
+            an = analyze(path)
+            n = [0]
+            real = pipeline.prepare
+
+            def counting(an, f, real=real, n=n):
+                n[0] += 1
+                return real(an, f)
+            pipeline.prepare = counting
+            try:
+                out = io.StringIO()
+                export_c(an, out, batch=batch)
+            finally:
+                pipeline.prepare = real
+            texts.append(out.getvalue())
+            counts.append(n[0])
+        assert texts[0] == texts[1]
+        assert counts[1] < counts[0], counts
+    assert pipeline._KEPT.get() is None

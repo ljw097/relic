@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import bisect
+import itertools
 import re
 from dataclasses import dataclass, field
 
@@ -62,16 +63,86 @@ class _Cover:
 
     def next_gap(self, pos: int, end: int) -> tuple[int, int] | None:
         """The first uncovered range [s, e) at or after `pos`, before `end`."""
-        i = bisect.bisect_right(self.starts, pos) - 1
-        if i >= 0 and self.ends[i] > pos:
-            pos = self.ends[i]
-            i += 1
-        else:
-            i += 1
-        if pos >= end:
-            return None
-        e = self.starts[i] if i < len(self.starts) else end
-        return (pos, min(e, end)) if pos < min(e, end) else self.next_gap(min(e, end), end) if e < end else None
+        starts, ends = self.starts, self.ends
+        while True:                 # (a loop: the gap scan asks millions of times)
+            i = bisect.bisect_right(starts, pos)
+            if i and ends[i - 1] > pos:
+                pos = ends[i - 1]
+            if pos >= end:
+                return None
+            e = starts[i] if i < len(starts) else end
+            stop = e if e < end else end
+            if pos < stop:
+                return (pos, stop)
+            if e >= end:
+                return None
+            pos = stop
+
+
+def _walk_gaps(cover: _Cover, first: int, end: int, probe, probed: dict, tried: set, found) -> None:
+    """Probe the gaps of [first, end) for function starts, in address order: `probe(s, e)` gives
+    the start in a gap (or None), `found(start)` analyses it and returns the block ranges it
+    adds, which `cover` then holds. Gaps before the one probed can shrink too (a new function's
+    callees), so the scan resumes from the earliest new block.
+
+    It is the walk over every gap from that point, skipping each one already probed (`probed`:
+    a gap's start depends on its bytes alone, so it gives nothing new) -- without visiting them
+    one by one. A gap not probed yet lies past the furthest probed one (`high`), or holds a
+    point of `dirty`: one next to a block added since (its gap shrank or appeared) or where the
+    walk resumed (a gap entered part way)."""
+    starts, ends = cover.starts, cover.ends
+    pos = high = first
+    dirty: list[int] = []               # sorted
+
+    def at(c: int):
+        """The gap the walk from `pos` meets at or after `c` (>= pos), and whether that does not
+        depend on `pos` (the walk enters the gap holding `pos` there, part way)."""
+        i = bisect.bisect_right(starts, c)
+        if i and ends[i - 1] > c:                       # (covered: the gap after the range)
+            return cover.next_gap(c, end), True
+        gs = ends[i - 1] if i else None
+        if gs is not None and gs >= pos:
+            return cover.next_gap(gs, end), True
+        return cover.next_gap(pos, end), False
+
+    def next_unprobed():
+        k = bisect.bisect_left(dirty, pos)
+        while k < len(dirty) and dirty[k] < high:
+            g, whole = at(dirty[k])
+            if g is not None and g not in probed:
+                return g
+            if g is None or whole:
+                del dirty[k]                            # (seen through: only a new block changes it)
+            else:
+                k += 1
+        g = at(high)[0] if high > pos else cover.next_gap(pos, end)
+        while g is not None and g in probed:            # (past `high` none is: a safeguard)
+            g = cover.next_gap(g[1], end)
+        return g
+
+    while True:
+        checkpoint()
+        gap = next_unprobed()
+        if gap is None:
+            return
+        s, e = gap
+        high = max(high, e)
+        start = probed[gap] = probe(s, e)
+        if start is None or start in tried:
+            pos = e
+            continue
+        tried.add(start)
+        blocks = found(start)
+        for bs, be in blocks:
+            cover.add(bs, be)
+            for c in (bs - 1, be):
+                k = bisect.bisect_left(dirty, c)
+                if k == len(dirty) or dirty[k] != c:
+                    dirty.insert(k, c)
+        pos = max(first, min([s] + [bs for bs, _ in blocks]))
+        k = bisect.bisect_left(dirty, pos)
+        if k == len(dirty) or dirty[k] != pos:
+            dirty.insert(k, pos)
 
 
 def _fragment(name: str) -> bool:
@@ -109,8 +180,10 @@ class Function:
 
     def block_at(self, addr: int) -> Block | None:
         for b in self.blocks.values():
-            if b.addr <= addr < b.end:
-                return b
+            if b.addr <= addr:
+                last = b.insns[-1] if b.insns else None       # (Block.end, inlined: a hot path)
+                if addr < (last.addr + last.size if last is not None else b.addr):
+                    return b
         return None
 
 
@@ -1519,6 +1592,17 @@ class FunctionAnalyzer:
             return
         prologues = (b"\xf3\x0f\x1e\xfa", b"\xf3\x0f\x1e\xfb", b"\x55\x48\x89\xe5", b"\x55\x89\xe5")
         tried: set[int] = set()
+        if self.dis.arch in ("arm", "arm64"):
+            probe = self._arm_gap_function
+        elif self.dis.arch in ("mips", "mips64"):
+            probe = self._mips_gap_function
+        elif self.dis.arch.startswith("riscv"):
+            probe = self._riscv_gap_function
+        elif self.dis.arch in ("ppc", "ppc64"):
+            probe = self._ppc_gap_function
+        else:
+            probe = lambda s, e: self._gap_function(s, e, prologues)
+        probed: dict = {}
         for sec in self.bin.exec_sections:
             if sec.name in (".plt", ".plt.sec", ".plt.got", ".init", ".fini"):
                 continue
@@ -1531,40 +1615,20 @@ class FunctionAnalyzer:
             for a, d in self.code_data.items():         # (data among code: no function starts there)
                 if sec.contains(a):
                     cover.add(a, a + _def_size(d, self.bin.bits // 8))
-            known = set(self.funcs)
-            pos = sec.addr
-            while True:
-                checkpoint()
-                gap = cover.next_gap(pos, sec.end)
-                if gap is None:
-                    break
-                s, e = gap
-                if self.dis.arch in ("arm", "arm64"):
-                    start = self._arm_gap_function(s, e)
-                elif self.dis.arch in ("mips", "mips64"):
-                    start = self._mips_gap_function(s, e)
-                elif self.dis.arch.startswith("riscv"):
-                    start = self._riscv_gap_function(s, e)
-                elif self.dis.arch in ("ppc", "ppc64"):
-                    start = self._ppc_gap_function(s, e)
-                else:
-                    start = self._gap_function(s, e, prologues)
-                if start is None or start in tried:
-                    pos = e
-                    continue
-                tried.add(start)
+            # (the scan only adds functions, and a dict keeps insertion order: those found by a
+            # drain are the last ones)
+            known = len(self.funcs)
+
+            def found(start: int) -> list[tuple[int, int]]:
+                nonlocal known
                 self._queue.append(start)
                 self._drain()
-                # only the functions just found change what is covered; gaps before this one can
-                # shrink too (a new function's callees), so scanning resumes from the earliest
-                new = [self.funcs[a] for a in set(self.funcs) - known]
-                known.update(a for a in self.funcs)
-                lo = min((b.addr for f in new if not f.is_import for b in f.blocks.values()
-                          if sec.contains(b.addr)), default=s)
-                for f in new:
-                    if not f.is_import:
-                        cover.add_blocks(f, sec)
-                pos = max(sec.addr, min(s, lo))
+                # only the functions just found change what is covered
+                new = list(itertools.islice(reversed(self.funcs.values()), len(self.funcs) - known))
+                known = len(self.funcs)
+                return [(b.addr, b.end) for f in new if not f.is_import for b in f.blocks.values()
+                        if sec.contains(b.addr)]
+            _walk_gaps(cover, sec.addr, sec.end, probe, probed, tried, found)
 
     def _arm_gap_function(self, s: int, e: int) -> int | None:
         """First prologue in [s, e) (an odd result is a Thumb start).

@@ -34,9 +34,14 @@ def _split(an: "Analysis", func: "Function", d) -> tuple[list[list[str]], list[s
     return blocks, body
 
 
-def export_c(an: "Analysis", out: TextIO, funcs: list["Function"] | None = None) -> dict:
+def export_c(an: "Analysis", out: TextIO, funcs: list["Function"] | None = None, batch: bool = False) -> dict:
     """Write the pseudocode of `funcs` (default: every function of the binary but imported
-    stubs) to `out`. Returns {"functions": n written, "failed": [names], "structs": n}."""
+    stubs) to `out`. Returns {"functions": n written, "failed": [names], "structs": n}.
+    `batch`: nothing edits the analysis meanwhile (the command line): see pipeline.prepared_once."""
+    if batch:
+        from .pipeline import prepared_once
+        with prepared_once():
+            return export_c(an, out, funcs)
     from .emit import decompile
     if funcs is None:
         funcs = [f for f in sorted(an.functions.values(), key=lambda f: f.addr) if not f.is_import]

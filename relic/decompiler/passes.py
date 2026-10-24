@@ -23,16 +23,17 @@ from ..progress import checkpoint
 from .arch import ArchInfo
 from .fp import fold_fcmp, is_fcmp, negate_fcmp
 from .interp import InterpError, apply_binop, apply_cast, apply_unop
+from .ir import _LEAVES  # noqa: I001 - (the kinds without sub-expressions)
 from .ir import (BARRIERS, Assign, BinOp, Branch, Call, CallStmt, Cast, Const, Effect, Expr, Extract, Intrinsic,
-                 IRFunction, Ite, Jump, Load, Phi, Return, UnOp, Unknown, Var, children, mask, stmt_defs, stmt_exprs,
-                 transform, walk)
+                 IRFunction, Ite, Jump, Load, Phi, Return, UnOp, Unknown, Var, children, has, mask, stmt_defs,
+                 stmt_exprs, transform, walk)
 
 MAX_ITERS = 64
 
 
 # ----------------------------------------------------------------- predicates
 def _has(e: Expr, *types) -> bool:
-    return any(isinstance(x, types) for x in walk(e))
+    return has(e, types)
 
 
 def _trivial(e: Expr) -> bool:
@@ -58,12 +59,13 @@ def _add_uses(c: Counter, s, k: int = 1) -> None:
     """Add `k` to the count of every variable statement `s` reads (an explicit stack: this
     runs over every statement of every pass round, generator recursion costs too much)."""
     stack = list(stmt_exprs(s))
-    pop, push = stack.pop, stack.extend
+    pop, push, leaves = stack.pop, stack.extend, _LEAVES
     while stack:
         x = pop()
-        if isinstance(x, Var):
+        t = type(x)
+        if t is Var:
             c[x] += k
-        else:
+        elif t not in leaves:
             push(children(x))
 
 
@@ -85,6 +87,12 @@ def _rewrite(fn: IRFunction, f) -> bool:
     changed = False
     for b in fn.blocks.values():
         for s in b.stmts:
+            if type(s) is Assign:               # (most statements: one expression read, no lists)
+                old = s.src
+                s.src = new = f(old)
+                if not changed and new is not old:
+                    changed = new != old
+                continue
             before = stmt_exprs(s)
             map_stmt(s, f)
             if not changed:
@@ -120,6 +128,8 @@ def _subst(e: Expr, sub: dict[Var, Expr]) -> Expr:
 
 # ------------------------------------------------------- constant folding / simplify
 def _fold_node(e: Expr) -> Expr:
+    if type(e) in _LEAVES:                  # (nothing to fold)
+        return e
     if isinstance(e, BinOp) and isinstance(e.a, Const) and isinstance(e.b, Const):
         try:
             return Const(apply_binop(e.op, e.a.value, e.b.value, e.a.bits, e.b.bits), e.bits)
@@ -240,6 +250,8 @@ def _narrow_cmp(op: str, a: Expr, b: Expr) -> Expr | None:
 
 
 def _simp_node(e: Expr) -> Expr:
+    if type(e) in _LEAVES:                  # (every rule below rewrites an operation)
+        return e
     if e.bits == 1 and isinstance(e, (BinOp, UnOp, Ite)) and (not isinstance(e, BinOp) or e.op[0] != "f"):
         f = fold_fcmp(e)
         if f is not e:
@@ -902,25 +914,34 @@ def _known_zext(fn: IRFunction) -> dict:
             defs.setdefault(s.dst, []).append(s.src)
         else:
             other.update(d for d in stmt_defs(s) if isinstance(d, Var))
+    # each definition's widths, worked out once: a width, None (not a zero-extension), or the
+    # variable a phi takes it from (known only once that one is)
+    shapes: dict = {}
+    for v, srcs in defs.items():
+        if v in other:
+            continue
+        ws = []
+        for e in srcs:
+            if isinstance(e, Cast) and e.kind == "low" and isinstance(e.a, Cast) and e.a.kind == "zext" and \
+                    e.a.a.bits <= e.bits:
+                e = e.a                             # (narrowed: `low32(zext64(byte))`)
+            if isinstance(e, Cast) and e.kind == "zext":
+                ws.append(e.a.bits)
+            elif isinstance(e, Phi):
+                ws += [x if isinstance(x, Var) else None for _, x in e.sources]
+            else:
+                ws.append(None)
+        if ws and None not in ws:
+            shapes[v] = ws
     known: dict = {}
     changed = True
     while changed:
         changed = False
-        for v, srcs in defs.items():
-            if v in known or v in other:
+        for v, shape in shapes.items():
+            if v in known:
                 continue
-            ws = []
-            for e in srcs:
-                if isinstance(e, Cast) and e.kind == "low" and isinstance(e.a, Cast) and e.a.kind == "zext" and \
-                        e.a.a.bits <= e.bits:
-                    e = e.a                             # (narrowed: `low32(zext64(byte))`)
-                if isinstance(e, Cast) and e.kind == "zext":
-                    ws.append(e.a.bits)
-                elif isinstance(e, Phi):
-                    ws += [known.get(x) if isinstance(x, Var) else None for _, x in e.sources]
-                else:
-                    ws.append(None)
-            if ws and all(w is not None for w in ws):
+            ws = [known.get(w) if isinstance(w, Var) else w for w in shape]
+            if all(w is not None for w in ws):
                 known[v] = max(ws)
                 changed = True
     return known

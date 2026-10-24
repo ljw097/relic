@@ -69,3 +69,15 @@ def test_strings_grep(capsys, vuln64):
     out = run(capsys, "strings", vuln64, "-g", "bin/sh")
     assert '"/bin/sh"' in out
     assert "hello" not in out
+
+
+def test_decompile_all_goes_on_past_a_function_that_fails(capsys, vuln64_pe):
+    """MinGW's `__CTOR_LIST__` is a symbol on data in .text: no instructions to decompile. `--all`
+    says so in its place and goes on (as the C export does); asked for alone, a one-line error."""
+    import pytest
+    out = run(capsys, "decompile", vuln64_pe, "--all")
+    assert "// __CTOR_LIST__ @ 0x" in out and "not decompiled (ValueError: no instructions at" in out
+    assert "int main(" in out
+    with pytest.raises(SystemExit) as e:
+        main(["decompile", vuln64_pe, "__CTOR_LIST__"])
+    assert "not decompiled" in str(e.value) and "Traceback" not in str(e.value)

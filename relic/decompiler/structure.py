@@ -126,6 +126,33 @@ def _domtree(entry, succ, pred):
     return idom
 
 
+def _subtree_spans(idom: dict) -> dict:
+    """Node -> (its preorder number, one past the last number in its subtree) in the tree
+    `idom` gives (node -> parent, the root its own parent): a dominates b exactly when b's
+    number is in a's span."""
+    kids: dict = {}
+    roots = []
+    for n, p in idom.items():
+        if p == n:
+            roots.append(n)
+        else:
+            kids.setdefault(p, []).append(n)
+    span: dict = {}
+    k = 0
+    for r in roots:
+        stack = [(r, False)]
+        while stack:
+            n, done = stack.pop()
+            if done:
+                span[n] = (span[n], k)
+                continue
+            span[n] = k
+            k += 1
+            stack.append((n, True))
+            stack.extend((c, False) for c in kids.get(n, ()))
+    return span
+
+
 def _negate(c):
     """Logical negation, inverting comparisons rather than wrapping in `!`."""
     if isinstance(c, UnOp) and c.op == "!":
@@ -222,6 +249,7 @@ class Structurer:
         self.succ = {a: [s for s in b.succs if s in fn.blocks] for a, b in self.blocks.items()}
         self.pred = {a: [p for p in b.preds if p in fn.blocks] for a, b in self.blocks.items()}
         self.idom = _domtree(fn.addr, lambda a: self.succ.get(a, []), lambda a: self.pred.get(a, []))
+        self._dom_span = None               # (dominance queries: see _dominates)
         self.ipdom = self._post_idom()
         self.loops = self._find_loops()        # header -> dict(body, follow, kind, latches)
         self.emitted: set[int] = set()
@@ -231,13 +259,14 @@ class Structurer:
 
     # -- dominance -----------------------------------------------------------
     def _dominates(self, a, b):
-        while True:
-            if a == b:
-                return True
-            nb = self.idom.get(b)
-            if nb is None or nb == b:
-                return False
-            b = nb
+        if a == b:
+            return True
+        span = self._dom_span
+        if span is None:
+            span = self._dom_span = _subtree_spans(self.idom)
+        sa, sb = span.get(a), span.get(b)
+        # (b lies in a's subtree of the dominator tree: a's preorder interval holds b's number)
+        return sa is not None and sb is not None and sa[0] < sb[0] < sa[1]
 
     def _post_idom(self):
         terminals = [a for a in self.blocks if not self.succ[a]]
@@ -655,9 +684,9 @@ class Structurer:
             after = reach(m)
             return not (reach(t, m) & after) and not (reach(f, m) & after)
         order = sorted(cands, key=self.rpo_index.__getitem__)
-        strict = [m for m in order if joins(m)]
-        if strict:
-            return strict[0]
+        first = next((m for m in order if joins(m)), None)      # (the earliest one that joins)
+        if first is not None:
+            return first
         return order[0] if order and RELAXED_JOIN else None
 
     def _switch_index_via(self, term: IndirectJump, n: int | None = None):

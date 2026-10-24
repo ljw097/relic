@@ -120,3 +120,61 @@ def test_vulns_use_decompiled_arguments_on_x86_32(vuln32):
     assert ("win", "win-function") in kinds
     assert ("vuln", "dangerous-call") in kinds
     assert not any(f.func == "menu" and f.kind == "format-string" for f in findings)   # scanf("%d")
+
+
+def _plain_gap_walk(cover, first, end, probe, probed, tried, found):
+    """The gap scan as the plain walk: every gap from where it resumes, skipping probed ones."""
+    pos = first
+    while True:
+        gap = cover.next_gap(pos, end)
+        if gap is None:
+            return
+        s, e = gap
+        start = probed.get(gap, probed)
+        if start is probed:
+            start = probed[gap] = probe(s, e)
+        if start is None or start in tried:
+            pos = e
+            continue
+        tried.add(start)
+        blocks = found(start)
+        for bs, be in blocks:
+            cover.add(bs, be)
+        pos = max(first, min([s] + [bs for bs, _ in blocks]))
+
+
+def test_gap_walk_skips_only_what_the_plain_walk_skips():
+    """_walk_gaps visits only gaps not probed yet: the same probes, in the same order, and the same
+    functions as walking every gap (random covers, probe results and functions found)."""
+    import random
+
+    from relic.analysis.functions import _Cover, _walk_gaps
+
+    def run(seed, walk):
+        rnd = random.Random(seed)
+        first, end = rnd.randint(0, 10), rnd.choice([30, 80, 200, 600])
+        cover = _Cover()
+        for _ in range(rnd.randint(0, end // 8)):
+            s = rnd.randint(first, end)
+            cover.add(s, s + rnd.randint(1, 12))
+        log = []
+
+        def probe(s, e):
+            log.append(("probe", s, e))
+            r = random.Random(f"{seed} {s} {e}")
+            x = r.random()
+            return None if x < 0.45 else s if x < 0.55 else r.randint(s, max(s, e - 1))
+
+        def found(start):
+            log.append(("found", start))
+            r = random.Random(f"{seed} {start}")
+            out = []
+            for _ in range(r.choice([0, 1, 1, 2, 3, 5])):
+                bs = r.choice([start, start, r.randint(first, end - 1), max(first, start - r.randint(1, 40))])
+                out.append((bs, bs + r.randint(1, 15)))
+            return out
+        walk(cover, first, end, probe, {}, set(), found)
+        return log, cover.starts, cover.ends
+
+    for seed in range(3000):
+        assert run(seed, _walk_gaps) == run(seed, _plain_gap_walk), seed
