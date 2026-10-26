@@ -2,29 +2,32 @@
 
 [English](README.md) | **한국어**
 
-리버싱과 포너블(pwn) 문제 풀이에 쓰려고 만들고 있는 디스어셈블러·디컴파일러입니다.
-GUI는 PySide6, 명령어 디코딩은 capstone을 쓰고, 그 위의 분석·디컴파일러·디버거는 모두 직접 구현했습니다.
+Relic은 리버싱과 포너블(pwn) 문제를 풀 때 쓰려고 만들고 있는 디스어셈블러·디컴파일러입니다.
+GUI는 PySide6, 명령어 디코딩은 capstone을 쓰고, 그 위에 올라가는 분석기·디컴파일러·디버거는 전부 직접
+만들었습니다.
 
-목표는 IDA Pro + Hex-Rays 수준이고, 가능하면 그 이상입니다. 아직 갈 길이 멀지만 x86-64나 ARM 바이너리를 열어
-함수를 훑어보고, 이름을 붙이고, 의사 코드를 읽고, 디버거로 오버플로 오프셋을 재는 데는 지금도 충분히 쓸 만합니다.
-현재 버전은 [1.1.2](https://github.com/ljw097/relic/releases/tag/v1.1.2)입니다.
+목표는 솔직히 좀 거창합니다. IDA Pro + Hex-Rays만큼, 할 수 있다면 그보다 낫게 만드는 겁니다. 아직 거기까지는
+멀었지만, x86-64나 ARM 바이너리를 열어서 함수를 훑어보고, 이름을 붙이고, 의사 코드를 읽고, 디버거로
+오버플로 오프셋을 재는 정도는 지금도 충분히 됩니다. 현재 버전은
+[1.1.2](https://github.com/ljw097/relic/releases/tag/v1.1.2)입니다.
 
 ![Relic 디버거: vuln()에서 gets() 직후에 멈춘 화면. 입력한 AAAA…가 레지스터와 스택 telescope에 보인다](docs/screenshots/debugger.png)
 
 ## 설치
 
-[릴리스 페이지](https://github.com/ljw097/relic/releases/tag/v1.1.2)에서 자기 운영체제에 맞는 실행 파일을 받아
-실행하면 됩니다. 따로 설치할 것은 없습니다.
+[릴리스 페이지](https://github.com/ljw097/relic/releases/tag/v1.1.2)에서 운영체제에 맞는 실행 파일을 받아
+실행하면 됩니다. 설치 과정은 없습니다.
 
 - **Windows**: `relic-<버전>-windows-x86_64.exe`
-- **Linux**: `relic-<버전>-linux-x86_64.tar.gz` (파일 하나, `relic`)
-- **macOS**: `relic-<버전>-macos-arm64.zip`(Apple 실리콘) 또는 `-macos-x86_64.zip`(Intel), 안에 `Relic.app`.
-  서명되지 않았으므로 처음에는 오른쪽 클릭 후 열기를 선택합니다.
+- **Linux**: `relic-<버전>-linux-x86_64.tar.gz` (안에 `relic` 파일 하나)
+- **macOS**: Apple 실리콘은 `relic-<버전>-macos-arm64.zip`, Intel은 `-macos-x86_64.zip`이고 안에 `Relic.app`이
+  들어 있습니다. 서명이 안 되어 있어서 처음 한 번은 오른쪽 클릭 후 "열기"를 골라야 합니다.
 
-파일 없이 열리고, File > Open(`Ctrl+O`), File > Open Recent, 또는 창에 파일을 끌어다 놓아서 엽니다.
-같은 실행 파일로 아래 명령도 쓸 수 있습니다(`relic info FILE`, `Relic.exe decompile FILE` 등).
+처음에는 빈 창으로 열립니다. File > Open(`Ctrl+O`)이나 File > Open Recent로 열거나, 파일을 창에 끌어다
+놓으면 됩니다. 같은 실행 파일로 아래에 나오는 명령도 쓸 수 있습니다(`relic info FILE`,
+`Relic.exe decompile FILE` 등).
 
-Python 3.10 이상이 있다면 릴리스 페이지의 wheel로 패키지로 설치할 수도 있습니다.
+Python 3.10 이상이 있다면 릴리스 페이지의 wheel을 설치해도 됩니다.
 
 ```sh
 python3 -m venv .venv
@@ -32,7 +35,7 @@ python3 -m venv .venv
 .venv/bin/relic
 ```
 
-소스에서 실행하려면:
+소스에서 바로 실행하려면:
 
 ```sh
 git clone https://github.com/ljw097/relic && cd relic
@@ -40,71 +43,80 @@ python3 -m venv .venv
 .venv/bin/pip install -e '.[dev]'
 ```
 
-분석과 디컴파일은 어느 운영체제에서나 같습니다. 그 밖에 기능별로 필요한 것:
+분석과 디컴파일은 어느 운영체제에서나 똑같이 됩니다. 몇몇 기능은 따로 필요한 것이 있습니다.
 
-- 디버거: `gdb` (`sudo apt install gdb`)
-- ARM·MIPS 등 다른 아키텍처 바이너리 디버깅: `gdb-multiarch`, `qemu-user`
-- 어셈블리로 패치하기(`Ctrl+Alt+A`): keystone. `pip install 'relic-re[asm]'`로 따로 설치합니다.
+- 디버거는 `gdb`가 있어야 합니다(`sudo apt install gdb`). ARM, MIPS 같은 다른 아키텍처 바이너리를
+  디버깅하려면 `gdb-multiarch`와 `qemu-user`도 설치하세요.
+- 어셈블리를 입력해서 패치하는 기능(`Ctrl+Alt+A`)은 keystone이 필요합니다. `pip install 'relic-re[asm]'`로
+  따로 설치합니다.
 
-## 기능
+## 할 수 있는 것
 
 | | |
 |---|---|
 | ![리스팅](docs/screenshots/listing.png) | ![그래프](docs/screenshots/graph.png) |
-| 리스팅. 문자열 참조는 주석으로, 호출 대상은 이름으로 표시됩니다 | CFG 그래프. 분기가 성립하는 간선은 초록, 아닌 간선은 빨강이고 루프의 역방향 간선은 옆으로 돌아갑니다 |
+| 리스팅. 문자열 참조는 주석으로, 호출 대상은 이름으로 보입니다 | CFG 그래프. 분기가 성립하는 쪽은 초록, 아닌 쪽은 빨강이고 루프로 돌아가는 간선은 옆으로 돌아갑니다 |
 | ![의사 코드](docs/screenshots/pseudocode.png) | ![취약점](docs/screenshots/vulns.png) |
-| 의사 코드. 점프 테이블이 `switch` 문으로 복원됩니다 | Vulns 탭. 포맷 스트링 버그, `gets()` 호출, ret2win 후보를 보여 줍니다 |
+| 의사 코드. 점프 테이블이 `switch`로 돌아왔습니다 | Vulns 탭. 포맷 스트링 버그, `gets()` 호출, ret2win 후보가 보입니다 |
 
 (스크린샷은 모두 [`tests/src/vuln.c`](tests/src/vuln.c)를 빌드한 바이너리입니다.)
 
-지원하는 것을 정리하면 다음과 같습니다.
+**파일 형식.** ELF(실행 파일, 공유 라이브러리, `.o`, 코어 덤프), PE, Mach-O(유니버설 파일 포함), COFF 객체,
+`.a` 아카이브 멤버, Intel HEX와 S-record, raw 덤프를 엽니다. raw 펌웨어는 적재 주소를 추정해 줍니다
+(`--base auto`).
 
-- **파일 형식**: ELF(실행 파일, 공유 라이브러리, 재배치 객체 `.o`, 코어 덤프), PE, Mach-O(실행 파일, dylib,
-  유니버설 파일), COFF 객체, `.a` 아카이브의 멤버,
-  Intel HEX / Motorola S-record, raw 바이너리. raw 펌웨어는 로드 주소를 추정할 수 있습니다(`--base auto`).
-- **아키텍처**: x86, x86-64, ARM/Thumb, AArch64, MIPS32(빅·리틀 엔디언), MIPS64, RISC-V(RV64GC),
-  PowerPC(32비트, 64비트 리틀 엔디언)는 디컴파일까지 지원합니다.
-- **분석**: 함수·CFG 복원, 상호 참조(xref), 문자열, 점프 테이블, stripped 바이너리에서 `main` 찾기,
-  빌드에 쓰인 컴파일러와 libc 식별.
-- **라이브러리 함수 식별**: 정적 링크된 stripped 바이너리에서 libc 등 라이브러리 함수를 바이트 시그니처(FLIRT 방식)로
-  찾아 이름을 붙입니다. 시그니처 파일은 설치된 툴체인의 정적 라이브러리로 직접 만들 수 있습니다(`relic sigs build --system`).
-- **디컴파일러**: 메모리 접근 패턴으로 구조체를 복원하고, 사용자가 타입을 지정할 수도 있습니다(`Y`).
-  부동소수점 연산, libc·Windows API 함수 원형, C 헤더 가져오기를 지원합니다.
-  테스트에서는 디컴파일 결과를 다시 컴파일해 원본과 같은 결과를 내는지 확인합니다.
-- **자동 이름**: stripped 바이너리의 `sub_XXXX` 함수에 코드가 보여 주는 이름을 붙입니다. `assert()`가 넘기는 함수 이름
-  (`table_insert`), 자기 이름을 담은 로그 메시지(`"shell_getc: ..."`), `xmalloc`, `usage`, `fatal`, `j_puts` 같은 썽크.
-  디컴파일러 변수도 쓰임새로 이름을 붙입니다: `fd = open(path, ...)`, `len = strlen(str)`, `FILE *fp`,
-  `home = getenv("HOME")`, 루프 카운터 `i`·`j`, `count++`, `lines = count_lines(...)`. 사용자가 붙인 이름이 항상 우선이고,
-  `relic funcs`가 이름을 붙인 이유를 보여 줍니다. View ▸ Automatic names(또는 `--no-auto-names`)로 생성된 이름을 볼 수 있습니다.
-- **GUI**: 이름 변경, 주석, xref, 검색, 북마크, 바이트 패치, 되돌리기 등 IDA에서 자주 쓰는 기능을 갖췄고,
-  단축키도 가능한 한 IDA와 같게 맞췄습니다.
-- **디버거**: gdb(GDB/MI)를 백엔드로 쓰고, 화면은 pwndbg와 비슷하게 구성했습니다. 로컬 실행, gdbserver 원격 연결,
-  qemu-user, 실행 중인 프로세스에 붙기를 지원하며 레지스터, 스택 telescope, vmmap, glibc 힙 청크를 볼 수 있습니다.
-- **스크립팅**: GUI 안의 Python 콘솔, `relic script` 일괄 실행, 플러그인.
-- **포너블용 기능**: checksec, 위험 함수 호출, 상수가 아닌 포맷 문자열, 폭 지정 없는 `scanf("%s")`, ret2win 후보 탐지.
-  IDA에 기본으로 없는 기능이라 따로 넣었습니다.
+**아키텍처.** x86, x86-64, ARM/Thumb, AArch64, MIPS32(빅·리틀 엔디언), MIPS64, RISC-V, PowerPC 32/64비트는
+의사 코드까지 나옵니다. 그 밖에 몇 가지는 디스어셈블만 됩니다.
 
-### IDA 대비 진행률
+**분석.** 함수와 CFG, 상호 참조, 문자열, 점프 테이블을 찾고, stripped 바이너리에서도 `main`을 찾습니다.
+어떤 컴파일러와 libc로 빌드했는지도 알려 줍니다. 정적 링크된 stripped 바이너리에서는 FLIRT 방식 바이트
+시그니처로 libc 같은 라이브러리 함수를 알아봅니다. 시그니처 파일은 설치된 툴체인의 정적 라이브러리로 바로
+만들 수 있습니다(`relic sigs build --system`).
 
-정밀하게 잰 값이 아니라 어림값입니다. 각 영역에서 "IDA가 하는 일 중 Relic이 비슷한 수준으로 하는 비율"로 읽어 주세요.
-전체 값은 영역별 가중 평균이며, 가중치는 실제 리버싱에서 각 영역이 차지하는 비중을 제 기준으로 정했습니다.
-현재 **약 91%**입니다.
+**디컴파일러.** 제어 흐름 복원은 기본이고, 메모리 접근 모양을 보고 구조체를 알아냅니다. 타입은 `Y`로 직접
+지정할 수도 있습니다. libc와 Windows API 원형을 알고, 부동소수점도 다루며, C 헤더를 가져올 수 있습니다.
+테스트에서는 디컴파일한 결과를 다시 컴파일해서 원본과 똑같이 동작하는지 확인합니다.
+
+**자동 이름.** stripped 바이너리의 함수는 코드에 단서가 있으면 이름이 붙습니다. `assert()`에 넘기는 함수
+이름(`table_insert`), 함수 이름으로 시작하는 로그 메시지(`"shell_getc: ..."`), `xmalloc`·`usage`·`fatal`·
+`j_puts` 썽크 같은 익숙한 모양이 그 단서입니다. 변수는 쓰이는 모양대로 이름이 붙습니다.
+`fd = open(path, ...)`, `len = strlen(str)`, `FILE *fp`, `home = getenv("HOME")`, 루프 카운터 `i`·`j`,
+`lines = count_lines(...)` 같은 식입니다. 직접 붙인 이름이 항상 우선입니다. 이름을 왜 그렇게 붙였는지는
+`relic funcs`로 볼 수 있고, View ▸ Automatic names(또는 `--no-auto-names`)를 끄면 원래 이름으로 돌아갑니다.
+
+**GUI.** 이름 바꾸기, 주석, xref, 검색, 북마크, 바이트 패치, 되돌리기처럼 IDA에서 손에 익은 기능은 대부분
+있고, 단축키도 되도록 IDA와 같게 맞췄습니다.
+
+**디버거.** 밑에서는 gdb(GDB/MI)가 돌고, 화면은 pwndbg처럼 꾸몄습니다. 로컬 실행, gdbserver 원격 연결,
+qemu-user로 다른 아키텍처 실행, 실행 중인 프로세스에 붙기가 되고, 레지스터·스택 telescope·메모리 맵·
+glibc 힙 청크를 볼 수 있습니다.
+
+**스크립팅.** GUI 안의 Python 콘솔, 일괄 실행용 `relic script`, 플러그인이 있습니다.
+
+**포너블 도우미.** checksec, 위험한 함수 호출, 상수가 아닌 포맷 문자열, 폭 지정 없는 `scanf("%s")`,
+ret2win 후보를 찾아 줍니다. IDA에는 기본으로 없는 기능이라 따로 넣었습니다.
+
+### IDA와 비교하면 어디쯤인지
+
+정확히 잰 값이 아니라 제 어림값입니다. 영역마다 "IDA가 하는 일 중에서 Relic이 비슷한 수준으로 하는 비율"로
+보시면 됩니다. 전체 값은 영역별 가중 평균이고, 가중치는 실제로 리버싱할 때 그 영역이 저한테 얼마나 중요한지로
+정했습니다. 지금은 **약 91%**입니다.
 
 | 영역 (가중치) | 진행률 | 비고 |
 |---|---|---|
-| 파일 형식 (8) | 100% | Mach-O와 Objective-C 메타데이터(의사 코드에 `[obj msg:arg]`) |
-| 프로세서 (8) | 100% | 디컴파일: x86/x64, ARM/Thumb, AArch64, MIPS32/64, RISC-V RV32/RV64, PowerPC 32/64(ELFv1·ELFv2). 디스어셈블: SPARC, SystemZ, M68K, SH, TriCore, eBPF, WebAssembly |
-| 자동 분석 (14) | 100% | stripped bash에서 `.eh_frame`에 있는 함수의 99.9%, `.eh_frame`을 지워도 99.96%를 찾음(돌아오지 않는 함수 추론, 꼬리 호출, 데이터 속 함수 포인터). RTTI로 C++ 클래스·vtable 복원(gcc/clang, MSVC), 객체를 따라가 가상 호출 대상 해석, 모든 프로세서에서 함수 포인터 변수를 거친 호출, 코드 사이 데이터 감지, bash 약 7초 |
-| 라이브러리 식별 (8) | 100% | 테스트용 stripped 정적 C 바이너리에서 원래 심볼이 있던 함수의 83~94%에 이름을 붙이며, 잘못 붙인 이름은 없습니다 |
-| 타입 시스템 (10) | 90% | libc 플래그 인자를 헤더 상수 이름으로(`PROT_READ \| PROT_WRITE`), 헤더의 `#define` 묶음은 열거형으로, PE는 Microsoft 비트필드 레이아웃. 구조체 값 전달(by-value) 인자·반환 미지원 |
-| 디컴파일러 (20) | 60% | goto는 벤치마크 시작 때의 절반, 남은 것은 대부분 큰 상태 기계 함수(gnulib `quotearg`, gzip deflate). SSE/AVX는 Intel intrinsic으로. x87 부동소수점은 32비트 x86에서 지원(`long double` 제외) |
+| 파일 형식 (8) | 100% | Objective-C 메타데이터까지 읽는 Mach-O 포함(의사 코드에 `[obj msg:arg]`) |
+| 프로세서 (8) | 100% | 디컴파일: x86/x64, ARM/Thumb, AArch64, MIPS32/64, RISC-V, PowerPC 32/64. 디스어셈블만: SPARC, SystemZ, M68K, SH, TriCore, eBPF, WebAssembly |
+| 자동 분석 (14) | 100% | stripped bash 함수의 99.9%, `.eh_frame`을 지워도 99.96%를 찾습니다. RTTI로 C++ 클래스 복원, 가상·간접 호출 대상 해석, 코드 사이 데이터 구분. bash 분석에 약 7초 |
+| 라이브러리 식별 (8) | 100% | 테스트용 stripped 정적 바이너리에서 원래 함수의 83~94%에 이름을 붙이고, 틀린 이름은 없습니다 |
+| 타입 시스템 (10) | 90% | libc 플래그는 상수 이름으로(`PROT_READ \| PROT_WRITE`), 헤더의 `#define` 묶음은 열거형으로. 구조체를 값으로 넘기고 돌려받는 경우는 아직 안 됩니다 |
+| 디컴파일러 (20) | 60% | goto가 처음 재기 시작했을 때의 절반이고, 남은 것은 대부분 gnulib `quotearg` 같은 큰 상태 기계에 있습니다. SSE/AVX는 intrinsic으로, x87은 `long double`만 빼고 됩니다 |
 | 대화형 UI (12) | 100% | |
 | 스크립팅·확장 (8) | 100% | |
-| 디버거 (7) | 100% | Windows(PE) 프로그램은 wine에서 Windows용 gdbserver.exe로 |
+| 디버거 (7) | 100% | Windows 프로그램은 wine에서 Windows용 gdbserver.exe로 |
 | 프로젝트·협업 (5) | 100% | 스냅숏, 버전 기록, 병합, Lumina 방식의 이름 공유 |
 
-영역별로 무엇을 100%의 기준으로 삼았는지와 남은 작업은 [TODO.md](TODO.md)에,
-완료한 작업의 기록은 [docs/history.md](docs/history.md)에 있습니다.
+영역마다 어디까지를 100%로 보는지, 무엇이 남았는지는 [TODO.md](TODO.md)에 적어 두었습니다.
+끝낸 작업의 기록은 [docs/history.md](docs/history.md)에 있습니다.
 
 ## CLI
 
@@ -301,7 +313,7 @@ for v in an.vulns():
 
 ```
 relic/
-  loader/      ELF / PE / COFF / 코어 덤프 / 펌웨어를 공통 Binary 모델로 적재
+  loader/      ELF / PE / Mach-O / COFF / 코어 덤프 / 펌웨어를 공통 Binary 모델로 적재
   disasm.py    capstone 래퍼
   analysis/    함수·CFG, xref, 문자열, 시그니처, 컴파일러 식별, checksec, 취약점 탐지, 프로젝트 파일
   decompiler/  리프터 → SSA·최적화 → 제어 흐름 구조화 → C 출력 (설계: docs/decompiler-plan.md)

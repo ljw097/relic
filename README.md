@@ -2,29 +2,35 @@
 
 **English** | [한국어](README.ko.md)
 
-A disassembler and decompiler I'm building for reverse engineering and pwn challenges.
-The GUI is PySide6 and disassembly comes from capstone; the analysis, decompiler and debugger on top of that are written from scratch.
+Relic is a disassembler and decompiler I'm building for reverse engineering and CTF pwn
+challenges. The GUI uses PySide6 and the disassembly comes from capstone. Everything on top of
+that, from the analysis to the decompiler and the debugger, I wrote myself.
 
-I'll admit the goal is ambitious: as good as IDA Pro + Hex-Rays, and better where I can manage it.
-There's a long way to go, but opening an x86-64 or ARM binary, browsing functions, naming things, reading pseudocode
-and measuring an overflow offset in the debugger all work fine today. The current release is [1.1.2](https://github.com/ljw097/relic/releases/tag/v1.1.2).
+The goal is admittedly ambitious: something as good as IDA Pro with Hex-Rays, and better where I
+can manage it. It isn't there yet. But for the everyday stuff it already works well: opening an
+x86-64 or ARM binary, finding your way around, naming things, reading the pseudocode, and
+measuring an overflow offset in the debugger. The current release is
+[1.1.2](https://github.com/ljw097/relic/releases/tag/v1.1.2).
 
 ![The Relic debugger stopped in vuln() right after gets(): the AAAA… input shows up in the registers and the stack telescope](docs/screenshots/debugger.png)
 
 ## Installing
 
-Download the executable for your system from the [release page](https://github.com/ljw097/relic/releases/tag/v1.1.2)
-and start it; there is nothing to install:
+Grab the executable for your system from the
+[release page](https://github.com/ljw097/relic/releases/tag/v1.1.2) and run it. There's nothing
+to install:
 
 - **Windows**: `relic-<version>-windows-x86_64.exe`
-- **Linux**: `relic-<version>-linux-x86_64.tar.gz` (one file, `relic`)
-- **macOS**: `relic-<version>-macos-arm64.zip` (Apple silicon) or `-macos-x86_64.zip` (Intel), a `Relic.app`.
-  It is not signed: the first time, right-click it and choose Open.
+- **Linux**: `relic-<version>-linux-x86_64.tar.gz`, which contains a single `relic` file
+- **macOS**: `relic-<version>-macos-arm64.zip` for Apple silicon or `-macos-x86_64.zip` for Intel,
+  each with a `Relic.app` inside. It isn't signed, so the first time you open it, right-click it
+  and choose Open.
 
-It opens with no file; open one with File > Open (`Ctrl+O`), File > Open Recent, or by dropping it on the window.
-The same executable runs the commands below too (`relic info FILE`, `Relic.exe decompile FILE`, ...).
+It starts without a file. Open one with File > Open (`Ctrl+O`) or File > Open Recent, or just
+drop it on the window. The same executable also runs all the commands below (`relic info FILE`,
+`Relic.exe decompile FILE`, and so on).
 
-With Python 3.10+, the wheel on the release page installs the same thing as a package:
+If you have Python 3.10 or newer, you can install the wheel from the release page instead:
 
 ```sh
 python3 -m venv .venv
@@ -40,69 +46,84 @@ python3 -m venv .venv
 .venv/bin/pip install -e '.[dev]'
 ```
 
-Analysis and decompilation work the same on every system. The debugger needs `gdb` (`sudo apt install gdb`); to debug ARM, MIPS and other
-foreign binaries, install `gdb-multiarch` and `qemu-user` as well.
-`Ctrl+Alt+A` (patch by assembling) needs keystone, which is a separate extra: `pip install 'relic-re[asm]'`.
+Analysis and decompilation work the same everywhere. A few features need extra tools:
+
+- The debugger needs `gdb` (`sudo apt install gdb`). For ARM, MIPS and other foreign binaries,
+  you'll also want `gdb-multiarch` and `qemu-user`.
+- Patching by typing assembly (`Ctrl+Alt+A`) needs keystone, which is an optional extra:
+  `pip install 'relic-re[asm]'`.
 
 ## What it does
 
 | | |
 |---|---|
 | ![Listing](docs/screenshots/listing.png) | ![Graph](docs/screenshots/graph.png) |
-| The listing. String references show up as comments, call targets by name | The CFG graph. Taken / not-taken edges are green / red, loops route around the side |
+| The listing. String references show up as comments, and calls show the target's name | The CFG graph. Taken edges are green, not-taken ones red, and loop edges route around the side |
 | ![Pseudocode](docs/screenshots/pseudocode.png) | ![Vulns](docs/screenshots/vulns.png) |
-| Pseudocode. A jump table comes back as a `switch` | The Vulns tab: format strings, `gets()`, ret2win candidates |
+| Pseudocode. The jump table came back as a `switch` | The Vulns tab: a format string bug, a `gets()` call and a ret2win candidate |
 
-(All screenshots are of [`tests/src/vuln.c`](tests/src/vuln.c).)
+(All the screenshots are of [`tests/src/vuln.c`](tests/src/vuln.c).)
 
-Roughly, here's what works:
+**File formats.** ELF (executables, shared libraries, `.o` files and core dumps), PE, Mach-O
+(including universal binaries), COFF objects, members of `.a` archives, Intel HEX and
+S-records, and raw dumps. For raw firmware it can guess the load address for you
+(`--base auto`).
 
-- **Files it opens**: ELF (executables, shared libraries, `.o` files, core dumps), PE, Mach-O (executables, dylibs,
-  universal files), COFF objects, members of `.a`
-  archives, Intel HEX / S-record, and plain raw dumps. For raw firmware it will also guess the load address (`--base auto`).
-- **Architectures**: x86, x86-64, ARM/Thumb, AArch64, MIPS32 (both byte orders), MIPS64, RISC-V (RV64GC), and
-  PowerPC (32-bit and 64-bit little-endian) go all the way to pseudocode.
-- **Analysis**: functions, CFGs, xrefs, strings, jump tables, finding `main` in stripped binaries, and working out
-  which compiler and libc built the binary.
-- **Library function names**: in statically linked, stripped binaries it finds libc and other library functions by
-  FLIRT-style byte signatures and names them. It can build the signature files from the static libraries of the
-  toolchains you have installed (`relic sigs build --system`).
-- **Decompiler**: recovers structs from memory access patterns, and you can assign types yourself (`Y`). Floating point, libc and Windows API
-  prototypes, and C header import are in. There are tests that recompile the output and check it behaves like the original.
-- **Automatic names**: a stripped binary's `sub_XXXX` functions are named from what their code shows -- the name an
-  `assert()` passes (`table_insert`), a log message naming its function (`"shell_getc: ..."`), `xmalloc`, `usage`,
-  `fatal`, `j_puts` thunks -- and the decompiler's variables from how they are used: `fd = open(path, ...)`,
-  `len = strlen(str)`, `FILE *fp`, `home = getenv("HOME")`, loop counters `i`, `j`, `count++`, `lines =
-  count_lines(...)`. Your own names always win; `relic funcs` says why each name was given, View > Automatic names
-  (or `--no-auto-names`) shows the generated ones.
-- **GUI**: most of what your hands know from IDA is there (names, comments, xrefs, search, bookmarks, byte patching, undo),
-  and the shortcuts match IDA's wherever I could make them.
-- **Debugger**: gdb (via GDB/MI) underneath, with a pwndbg feel on top. Local, gdbserver, qemu-user and attaching to a running process
-  all work, and you get registers, a stack telescope, vmmap and glibc heap chunks.
-- **Scripting**: a Python console inside the GUI, `relic script`, and plugins.
-- **For pwn**: checksec, dangerous calls, non-constant format strings, width-less `scanf("%s")`, ret2win candidates.
-  IDA doesn't do these, so I added them.
+**Architectures.** x86, x86-64, ARM/Thumb, AArch64, MIPS32 in both byte orders, MIPS64, RISC-V
+and 32/64-bit PowerPC all go all the way to pseudocode. A handful of others can be disassembled.
 
-### Where it stands against IDA
+**Analysis.** Functions and their control flow graphs, cross references, strings and jump
+tables. It finds `main` in stripped binaries and tells you which compiler and libc built the
+file. In statically linked, stripped binaries it recognizes libc and other library functions
+from FLIRT-style byte signatures. You can build the signature files from the static libraries of
+whatever toolchains you have installed (`relic sigs build --system`).
 
-These numbers are eyeballed. Read them as "the share of what IDA does in that area that Relic does about as well."
-The total is a weighted average, with weights from how much each area matters to me when I'm actually reversing. Right now it's **about 91%**.
+**Decompiler.** Besides the usual control flow recovery, it works out structs from the way memory
+is accessed, and you can set types yourself with `Y`. It knows libc and Windows API prototypes,
+handles floating point, and can import C headers. The test suite recompiles the output and checks
+that it behaves like the original.
+
+**Automatic names.** In a stripped binary, functions get names when their code gives them away:
+the name passed to an `assert()` (`table_insert`), a log message that starts with the function
+name (`"shell_getc: ..."`), or a recognizable shape like `xmalloc`, `usage`, `fatal` or a `j_puts`
+thunk. Variables get named after how they're used: `fd = open(path, ...)`, `len = strlen(str)`,
+`FILE *fp`, `home = getenv("HOME")`, loop counters `i` and `j`, `lines = count_lines(...)`. Your
+own names always win. `relic funcs` tells you why each name was given, and View > Automatic
+names (or `--no-auto-names`) switches back to the generated ones.
+
+**GUI.** Most of what your fingers know from IDA is there: names, comments, xrefs, search,
+bookmarks, byte patching and undo, with IDA's shortcuts wherever I could manage it.
+
+**Debugger.** It runs gdb (over GDB/MI) underneath, with a pwndbg-style interface on top. It can
+run programs locally, connect to a gdbserver, run foreign binaries under qemu-user, or attach to a
+running process. It shows registers, a stack telescope, the memory map and glibc heap chunks.
+
+**Scripting.** There's a Python console in the GUI, `relic script` for batch jobs, and plugins.
+
+**Pwn helpers.** checksec, dangerous calls, non-constant format strings, `scanf("%s")` without a
+width, and ret2win candidates. IDA doesn't do these out of the box, so I added them.
+
+### How far along it is compared to IDA
+
+These numbers are my own rough estimates. Each one is the share of what IDA does in that area
+that Relic does about as well. The total is a weighted average, weighted by how much each area
+matters to me when I'm actually reversing something. Right now it comes to **about 91%**.
 
 | Area (weight) | Progress | Notes |
 |---|---|---|
-| File formats (8) | 100% | Mach-O with Objective-C metadata (`[obj msg:arg]` in the pseudocode) |
-| Processors (8) | 100% | Decompiles x86/x64, ARM/Thumb, AArch64, MIPS32/64, RISC-V RV32/RV64, PowerPC 32/64 (ELFv1 and ELFv2); disassembles SPARC, SystemZ, M68K, SH, TriCore, eBPF and WebAssembly |
-| Auto-analysis (14) | 100% | Finds 99.9% of the functions `.eh_frame` lists in stripped bash, 99.96% with `.eh_frame` removed (noreturn inference, tail calls, function pointers in data); C++ classes and vtables from RTTI (gcc/clang and MSVC); virtual calls resolved by following objects; calls through function-pointer variables on every processor; data among code; bash in about 7 seconds |
-| Library identification (8) | 100% | On the stripped static C test binaries, 83–94% of the functions that had symbols get named, with no wrong names |
-| Type system (10) | 90% | libc flag arguments print as their constants (`PROT_READ \| PROT_WRITE`), `#define` groups from headers become enums, Microsoft bit-field layout on PE; no by-value struct arguments or returns |
-| Decompiler (20) | 60% | Gotos are down to half of where the benchmark started; most of what's left is in big state machines (gnulib `quotearg`, gzip's deflate). SSE/AVX as Intel intrinsics; x87 floating point on 32-bit x86, except `long double` |
+| File formats (8) | 100% | Including Mach-O with Objective-C (`[obj msg:arg]` in the pseudocode) |
+| Processors (8) | 100% | Decompiles x86/x64, ARM/Thumb, AArch64, MIPS32/64, RISC-V and PowerPC 32/64. Disassembles SPARC, SystemZ, M68K, SH, TriCore, eBPF and WebAssembly |
+| Auto-analysis (14) | 100% | Finds 99.9% of the functions in stripped bash, and 99.96% even with `.eh_frame` removed. C++ classes from RTTI, virtual and indirect call targets, data mixed into code. bash takes about 7 seconds |
+| Library identification (8) | 100% | Names 83–94% of the original functions in stripped static test binaries, with no wrong names |
+| Type system (10) | 90% | libc flags print as their constants (`PROT_READ \| PROT_WRITE`), header `#define` groups become enums. Structs passed or returned by value aren't supported yet |
+| Decompiler (20) | 60% | Half as many gotos as when I started measuring; most of the rest are in big state machines like gnulib's `quotearg`. SSE/AVX shows as intrinsics, x87 works except `long double` |
 | Interactive UI (12) | 100% | |
 | Scripting & extensions (8) | 100% | |
-| Debugger (7) | 100% | Windows (PE) programs run under wine with Windows' own gdbserver.exe |
+| Debugger (7) | 100% | Windows programs run under wine with Windows' own gdbserver.exe |
 | Projects & collaboration (5) | 100% | Snapshots, version history, merging, Lumina-style name sharing |
 
-What "100%" means for each area, and what's left, is written down in [TODO.md](TODO.md).
-The log of finished work is in [docs/history.md](docs/history.md). (Both are in Korean.)
+What I count as 100% for each area, and what's still missing, is in [TODO.md](TODO.md). The
+log of finished work is in [docs/history.md](docs/history.md). Both are in Korean.
 
 ## CLI
 
@@ -294,7 +315,7 @@ for v in an.vulns():
 
 ```
 relic/
-  loader/      ELF / PE / COFF / core dumps / firmware → a common Binary model
+  loader/      ELF / PE / Mach-O / COFF / core dumps / firmware → a common Binary model
   disasm.py    capstone wrapper
   analysis/    functions & CFGs, xrefs, strings, signatures, compiler identification, checksec, vulns, project files
   decompiler/  lifters → SSA & optimization → structuring → C output (design notes in docs/decompiler-plan.md)
