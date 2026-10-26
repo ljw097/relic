@@ -167,6 +167,9 @@ $ relic vulns vuln64.out
 [high  ] 0x4014d0 show_note            format-string   printf() called with a non-constant format string
 [high  ] 0x40162e vuln                 dangerous-call  gets() never checks bounds: stack/heap overflow
 [info  ] 0x401296 win                  win-function    win runs system("/bin/sh") - ret2win target?
+[info  ] 0x4012a8 win                  dangerous-call  system() call
+[info  ] 0x401511 del_note             dangerous-call  free() call (check for UAF / double free)
+[info  ] 0x401531 del_note             dangerous-call  free() call (check for UAF / double free)
 ```
 
 Build the same source with `-fstack-protector-strong -pie -O1` and decompile:
@@ -198,9 +201,9 @@ struct s_notes {  // recovered, 12 bytes
     int f_8;
 };
 ...
-        notes[var_1c] = malloc(16);
-        notes[var_1c]->f_0 = malloc(var_20);
-        notes[var_1c]->f_8 = var_20;
+        notes[i] = malloc(16);
+        notes[i]->f_0 = malloc(size);
+        notes[i]->f_8 = size;
 ```
 
 Rename it in the GUI with `N` (say, `struct note { char *data; int size; }`) and every other function picks up the new names.
@@ -232,21 +235,26 @@ If you've used IDA, these will feel familiar.
 | `Tab`, `F5` | Listing ↔ pseudocode |
 | `Ctrl+H` | Hex |
 | `N` | Rename (in pseudocode: variables, structs and fields too) |
-| `;` | Comment |
+| `;` / `:` | Comment / repeatable comment (shows wherever the address is referenced) |
 | `Y` | Set type (`char *`, `struct note *` …) |
 | `X` | Xrefs |
-| `U` / `C` / `D` / `A` / `P` | Undefine / code / data / string / create function |
+| `U` / `C` / `D` / `A` / `*` | Undefine / code / data / string / array |
+| `P` / `Ctrl+Delete` | Create / delete function |
 | `H` / `R` / `B` | Show a number as hex↔decimal / char / binary |
-| `Alt+B` / `Alt+T` / `Alt+I` | Search bytes / text / immediate |
+| `Alt+B` / `Alt+T` / `Alt+I` / `Ctrl+Alt+I` | Search bytes / text / immediate / instruction (regex) |
 | `Ctrl+Z` / `Ctrl+Shift+Z` | Undo / redo |
 | `Alt+M` / `Ctrl+M` | Add bookmark / list bookmarks |
+| `Ctrl+F` | Function list |
+| `Ctrl+Shift+G` | Call graph of the current function |
 | `Ctrl+Shift+S` | Structs window |
-| `Ctrl+Shift+P` | Python console |
+| `Ctrl+Shift+P` / `Alt+F7` | Python console / run a script file |
 | `Shift+F5` | Signatures window |
-| `Ctrl+Alt+N` / `Ctrl+Alt+J` / `Ctrl+Alt+A` | NOP out / flip branch / patch by assembling |
-| `F9` / `F7` / `F8` / `F4` / `F2` | Debugger run·continue / step into / step over / run to cursor / breakpoint |
+| `Ctrl+Alt+P` / `Ctrl+Alt+N` / `Ctrl+Alt+J` / `Ctrl+Alt+A` | Patch bytes / NOP out / flip branch / patch by assembling |
+| `F9` / `Shift+F9` / `Ctrl+F2` | Debugger run·continue / start and stop at `main` / stop |
+| `F7` / `F8` / `Ctrl+F7` / `F4` | Step into / step over / step out / run to cursor |
+| `F2` / `Ctrl+Alt+B` / `Ctrl+Alt+W` | Breakpoint / breakpoint on a function / watchpoint |
 | `Ctrl+Shift+L` | Light / dark theme |
-| `Ctrl+=` / `Ctrl+-` | Bigger / smaller font |
+| `Ctrl+=` / `Ctrl+-` / `Ctrl+0` | Bigger / smaller / default font |
 | `Ctrl+.` | Cancel a running analysis or search |
 
 ### Debugger

@@ -160,6 +160,9 @@ $ relic vulns vuln64.out
 [high  ] 0x4014d0 show_note            format-string   printf() called with a non-constant format string
 [high  ] 0x40162e vuln                 dangerous-call  gets() never checks bounds: stack/heap overflow
 [info  ] 0x401296 win                  win-function    win runs system("/bin/sh") - ret2win target?
+[info  ] 0x4012a8 win                  dangerous-call  system() call
+[info  ] 0x401511 del_note             dangerous-call  free() call (check for UAF / double free)
+[info  ] 0x401531 del_note             dangerous-call  free() call (check for UAF / double free)
 ```
 
 같은 소스를 `-fstack-protector-strong -pie -O1`로 빌드해 디컴파일하면:
@@ -193,9 +196,9 @@ struct s_notes {  // recovered, 12 bytes
     int f_8;
 };
 ...
-        notes[var_1c] = malloc(16);
-        notes[var_1c]->f_0 = malloc(var_20);
-        notes[var_1c]->f_8 = var_20;
+        notes[i] = malloc(16);
+        notes[i]->f_0 = malloc(size);
+        notes[i]->f_8 = size;
 ```
 
 GUI에서 `N`으로 이 구조체를 `struct note { char *data; int size; }`처럼 고치면 다른 함수의 의사 코드에도 바로 반영됩니다.
@@ -227,21 +230,26 @@ IDA를 써 봤다면 대부분 같은 키입니다.
 | `Tab`, `F5` | 리스팅 ↔ 의사 코드 |
 | `Ctrl+H` | 헥스 뷰 |
 | `N` | 이름 바꾸기 (의사 코드에서는 변수, 구조체, 필드도) |
-| `;` | 주석 |
+| `;` / `:` | 주석 / 반복 주석(그 주소를 참조하는 곳마다 보임) |
 | `Y` | 타입 지정 (`char *`, `struct note *` 등) |
 | `X` | 상호 참조(xref) |
-| `U` / `C` / `D` / `A` / `P` | 정의 해제 / 코드로 / 데이터로 / 문자열로 / 함수 만들기 |
+| `U` / `C` / `D` / `A` / `*` | 정의 해제 / 코드로 / 데이터로 / 문자열로 / 배열로 |
+| `P` / `Ctrl+Delete` | 함수 만들기 / 지우기 |
 | `H` / `R` / `B` | 숫자 표시를 16진↔10진 / 문자 / 2진으로 |
-| `Alt+B` / `Alt+T` / `Alt+I` | 바이트 패턴 / 텍스트 / 즉칫값 검색 |
+| `Alt+B` / `Alt+T` / `Alt+I` / `Ctrl+Alt+I` | 바이트 패턴 / 텍스트 / 즉칫값 / 명령(정규식) 검색 |
 | `Ctrl+Z` / `Ctrl+Shift+Z` | 실행 취소 / 다시 실행 |
 | `Alt+M` / `Ctrl+M` | 북마크 추가 / 북마크 목록 |
+| `Ctrl+F` | 함수 목록 |
+| `Ctrl+Shift+G` | 현재 함수의 호출 그래프 |
 | `Ctrl+Shift+S` | 구조체 창 |
-| `Ctrl+Shift+P` | Python 콘솔 |
+| `Ctrl+Shift+P` / `Alt+F7` | Python 콘솔 / 스크립트 파일 실행 |
 | `Shift+F5` | 시그니처 창 |
-| `Ctrl+Alt+N` / `Ctrl+Alt+J` / `Ctrl+Alt+A` | NOP으로 채우기 / 조건 분기 뒤집기 / 어셈블리로 패치 |
-| `F9` / `F7` / `F8` / `F4` / `F2` | 디버거 실행·계속 / 한 단계(함수 안으로) / 한 단계(함수 건너뛰기) / 커서까지 실행 / 중단점 |
+| `Ctrl+Alt+P` / `Ctrl+Alt+N` / `Ctrl+Alt+J` / `Ctrl+Alt+A` | 바이트 패치 / NOP으로 채우기 / 조건 분기 뒤집기 / 어셈블리로 패치 |
+| `F9` / `Shift+F9` / `Ctrl+F2` | 디버거 실행·계속 / `main`에서 멈추게 시작 / 중지 |
+| `F7` / `F8` / `Ctrl+F7` / `F4` | 한 단계(함수 안으로) / 한 단계(함수 건너뛰기) / 함수 끝까지 / 커서까지 실행 |
+| `F2` / `Ctrl+Alt+B` / `Ctrl+Alt+W` | 중단점 / 함수 이름으로 중단점 / watchpoint |
 | `Ctrl+Shift+L` | 라이트 / 다크 테마 |
-| `Ctrl+=` / `Ctrl+-` | 글꼴 크게 / 작게 |
+| `Ctrl+=` / `Ctrl+-` / `Ctrl+0` | 글꼴 크게 / 작게 / 기본 크기 |
 | `Ctrl+.` | 진행 중인 분석·검색 취소 |
 
 ### 디버거
