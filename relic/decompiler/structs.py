@@ -420,6 +420,264 @@ def _scan_function(an: "Analysis", f) -> dict[tuple, _Use]:
     return cache[f.addr]
 
 
+# x86-64 registers by family (`eax`, `ax`, `al` are `rax`), and those a call may change
+_X64_FAMILY = {}
+for _r in "abcd":
+    for _n in (f"r{_r}x", f"e{_r}x", f"{_r}x", f"{_r}l", f"{_r}h"):
+        _X64_FAMILY[_n] = f"r{_r}x"
+for _r in ("si", "di", "bp", "sp"):
+    for _n in (f"r{_r}", f"e{_r}", _r, _r + "l"):
+        _X64_FAMILY[_n] = "r" + _r
+for _k in range(8, 16):
+    for _n in (f"r{_k}", f"r{_k}d", f"r{_k}w", f"r{_k}b"):
+        _X64_FAMILY[_n] = f"r{_k}"
+_X64_SCRATCH = frozenset(("rax", "rcx", "rdx", "rsi", "rdi", "r8", "r9", "r10", "r11"))
+_HARMLESS = frozenset(("cmp", "test"))          # read a register, write only the flags
+
+
+def may_reach_global(an: "Analysis", f, key: tuple) -> bool:
+    """Whether scanning `f` (preparing it) can add anything to the struct of `key`, a global's
+    key (see `global_struct`), from a cheap look at its instructions: x86-64 only (elsewhere,
+    always). Pointers read from the global's slot (`g`, `g[i]`) and from their fields are
+    followed through registers; `f` can add something when it accesses memory through `key`'s
+    pointer, hands the slot's pointer to one of the binary's functions, or does anything with
+    such a pointer the instructions alone do not settle (stores or pushes it, does arithmetic
+    with it, takes a field's address) -- or stores a pointer into the slot."""
+    if an.bin.arch != "x64":
+        return True
+    acc = _x64_accesses(an, f, root(key)[1])
+    return acc is None or key in acc[0] or bool(acc[1])
+
+
+def _x64_accesses(an: "Analysis", f, g: int, param: str | None = None):
+    """(key -> (offsets, offsets of arrays), [(callee, argument index) handed the slot's pointer]) for `f` and
+    the pointer at `g` (see may_reach_global) -- or, with `param`, the pointer `f` receives in that
+    register (keys rooted at ("param",)) -- or None when the instructions do not settle it."""
+    cache = an.__dict__.setdefault("_reach_global", {})
+    k = (f.addr, g, param)
+    if k not in cache:
+        try:
+            cache[k] = _global_accesses_x64(an, f, g, param)
+        except Exception:  # noqa: BLE001 - text it does not follow: scan the function
+            cache[k] = None
+    return cache[k]
+
+
+def _may_be_struct(an: "Analysis", key: tuple, funcs: list) -> bool:
+    """False when `key` (a global's) cannot come out a struct from `funcs`: the offsets the
+    instructions access through it -- in `funcs` and, through their parameters, in the callees
+    handed the slot's pointer -- are a superset of what the IR's scan finds (see
+    may_reach_global; a function that does not settle it is scanned), and too few for
+    `_is_struct`, which goes by offsets alone where this says no."""
+    if an.bin.arch != "x64":
+        return True
+    g = root(key)
+    offs: set = set()
+    arrays: set = set()
+
+    def add(acc, k):
+        if k in acc:
+            offs.update(acc[k][0])
+            arrays.update(acc[k][1])
+
+    regs = _param_regs(an)
+    for f in funcs:
+        acc = _x64_accesses(an, f, g[1])
+        if acc is None:
+            res = _scan_function(an, f)
+            u = res.get(key)
+            if u is not None:
+                offs.update(u.sizes)
+                arrays.update(u.arrays)
+            if any(passed == g for _, _, passed in res.get(("passes",), ())):
+                return True                  # (a callee's accesses count too)
+            continue
+        add(acc[0], key)
+        for callee, last in acc[1]:
+            cf = an.functions.get(callee)
+            if cf is None or cf.is_import:
+                continue
+            # (the IR names the parameter by the argument's position among those passed, which is
+            # at most its register's: any of those)
+            for r in regs[:last + 1]:
+                cacc = _x64_accesses(an, cf, g[1], r)
+                if cacc is None:
+                    return True
+                add(cacc[0], reroot(key, ("param",)))
+    # (what _is_struct asks of the offsets: none of it holds for fewer)
+    return bool(arrays) and bool(offs or max(arrays) > 0) or len(offs) >= 2 or \
+        key[0] == "field" and any(o > 0 for o in offs)
+
+
+_NEAR = 64                 # bytes around the slot whose addresses are followed (("addr", offset) in a register)
+_MAX_DEPTH = 4             # field chains followed (base_key follows 3)
+
+
+def _near(keys) -> set | None:
+    """The offsets from the slot of the addresses `keys` hold (None among them: any near it), or
+    None unless that is all they hold."""
+    offs = {k[1] for k in keys if k[0] == "addr"}
+    return offs if len(offs) == len(keys) else None
+
+
+def _addrs(offs: set) -> set:
+    """Address keys for offsets from the slot; widened to "anywhere near it" (a loop walking the
+    globals beside it) past _NEAR."""
+    if None in offs or len(offs) > 8 or any(abs(o) > _NEAR for o in offs):
+        return {("addr", None)}
+    return {("addr", o) for o in offs}
+
+
+def _global_accesses_x64(an: "Analysis", f, g: int, param: str | None):
+    """_x64_accesses, worked out: what each register may hold at each instruction, a forward
+    walk over the blocks to a fixpoint (joins take the union)."""
+    from ..disasm import CALL, _x86_operands
+    fam = _X64_FAMILY
+    entry: dict[int, dict] = {a: {} for a in f.blocks}
+    if param is not None and f.addr in entry:
+        entry[f.addr] = {param: {("param",)}}
+    slot = ("gelem", g)
+    accessed: dict = {}                      # key -> (offsets accessed, offsets of arrays)
+    handed: set = set()                      # (callee, the last argument register handed the slot's pointer)
+    work = sorted(f.blocks)
+    while work:
+        a = work.pop()
+        b = f.blocks[a]
+        held = dict(entry[a])                # register -> the keys of the pointers it may hold
+        for i in b.insns:
+            ops = _x86_operands(i.op_str) if i.op_str else ()
+            if ops is None:
+                return None
+            texts = i.op_str.split(", ") if i.op_str else []
+            m = i.mnemonic
+            regs = [fam.get(t) for t in texts]
+            mem = next((o for o in ops if o[0] == "mem"), None)
+            mem_text = next((k for k, t in enumerate(texts) if "[" in t), None)
+            if mem is not None and mem_text is None or sum(o[0] == "mem" for o in ops) > 1:
+                return None
+            loaded = None                    # the keys of what a pointer-sized load here reads
+            bf = None                        # the base register of an access through a pointer
+            if mem is not None:
+                _, base, index, disp = mem
+                bf, xf = fam.get(base), (fam.get(index.split("*")[0]) if index else None)
+                if xf in held:
+                    return None              # a pointer used as an index
+                if bf in held:
+                    keys = held[bf]
+                    near = _near(keys)
+                    if near is not None:
+                        offs = {None if d is None else d + disp for d in near}
+                        if m == "lea":
+                            if index or not regs[0]:
+                                return None
+                            held[regs[0]] = _addrs(offs)
+                            continue
+                        if 0 in offs or None in offs:
+                            if index and not index.endswith("*8"):
+                                return None
+                            loaded = {slot}  # `[&g + i*8]`: the slot (or, for all this says, it)
+                        # (else another global beside it, `[&g + 8]`: a key of its own)
+                    elif any(k[0] == "addr" for k in keys) or m == "lea":
+                        return None          # near the slot, or a field's address taken
+                    elif index:
+                        for k in keys:       # an array in the struct (`p->vals[i]`)
+                            accessed.setdefault(k, (set(), set()))[1].add(disp)
+                    else:
+                        for k in keys:
+                            accessed.setdefault(k, (set(), set()))[0].add(disp)
+                        loaded = {("field", k, disp) for k in keys}
+                        if any(_depth(k) >= _MAX_DEPTH for k in loaded):
+                            return None
+                else:
+                    addr = i.addr + i.size + disp if base == "rip" else disp if not base else None
+                    if addr is not None and m == "lea" and abs(addr - g) <= _NEAR:
+                        if index or not regs[0]:
+                            return None
+                        held[regs[0]] = {("addr", addr - g)}
+                        continue
+                    if addr == g:
+                        loaded = {slot}
+            near_imm = [v - g for kind, v, *_ in ops if kind == "imm" and abs(v - g) <= _NEAR]
+            if near_imm and m not in _HARMLESS:  # (an address as an immediate: `mov ebx, offset g`)
+                if m == "mov" and regs[0] and mem is None:
+                    held[regs[0]] = {("addr", near_imm[0])}
+                    continue
+                return None
+            if mem is not None and mem_text == 0 and m not in _HARMLESS:
+                if loaded == {slot} and len(texts) > 1 and regs[1] is not None:
+                    return None              # a register stored into the slot: it points to the struct
+                if any(r in held for r in regs[1:]):
+                    if bf in ("rsp", "rbp") or fam.get(mem[1]) in ("rsp", "rbp") or not mem[1]:
+                        return None          # the pointer spilled (the IR follows it through the slot)
+                    continue                 # (kept in another struct's field: a key of its own there)
+                if loaded is not None:
+                    continue                 # (into a field; a constant stored, incremented)
+            if m == "push" and regs and regs[0] in held:
+                return None
+            tail = m.startswith("jmp") and (i.target is None or i.target not in f.blocks)
+            if i.kind == CALL or tail:
+                # the IR records a pointer handed over only to a direct call (`call [g]`, `call
+                # [p + 8]`: a function pointer, no struct of its own)
+                passed = [k for k, r in enumerate(_param_regs(an)) if slot in held.get(r, ())]
+                if i.target is not None and passed:
+                    t = an.functions.get(i.target)
+                    if t is None:
+                        return None
+                    if not t.is_import:
+                        handed.add((t.addr, max(passed)))
+                if tail:
+                    continue
+                for r in _X64_SCRATCH:
+                    held.pop(r, None)
+                continue
+            if m in _HARMLESS:
+                continue
+            if m in ("add", "sub") and len(ops) == 1 and ops[0][0] == "imm" and regs[0] in held and \
+                    _near(held[regs[0]]) is not None:
+                d = ops[0][1] if m == "add" else -ops[0][1]
+                held[regs[0]] = _addrs({None if o is None else o + d for o in _near(held[regs[0]])})
+                continue                     # (walking the globals beside the slot)
+            if m == "mov" and len(regs) == 2 and regs[0]:
+                if loaded is not None:
+                    if texts[1].startswith("qword"):
+                        held[regs[0]] = loaded
+                    else:
+                        held.pop(regs[0], None)
+                    continue
+                if mem is None and regs[1] in held:
+                    held[regs[0]] = held[regs[1]]
+                    continue
+            if not held:
+                continue                     # (nothing followed: no need for capstone's register detail)
+            writes = {fam.get(r) for r in i.regs_write} - {None}
+            if m in ("xor", "pxor", "sub") and len(texts) == 2 and texts[0] == texts[1]:
+                pass                         # (zeroing the register)
+            elif any(fam.get(r) == r and r in held and not (mem is not None and r == bf) for r in i.regs_read):
+                return None                  # arithmetic on the pointer (or what the IR may see as such)
+            # (a 32-bit or narrower part read is no pointer)
+            for w in writes:
+                held.pop(w, None)
+        for s in b.succs:
+            if s not in entry:
+                continue
+            e = entry[s]
+            grown = False
+            for r, keys in held.items():
+                if not keys <= e.get(r, set()):
+                    e[r] = e.get(r, set()) | keys
+                    grown = True
+            if grown:
+                work.append(s)
+    return accessed, sorted(handed)
+
+
+def _depth(key: tuple) -> int:
+    n = 0
+    while key[0] == "field":
+        key, n = key[1], n + 1
+    return n
+
+
 def reroot(key: tuple, new_root: tuple) -> tuple:
     """`key` with its root base replaced (a callee's `a1->f_8` seen from the caller's struct)."""
     return ("field", reroot(key[1], new_root), key[2]) if key[0] == "field" else new_root
@@ -500,7 +758,12 @@ def _global_struct(an: "Analysis", key: tuple, ptr_bits: int, reg: dict) -> Stru
     merge = use.merge
 
     regs = _param_regs(an)
+    if not _may_be_struct(an, key, funcs[:MAX_SCAN]):
+        reg[key] = None
+        return None
     for f in funcs[:MAX_SCAN]:
+        if not may_reach_global(an, f, key):
+            continue                         # (nothing it does with the global can show here)
         res = _scan_function(an, f)
         links.update(res.get(("links",), {}))
         u = res.get(key)

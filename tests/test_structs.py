@@ -305,3 +305,42 @@ def test_structs_pointing_at_each_other_are_declared_once():
     view.an, view.used = SimpleNamespace(struct_names={}), []
     view._use(a)
     assert [s.name for s in view.used] == ["s_list", "s_node"]
+
+
+@pytest.mark.parametrize("variant", ["vuln64", "vuln64_pie", "structs_O0", "structs_O2", "flow_O2", "vuln64_pe"])
+def test_instruction_look_keeps_everything_the_scan_finds(request, variant):
+    """The look at the instructions before preparing functions for a global's struct
+    (may_reach_global, _may_be_struct) only skips work: a function it passes over adds nothing
+    to the key there, and a key it says cannot be a struct is not one by the scan either."""
+    from relic.decompiler import structs as S
+    an = analyze(request.getfixturevalue(variant))
+    funcs = sorted((f for f in an.functions.values() if not f.is_import), key=lambda f: f.addr)
+    keys = set()
+    for f in funcs:
+        res = S._scan_function(an, f)
+        keys |= {k for k in res if k[0] in ("gelem", "field") and S.root(k)[0] == "gelem"}
+    assert keys or variant != "vuln64"         # (`notes`)
+    regs = S._param_regs(an)
+    for key in sorted(keys, key=str):
+        g = S.root(key)
+        cands = []
+        for x in an.xrefs_to.get(g[1], ()):
+            f = an.function_at(x.frm)
+            if f is not None and f not in cands and not f.is_import:
+                cands.append(f)
+        cands = cands[:S.MAX_SCAN]
+        use = S._Use()
+        for f in cands:
+            res = S._scan_function(an, f)
+            passed = [(c, k) for c, k, p in res.get(("passes",), ())    # (what _global_struct follows)
+                      if p == g and c in an.functions and not an.functions[c].is_import and k < len(regs)]
+            if not S.may_reach_global(an, f, key):
+                assert key not in res and not passed, (key, f.name)
+            if key in res:
+                use.merge(res[key])
+            for c, k in passed:
+                cu = S._scan_function(an, an.functions[c]).get(S.reroot(key, ("var", c, regs[k])))
+                if cu is not None:
+                    use.merge(cu)
+        if not S._may_be_struct(an, key, cands):
+            assert not S._is_struct(use, key[0] == "gelem", key[0] == "field", an.bin.bits), key
