@@ -1,222 +1,451 @@
 # 작업 기록
 
-완료된 항목의 기록입니다. 남은 작업은 [TODO.md](../TODO.md)에 있습니다.
+끝낸 일을 영역별로 모아 둔 기록입니다. 남은 일은 [TODO.md](../TODO.md)에 있습니다.
+릴리스마다 무엇이 바뀌었는지는 [docs/releases](releases/)에 따로 정리했습니다.
+
+숫자는 그 작업을 할 때 잰 값입니다. 나중에 다른 작업으로 더 좋아진 것도 있습니다.
+
+
+## 파일 형식
+
+처음에는 ELF, PE, raw만 열었다. 지금은 IDA로 자주 여는 형식은 거의 다 연다.
+
+- **ELF 재배치 객체(`.o`).** 할당 섹션을 0x100000부터 차례로 배치하고 재배치를 직접 적용한다. 정의되지
+  않은 심볼은 `.extern` 스텁(import)이 되고, GOT를 쓰는 재배치는 `.got` 슬롯, common 심볼은 `.common`으로
+  간다. 재배치는 x86-64, x86, AArch64, ARM/Thumb, MIPS o32, RISC-V를 지원한다.
+- **COFF 객체와 정적 라이브러리.** MSVC나 MinGW가 만드는 `.obj`(AMD64, i386)를 열고, `lib.a:member.o`처럼
+  아카이브 안의 멤버를 바로 열 수 있다. 멤버를 지정하지 않으면 첫 객체를 연다.
+- **펌웨어.** Intel HEX와 Motorola S-record를 읽는다. 체크섬을 확인하고, 시작 주소 레코드가 없으면
+  Cortex-M 벡터 테이블의 리셋 핸들러를 진입점으로 쓴다.
+- **ELF 코어 덤프.** 메모리 영역을 매핑된 파일 이름(`libc.so.6`, `[stack]`)이 붙은 섹션으로 보여 주고,
+  프로세스 정보, 시그널, 스레드별 레지스터를 읽는다. 진입점은 멈춘 pc다. 디스크에 원래 실행 파일이 남아 있으면
+  그 심볼을 실제 적재 주소에 맞춰 얹는다.
+- **PE 부가 정보.** TLS 콜백(`tls_callback_N`), 리소스와 버전 문자열, PDB 경로·GUID·age, 지연 import(GNU ld가
+  데이터 디렉터리를 비워 두면 `__DELAY_IMPORT_DESCRIPTOR_*` 심볼에서 찾는다), .NET 런타임 버전.
+- **raw 펌웨어의 적재 주소 추정.** 포인터 크기 워드가 문자열 시작 위치에 가장 많이 떨어지는 주소를 고른다.
+  Cortex-M 벡터 테이블도 근거로 쓴다. `--base auto`로 쓰고, `relic info`가 후보를 보여 준다.
+- **Mach-O.** 32/64비트, 빅·리틀 엔디언, 유니버설 파일(원하는 슬라이스, 없으면 x86-64, 그것도 없으면 첫
+  슬라이스). nlist 심볼, 간접 심볼 표로 찾는 import, `LC_MAIN`·`LC_UNIXTHREAD` 진입점, `LC_FUNCTION_STARTS`,
+  dylib·rpath·UUID·코드 서명·암호화 여부까지 읽고 checksec도 한다. Apple arm64는 가변 인자를 스택으로
+  넘기는 호출 규약이 달라서 따로 처리했다. 테스트 바이너리는 clang과 ld64.lld로 libSystem 텍스트 스텁에
+  링크해서 만든다.
+- **Mach-O 재배치 객체와 chained fixups.** `MH_OBJECT`는 ELF `.o`처럼 직접 배치하고 재배치한다(x86-64, arm64).
+  macOS 12부터 쓰는 chained fixups는 체인을 따라가 rebase는 실제 주소로, bind는 import 이름으로 바꾼다.
+- **Objective-C.** 클래스, 메서드, ivar, 속성, 카테고리를 메타데이터에서 읽어서 stripped 바이너리에서도
+  메서드에 `-[Class sel:]` 이름을 붙인다. 의사 코드에서는 `objc_msgSend` 호출을 `[recv sel:arg]`로,
+  `objc_alloc_init`을 `[[Cls alloc] init]`로 쓴다. 인자 수는 셀렉터의 `:` 개수로 정하고, 메서드에는 `self`와
+  `_cmd` 매개변수를 붙인다. clang -O2가 `objc_msgSend`를 레지스터에 담아 두고 부르는 경우도 따라간다.
+- **WebAssembly 모듈.** 코드 섹션의 함수, export와 `name` 섹션의 이름, import 함수를 읽는다. 디스어셈블만 된다.
+- **망가진 파일.** 섹션 헤더가 없거나 일부러 깨 놓은 ELF(`sstrip`, 안티 분석)는 커널처럼 프로그램 헤더로
+  적재하고, import와 라이브러리는 dynamic 세그먼트에서 찾는다. 잘린 파일은 traceback 대신 짧은 오류를 낸다.
+  크기 필드 하나가 깨져서 분석이 몇 분씩 돌던 문제는 스캔을 파일에 실제로 있는 바이트까지만 하도록 막았다.
+
+
+## 프로세서
+
+기준은 IDA가 지원하는 CPU 전부가 아니라, 리버싱·포너블·펌웨어에서 실제로 마주치는 것들이다.
+
+- **x86 / x86-64.** 처음부터 있던 대상이다. 32비트는 cdecl 스택 인자, `__x86.get_pc_thunk.*` PC 썽크(stripped면
+  본문 모양으로 알아본다), `main`의 스택 재정렬, GOT를 거친 전역(`stdout`)을 처리한다.
+- **AArch64.** 시프트·확장 피연산자, pre/post-index, `ldp`/`stp`, `csel`/`cset`/`ccmp`, 비트필드 명령, `cbz`/`tbz`를
+  리프팅한다. `__stack_chk_guard` 카나리를 알아보고, `adrp`가 만드는 페이지 주소를 코드 참조로 착각하지 않는다.
+- **ARM32 (A32, Thumb-2).** 조건 실행은 `c ? new : old`로, 조건부 호출·리턴은 따로 만든 블록으로 표현한다.
+  배럴 시프터의 캐리, 리터럴 풀 상수, `ldm`/`stm`, `__aeabi_idiv`를 나눗셈으로 바꾸기, ARM PLT 스텁도 다룬다.
+  주소마다 ARM인지 Thumb인지는 `$a`/`$t` 매핑 심볼과 주소의 최하위 비트로 정하고, IT 블록은 한 번에 디코딩한다.
+- **MIPS.** o32부터 시작해서 빅 엔디언과 MIPS64(n64)까지 넓혔다. 지연 슬롯은 분기 블록에 넣고, 리프팅할 때는
+  분기 조건과 호출 대상을 먼저 계산한 다음 슬롯 명령을 실행한다. `$gp`는 상수로 보고 GOT 슬롯을 통해 import
+  이름을 찾는다. n64에서는 32비트 연산 결과의 부호 확장, `a4`-`a7` 인자, `.gpdword` 점프 테이블을 처리한다.
+  branch-likely 명령(`beql`, `bnel`)은 지연 슬롯의 쓰기를 조건부 대입으로 바꾼다. 정적 MIPS 바이너리의
+  `$gp`는 `.reginfo`에서 읽는데, 이것만으로 문자열 참조가 10개에서 401개로 늘었다.
+- **RISC-V.** RV64GC(LP64D)를 먼저 만들고, 나중에 리프터를 XLEN으로 일반화해서 RV32GC(ILP32D)도 지원했다.
+  압축 명령, `auipc`/`lui` 쌍으로 만드는 상수, F/D 부동소수점을 다룬다. 가변 인자 함수의 `double`은 정수
+  레지스터로 넘어가고, 부동소수점 레지스터가 다 차면 남은 `double`도 정수 레지스터로 간다. RV32에서는 그 값이
+  레지스터 쌍(`a0:a1`)이 되는데, 호출하는 쪽과 받는 쪽 양쪽에서 쌍을 하나의 `double`로 다시 합친다. RV32용
+  libc가 없어서 테스트는 직접 만든 작은 런타임(`tests/src/rv32rt.c`)과 함께 빌드해 qemu에서 돌린다.
+- **PowerPC.** 32비트 SysV(빅 엔디언)와 64비트 ELFv2(리틀 엔디언). capstone이 보여 주는 단순화된 니모닉 대신
+  명령 필드를 직접 해독한다. CR은 1비트 필드로 나눠서 모델링하고, PLT 호출 스텁, ctr 점프 테이블, TOC, 로컬
+  진입점을 처리한다. 부동소수점 레지스터는 항상 double 형태라 단정밀도 연산은 따로 구분하고, 정수를 double로
+  바꾸는 `0x43300000` 관용구와 POWER9 VSX 스칼라 명령도 알아본다. 나중에 ELFv1(빅 엔디언, `.opd` 함수
+  디스크립터)도 추가했다. 심볼, 진입점, 함수 포인터가 가리키는 디스크립터를 실제 코드 주소로 바꾸고, TOC는
+  디스크립터에서 읽는다.
+- **디스어셈블만 되는 프로세서.** SPARC/SPARC V9, SystemZ, M68K, SH, TriCore, eBPF, WebAssembly. 함수 찾기,
+  제어 흐름, 리스팅은 되고, 디컴파일하려고 하면 "디스어셈블 전용"이라고 알려 준다.
+
+여러 아키텍처를 하나씩 붙이다 보니 공통 코드의 버그도 꽤 나왔다. ARM에서는 스택 버퍼를 훑는 포인터를 고정
+주소로 잘못 보던 문제를, MIPS에서는 x86에만 있는 반환 주소 슬롯을 모든 아키텍처에 가정하던 문제를 찾았다.
+RISC-V에서는 부호 확장된 값끼리 비교할 때 폭을 잘못 고르던 문제가 나왔다.
+
+
+## 자동 분석
+
+### 함수 찾기
+
+- **기본.** 진입점과 심볼에서 시작하는 재귀 하강에, `.init_array`, PE `.pdata`, Mach-O `LC_FUNCTION_STARTS`를 시드로
+  더한다. 그래도 남는 빈 구간은 프롤로그를 찾아 훑는다(x86, ARM/Thumb, AArch64, MIPS, RISC-V, PowerPC).
+  PE에서는 `.pdata`만으로 stripped MinGW 바이너리의 함수가 130개에서 174개로 늘었다.
+- **stripped 바이너리의 `main`.** `_start`가 `__libc_start_main`에 넘기는 첫 인자를 읽는다. x86-64는
+  레지스터, ARM과 AArch64는 리프팅한 IR에서 GOT나 리터럴 풀 슬롯을 따라간다. PowerPC는 r8이 가리키는 시작
+  정보 블록, 32비트 x86 PIE는 GOT 슬롯을 본다. Windows는 C 런타임이 결과를 `exit`에 넘기는 호출을 찾는다.
+  AArch64가 `__wrap_main`(`nop; b main`)을 거치는 경우도 따라간다.
+- **`.eh_frame`.** FDE를 함수 목록으로 쓴다. 다만 첫 CFA 행이 진입 상태가 아닌 것(`.cold` 조각, PLT)은 뺀다.
+  이것을 함수 경계와 꼬리 호출 판정에도 써서, stripped bash에서 `.eh_frame`이 아는 함수의 99.9%를 찾는다.
+  다른 함수를 삼켜 3306블록이 되어 있던 함수도 이 작업으로 풀렸다.
+- **`.eh_frame`이 없을 때.** 나가는 길이 돌아오지 않는 호출뿐인 함수를 noreturn으로 추론하고(고정점), 그전에
+  분석한 호출자는 다시 분석한다. `error(0이 아닌 값, ...)`, `__longjmp_chk`도 돌아오지 않는 호출로 본다.
+  꼬리 호출은 `endbr64` 대상이나 에필로그 뒤 정렬된 주소로 가는 `jmp`로 알아본다. bash에서 `.eh_frame`을
+  지워도 함수의 99.96%를 찾고, 다음 함수로 흘러 들어간 함수는 140개에서 1개로 줄었다. gzip, grep, ls는 100%다.
+- **데이터 속 함수 포인터.** 콜백 표나 구조체 초기값에 든 포인터에서 함수를 찾는다. PIE에서는 RELATIVE
+  재배치 대상만 보고, CET 바이너리는 `endbr64`로 시작하는 것만 인정한다. x86-64 PIC의 즉치값은 주소로 보지
+  않는다(`lea [rip+…]`만 주소다). ARM과 AArch64의 즉치값도 마찬가지로, `mov w0, #0xffff`가 PIE에서 함수
+  시작으로 잡히던 문제가 있었다.
+
+### 점프 테이블과 간접 호출
+
+- **점프 테이블.** x86에서는 테이블을 실제로 읽는 레지스터를 만든 `lea`를 찾는다. 근처에 있는 아무 `lea`가
+  아니라, 루프 밖으로 끌어낸 기준 레지스터라면 함수 처음부터 순서대로 따라간다. 음수 case 범위(`cmp x, -5; jb`)도
+  처리한다. 32비트 PIC(GOT 기준 오프셋), AArch64(`adrp`+`add`, 바이트·하프워드 항목), ARM(`addls pc`,
+  `ldr pc`, Thumb `tbb`/`tbh`), MIPS(`.gpword`), RISC-V, PowerPC 테이블도 지원한다. stripped bash에서 해석되지
+  않은 간접 점프가 103개에서 12개로 줄었고, 남은 것은 꼬리 호출이다.
+- **레지스터를 거친 꼬리 호출.** 에필로그 뒤의 `jmp rax`는 함수 포인터 꼬리 호출로 본다. import를 담아 둔
+  레지스터로 점프하면 그 import를 부른 것이다(`jmp rbx` = `objc_msgSend`).
+- **함수 포인터 변수를 거친 호출.** 변수의 초기값과 코드가 그 변수에 저장하는 함수를 모아서 호출 대상을 정한다.
+  주소가 다른 데로 새거나 모르는 값이 저장되면 "그 밖에도 있음"으로 둔다. 대상은 xref와 리스팅 주석
+  (`; → print_and_abort`)에 나온다. 대상이 모두 돌아오지 않으면 그 호출도 돌아오지 않는 것으로 본다. 이걸로
+  gnulib의 `obstack_alloc_failed_handler` 때문에 ls와 grep에서 다음 함수로 흘러 들어가던 함수가 모두 없어졌다.
+  처음에는 x86만 됐고, 이후 ARM, AArch64, MIPS, RISC-V, PowerPC로 넓혔다. 여러 명령으로 만드는 주소
+  (`adrp`/`add`, `lis`/`addi`, `auipc`/`addi`, TOC)는 블록 안에서, 또는 선행 블록이 일치하는 블록까지 따라간다.
+
+### C++
+
+- **RTTI로 클래스 복원.** gcc/clang(Itanium)은 typeinfo 재배치로 클래스와 기반 클래스를 찾고, 데이터에서 vtable을
+  찾는다. MSVC는 vtable 바로 앞 워드의 Complete Object Locator에서 TypeDescriptor와 클래스 계층을 읽는다
+  (`.?AVDog@@` → `Dog`, 중첩 이름도). 가상 메서드에는 `Dog::vfunc2` 같은 이름이 붙는다. 여러 클래스가 공유하면
+  공통 기반 클래스 이름이 붙고, 두 번째 vtable의 썽크는 `Parrot::thunk8_vfunc0`처럼 된다. `relic classes`로
+  목록을 본다.
+- **가상 호출 대상.** 객체를 레지스터와 스택 슬롯으로 따라가서 어떤 클래스인지 알아내고, vptr 로드에서 슬롯
+  로드, 호출까지 이어지는 모양에서 그 슬롯의 메서드를 찾는다. 클래스는 생성자 호출, 그 자리에서 쓰는 vtable
+  (인라인된 생성자, SSE 두 워드 저장 포함), `__dynamic_cast` 결과에서 온다. 함수가 돌려주는 객체, 모든 호출
+  지점이 같은 객체를 넘기는 인자, 가상 메서드 안의 `this`도 근거가 된다. x86-64, x86, AArch64에서 -O0과 -O2
+  모두 된다.
+
+### 코드와 데이터 구분
+
+- x86에서 손으로 쓴 어셈블리나 `.text` 안의 데이터를 알아본다. 코드가 읽고 쓰는 `.text` 주소는 접근 폭에 맞는
+  배열로, `lea`가 가리키는 C 문자열은 문자열로 본다. 코드 포인터가 이어지는 표는 거기 적힌 함수를 찾는 데 쓴다.
+  이렇게 찾은 데이터 안에서는 함수를 만들지 않고, 리스팅에는 `db "..."`, `dd`, `dq offset`으로 보인다.
+- ARM에서 돌아오지 않는 줄 몰랐던 호출 뒤로 흐름이 리터럴 풀에 닿으면 거기서 멈추고 `.word`로 보여 준다.
+
+### 아키텍처별 상수 추적
+
+- 함수 안에서 레지스터 상수를 전파하는 패스(`analysis/constprop.py`)를 만들었다. 합류점에서는 모든 선행 블록이
+  같은 값일 때만 값을 유지하고, 호출은 caller-saved 레지스터를 지운다. pc에서 나온 값이나 비-PIE 절대 주소처럼
+  "주소"라고 표시된 값만 데이터 참조로 기록해서 문자열·전역·GOT xref와 리스팅 주석을 만든다. 32비트 x86 PIC,
+  AArch64 `adrp`, ARM 리터럴 풀·`movw`/`movt`, MIPS `$gp`·`lui`+`addiu`를 다룬다. 문자열 xref가 armhf `ld.so`에서
+  1개에서 513개로, aarch64 `ld.so`에서 0개에서 409개로 늘었다.
+- 위험 함수 검사에 쓰는 호출 인자는 디컴파일러가 복원한 값을 쓴다. x86-64는 블록 안에서 역추적해 보고 결론이
+  안 날 때만 디컴파일러에 묻는다.
+- MIPS는 GOT(`DT_MIPS_LOCAL_GOTNO` 등)로 import를 찾고, `jalr $t9`는 `$t9`를 읽어 온 GOT 슬롯으로 이름과
+  noreturn 여부를 정한다.
+
+### 그 밖에
+
+- **C++ 디맹글링.** libstdc++의 `__cxa_demangle`을 쓰고, 없으면 `c++filt`를 쓴다. 목록과 리스팅에는 전체 이름,
+  의사 코드의 호출에는 `ns::Cls::method`가 나온다.
+- **툴체인 식별.** ELF `.comment`(GCC, clang, rustc), 필요한 GLIBC 버전, 인터프리터(musl, bionic), PE Rich
+  헤더(MSVC 버전), MinGW 런타임 문자열, msvcrt/ucrt import, Go 빌드 정보, Rust 런타임 문자열을 본다.
+  `relic info`와 Checksec 표에 나온다.
+- **Windows import 썽크.** `jmp [__imp_exit]`만 있는 함수는 그 import 이름을 받고 라이브러리 코드로 표시된다.
+  import가 돌아오지 않으면(`exit`) 호출자의 흐름도 거기서 끝난다.
+
+
+## 라이브러리 식별
+
+정적 링크된 stripped 바이너리에서 libc 같은 라이브러리 함수를 FLIRT 방식 시그니처로 찾는다.
+
+- **시그니처 만들기.** 정적 라이브러리(`ar` 안의 재배치 ELF)에서 함수 바이트를 뽑고 재배치가 채우는 부분을
+  가린다. 앞 16바이트로 색인하고, 맞는 후보가 여럿이면 가장 긴 것, 함수 끝 위치, 참조하는 이름으로 고른다.
+  IFUNC 리졸버와 IRELATIVE 스텁, 별칭도 처리한다. `relic sigs build`로 만들고, `--system`을 주면 설치된 네이티브·
+  크로스 GCC의 libc.a, libm.a, libstdc++.a, libgcc.a를 세트로 묶는다. 툴체인 식별 결과로 맞는 세트(다른 C
+  라이브러리나 파일 형식은 빼고, 같은 라이브러리면 버전이 맞는 것)를 고른다.
+- **정확도를 올린 것들.** 정적(local) 함수도 시그니처에 넣고, 생성자·소멸자 변형(C1/C2, D1/D2)은 한 이름으로
+  묶는다. 코드가 같아서 여러 시그니처가 맞는 함수는 참조 대상의 이름으로 후보를 함께 좁힌다. 이름이 붙은 함수가
+  참조하는 짧은 함수에는 이름을 전파한다. vtable이나 glibc `__io_vtables` 같은 함수 포인터 표는 시그니처 파일에
+  슬롯을 저장해 두었다가, 참조로 위치를 찾아 슬롯의 함수에 이름을 붙인다. 호출되지 않는 가상 메서드도 이때
+  함수로 만든다. 이 작업으로 x86-64는 66%에서 85%, MIPS는 72%에서 94%가 됐고, 틀린 이름은 2개에서 0개가 됐다.
+- **ARM과 AArch64.** Thumb 함수 심볼의 코드를 1바이트 밀려 읽던 버그가 있었다. 고치고 나니 ARM 정적
+  바이너리에서 이름이 2개에서 375개로 늘었다. 재배치가 채우는 즉치 비트만 가리는 비트 단위 마스크도 이때
+  넣었다(`adrp`, lo12, `b`/`bl`, `movw`/`movt`).
+- **MIPS와 RISC-V.** 같은 비트 단위 마스크를 MIPS의 26비트 점프·16비트 즉치와 RISC-V 명령 형식에 맞췄다.
+  RISC-V는 링커 완화(relaxation) 때문에 따로 손이 많이 갔다. 링커가 `auipc+jalr`을 `jal`이나 `c.j`로 줄이고,
+  주소를 만드는 명령이나 정렬용 nop을 지우면 뒤의 코드가 밀린다. 그래서 완화 지점마다 가능한 형태를 골라 맞추는
+  방식으로 바꿨고, RISC-V 정적 바이너리에서 이름 붙는 비율이 36%에서 84%가 됐다(오식별 0).
+- **MinGW(COFF).** COFF 정적 라이브러리(libmingwex, libmingw32, libmsvcrt, libgcc, 시작 객체)로도 시그니처를
+  만든다. i386의 `_` 접두사와 stdcall `@N`을 떼고 같은 주소의 별칭을 하나로 묶는다. stripped 정적 MinGW
+  바이너리에서 x86-64 111/130, i686 82/106개 함수에 이름이 붙었다.
+- **시그니처 창.** File ▸ Library signatures(`Shift+F5`)에서 세트 목록(라이브러리, 버전, 아키텍처, 형식,
+  시그니처 수)과 이 바이너리에 맞는 세트, 세트별로 이름을 붙인 수를 보고, 적용하거나 이름을 되돌릴 수 있다.
+
+결과적으로 테스트용 stripped 정적 C 바이너리에서 원래 심볼이 있던 함수의 83~94%에 이름이 붙고, 틀린
+이름은 없다.
+
+
+## 디컴파일러
+
+설계와 단계별 구조는 [decompiler-plan.md](decompiler-plan.md)에 따로 적었다.
+
+### 처음 만든 파이프라인
+
+x86-64 하나로 다음 순서대로 만들었다. 단계마다 IR 인터프리터로 변환 전후 결과를 비교하는 테스트를 붙였다.
+
+1. IR 정의와 x86-64 리프팅(`relic ir`)
+2. SSA와 최적화: 상수·복사 전파, 대수 단순화, 한 번만 쓰는 load 끌어오기, 플래그를 비교식으로 되돌리기,
+   죽은 코드 제거(`relic opt`)
+3. 호출 인자와 반환값 복원, 스택 프레임 분석(버퍼 크기, 카나리), 스택 슬롯을 지역 변수로
+4. 제어 흐름 구조화: if/else, while, do-while, `while (1)`과 break/continue, switch, 남는 곳은 goto
+5. out-of-SSA, 변수 폭과 타입, C 출력. 줄과 주소를 서로 이어 둔다(`relic decompile --addrs`).
+6. GUI Pseudocode 탭(`Tab`/`F5`)과 x86-32 리프터
+
+출력을 gcc로 다시 컴파일해 원본과 같은 결과를 내는지 보는 테스트도 이때부터 있었다. 디컴파일은 GUI에서
+백그라운드 스레드로 돌고, 다른 함수로 이동하면 하던 것을 취소한다.
+
+### 구조화와 goto
+
+- `X = init; while (c) { ...; X += k; }`는 `for`가 된다(본문에 그 루프의 `continue`가 있으면 그대로 둔다).
+- 같은 값을 비교하는 if 사슬은 `switch`로 바꾼다(`decompiler/chains.py`). gcc가 case를 이진 탐색으로 나눈 비교
+  트리도 합치고, -O0에서 테스트 사이에 빈 블록이 끼어 사슬이 끊기던 것도 고쳤다. 루프를 빠져나가는 `break`가
+  든 본문은 바꾸지 않는다. 변수로 계산한 점프 대상(`v2 = base + table[v1]; goto *v2`)도 `switch (v1)`이 된다.
+- 구조화가 정확한지는 무작위 CFG로 확인한다. 구조화한 트리를 실행했을 때 원래 CFG와 같은 순서로 블록을
+  밟는지 비교하고, 출력한 C를 gcc로 컴파일해 실행해 보기도 한다. 이 테스트로 합류점, do-while 래치, 바깥
+  루프로 가는 점프 쪽에서 버그를 여럿 잡았다.
+- goto 줄이기는 두 번에 나눠 했다. 처음에는 단락 평가(`&&`, `||`) 합치기, 후지배자가 없는 if의 합류점 고르기,
+  작은 꼬리 영역 복제(6블록·12문장 이하)로 true·cat·gzip의 goto를 1911개에서 1469개로 줄였다. 1.0.0 때는
+  출구가 같은 루프의 follow 합치기, 짧은 return 복제, 바로 다음으로 가는 goto 지우기를 했다. `else if (c2) goto L`이
+  then 가지 한가운데로 들어가는 꼴은 `if (c1 || c2) { if (c1) ...; L... }`로 바꿨다. 벤치마크(true, cat, gzip,
+  grep) 합계가 3300개에서 1798개가 됐다. 복제 예산을 키워 보기도 했지만 줄 수만 늘고 goto는 줄지 않았다.
+
+### 호출과 인자
+
+- import는 libc 시그니처 표로 인자 수를 정하고, 포맷 문자열이 있으면 거기서 인자 수를 센다(`_chk` 변형 포함).
+  내부 함수는 피호출자가 실제로 읽는 인자 레지스터로 정한다. 피호출자의 매개변수는 최적화한 SSA에서 구해서,
+  ARM 술어 실행이 남기던 가짜 매개변수가 없어졌다.
+- gcc `-fipa-ra`: 바이너리 안의 함수를 부르면 그 함수가 실제로 쓰는 레지스터만 바뀐다고 본다(`clobbers.py`).
+  예전에는 `gcd(y, 4) - sc_or(y, 9)`가 `sc_or(gcd(y, 4), 9)`처럼 엉뚱하게 나왔다.
+- 레지스터보다 인자가 많으면 스택으로 넘긴 인자를 거둔다(x86-64 SysV/Win64, AArch64, 32비트 x86, ARM). 긴
+  `printf`의 인자 15개가 모두 나온다. Win64는 홈 공간 32바이트 뒤에서 읽고, `CreateFileA`의 인자 7개도 맞는다.
+- 피호출 함수가 인자를 32비트로만 읽으면, 넘기는 상수 `0xfffffffb`를 `-5`로 쓴다.
+- `main`은 `int main(int argc, char **argv[, char **envp])`가 된다. 쓰지 않는 `argc` 뒤의 `argv`도 매개변수로 친다.
+- 호출자가 없는 함수의 반환값: 진입할 때의 반환 레지스터 값이 그대로 돌아갈 수 있는 경로가 있으면 반환값이
+  없다고 본다. -O0에서 `rax`를 임시로 쓰던 void 함수가 `rax`를 돌려주는 것처럼 나오던 문제였다.
+- 함수에 그대로 넘기는 인자 레지스터도, 그 뒤의 레지스터가 쓰이면 매개변수로 본다. 대상을 아는 간접 호출은
+  대상의 매개변수를 따른다.
+
+### 타입과 구조체
+
+- **구조체 복원.** 포인터 변수, 매개변수, 전역 포인터, 전역 포인터 배열의 원소(`notes[i]`)를 기준으로 고정
+  오프셋 접근을 모아 필드를 만든다. 전역에서 시작한 구조체는 그 전역을 쓰는 모든 함수가 같은 정의를 공유한다.
+  필드에서 읽은 포인터를 다시 기준으로 쓰면 중첩 구조체가 되고(`n->it->count`), `n = n->next`는 자기 참조
+  필드가 된다. 배열 필드(`p->f_8[i]`)도 알아본다. 호출자가 넘기는 구조체는 피호출자 매개변수에도 붙어서,
+  피호출자가 읽는 필드가 호출자 쪽 구조체에 더해진다.
+- **직접 지정.** `Y`로 변수와 매개변수에 C 타입을 주고, 복원한 구조체를 이름으로 다른 함수에 적용한다. `N`으로
+  구조체와 필드 이름을 바꾼다. 이름을 붙이거나 적용한 구조체는 레이아웃이 프로젝트에 저장된다. 구조체 창
+  (`Ctrl+Shift+S`)에서는 필드를 바로 고치고, 더하고, 지울 수 있다.
+- **C 헤더 가져오기.** 구조체, 공용체, 열거형, typedef, 함수 원형, 함수 포인터, 다차원·유연 배열을 읽는다.
+  레이아웃은 대상 ABI(LP64, Windows LLP64, ILP32, i386)를 따르고, gcc의 `offsetof`/`sizeof`와 같은지
+  테스트한다. 원형은 매개변수와 반환 타입이 되고, 열거형 상수는 비교·대입·switch·인자에서 이름으로 나온다.
+  모든 값이 2의 거듭제곱이면 `OPT_VERBOSE | OPT_DRY`처럼 플래그로 쓴다. `#define NAME 상수식`도 배열 크기와
+  열거 값에 쓴다.
+- **비트필드.** System V 배치를 gcc와 맞췄다(x86-64, i386, ARM). `(unit >> k) & mask` 같은 읽기와, 저장 단위를
+  읽고 고쳐 쓰는 모양을 `p->version = 4;` 같은 필드 대입으로 바꾼다. PE/COFF는 Microsoft 방식(같은 크기 타입끼리만
+  한 단위를 나눠 씀)을 따라서 MinGW와 크기가 같다.
+- **라이브러리 원형.** libc·POSIX 원형 약 180개(`libc_h.py`)와 Windows API 원형 175개(`win32_h.py`, kernel32,
+  advapi32, user32, ws2_32)를 넣었다. 인자 수와 포인터 타입이 정확해지고, `int` 매개변수에 넘긴 64비트 상수는
+  `-1`처럼 나온다. libc 구조체(`stat`은 x86-64와 asm-generic 레이아웃이 따로)와 Windows 구조체 18개는 타입
+  라이브러리로 프로젝트에 가져올 수 있다. 원형에서 온 구조체 포인터 결과가 접근으로 짐작한 타입보다 우선한다
+  (`v = localtime(&t)` → `struct tm *v; v->tm_year`).
+- **libc 플래그 상수.** libc 호출의 상수 인자를 헤더 이름으로 쓴다(`PROT_READ | PROT_WRITE`,
+  `O_WRONLY | O_CREAT`, `open`의 mode는 8진수). 가져온 헤더에서 접두사가 같은 `#define`이 둘 이상이면 열거형이
+  되고, 그 이름의 정수 매개변수에 붙는다.
+- libc 인자·결과로 변수 타입을 정한다. `strlen(a1)`이면 `char *a1`, `malloc(n)`이면 `size_t n`, `fopen`의
+  결과는 `FILE *`이다. 메모리 접근으로 복원한 포인터 타입이 있으면 그쪽이 우선이다.
+
+### 부동소수점과 SIMD
+
+- **x86-64 SSE 스칼라.** `comisd`/`ucomisd`가 남기는 ZF/PF/CF를 결과 집합으로 접어 비교 하나로 만든다
+  (`jp`+`jne`이면 `!=`). 부호 마스크 `xorpd`/`andpd`는 `-x`/`fabs`가 되고, `.rodata` 상수는 `3.0`, `1.5f` 같은
+  리터럴이 된다. `floats.c`를 디컴파일해 다시 컴파일한 결과가 원본과 비트 단위로 같다. mawk의 `__asm`이
+  291개에서 36개로 줄었다.
+- **AArch64, ARM VFP, RISC-V, PowerPC.** 각 아키텍처의 부동소수점 명령과 호출 규약을 따로 넣었다. 반올림이 한
+  번인 `fmadd`류는 `fma()`로 쓴다(`a * b + c`로 쓰면 결과가 달라진다). ARM VFP는 `s2k`/`s2k+1`이 `dk`의 두
+  절반이라는 점과, 가변 인자 호출에서 `double`이 `r2:r3` 쌍으로 가는 것까지 맞췄다. 전부 qemu에서 재컴파일
+  결과를 비트 단위로 비교한다.
+- **x87 (32비트 x86).** 레지스터 스택을 깊이로 이름 붙인다. 함수마다 명령 앞의 스택 깊이를 구하는데, 호출 뒤는
+  0이고 `float`를 돌려주는 호출 뒤는 1이다. `float`를 돌려주는지는 libc 원형과 피호출자의 코드로, 아니면 호출
+  뒤 코드가 넣지 않은 값을 읽는지로 판단한다. C 캐스트 때문에 컴파일러가 하는 제어 워드 저장·설정·복원은
+  상수로 처리해서 쓰레기 지역 변수가 생기지 않는다. -m32 -O0/-O2와 `-march=i386` 빌드 모두 재컴파일하면
+  비트 단위로 같다. `long double`(80비트)은 아직 `__asm`으로 남는다.
+- **SSE/AVX 벡터 코드**는 Intel intrinsic(`_mm_add_epi32`, `_mm256_...`)으로 쓴다.
+- unsigned와 double 사이의 변환 관용구(`cvtsi2sd`에 보정 분기)는 `(double)(uint64_t)x` 같은 캐스트로 줄인다.
+
+### 출력 정리
+
+- 상수 나눗셈과 나머지: 매직 넘버 곱셈을 `x / c`, `x % c`로, 곱셈 역원 비교를 `x % c == r`로 되돌린다. 모양을
+  맞추는 대신, 경계값과 난수로 평가해서 원래 식과 모두 같을 때만 바꾼다. 부호 있는 2의 거듭제곱 나눗셈
+  (`(x < 0 ? x + 15 : x) >> 4`), MIPS64 gcc가 시프트·덧셈 사슬로 만드는 매직 곱, x86 `cdq; idiv`의 나머지도
+  처리한다.
+- 카나리 검사, 프롤로그 저장, 정렬용 `push`는 숨긴다. 스택 슬롯은 `var_c`, `buf_48`처럼 반환 주소에서의
+  거리로 이름 붙인다.
+- 부호 있는 값을 좁혀서 하는 unsigned 연산에는 `(unsigned int)` 캐스트를 붙이고, 0 확장은
+  `(unsigned int)(unsigned short)x`로 쓴다. 예전에는 부호 확장되는 C가 나왔다.
+- 데이터 객체 안이나 바로 뒤를 가리키는 주소는 `(char *)&pool + 32`처럼 쓴다. 루프 끝 포인터가 숫자로 나오던
+  것을 고쳤다.
+- -O0에서 매개변수를 스택 슬롯에 복사하는 것(`var_1c = argc`)은 매개변수 자체로 합친다. 아무도 읽지 않는 스택
+  쓰기는 지운다.
+- 바이너리 전체를 C 파일 하나로 내보낸다(`relic decompile -a -o out.c`, File ▸ Export pseudocode). 구조체
+  선언은 맨 앞에 한 번씩 나오고, 실패한 함수는 이유를 주석으로 남긴다. 디컴파일할 수 없는 심볼을 만나면
+  `relic decompile --all`도 그 자리에 이유를 쓰고 계속한다(MinGW `__CTOR_LIST__`).
+
+
+## 자동 이름
+
+IDA에 없는 기능이라 따로 신경 썼다. 사용자가 붙인 이름이 항상 우선이고, 프로젝트에는 생성된 이름 그대로
+저장된다. View ▸ Automatic names, `--no-auto-names`, `RELIC_AUTO_NAMES=0`으로 끌 수 있다.
+
+- **함수.** stripped 바이너리의 `sub_XXXX`에 코드가 알려 주는 이름을 붙인다. 가장 강한 단서는 `assert()`다.
+  `__assert_fail`이 함수 이름을 인자로 받으니 소스의 이름을 그대로 얻는다. 그다음은 자기 이름으로 시작하는 로그
+  메시지(`"shell_getc: ..."`)다. 밑줄이나 camelCase가 든 식별자만, 함수당 하나만, libc 이름이나 프로그램 전체에
+  공통인 접두사는 빼고 본다. 그 밖에 점프 썽크는 `j_X`(호출자는 X의 원형을 씀), 할당하고 실패하면 죽는 작은
+  래퍼는 `xmalloc`, "Usage:"를 찍고 끝나면 `usage`, 메시지를 찍고 돌아오지 않으면 `fatal`이다. `relic funcs`가
+  왜 그 이름인지 `[auto: ...]`로 보여 준다. stripped ls에서는 `sort_files`, `usage`, `xmalloc`이, bash에서는
+  `shell_getc`, `execute_coproc`, `vidomove_dispatch`가 나왔다.
+- **변수.** `for` 카운터는 중첩 순서대로 `i`, `j`, `k`가 된다. 알려진 호출의 결과는 `fd`, `fp`, `len`, `buf`,
+  `nread`가 되고, `getenv("HOME")`의 결과는 `home`이다. 내부 함수는 이름에서 따서 `get_config`의 결과가 `config`,
+  `count_lines`는 `lines`가 된다. 타입에서 `FILE *fp`, `struct stat st`를, 넘기는 매개변수 자리에서
+  `read(fd, buf, count)`를 따온다. `count`, `total`, `result` 같은 모양도 알아본다. 제안한 이름은 다른 변수,
+  함수, libc 함수, 키워드와 겹치지 않는다. 제안된 이름으로 floats 샘플을 다시 컴파일해도 결과가 같다.
+- 1.1.1에서 고친 것: 처음 버전은 `assert()` 이름을 읽으려고 함수와 그 피호출자를 통째로 디컴파일해서 gdb
+  분석이 30초 넘게 늘었다. 지금은 호출 직전 블록에서 인자 레지스터의 상수를 먼저 읽고, 못 찾을 때만
+  디컴파일한다. `initialize_table()`의 결과가 `ialize_table`이 되던 것처럼 동사 접두사를 단어 중간에서 자르던
+  것도 고쳤다.
+
+
+## 속도
+
+순수 Python이라 큰 바이너리에서는 늘 속도가 문제다. 아래는 출력을 바꾸지 않고 줄인 것들이다.
+
+- **분석.** 빈 구간을 훑는 스캔이 함수를 하나 찾을 때마다 모든 블록 구간을 다시 정렬하던 것을, 병합한 구간
+  집합(`_Cover`)을 조금씩 고치는 방식으로 바꿨다. 정적 링크된 vuln(함수 1131개) 분석이 42초에서 17초가 됐다.
+  x86 디코딩은 capstone의 `disasm_lite`로 하고 Intel 문법 텍스트에서 주소만 뽑는다. 연산자 상세 정보는 처음
+  필요할 때 만든다. bash의 함수 찾기가 34초에서 7초가 됐다.
+- **디컴파일러(첫 번째).** 함수마다 최적화한 SSA를 한 번만 만들게 했다. 호출자가 매개변수를 추정하려고 만든
+  것을 디컴파일할 때도 재사용한다. 나눗셈 판별식 후보를 평가하는 횟수에 상한을 두고, IR 복사는 식을 공유하게
+  했다. `/usr/bin/find`의 `main` 하나가 20분 넘게 걸리던 것이 14초가 됐다. 카나리 검사를 찾는 코드가 SSA
+  그래프를 깊이 4까지 반복해서 훑던 지수 시간 문제도 메모로 고쳐서, mawk 전체가 620초에서 62초가 됐다.
+  grep은 174개 함수 디컴파일이 87초에서 43초가 됐다.
+- **IR 순회.** `children`은 정확한 타입으로 찾는 사전으로, `transform`은 제너레이터 없이, `walk`는 명시적
+  스택으로 바꿨다. 이 작업은 PR #14에서 갈라져 나간 브랜치(`ccr-1ba61b91-3k0qem`)에서 가져왔다. 그 브랜치에서는
+  정적 MIPS의 `.reginfo` `$gp`, branch-likely 명령, 따옴표 문자열 패치, PE64 주소가 Qt 시그널에서 32비트로
+  잘리던 버그 수정도 함께 옮겼다.
+- **1.1.2.** 이번에는 결과가 바이트 단위로 같은지 바이너리 100개 넘게 비교하면서 줄였다. gap 스캔은 이미 본
+  gap을 다시 걷지 않고 바뀔 수 있는 곳만 본다. 원래 방식과 같은 순서로 같은 결과를 내는지는 무작위 테스트로
+  확인한다. 일괄 디컴파일에서는 구조체를 분석하느라 준비한 함수를 그 함수의 디컴파일에 다시 쓴다. GUI에서는
+  편집이 끼어들 수 있으니 이 재사용은 명령줄에서만 한다. 그 밖에 지배 관계 질의를 O(1)로 바꾸고, 쓸데없이
+  반복하던 계산들을 걷어냈다. stripped gdb 분석이 28.9초에서 21.3초가 됐고, `decompile --all`은 make가
+  44.6초에서 29.4초, MinGW 프로그램은 27.0초에서 14.5초가 됐다.
 
 
 ## GUI
 
-- [x] 커서 아래 단어 하이라이트 (리스팅·의사 코드, 레지스터는 rax/eax/ax/al 별칭까지)
-- [x] 최근 파일 목록(File ▸ Open Recent), 창 크기·dock 배치 저장 (`QSettings`, `RELIC_SETTINGS`로 ini 경로 지정 가능)
-- [x] 백그라운드 작업 취소·진행 표시: 상태 표시줄 진행 막대 + Cancel(`Ctrl+.`), 스레드별 취소 토큰(`relic/progress.py`)을 함수 탐색·xref·취약점 스캔·디컴파일 패스 사이에서 확인; 종료 시 기다리지 않고 취소(최대 2초, 넘으면 창을 숨기고 스레드 종료 후 닫음)
-- [x] 취약점 스캔 실패를 "발견 없음"과 구분해 표시(`VulnsThread.failed`, 표에 오류 행)
-- [x] CFG 레이아웃: Sugiyama 방식(`relic/gui/layout.py`) — back edge 역전, 최장 경로 층, 긴 간선 더미 노드 경로, barycenter 교차 최소화(`/bin/ls` 큰 함수 교차 16656 → 1248), isotonic 좌표 배치, 층 하단까지 수직으로 내린 뒤 꺾는 간선
-- [x] CFG 교차 계산 가속: Fenwick 트리로 층 쌍마다 O(E log V) (3000-case switch 6000블록 2.0초 → 0.18초)
-- [x] CFG 블록 접기: 선택한 블록(`-`) 또는 그것을 감싼 가장 안쪽 루프(`L`)를 노드 하나로, `+`/`=`나 더블클릭으로 펼침, 접힌 블록 주소로 이동하면 그룹 노드가 선택됨, 함수별로 세션 동안 유지
-- [x] CFG 간선 묶음: 한 블록으로 들어오는 전방 간선이 3개 이상이면 블록 위 합류점에서 모이고, 3개 이상 나가는 블록(switch)은 공통 줄기로 내려와 갈라짐
-- [x] 테마 전환(라이트/다크, `Ctrl+Shift+L`)과 코드 글꼴 크기(`Ctrl+=`/`Ctrl+-`/`Ctrl+0`): 모든 뷰·표·앱 팔레트에 즉시 반영, `QSettings`에 저장
+- 기본 뷰: 리스팅, CFG 그래프, 의사 코드, 헥스. 이름, 주석, 변수 이름, xref, 검색, 북마크(`Alt+M`, `Ctrl+M`),
+  구조체 창과 C 타입 창, 섹션 창이 있다.
+- **CFG 그래프.** Sugiyama 방식으로 직접 배치한다(`gui/layout.py`). back edge를 뒤집고, 층을 나누고, 긴 간선에는
+  더미 노드를 두고, barycenter로 교차를 줄인다. `/bin/ls`의 큰 함수에서 교차가 16656개에서 1248개로 줄었다.
+  교차 계산은 Fenwick 트리를 써서 3000-case switch(6000블록)도 0.18초면 된다. 블록이나 루프를 노드 하나로 접을
+  수 있고(`-`, `L`), 들어오고 나가는 간선이 많으면 한데 묶어서 그린다.
+- 모든 편집을 되돌릴 수 있다(`Ctrl+Z`, `Ctrl+Shift+Z`). 이름, 주석, 타입, 구조체, 북마크, 패치가 같은 기록에
+  순서대로 쌓인다. 바뀐 게 없거나 실패한 편집은 기록하지 않는다.
+- IDA의 H/R/B/O처럼 숫자 표시 형식을 바꿀 수 있다. 리스팅은 피연산자별로, 의사 코드는 상수별로 16진, 10진,
+  문자, 2진, 오프셋 중에서 고른다.
+- 반복 주석(`:`)은 그 주소를 참조하는 모든 곳에 `⇢ 주석`으로 보인다.
+- Names 창, 호출 그래프(`Ctrl+Shift+G`, 호출자와 피호출자 1~4단계), 창 위쪽의 내비게이션 밴드(바이너리 전체를
+  함수·라이브러리·데이터·미분석 코드로 칠한 띠)를 넣었다.
+- 함수 밖 메모리도 리스팅으로 보인다. U/C/D/A/`*`로 바이트를 코드, 데이터, 문자열, 배열로 정의하고, P와
+  `Ctrl+Delete`로 함수를 만들고 지운다. 이것으로 대화형 UI에서 기준으로 삼은 항목을 다 채웠다.
+- 커서 아래 단어 강조(레지스터는 `rax`/`eax`/`ax`/`al`을 같은 것으로 본다), 최근 파일, 창 배치 저장, 라이트·다크
+  테마, 글꼴 크기.
+- 오래 걸리는 작업은 상태 표시줄에 진행 막대가 나오고 `Ctrl+.`로 취소한다. 창을 닫을 때도 기다리지 않는다.
+  취약점 스캔이 실패하면 "발견 없음"과 구분해서 보여 준다.
+- README 스크린샷은 `docs/screenshots/make_screenshots.py`로 다시 만든다.
 
-## 스크립팅
 
-- [x] 스크립팅 API(`relic/scripting.py`), GUI Python 콘솔(`Ctrl+Shift+P`, 기록, 여러 줄 문장), 플러그인(`RELIC_PLUGINS` / `~/.relic/plugins`의 `register(api)` → Plugins 메뉴, 오류는 콘솔에), `relic script`
+## 디버거
+
+gdb를 GDB/MI로 부리고, 화면은 pwndbg처럼 꾸몄다.
+
+- 세션(`debugger/session.py`)은 pty로 입출력을 주고받는다. 시작(진입점이나 `main`에서 멈춤), 계속, 단계 실행,
+  커서까지 실행, 중단점, 레지스터 변경 추적, telescope, 백트레이스를 지원하고, PIE 주소는 정적 주소와 실제
+  주소를 오간다.
+- 패널: Registers, Stack, Backtrace, Code, Console, Vmmap, Memory(주소, gdb 식, Relic 이름을 받는 hexdump),
+  Breakpoints(조건, 활성화, 적중 횟수), Threads, Modules, Heap.
+- 하드웨어 watchpoint(쓰기·읽기·접근)와 이름으로 거는 중단점. 바이너리 함수는 정적 주소로 걸고, `puts` 같은
+  라이브러리 함수는 gdb pending 중단점으로 libc 안에서 멈춘다. 멈춘 이유도 보여 준다
+  (`watchpoint 3 …: 0 -> 0x4052a0`).
+- 레지스터와 메모리 값을 고칠 수 있다(hex, `"문자열\n"`, 워드). 의사 코드 뷰에도 현재 문장과 중단점이 표시된다.
+- 대상: 로컬, 원격 gdbserver, qemu-user(다른 아키텍처면 자동으로 고른다), 실행 중인 프로세스에 붙기·떼기.
+  로컬 실행은 환경 변수, 작업 디렉터리, 입력 파일을 정할 수 있다. 매핑 정보를 주지 않는 gdb 스텁은 보조 벡터의
+  `AT_ENTRY`로 적재 주소를 맞춘다.
+- 시그널 정책(Debug ▸ Signals), 라이브러리 적재 시 정지, 명령 단위 추적(실행된 명령을 리스팅에 표시).
+- 힙 뷰는 libc 심볼 없이 `[heap]`의 청크를 처음부터 top까지 걷는다. 다음 청크의 `PREV_INUSE`로 해제 여부를
+  보고, `tcache_perthread_struct`로 tcache 목록도 읽는다. safe-linking(glibc 2.32+)은 목록이 힙 안에 머무는지로
+  판별한다.
+- Windows 프로그램은 Linux에서 wine으로 띄운 Windows용 `gdbserver.exe`에 붙어서 디버깅한다. pty를 쓰면 wine이
+  콘솔을 흉내 내면서 제어 문자가 섞여서, 입출력은 파이프로 한다.
+- 고친 것들: 실행 파일이 번들한 라이브러리 경로를 gdb가 물려받아 새 시스템에서 시작하지 못하던 문제(1.0.1),
+  셸이 프로그램 인자의 `$`와 백틱을 해석하던 문제(1.0.2). 패치가 있으면 패치한 임시 사본을 실행한다.
+
 
 ## 패치
 
-- [x] 바이트·NOP·조건 분기 반전(x86, ARM/Thumb, AArch64, MIPS)·어셈블(keystone), 재분석, 프로젝트에 저장·다시 적용, 패치된 파일 내보내기(`relic patch`, Edit 메뉴)
-- [x] 디버거가 패치된 이미지를 실행(패치가 있으면 임시 디렉터리에 내보낸 사본, 세션을 닫으면 삭제), 패치 undo/redo(`Ctrl+Z` / `Ctrl+Shift+Z`, 패치·되돌리기 모두)
+바이트 쓰기, NOP 채우기, 조건 분기 뒤집기(x86, ARM/Thumb, AArch64, MIPS), keystone으로 어셈블하기가 된다.
+패치는 프로젝트에 저장했다가 다시 적용하고, 패치한 파일로 내보낼 수 있다(`relic patch`, Edit 메뉴). 따옴표
+문자열(`--bytes '"/bin/ls\0"'`)도 바로 쓸 수 있다.
 
-## 디버거 (로컬, GDB/MI, pwndbg식 GUI)
 
-- [x] GDB/MI 레코드 파서·프로세스 래퍼(`relic/debugger/mi.py`), 세션(`session.py`): pty 입출력, 시작(entry/main)·계속·단계 실행·커서까지·중단·종료, 중단점, PIE 슬라이드(`to_live`/`to_static`), 레지스터 변경 추적, `telescope`, 백트레이스
-- [x] GUI(`relic/gui/debugger.py`): 작업 스레드 컨트롤러, Registers·Stack·Backtrace·Code·Console 패널, Debug 메뉴(F9/F7/F8/F4/F2), 리스팅 pc·중단점 표시
-- [x] vmmap 패널, 메모리(hexdump) 뷰(주소·gdb 식·Relic 이름), 레지스터·스택 값 더블클릭으로 리스팅/메모리 따라가기
-- [x] 중단점 목록 패널(조건·활성/비활성·적중 횟수, 재실행 시 유지)
-- [x] 하드웨어 watchpoint(쓰기/읽기/접근, 바이너리 전역·주소는 PIE 보정한 `*(T *)live`로, 크기 1/2/4/8, 그 밖은 gdb 식), 이름으로 중단점(바이너리 함수·`puts@plt`는 정적 주소, `puts` 같은 라이브러리 함수는 gdb pending 중단점으로 libc 안에서 멈춤), 중단점 패널에 종류 열·`Delete`로 삭제, 멈춘 이유(`watchpoint 3 …: 0 -> 0x4052a0`) 표시
-- [x] 의사 코드 뷰에서 현재 문장(pc)·중단점 줄 표시
-- [x] 레지스터·메모리 값 편집(Registers 패널 `E`/우클릭, Debug ▸ Set register / Write memory: hex·`"문자열\n"`·`0x…` 워드)
-- [x] 디버그 대상(`debugger.Target`, Debug ▸ Debugger target): 원격 gdbserver(`host:port`), qemu-user gdb 스텁(다른 아키텍처면 자동 — 프로그램 입출력은 세션의 터미널, `-E` 환경 변수, 크로스 툴체인 sysroot를 qemu `-L`·gdb `set sysroot`로), 실행 중인 프로세스에 붙기·떼기(Debug ▸ Detach), 로컬 실행의 환경 변수·작업 디렉터리·입력 파일; 매핑을 못 주는 스텁은 보조 벡터의 AT_ENTRY로 슬라이드(Thumb 비트 제외), vmmap은 바이너리 세그먼트로; MIPS·RISC-V 레지스터 표, gdb 아키텍처 이름 접두사(`riscv:rv64`, `armv7`)로 표 선택. CI에 gdbserver·gdb-multiarch
-- [x] 스레드(`Session.threads`·`select_thread`, Threads 창 — 더블클릭으로 전환), 공유 라이브러리(`modules`, Modules 창; Debug ▸ Stop on library load), 시그널 정책(`set_signal`·`signal`, Debug ▸ Signals — 다음 세션에도), 명령 추적(`trace`: 한 명령씩 실행하며 주소 기록, 브레이크·시그널·종료에서 멈춤; Debug ▸ Trace instructions — 바이너리의 실행된 명령을 리스팅에 표시, Clear trace)
+## 스크립팅·확장
 
-## 아키텍처별 분석 보강
+- GUI의 Python 콘솔(`Ctrl+Shift+P`), 스크립트 파일 실행(`Alt+F7`), 일괄 실행(`relic script`)이 같은 API를 쓴다.
+  GUI에서 하는 편집과 조회는 모두 API로도 할 수 있다.
+- 플러그인은 `register(api)` 함수 하나로 메뉴 동작과 단축키를 더한다. 훅으로 리스팅 줄 꾸미기, 분석 후, 커서
+  이동, 편집, 디버거 정지, 의사 코드 변경 때 코드를 끼울 수 있다. 플러그인에서 난 예외는 콘솔에 한 번만 보고하고
+  GUI는 계속 돈다.
+- IDA SDK에 해당하는 확장점: 플러그인 파일 로더(내장 로더보다 먼저 시도), 프로세서 모듈(명령 디코더), 의사 코드
+  훅. 명령줄에서도 확장점은 읽는다. 디컴파일러 리프터를 바꾸는 확장점은 없다.
+- 모든 API에 docstring을 달고, 거기서 [docs/scripting.md](scripting.md)를 만든다(`tools/gen_scripting_docs.py`).
+  문서가 최신인지는 테스트가 확인한다.
 
-- [x] **P0** 함수 단위 레지스터 상수 전파 패스(`analysis/constprop.py`): CFG 위 전방 데이터 흐름(합류점은 모든 선행자가 같은 값일 때만, 호출은 caller-saved 소멸), "주소" 플래그(pc 유래 값, 비-PIE 절대 리터럴)가 붙은 값만 데이터 참조로 기록 → 문자열·전역·GOT 슬롯 xref와 리스팅 주석
-  - [x] x86-32 PIC: `__x86.get_pc_thunk.*` + `add` 로 만든 GOT 기준 레지스터
-  - [x] AArch64: `adrp` + `add` / `ldr`
-  - [x] ARM / Thumb: 리터럴 풀 `ldr rN, [pc, #off]`, `add rN, pc`, `adr`, `movw`/`movt`
-  - [x] MIPS: `$gp` 고정(`_gp` = GOT + 0x7ff0), `lui` + `addiu`, GOT 슬롯 로드(PIE의 로컬 GOT 페이지 + `addiu`), 슬롯에서 읽은 `$t9`로 호출 이름
-  - 문자열 xref 비율: armhf `ld.so` 1 → 513/842, aarch64 `ld.so` 0 → 409/836, `vuln32_pie` 0 → 10/10
-  - [x] ARM/AArch64 즉치값은 주소로 보지 않음(`mov w0, #0xffff`가 PIE에서 함수 시작으로 잡히던 문제), 빈 구간 계산은 함수 범위가 아니라 블록 구간으로(멀리 떨어진 cold 블록이 사이 함수들을 가리던 문제), 구간 중간의 프롤로그도 종결 명령 뒤라면 인정
-  - [x] x64 SysV / Win64, x86 cdecl: 디컴파일러가 복원한 호출 인자 사용 (x64는 블록 안 역추적으로 결론이 안 날 때만; GUI는 창을 먼저 띄우고 백그라운드에서 스캔)
-  - [x] AArch64 x0–x7 (AArch64 리프터)
-  - [x] ARM r0–r3 (ARM32 리프터)
-  - [x] MIPS a0–a3 (MIPS32 리프터)
-- [x] **P1** 점프 테이블: ~~x86-32 PIC(GOT 기준 오프셋)~~ (완료), ~~AArch64(`adrp`+`add` 테이블, `ldrb/ldrh/ldr` 항목, `adr` 기준, `add ..., sxtb #2`, 다른 블록의 `cmp`와 `mov` 별칭으로 범위)~~ (완료), ~~ARM(`addls pc, pc, rN, lsl #2`, `ldr pc, [pc, rN, lsl #2]`, Thumb `tbb`/`tbh`, `adr`+`ldr`+`add`+`bx` 오프셋 테이블)~~ (완료)
-  - 상대 테이블은 후보 기준 주소들을 검증해서 선택
-- [x] **P1** MIPS: GOT(`DT_PLTGOT`, `DT_MIPS_LOCAL_GOTNO`, `DT_MIPS_GOTSYM`, `DT_MIPS_SYMTABNO`) 기반 import(슬롯·`.MIPS.stubs` 스텁), 지연 슬롯을 분기 블록에 포함(`Insn.delay`, `Block.last`는 분기), `bal`은 호출(`bal .+8`은 pc 읽기), `jalr $t9`는 `lw $t9, off($gp)` 슬롯으로 이름·noreturn 판정
-- [x] **P1** ARM Thumb 모드: 주소별 명령어 집합(`$a`/`$t` 매핑 심볼, 심볼·엔트리 LSB, `bl`은 유지·`blx label`은 전환), IT 블록(조건을 한 번에 디코딩), Thumb PLT 진입점(`bx pc`)
-  - [x] 심볼 없는(stripped) ARM / Thumb / AArch64: `_start`의 리프트된 IR에서 `__libc_start_main` 첫 인자(GOT·리터럴 풀 슬롯)를 읽어 `main` 복원, 함수 사이 빈 구간의 프롤로그 스캔(A32/Thumb `push {…, lr}`, AArch64 `stp x29, x30`·`paciasp`·`bti c`)으로 포인터로만 쓰이는 함수(`win`) 발견
 
-## 프로세서
+## 프로젝트·협업
 
-- [x] MIPS 빅 엔디언(`mips-linux-gnu`): 분석·디컴파일·재컴파일 실행 검증(qemu-mips)·디버깅 — 바이트 순서 외에는 리틀 엔디언과 같은 경로
-- [x] MIPS64 n64(`lift/mips.py`를 32/64비트로): 64비트 레지스터, `a4`-`a7`(capstone의 o32 이름 `t0`-`t3`을 n64 이름으로), 32비트 연산(`addu`·`sll`·`lw`·`mult`·`div`)은 결과를 부호 확장, `d...` 명령(`daddu`·`dsll32`·`dmult`(128비트 곱)·`ddiv`·`dext`/`dins`·`ld`/`sd`·`lwu`), `lui`의 부호 확장; 진입 시 `$t9` = 함수 주소(리프 함수가 `_gp`를 다른 레지스터에 만들 때), `ld $t9, slot($gp)` 호출, `.gpdword` 점프 테이블(`dsll 3`); `mips-n64` 호출 규약(인자 a0-a7, int는 64비트로 부호 확장된 채 전달 → RISC-V와 같은 좁히기); qemu-mips64el 디버깅
-- [x] 상수 나눗셈: 곱셈 대신 시프트·덧셈 사슬로 만든 매직 곱(MIPS64 gcc)도 후보로, 32비트 값을 담은 64비트 피제수(`x & 0xffffffff`, 부호 확장된 int 인자)는 32비트로 인식 후 다시 좁히기
-- [x] 출력: 부호 있는 값을 좁힌 피연산자의 `/u`·`%u`·`>>u`는 `(unsigned int)` 캐스트(전에는 `(int)v / 10`처럼 부호 있는 나눗셈으로 보였음)
-- [x] 테스트 빌드를 임시 파일 + 이름 바꾸기로(병렬 워커가 같은 샘플을 동시에 빌드하다 덜 쓴 파일을 읽던 문제)
+- 작업 내용은 바이너리 옆 `<binary>.relic.json`에 저장한다. 이름, 주석, 타입, 구조체, 패치 같은 편집만 저장하고,
+  분석은 열 때마다 다시 한다. 바이너리의 SHA-256도 같이 기록한다. 저장이 실패해도 원래 파일은 남고, 읽을 수
+  없는 프로젝트 파일은 경고만 하고 다음 저장 때 `.bak`으로 남긴다.
+- 스냅숏: 모든 주석 상태의 이름 붙인 사본. 복원은 되돌리기 한 단계다.
+- 다른 분석가의 프로젝트 병합: 없는 것은 더하고, 값이 다르면 충돌로 보고한 뒤 우리 값(`--theirs`면 그쪽)을
+  남긴다. 다른 바이너리의 프로젝트는 거부한다.
+- 버전 기록: commit, log, diff, checkout(`relic project`, File ▸ History). IDA Teams의 버전 관리에 해당한다.
+- Lumina 같은 함수 정보 공유: 명령에서 주소와 변위를 지운 위치 독립 지문으로 함수를 알아보고, 이름, 주석,
+  변수 이름, 타입을 저장소에 올리고 받는다. 저장소는 JSON 파일이거나 `relic lumina serve` HTTP 서버다.
+  stripped 사본에 13개 함수의 이름이 정확히 붙었다.
 
-- [x] PowerPC(`lift/ppc.py`): 32비트 SysV(빅 엔디언)와 64비트 ELFv2(리틀 엔디언). capstone의 단순화 니모닉(`slwi`·`clrlwi`·`bdnzl`로 보이는 `bcl 20,31`) 대신 명령 필드에서 해독; CR을 1비트 필드(`crN_lt/gt/eq/so`)로, record 형식은 결과를 0과 비교, `mfcr`+`rlwinm`은 CR 비트 하나로; `stwu`/`stdu`로 만든 프레임(back chain은 모델링하지 않음); 스레드 포인터(r2/r13) → `tp_base`로 스택 보호값 숨김; PPC64 TOC(r2)는 상수, 로컬 진입점(st_other)은 함수 자체로(디버거 중단점도 로컬 진입점에)
-- [x] PPC 로더: `.text`의 PLT 호출 스텁 이름(절대 주소 / PIE는 호출자가 `bcl;mflr;addis;addi`로 만든 r30 기준 / PPC64는 TOC 기준), RELA RELATIVE 워드 채우기(`Binary.reloc_fill`: 파일은 0, 읽기는 링크 시 값), `.got2`·`.toc` 워드를 IR 단계에서 상수로(`IRFunction.const_words`), `R_PPC_ADDR32` GOT 워드를 데이터 import로, 점프 테이블(`lis/addi`·GOT·TOC 테이블, `slwi`+`lwzx`, `extsw`된 상대 엔트리), stripped `main`(r8이 가리키는 `{sda_base, main, init, fini}`), 프롤로그 스캔
-- [x] PPC 부동소수점: FPR은 항상 double 형태 — 단정밀도 연산은 피연산자를 float로 읽어(`fpsingle`, float 매개변수의 증거) 결과를 double로 넓힘(`fmadds` = `fmaf`), `frsp`는 명시적 변환; 반환은 넓힌 float이면 float; `fctiwz; stfd; lwz`·`mfcr`·`0x43300000` 정수→double 관용구(루프 밖으로 끌어올린 상위 워드 포함)·POWER8/9 VSX 스칼라(`xscmpgtdp`+`xxsel`, `xsmadd*`, `mffprd`, `lfiwax`, `lxsd v12`), ELFv2의 위치 기반 인자(부동소수점 인자도 GPR 자리를 차지 → 매개변수를 C 순서로), 스택 인자(r1+8 / r1+96)
-- [x] 공통 개선: 인터프리터 메모리를 바이너리의 바이트 순서로, unordered 비교는 `!(a > b)`로 출력(NaN 정확), `~x + x` = -1, `(x ^ c1) ^ c2`, `(x + c1) + c2`, `low(zext(x))`, 0으로 확장된 바이트의 중복 `& 0xff`(phi 포함), `clz(x) >> 5` = `x == 0`, 같은 상수의 phi, `srawi; addze` 부호 있는 2의 거듭제곱 나눗셈, 피제수가 unsigned int일 때 0 확장으로도 시도
 
-## 파일 포맷
+## 테스트·인프라
 
-- [x] ELF 재배치 객체(`relic/loader/elfobj.py`): 할당 섹션을 0x100000부터 정렬해 배치, 정의 안 된 심볼은 `.extern` 스텁(import), GOT 형태 재배치는 `.got` 슬롯, 공통 심볼은 `.common`; 재배치 적용 — x86-64(64/PC32/PLT32/32/32S/GOTPCREL(X)), x86(32/PC32/PLT32), AArch64(ABS·PREL·CALL26/JUMP26·ADR(_GOT)_PAGE·ADD/LDST lo12·CONDBR19·TSTBR14), ARM(ABS32·REL32·CALL/JUMP24·THM_CALL/JUMP24·MOVW/MOVT), MIPS o32(32·26·HI16/LO16·GOT16·CALL16·GOT_DISP), RISC-V(32/64·CALL·PCREL_HI20/LO12·HI20/LO12·JAL·BRANCH·RVC); COFF 객체(`coff.py`, AMD64·i386 재배치, `__imp_` 슬롯); 정적 라이브러리 멤버(`archive.py`, `lib.a:member.o`); Intel HEX·S-record(`firmware.py`, 체크섬 확인, 시작 주소 레코드 또는 Cortex-M 리셋 벡터); COFF도 Windows ABI·LLP64; 로드 오류는 CLI 메시지로
-- [x] ELF 코어 덤프(`core.py`): PT_LOAD를 매핑 파일 이름(`libc.so.6`·`[stack]`·`[anon]`) 섹션으로, NT_PRPSINFO(프로세스·명령), NT_PRSTATUS(시그널·pid·스레드별 레지스터, x64/x86/AArch64/ARM/MIPS/RISC-V), NT_FILE(매핑된 파일); 진입점 = 정지한 pc; 디스크에 남은 매핑 파일의 심볼을 PIE 바이어스로 얹음; 툴체인 식별은 덤프 속 라이브러리 문자열이 아니라 실행 파일로
-- [x] PE 부가 정보(`pe.py`): TLS 콜백(`tls_callback_N`), 리소스 종류·버전 문자열, CodeView RSDS의 PDB 경로·GUID·age, 지연 import(데이터 디렉터리 13 — GNU ld가 비워 두면 `__DELAY_IMPORT_DESCRIPTOR_*` 심볼에서), .NET CLR 헤더·메타데이터 런타임 버전
-- [x] RAW 적재 주소 추정(`rawbase.py`): 포인터 크기 워드가 문자열 시작에 가장 많이 떨어지는 정렬된 base(하위 비트로 묶어 후보 계산), Cortex-M 벡터 테이블(Thumb 핸들러가 이미지 안에); `--base auto`, `relic info`의 `Base?` 후보
-
-## 테스트 / 인프라
-
-- [x] **P0** GitHub Actions CI (pytest, gcc 설치, Python 3.10 / 3.12 / 3.13)
-- [x] case마다 함수를 호출하는 `switch` 샘플(`flow.c`의 `sw_calls`): x86-64/x86-32 × -O0/-O2 모두 점프 테이블 → `switch`, 재컴파일 검증
-- [x] PE 테스트: MinGW x64/x86 샘플로 로더·COFF 심볼·IAT 호출 이름·checksec·vulns·디컴파일 (CI에 mingw 설치, 없으면 skip)
-- [x] ruff 린트(`pyproject.toml`, E/F/W/B, CI `lint` job). 포맷터·import 정렬은 기존 줄바꿈 스타일과 맞지 않아 적용하지 않음
-
-## 분석 정확도
-
-- [x] C++ 심볼 디맹글링(`relic/demangle.py`: libstdc++ `__cxa_demangle`, 없으면 `c++filt`): 목록·리스팅은 전체 이름, 의사 코드 호출은 `ns::Cls::method`, 이름 해석은 원래·전체·짧은 이름 모두
-- [x] PE: 예외 디렉터리(`.pdata`)로 함수 시작 시드(chained 항목 제외), TLS 콜백 이름(`tls_callback_N`) — stripped MinGW x64에서 함수 130 → 174개
-- [x] 대형 바이너리 성능 1차: 빈 구간 스캔이 함수를 찾을 때마다 모든 블록 구간을 다시 정렬하던 것을 병합 구간 집합(`_Cover`)의 증분 갱신으로, `regs_access`는 처음 쓸 때 계산 — 정적 링크 vuln(1131 함수) 42초 → 17초
-
-## 디컴파일러
-
-설계: [docs/decompiler-plan.md](docs/decompiler-plan.md)
-
-- [x] **P1** 단계 1 — IR 정의와 x86-64 리프팅 (`relic ir`, IR 인터프리터로 의미 검증)
-- [x] **P1** 단계 2 — SSA, 상수/복사 전파, 죽은 코드 제거 (패스 전후 결과를 `interp`로 비교)
-  - [x] 호출 규약 표(`arch.py`), SSA 구성(`ssa.py`: 지배자, phi, 이름 부여)
-  - [x] 최적화 패스(`passes.py`): 상수 폴딩·대수 단순화, 상수/복사 전파, 단일 사용 load 전달, 플래그→비교식 복원, DCE
-  - [x] 인터프리터의 SSA 실행 지원(phi, 호출 use/def, version-0 → 진입 레지스터)
-  - [x] 최적화 IR의 문자열/교차참조(`refs.py`: `ir_xrefs`, `format_ir`), `relic opt` 커맨드
-- [x] **P1** 단계 3 — 호출 인자/반환값 복원, 스택 변수
-  - [x] 호출 인자 복원(`calls.py`, `sigs.py`): libc 시그니처 + 포맷 문자열 인자 수, `_chk` 변형, 내부 함수는 live-in 레지스터 프리픽스, 시그니처 없는 import·함수 포인터는 호출 직전에 설정된 인자 레지스터
-  - [x] 스택 프레임 분석(`stack.py`): rsp_0 기준 오프셋, 슬롯 분류(retaddr/saved/canary/buffer/local), 버퍼 크기, 카나리 탐지, `relic opt` 프레임 요약
-  - [x] 스택 슬롯 → 지역 변수(`var_c`, `buf_48`), 프롤로그 저장·카나리 검사 숨김(`cleanup.py`)
-- [x] **P1** 단계 4 — 제어 흐름 구조화(if/while/switch) (`structure.py`)
-  - [x] 지배자/후지배자, 자연 루프, if/else, while, do-while, while(1)+break/continue, switch, goto 폴백
-  - [x] switch case 값(점프 테이블 인덱스), bounds check → `default`, case 끝 `break`
-  - [x] 루프 밖 합류점 → 명시적 `break`, 작은 공유 꼬리 블록·반환 블록은 goto 대신 복제
-  - [x] 모든 도달 가능 블록이 정확히 한 번 출력되는지 구조 불변식으로 검증
-  - [x] `X = init; while (c) { ...; X += k; }` → `for` (본문에 그 루프의 `continue`가 있으면 만들지 않음)
-  - [x] if-else-if 사슬 → switch(`decompiler/chains.py`): 빠져나가는 `if (x == C)` 연속(나머지는 switch 뒤에), 일관성을 검사한 범위 분할 병합(gcc 이진 탐색 비교 트리), 본문이 이어지는 else-if 사슬은 `break`·`default`; 루프를 겨냥한 `break`가 든 본문은 변환하지 않음. AArch64 -O2 `sw_calls`가 8-case switch로
-  - [x] `-O2` goto 줄이기 1차: 단락 평가 `&&`/`||` 결합, 후지배자 없는 if의 합류점 선택, 작은 비순환 꼬리 영역 복제(6블록/12문장) — `/usr/bin/{true,cat,gzip}` goto 1911 → 1469
-  - [x] 상수 나눗셈·나머지 복원(`arith.py`): 매직 넘버 곱셈 → `x / c`, `x % c`, 곱셈 역원 비교 → `x % c == r` (부호·음수 제수·64비트, 평가로 검증)
-  - [x] 부호 있는 2의 거듭제곱 나눗셈·나머지(`(x < 0 ? x + 15 : x) >> 4` → `x / 16`, `% 8`)
-- [x] **P1** 단계 5 — out-of-SSA, 타입, C 출력 (`outssa.py`, `vartypes.py`, `pipeline.py`, `emit.py`)
-  - [x] phi → 복사 + 간섭 기반 병합(인터프리터로 검증), 단일 사용 임시 변수 인라인
-  - [x] void / 반환 폭(호출자가 읽는 폭), 변수 폭 축소(`low32` 제거), 포인터·unsigned 추론, 복사로 포인터 타입 전파
-  - [x] 시그니처·지역 변수 선언, 문자열·심볼·배열 인덱스, 포인터 산술 원소 단위, `&&` 조건, else-if, early return
-  - [x] 줄 ↔ 주소 매핑(`Decompiled.lines`, `relic decompile --addrs`)
-  - [x] 재컴파일 테스트: `checksum`/`classify` 디컴파일 결과를 gcc로 다시 컴파일해 원본과 비교
-  - [x] 사용자 이름 변경(`Analysis.renames`)·주석·변수 이름(`Analysis.var_names`)을 의사 코드에 반영
-  - [x] 구조체 복원(`decompiler/structs.py`): 포인터 변수·매개변수·전역 포인터·전역 포인터 배열 원소(`notes[i]`)를 기준으로 고정 오프셋 접근을 모아 필드로(폭이 둘 이상이거나 포인터/정수 필드가 섞이거나 전역 포인터 배열 원소), 전역 기반 구조체는 그 전역을 참조하는 모든 함수에서 공유(`notes[i] = v3`처럼 슬롯에 저장된 지역 포인터도 같은 구조체), 필드 타입은 `malloc` 저장 → `void *`, 포맷·문자열 인자 → `char *`, 주소로 쓰임 → `void *`; 출력은 `p->f_8`, `&p->f_8`, 함수 위에 패딩 포함 `struct` 정의. 이름 변경(`N`, `rename_struct`/`rename_field`, 프로젝트에 저장). `structs.c`를 디컴파일·재컴파일해 원본 구조체로 호출 비교(-O0/-O2)
-  - [x] 데이터 객체 안·바로 뒤 주소는 `(char *)&pool + 32`(루프 끝 포인터가 원본 주소 숫자로 나오던 것)
-  - [x] 중첩 구조체: 필드에서 읽은 포인터를 기준으로 쓰면 그 필드의 구조체(`n->it->count`, 필드 타입 `struct s_x_8 *`), `n = n->next`는 자기 참조 필드(`struct s *next`), 가리키는 구조체를 먼저 선언, `-O0` 스택 복사본(`var_20 = a1`)의 구조체를 매개변수에도
-  - [x] 타입 직접 지정(`Y`, `set_type`/`set_field_type`): 변수·매개변수에 C 타입(`unsigned int`, `char *`, `struct item *`), 복원된 구조체를 이름으로 다른 함수에 적용(그 함수의 접근으로 필드가 늘어나고 모든 함수가 같은 정의를 공유), 필드 타입 지정(`struct item *`이면 중첩 접근이 그 구조체로), 없는 구조체 이름은 주석으로 알림, 이름 붙이거나 적용한 구조체는 레이아웃을 프로젝트에 저장(새 세션에서도 적용), 필드 복사 변수는 필드 포인터 타입(`char *v1 = a1->name`)
-  - [x] 함수 간 통합: 호출자가 전역 구조체 포인터(`pool[0]`, `notes[i]`)를 넘기는 매개변수는 그 구조체(꼬리 호출 포함), 피호출자의 접근도 전역 구조체의 필드로; `pool`과 `pool[i]`는 같은 종류의 키, 배열 객체 첫 원소 읽기는 `pool[0]`(이름만 쓰면 배열 자체)
-  - [x] 포인터 크기 칸이 쓰임새로만 갈리는 경우(`argv[0]`, `argv[1]`)는 구조체가 아님
-  - [x] 지역 구조체의 매개변수 통합: 호출자가 자기 구조체(`it = malloc(...)`)를 넘기면 피호출자 매개변수는 그 구조체, 피호출자가 매개변수로 읽는 필드도 호출자 쪽 구조체에(전역 출처가 있으면 그쪽 우선); 넓은 필드의 하위 바이트 읽기는 `*(short *)&p->f_10`
-  - [x] 0 확장 출력 수정: 부호 있는 좁은 값을 넓힐 때 `(unsigned int)(unsigned short)x`(전에는 `(unsigned int)(short)x`로 부호 확장되는 C가 나옴)
-  - [x] 배열 필드: `base + k + i*s`(덧셈 순서 무관, 바이트 배열은 배율 없이) → `p->f_8[i]`, 상수 첨자 접근은 같은 배열의 원소, 길이는 다음 필드까지(뒤에 없으면 flexible `[]`), 프로젝트 레이아웃에도 길이 저장; 구조체 포인터의 바이트 오프셋(루프 끝 포인터)은 `(char *)p + n`
-  - [x] 호출자 없는 함수의 반환값 판정: 어떤 경로에서 진입 시 반환 레지스터 값이 그대로 돌아갈 수 있으면 반환값 없음(`-O0`에서 `rax`를 임시로 쓰던 void 함수가 `rax`를 반환하던 것)
-  - [x] 구조체 편집 창(View ▸ Structures, `Ctrl+Shift+S`): 복원·저장된 구조체 목록, 필드 표(오프셋·이름·타입·크기)에서 이름·타입 바로 수정, 필드 추가(`0x10 char[8] tag`)·삭제, 구조체 이름 변경; 손으로 한 추가·삭제는 프로젝트에 저장되어 다음 세션의 복원 결과에도 적용(`add_field`/`remove_field`)
-  - [x] GUI Pseudocode 탭(`Tab`/`F5`): 지연 디컴파일·캐시, 리스팅과 커서 주소 동기화, 이름 변경 반영, 더블클릭 이동
-  - [x] 디컴파일은 백그라운드 스레드에서(한 번에 하나, 진행 중 표시, 오래된 결과 폐기)
-  - [x] 의사 코드에서 변수·매개변수 이름 변경(`N`, 프로젝트 파일에 저장), 사용자 주석 표시
-  - [x] AArch64 리프터(`lift/arm64.py`): 시프트·확장 피연산자, pre/post-index, ldp/stp, csel/cset/ccmp, 비트필드, cbz/tbz, NZCV(C=no-borrow); AAPCS64, `__stack_chk_guard` 카나리, `adrp` 페이지를 코드 참조로 오인하지 않음
-  - [x] ARM32 리프터(`lift/arm.py`): A32·Thumb-2, 조건 실행(`movgt` → `c ? new : old`, 조건부 호출/리턴은 합성 블록), 배럴 시프터 캐리, 리터럴 풀 상수, ldm/stm/push/pop, `__aeabi_idiv(mod)` → `/`·`%`, cbz/cbnz, strex; AAPCS(r0–r3), 정렬용 `push {r3, lr}` 숨김, ARM PLT 스텁 해석
-  - [x] 공통 개선(ARM에서 발견): 루프에서 스택 버퍼를 훑는 포인터 phi를 고정 스택 주소로 잘못 보던 버그 수정, 조건 플래그 중복 전파(술어 실행), `c ? x : !c` 류 정리, 단독 GOT 슬롯 → `&stdout`
-  - [x] AArch64 점프 테이블(`flow.c`의 12-case `sw_big`, 모든 아키텍처에서 재컴파일 검증)
-  - [x] 호출 간 레지스터 보존(gcc `-fipa-ra`): 바이너리 안 함수 호출은 피호출 함수가 (전이적으로) 쓰는 레지스터만 덮어쓴다고 보고(`decompiler/clobbers.py`), import·간접 호출·미해결 점프·syscall은 ABI 전체. 이전에는 `gcd(y, 4) - sc_or(y, 9)`가 `sc_or(gcd(y, 4), 9)`와 미정의 변수로 나왔음
-  - [x] 32비트 `int` 매개변수에 넘기는 음수 상수: 피호출 함수가 인자 레지스터를 하위 32비트로만 읽으면 `0xfffffffb` 대신 `-5`
-  - [x] MIPS32 리프터(`lift/mips.py`, o32): 지연 슬롯은 분기 조건·호출 대상을 먼저 계산한 뒤 슬롯 명령, 그다음 분기(`lift_delayed`), `$gp`는 상수 `_gp`(쓰기·cprestore 저장 무시), 로컬 GOT 항목은 링크 시 상수, `jalr $t9`는 GOT 슬롯의 import 이름, hi/lo(mult/div), movn/movz, ext/ins; 점프 테이블(절대·`$gp` 상대 `.gpword`, `sltiu` 범위). 재컴파일 검증은 mipsel-gcc `-static` + `qemu-mipsel`
-  - [x] 공통 개선(MIPS에서 발견): 스택 프레임의 반환 주소 슬롯은 x86 계열만(진입 sp+0은 호출자 영역: o32 인자 홈 슬롯 `arg_0`), 콜리 저장 레지스터 요약이 capstone `regs_access` 없는 아키텍처는 리프트 결과로, import GOT 슬롯을 통한 호출은 이름으로 출력, 가드 주소를 레지스터에 두는 카나리 인식, 분기형 부호 보정(`if (x < 0) x += 15`, 두 return)을 select로 바꿔 `/ 16`·`% 8` 복원, `sltiu x, 1` → `x == 0`
-  - [x] x86-32: cdecl 스택 인자, 스택 매개변수(`a1`…), PC 썽크(`__x86.get_pc_thunk.*`, stripped는 본문으로 인식), `main`의 스택 재정렬, GOT 경유 전역(`stdout`)
-  - [x] RISC-V RV64GC 리프터(`lift/riscv.py`, LP64D): 정수(RV64IMC, Zba/Zbb 일부), `w` 연산은 하위 32비트 계산 후 부호 확장, 압축 명령(`c.ldsp`·`c.addi16sp`·`c.addi4spn` 등, capstone이 메모리 피연산자를 즉치값+기준 레지스터로 줌), `auipc`/`lui` 쌍은 상수, `jal`/`jalr` 호출·`ret`·`j`/`jr` 꼬리 호출, F/D 부동소수점(산술·`fmadd` 계열→`fma`·비교·변환·`fmv`), `__global_pointer$`가 있으면 `gp`는 상수
-    - 호출 규약: a0–a7 / fa0–fa7 인자, a0 / fa0 반환, s0–s11·fs0–fs11 콜리 저장; 가변 인자 함수의 `double`은 정수 레지스터(`printf("%f")`), fa0–fa7이 다 차면 남은 `double` 인자는 정수 레지스터로(피호출 쪽에서 `fmv.d.x`/스택 경유 `fld`로 확인해 순서 복원)
-    - 분석: 분기·`jal` 대상은 pc 상대, PLT 스텁(`auipc t3; ld t3; jalr t1, t3`)은 점프이고 import 이름, `auipc`+`addi` 상수 전파로 문자열 xref, 리스팅에서 호출 대상 이름, 점프 테이블(`auipc`+`addi` 기준, `lw` 오프셋/`ld` 절대 항목, `bltu` 범위), pyelftools가 모르는 RISC-V 재배치 이름, `.got`의 `R_RISCV_64`는 데이터 import(`stdout`), stripped 바이너리 프롤로그 스캔(`addi sp, sp, -n`), 인자 추적 취약점 탐지
-    - 공통 개선(RISC-V에서 발견): 부호/0 확장된 두 값(또는 들어맞는 상수)의 비교는 안쪽 폭으로(`(int64_t)x <= 1` → `x <= 1`), 정의가 모두 부호 확장인 변수(비트 연산·작은 0 확장·복사 포함, 낙관적 고정점)는 통째로 비교·비트 연산돼도 `int`로 좁힘, RISC-V `int` 매개변수(하위 32비트 읽기나 부호 확장 값과의 비교가 근거), 부호 확장 상수 반환(`li a0, -1`)은 `int`, float 매개변수를 그대로 돌려주는 경로는 반환 폭 판단에서 중립, 여러 번 쓰는 읽기 전용 상수 로드는 사용처마다 리터럴
-    - 재컴파일 검증: riscv64-gcc `-static` + `qemu-riscv64` (flow·floats, -O0/-O2)
-  - [x] C 헤더 가져오기(`decompiler/cheader.py`, `Analysis.import_header`, `relic types`, `relic decompile --header`, File ▸ Import C header, 스크립팅 `import_header`)
-    - 파서: 구조체·공용체(익명·중첩)·열거형(상수식, `sizeof`, 앞 열거자 참조)·typedef(`typedef struct { … } point;`는 이름을 그대로, 출력도 `point`)·함수 원형(본문은 건너뜀)·함수 포인터·다차원/유연 배열, 주석·전처리 줄·`__attribute__` 무시; 비트필드·알 수 없는 타입·정의되지 않은 매크로는 줄 번호와 함께 거부(가져오기 전체 취소)
-    - 레이아웃: 대상 ABI(LP64, Windows LLP64, ILP32, i386 SysV의 8바이트 정렬 4) — gcc `offsetof`/`sizeof`와 x86-64·i386·ARM·AArch64에서 일치를 테스트로 확인
-    - 디컴파일러: 구조체는 태그 이름으로(중첩 구조체는 `p->hdr.len`으로 펼침, 공용체는 가장 큰 멤버), 선언은 헤더에 적힌 그대로(값으로 담은 구조체 먼저, 사용자가 필드를 고치면 복원 레이아웃 보기로), 함수 원형은 매개변수·반환 타입(`char *state_name(enum state a1)`; 반환 타입은 반환 폭 축소에도 반영, `Y`를 함수 이름에서 누르면 반환 타입 지정), 복사(`var_c = a1`)로 열거형·구조체 포인터 타입 전파
-    - 열거형 출력: 비교·대입·저장·복합 대입·switch case·내부 함수 인자의 상수를 열거자 이름으로, 모두 2의 거듭제곱인 열거형은 플래그 조합(`OPT_VERBOSE | OPT_DRY`), 비트 검사(`tbz`: `((o >> 2) & 1) != 0`)는 `(o & OPT_DRY) != 0`
-    - 프로젝트에 저장(`c_types`), 가져오기 한 번이 undo 한 단계; 두 번째 헤더는 앞 헤더의 typedef·구조체·열거자를 씀
-    - 검증: `tests/src/types.c`를 -O0/-O2로 빌드해 헤더를 가져온 의사 코드를 헤더와 함께 다시 컴파일, 원본과 같은 입력으로 실행해 출력 비교
-  - [x] 라이브러리 함수 원형: `decompiler/libc_h.py`의 libc·POSIX·소켓·mmap·프로세스·dl/pthread 원형 약 180개(`sigs.lookup`이 기존 표 다음으로 참조) — 인자 수(`socket(2, 1, 0)`, `mmap(0, n, 3, 34, -1, 0)`), 정확한 포인터 타입, 결과 타입; `int` 매개변수에 넘긴 64비트 상수는 32비트로(`-1`), 형식 없는 가변 인자 함수(`execl`)는 고정 인자 + 호출 전에 설정된 레지스터
-    - 헤더의 원형이 표보다 우선: import 함수 원형은 호출 모양, 마지막 고정 인자가 `fmt`/`format`인 가변 인자 함수는 printf처럼 형식에서 인자 수(내부 래퍼 `log_msg(2, a1)`도), 형식 문자열 취약점 검사가 그 래퍼까지(`log_msg() called with a non-constant format string`), `double` 매개변수는 부동소수점 레지스터로 배치
-  - [x] 비트필드: System V 배치(정렬 경계의 `sizeof(T)` 컨테이너, 0폭 비트필드, 이름 없는 비트필드는 정렬에 영향 없음, i386 `long long` 정렬 4) — gcc와 x86-64·i386·ARM에서 일치; 같은 저장 단위의 비트필드는 필드 하나, 선언은 헤더 그대로(`unsigned int version : 4;`); 읽기 `(unit >> k) & mask`·좁은 로드·한 번 읽어 둔 변수·`(unit & 0xe0) == 0x40` 비교를 `p->version`, `p->flags == 2`로; 비트필드가 아닌 저장 단위 접근은 일반 메모리 표기(이름·주소가 없으므로)
-  - [x] `#define NAME 상수식`: 배열 크기·열거 값에 사용(함수형 매크로·상수가 아닌 값은 무시)
-- [x] 의사 코드 내보내기: 바이너리 전체를 C 파일 하나로(구조체 선언은 맨 앞에 한 번씩, 함수는 주소 순서와 주소 주석, 실패한 함수는 이유 주석) — `relic decompile -a -o out.c`, File ▸ Export pseudocode(백그라운드, 진행 표시·취소, 취소하면 반쯤 쓴 파일을 남기지 않음), 스크립팅 `export(path)`
-- [x] C 타입 창(View ▸ C types): 가져온 열거형(값)·typedef·구조체(필드)·함수 원형 목록, 헤더 가져오기, 모두 지우기(undo 한 단계, `Analysis.clear_imported_types`)
-- [x] 변수로 계산한 점프 대상(`v2 = base + table[v1]; goto *v2`, PIE의 상대 점프 테이블)도 switch 색인으로: `switch (v1)`과 case 값, 대상 계산문과 그 변수는 출력에서 빠짐
-- [x] 디컴파일러 속도(P0): 함수마다 최적화 SSA를 한 번만 — 호출자가 매개변수를 추정하려고 만든 최적화 SSA(`_entry_opt`)를 `decompile_ir`가 복사해 호출 복원(이전에는 lift·SSA·최적화를 두 번), 부동소수점 결과가 없으면 캐시된 SSA의 복사본을 최적화, 스택 매개변수 계산도 캐시 사용; 나눗셈 판별식(`x % c == r`) 인식이 후보마다 최대 4c(최대 26만)번 식을 평가하던 것을 1024개 + c의 배수로(모든 후보는 기존 표본으로 검증하므로 결과 동일); `IRFunction` 깊은 복사는 문장·컨테이너만 새로(식은 불변이라 공유); `_rewrite`의 변경 비교는 새 객체만. `/usr/bin/find` `main` 단독 20분 이상 → 14초, 테스트 바이너리 전체 출력 동일하게 69초 → 46초, 테스트 스위트 72초 → 38초
-
-## 완료
-
-- [x] ELF / PE / RAW 로더
-- [x] 멀티 아키텍처 디스어셈블러
-- [x] 함수 탐색, CFG, noreturn, tail call, x86-64 점프 테이블
-- [x] stripped 바이너리 `main` 복구, 프롤로그 스캔
-- [x] xref, 문자열, checksec, 포너블 휴리스틱(x86-64)
-- [x] 프로젝트 저장(이름 변경·주석)
-- [x] CLI, pytest 스위트
-- [x] GUI 뷰 위젯(디스어셈블리 / CFG / 헥스)
-- [x] GUI 메인 윈도우: 함수 목록, 백그라운드 분석, 이동 히스토리, 이름 변경·주석·xref, 정보 테이블, 스모크 테스트
-- [x] ELF 재배치 타입 이름 기록 (GLOB_DAT import 해석)
-- [x] x86-64 디컴파일러 단계 1–5 (`relic decompile`)
-- [x] 구조화 정확성: 구조화된 트리를 실행해 CFG와 같은 블록 순서를 밟는지 무작위 그래프로 비교하는 테스트, 그것으로 찾은 버그 수정 — 한쪽이 건너뛰는 합류점, 분기 안에서 만난 do-while 래치(`continue`), 루프 follow이자 영역 끝인 꼬리(`break`), 바깥 루프의 헤더·follow로의 점프(`goto`), 영역 끝으로 바로 가는 분기; 점프 테이블(switch) 포함 — 다음 case로 이어지는(fall-through) 분기·복사된 꼬리, 서로 다른 끝으로 가는 두 분기
-- [x] 라이브러리 시그니처(FLIRT 방식): 정적 라이브러리(`ar` + 재배치 ELF)에서 재배치 바이트를 가린 함수 패턴, 앞 16바이트 마스크별 색인, 가장 긴 일치·끝 위치 확인·별칭 묶음·참조 이름으로 모호성 해소, IFUNC 리졸버와 IRELATIVE 스텁 이름, noreturn 이름이면 함수 다시 찾기, `relic sigs`, GUI 적용
-- [x] 라이브러리 식별 보강(`libsigs.py`): 정적(local) 함수도 시그니처로, 생성자·소멸자 변형(C1/C2, D1/D2)을 한 이름으로, 코드가 같아 여러 시그니처가 맞는 함수는 참조 대상의 이름으로 함께 후보를 좁히고(`__throw_length_error` 등 9개), 이름 붙은 함수의 시그니처가 참조하는 함수에 이름을 전파(너무 짧아 혼자 못 맞추는 함수 포함), 데이터 테이블(vtable·glibc `__io_vtables` 같은 함수 포인터 표: 시그니처 파일의 `tables`에 크기와 슬롯 저장)은 참조로 시작 위치를 찾아(null 슬롯은 링크 안 된 weak 참조, 포인터가 아닌 칸에 코드 주소가 없어야 함) 슬롯의 함수 이름 — 호출되지 않는 가상 메서드는 함수로 만들어서. stripped 정적 바이너리(`tests/src/libtypes.c`)에서 심볼 있는 함수 중 이름 붙은 비율: x86-64 66→85%, ARM 66→87%, AArch64 62→83%, MIPS 72→94%, RISC-V 27→36%; C++(iostream) 42→69%; 오식별 2→0
-- [x] 툴체인 식별(`relic/analysis/ident.py`): ELF `.comment`(GCC/clang/rustc, 가장 새 버전), 동적 심볼의 GLIBC_x.y 요구 버전, 인터프리터(musl·bionic), 정적 glibc 문자열, PE Rich 헤더(MSVC 제품 ID·빌드 → Visual Studio 버전), MinGW 런타임 문자열, msvcrt/ucrt import, Go 빌드 정보, Rust 런타임 문자열, C++ 런타임; `relic info`·Checksec 표·스크립트 `toolchain()`. 시그니처 세트에 라이브러리·버전·형식 기록(glibc 배너, GCC 디렉터리), 식별 결과로 다른 C 라이브러리·형식의 세트를 빼고 같은 라이브러리 여러 버전 중 맞는 것(없으면 최신) 선택; `relic sigs build --system`(File ▸ Build signatures from installed toolchains): 네이티브·크로스 GCC의 libc.a·libm.a(GNU ld 스크립트 풀기)·libstdc++.a·libgcc.a를 세트로
-- [x] MinGW(COFF) 시그니처(`libsigs.coff_object_signatures`): AMD64·i386 재배치 마스크, 함수 크기는 같은 섹션의 다음 심볼까지에서 정렬 패딩(nop·int3)을 뺀 길이, 같은 주소의 별칭을 한 이름으로, i386의 `_`·stdcall `@N` 제거, 세트 형식 `PE`(`-pe.sig`); `system_libraries`에 MinGW-w64 트리플(libmingwex·libmingw32·libmsvcrt·crt2.o/crtbegin.o/crtend.o·libgcc). stripped 정적 MinGW 바이너리(`tests/src/libtypes.c`)에서 심볼 있는 함수 x86-64 111/130, i686 82/106, 오식별 0
-- [x] RISC-V 링커 완화 모델링(`libsigs.match_relaxed`): 함수 전체를 시그니처로 두고 완화 지점 기록(`call`: auipc+jalr 8바이트 → `jal rd` 4바이트 또는 `c.j`; 주소를 만드는 auipc/lui·TLS add: 남거나 삭제, 짝 명령의 기준 레지스터는 gp/tp가 될 수 있어 가림, GOT 로드는 `addi`가 될 수 있어 rd만; 정렬 nop: 일부·전부 삭제), 지점마다 형태를 골라 맞추고 참조 위치를 옮겨 계산(삭제된 명령의 참조는 대상 없음); 완화 지점으로 시작하는 패턴은 그 뒤 바이트로 색인; 완화로 바이트가 지워지므로 알려진 바이트가 32 미만이면 참조 확인 필요; 로컬 라벨 참조(`.L0 `)는 버림. RISC-V stripped 정적 바이너리에서 심볼 있는 함수 201→663/792(36→84%), 오식별 0
-- [x] 시그니처 창(`relic/gui/signatures.py`, File ▸ Library signatures `Shift+F5`): 시그니처 디렉터리와 추가한 파일의 세트(라이브러리·버전·아키텍처·형식·시그니처 수), 툴체인 식별로 고른 이 바이너리용 세트, 세트별 이름 붙인 함수 수(`Analysis.lib_sources`: 이름을 준 세트, 참조로 이름 붙은 함수는 참조한 함수의 세트); 선택한 세트 적용·이름 되돌리기(`Analysis.unapply_signatures`)·파일 추가(정적 라이브러리는 세트로 만들어)·툴체인에서 생성. 라이브러리 식별 체크리스트 완료
-- [x] 리스팅의 함수 내부 데이터: 블록 사이·마지막 블록 뒤의 바이트를 빈 줄 대신 데이터로 — ARM/Thumb·AArch64 리터럴 풀(`.word`, 그 슬롯을 읽는 명령 `<- vuln+0x28`, PIC `ldr`+`add rX, pc`는 만들어지는 주소 `pc + 0x250 = "name?"`, GOT 오프셋은 `[x@got]`), Thumb `tbb`/`tbh`·ARM `ldr pc` 표(`jumptable_…`, `case k -> loc_…`), x86 정렬 패딩(`align 16`), `$a`/`$t` 매핑 심볼이 코드라고 하는 구간·x86의 도달하지 않는 코드는 `not reached`(미해결 간접 점프가 있는 함수면 그렇다고 표시); 다른 함수의 블록이 낀 구간은 건너뜀
-- [x] 모든 편집의 undo/redo(`Analysis.undo`/`redo`, GUI `Ctrl+Z`/`Ctrl+Shift+Z`): 이름·주석·변수 이름·타입·구조체 편집·북마크는 편집 전 주석 상태를 기록(바뀐 게 없는 편집·실패한 편집은 기록하지 않음, 중첩 편집은 한 단계), 패치와 같은 기록에 순서대로; 되돌린 위치로 커서 이동. 북마크(`Alt+M`, Bookmarks 패널 `Ctrl+M`, 프로젝트에 저장)
-- [x] x86-64 SSE 스칼라 부동소수점(`fp.py`, `fpabi.py`, `fpconst.py`): `movss/movsd`, `add/sub/mul/div/min/max/sqrt/round`, `cvtsi2sd`·`cvttsd2si`·`cvtss2sd`(변환은 정수 패스가 건드리지 않는 내장 함수), `comisd/ucomisd`의 ZF/PF/CF를 결과 집합 진리표로 접어 비교 하나로(`ja` → `a > b`, `jp`+`jne` → `!=`), 부호 마스크 `xorpd`/`andpd` → `-x`/`fabs`; xmm 인자(SysV 순서·Win64 위치, printf 형식의 `%f`, libm 시그니처)와 xmm0 반환값(호출자가 읽는 폭, 아니면 모든 반환 경로의 마지막 쓰기 — xmm 사이 복사를 따라감), `.rodata` 상수 → `3.0`·`1.5f` 리터럴, `double`/`float`·`double *` 타입. `tests/src/floats.c`를 -O0/-O2로 디컴파일해 다시 컴파일한 결과가 원본과 비트 단위로 같음; 최적화 전후 IR을 NaN·부호 있는 0 포함 입력으로 비교. mawk `__asm` 291 → 36
-- [x] `main`의 매개변수: `int main(int argc, char **argv[, char **envp])` 이름·타입(복사본까지), 쓰지 않는 `argc` 뒤의 `argv`도 매개변수로; 포인터의 포인터 인덱싱(`argv[1]`)
-- [x] 카나리 검사 찾기(`_reaches_tls`)의 지수 시간: phi로 그래프가 된 SSA 정의를 사용처마다 깊이 4까지 다시 훑던 것을 (변수, 깊이) 메모로 — mawk `main` 530초 → 31초, mawk 전체 620초 → 62초(시간 초과 2 → 0)
-- [x] AArch64 스칼라 부동소수점: `fadd/fsub/fmul/fdiv/fnmul/fneg/fabs/fsqrt/frint*/fmax(nm)/fmin(nm)`, `fmov` 즉치값·레지스터, `movi d0, #0`, `scvtf/ucvtf/fcvtz[su]/fcvt[mpan]s/fcvt`, `fcmp(e)`의 NZCV(lt 1000, eq 0110, gt 0010, un 0011)를 결과 집합으로, `fcsel`, `fmadd/fmsub/fnmadd/fnmsub` → `fma()`(반올림 한 번이라 `a * b + c`로 쓰면 결과가 달라짐); AAPCS64 v0–v7 인자·v0 반환값, d8–d15 저장 슬롯 숨김. `floats.c` AArch64 -O0/-O2 재컴파일(qemu-aarch64)도 비트 단위로 같음. out-of-SSA 임시 변수 이름을 `_vN`으로(AArch64 `v1` 레지스터와 같은 이름이라 매개변수와 합쳐지던 문제)
-- [x] 레지스터보다 많은 인자(x86-64 SysV/Win64, AArch64): 호출 쪽은 나가는 인자 영역(`[rsp]`, `[rsp+8]`…, Win64는 홈 공간 32바이트 뒤)의 저장을 인자로 거두고, SysV/AAPCS64는 정수·실수 레지스터를 따로 채우므로 7번째 정수 뒤의 `double`도 xmm으로 배치; 피호출 쪽은 스택 매개변수(`arg_8`…), 스택으로 받은 `double`도 실수로 표시. 긴 `printf`의 인자 15개가 모두 나옴, 시그니처가 `char *`라는 인자는 앞에 NUL이 없어도 문자열 리터럴로
-- [x] 플러그인 훅: `api.add_line_decorator(fn)`(리스팅 줄에 주석·배경색), `api.on_analysis(fn)`(분석·재분석 후), `api.on_cursor(fn)`(커서가 다른 주소로); 훅의 예외는 훅마다 한 번 콘솔에 보고
-- [x] -O0 비교 트리 → `switch`: 테스트 사이의 빈 블록이 else-if 사슬을 끊던 것(`x > K` 범위 갈래가 default로 가는 gcc -O0 이진 탐색), 재컴파일 비교 테스트
-- [x] ARM32 VFP(armhf, ELF `EF_ARM_ABI_FLOAT_HARD`): `s2k`/`s2k+1`은 `dk`의 아래·위 절반(쓰기는 병합, 읽기는 최적화 패스가 그 절반에 쓴 값으로), `vadd/vsub/vmul/vdiv/vneg/vabs/vsqrt`, 반올림 두 번인 `vmla/vmls/vnmla/vnmls`와 한 번인 `vfma/vfms`, `vcvt`(고정소수점 포함)·`vcvtr`, `vcmp(e)` + `vmrs APSR_nzcv`, `vmov` 모든 형태(즉치값·코어 레지스터 쌍), `vldr`(리터럴 풀 상수)·`vstr`·`vpush`·`vpop`·`vldmia`; AAPCS-VFP 인자 배치(빈 단정도 슬롯 back-fill, 스택으로 넘어간 뒤는 모두 스택), 가변 인자 호출은 기본 규약(`double`은 `r2:r3` 쌍 또는 8바이트 정렬 스택), d0 반환값, d8–d15 저장 슬롯; `ldrd r2, r3` + `vmov d7, r2, r3`(코어 레지스터를 거친 double, 합류점의 phi까지)를 64비트 값으로; ARM32 스택 매개변수(double은 두 워드). `floats.c` ARM/Thumb -O0/-O2 재컴파일(qemu-arm) 비트 단위 일치. 공통: 피호출 함수의 매개변수(live-in)를 최적화한 SSA에서(술어 실행 `movgt/movle`이 남기던 가짜 `r0` 매개변수, `sc_or(v2, 2, 0x402024)` 같은 가짜 인자 제거), `-fipa-ra`로 호출 너머 결과 레지스터를 유지하는 호출자도 결과를 읽는 것으로
-- [x] README 스크린샷과 사용 흐름·디버거 따라 하기(`docs/screenshots/make_screenshots.py`로 재생성)
-- [x] 비트필드 쓰기: 저장 단위의 읽기-수정-쓰기(`unit = unit & keep | (x & m) << k | c`, 앞서 읽어 둔 단위 값·바이트 하나만 쓰는 저장·단위가 겹치는 컨테이너 포함)를 필드마다 대입 `p->ihl = x; p->version = 4;`로 — 지키는 비트가 정확히 다른 필드일 때만, 앞서 읽은 값이면 그 사이에 같은 바이트를 바꾸는 저장이 없을 때만; 그 저장에만 쓰인 단위 읽기는 숨김. `types.c` `packet_set` -O0/-O2 재컴파일 비교
-- [x] 프로젝트 스냅숏과 병합(`relic/analysis/project.py`): 모든 주석 상태(이름·주석·변수 이름·타입·구조체·북마크·C 타입)의 이름 붙인 사본을 프로젝트 파일에 저장, 복원은 undo 한 단계; 같은 바이너리(프로젝트에 SHA-256 기록)의 다른 프로젝트 파일 병합 — 없는 것은 추가, 서로 다른 값은 충돌로 보고하고 우리 값(`--theirs`면 그쪽 값) 유지, 다른 바이너리의 프로젝트는 거부(`--force`), 패치는 병합하지 않음. `relic project`, File ▸ Snapshots / Merge project, 스크립팅 `snapshot()`/`restore_snapshot()`/`merge()`
-- [x] ARM·AArch64 라이브러리 시그니처: Thumb 함수 심볼(주소 bit 0)의 코드를 1바이트 밀려 읽던 버그(ARM 정적 바이너리에서 584개 중 2개 → 375개 이름), 재배치가 채우는 즉치 비트만 가리는 비트 단위 마스크(`adrp`·lo12·`b`/`bl`·조건 분기·`movw`/`movt`, `bl` → `blx` 변환 비트 포함; GOT·TLS·정의 없는 weak 호출(`nop`으로 바뀜)은 워드 전체), 부분 마스크를 담는 시그니처 파일 형식(이전 파일 호환); 일치 판정: 고정 바이트 64 이상이면 함수 끝 확인 생략(아직 noreturn을 모르는 호출로 분석이 다음 함수까지 이어진 경우), 더 긴 후보가 모두 참조로 부정되면 짧은 후보로. 정답 심볼과 비교: x86-64 582 → 640, AArch64 426 → 475, ARM 2 → 375(나머지 차이는 별칭). AArch64 `_start`가 넘기는 `__wrap_main`(`nop; b main`)을 따라가 `main` 찾기
-- [x] MIPS·RISC-V 라이브러리 시그니처: 비트 단위 재배치 마스크(MIPS 26비트 점프·16비트 즉치, `R_MIPS_JALR`은 워드 전체; RISC-V U/I/S/B/J 즉치·완화되지 않은 `call`·압축 분기), RISC-V는 `R_RISCV_RELAX`/`R_RISCV_ALIGN` 위치(링커가 `auipc+jalr`을 `jal`로 줄이거나 nop을 지워 뒤 코드가 밀림)에서 패턴을 끊은 접두 시그니처(함수 끝 확인 없음, 알려진 바이트 32 이상 — 비슷한 프롤로그의 오탐 방지). 정답 심볼과 비교: RISC-V 107 → 202(오탐 0), MIPS 409 → 411
-- [x] 디버거 힙 뷰(`relic/debugger/heap.py`, Heap 패널): libc 심볼 없이 `[heap]` 매핑의 청크를 처음부터 top까지 걷기(크기·플래그, 다음 청크의 PREV_INUSE로 해제 판정, 깨진 크기에서 멈추고 알림), 첫 청크 `tcache_perthread_struct`의 목록(counts uint16/uint8 판별, safe-linking(glibc 2.32+) 여부를 목록이 힙 안에 머무는 쪽으로 판별, 힙 밖 포인터·순환에서 멈춤)으로 tcache 청크 표시; 청크·목록 항목 더블클릭 → 메모리 뷰. `Session.heap()`. 합성 힙 바이트와 실제 프로세스(`tests/src/heap.c`: 사용 중·tcache 2개 목록·unsorted 해제 청크)로 테스트
-- [x] 숫자 표시 형식(IDA H/R/B/O, `relic/numfmt.py`): 리스팅은 명령의 피연산자별(커서가 있는 피연산자, `[]` 안의 쉼표는 구분 아님, ARM `#`·AT&T `$` 접두사 유지), 의사 코드는 함수의 상수별(보이는 값 기준: 음수로 보이는 상수는 음수 키)로 16진·10진·문자 상수(`'ABCD'`, 출력 불가 바이트면 그대로)·2진·오프셋(주소의 이름); H는 16진↔10진 전환, 같은 형식을 다시 누르면 원래대로. 프로젝트 저장(`operands`, `numbers`)·undo·스냅숏·병합 포함, Edit ▸ Number 메뉴, 스크립팅 `op_format()`·`number_format()`
-- [x] 반복 주석(Edit ▸ Repeatable comment, `:`): 그 주소와, 그 주소로 분기·호출하거나 참조하는 모든 명령에 `⇢ 주석`으로 표시(프로젝트 `repeatable`, undo·스냅숏·병합); Names 창(함수·import·라이브러리 함수·데이터 심볼·사용자 라벨, 필터, 더블클릭 이동, 이름 변경을 따라감), `Analysis.names()`, 스크립팅 `rcomment()`·`names()`
-- [x] 호출 그래프(View ▸ Call graph, `Ctrl+Shift+G`, `relic/analysis/callgraph.py`): 커서가 있는 함수의 호출자(왼쪽)·피호출자(오른쪽)를 1–4단계까지(꼬리 호출 포함, 단계당 40개 넘으면 `…`), 더블클릭 이동, Shift+더블클릭은 그 함수를 중심으로 다시 그림
-- [x] 내비게이션 밴드(창 위쪽 띠, `relic/analysis/navband.py`): 적재된 섹션 전체를 이어 붙여 함수 코드·라이브러리 코드·import 스텁(`.plt*`)·데이터·미분석 코드(어느 함수 블록에도 속하지 않은 실행 바이트)로 칠함, 현재 위치 표시, 클릭·드래그로 이동
-- [x] 함수 밖 메모리 리스팅과 코드·데이터 정의(`relic/datalist.py`): 데이터 섹션·함수 사이의 실행 바이트를 리스팅으로(16진 뷰 대신) — 이름·xref 라벨(`unk_…`), 자동 문자열·이름 있는 곳을 가리키는 포인터(`dq offset name`)·0 반복(`dup(0)`)·바이트; 사용자 정의(U 정의 해제/원시 바이트, C 코드로 디스어셈블, D 바이트→워드→더블워드→쿼드워드, A 문자열, `*` 배열), 함수 만들기(P)·지우기(Ctrl+Delete: 분석을 다시 하고 프로젝트 `function_edits`에 저장, undo도 다시 분석). 이로써 대화형 UI 기준 항목을 모두 갖춰 README 진행률 100%
-- [x] Lumina 대응 함수 메타데이터 공유(`relic/analysis/lumina.py`): 명령의 니모닉·피연산자에서 주소·분기 대상(블록 번호)·pc/rip 상대 변위를 지운 위치 독립 지문(명령 6개 미만은 제외), 함수 이름(사용자·심볼, 시그니처 추정은 제외)·주석(함수 시작 기준 오프셋)·반복 주석·변수 이름·타입을 저장소에 push, 같은 지문의 함수에 pull(사용자가 이름 붙인 함수는 `--overwrite` 없이는 그대로, undo 한 단계); 저장소는 JSON 파일(`~/.relic/lumina.json`, `$RELIC_LUMINA`) 또는 `relic lumina serve`(기본 localhost) HTTP 서버. stripped 사본에 13개 함수 이름이 정확히 붙음. File ▸ Lumina, 스크립팅. 버전 기록(Teams 대응): commit(작성자·메시지)·log·diff(버전↔버전·버전↔현재, 항목별 추가/삭제/변경)·checkout(undo 한 단계), `relic project commit|log|diff|checkout`, File ▸ History. 프로젝트·협업 영역 README 100%
-- [x] 스크립팅·확장: 확장점(`relic/extend.py` — 플러그인 파일 로더(내장 ELF/PE/raw보다 먼저), 프로세서 모듈(`decode(code, addr) -> Insn`, 분석이 분기·호출을 따라감), 의사 코드 훅(줄 바꾸기, 실패한 훅은 건너뜀)), CLI도 플러그인을 읽음(확장점만), 플러그인 훅 `on_edit`·`on_debug_stop`, 스크립트 파일 실행(File ▸ Run script `Alt+F7`, 최근 목록, 출력·오류는 Python 콘솔), API 추가(`read`·`read_int`·`sections`·`insn`·`define`·`undefine`·`make_function`·`delete_function`·`bookmark`·`callers`·`callees`), 모든 API에 docstring, `docs/scripting.md` 자동 생성(`tools/gen_scripting_docs.py`, 최신 여부 테스트). 스크립팅·확장 영역 README 100%
-- [x] 타입 라이브러리와 호출을 통한 타입 전파(`relic/decompiler/typelibs.py`): libc 구조체(`stat`은 x86-64와 asm-generic 레이아웃 따로), `Analysis.load_type_library`, `relic types FILE --lib libc`, C types 창의 Load libc types; 원형의 구조체 포인터 결과가 접근으로 짐작한 `int *`보다 우선(`v = localtime(&t)` → `struct tm *v; v->tm_year`, 식 안에 접힌 호출의 결과도), 주소가 `struct S *` 인자로 넘어가는 스택 슬롯은 `struct S` 지역 변수(안쪽 슬롯은 `.st_size` 필드), 사용자가 타입을 준 함수의 매개변수·반환 타입이 호출자의 인자 변수로
-- [x] Windows API 타입 라이브러리(`relic/decompiler/win32_h.py`): kernel32·advapi32·user32·ws2_32 함수 원형 175개(`sigs.lookup`의 내장 원형: 가져오지 않아도 인자 수·타입·결과 타입), `win32` 타입 라이브러리(HANDLE·DWORD 등 typedef와 `SYSTEM_INFO`·`STARTUPINFOA`·`PROCESS_INFORMATION`·`WIN32_FIND_DATAA`·`MEMORY_BASIC_INFORMATION`·`CRITICAL_SECTION`·`MSG` 등 구조체 18개, 32/64비트 레이아웃을 mingw `<windows.h>`의 `offsetof`로 검증), PE면 기본 라이브러리(`load_type_library()`, C types 창의 Load type library); Win64에서 원형의 5번째 이후 인자를 스택(홈 영역 다음)에서 읽음(`CreateFileA` 7개), 64비트 대상에서 32비트 스택 인자 저장을 쪼개진 double로 오인하던 문제 수정, 스택 구조체의 첫 필드 접근도 필드로(`st.wYear`)
-- [x] `ccr-1ba61b91-3k0qem` 브랜치(PR #14에서 갈라져 같은 기능을 따로 만든 줄기)와 비교해 main에 없던 것을 옮김: IR 순회 가속(`children`은 정확한 타입의 사전, `transform`은 생성기·zip 없이, `walk`는 명시적 스택 — gzip 앞 60개 함수 22.3초 → 19.5초, 출력 동일), 정적 MIPS의 `$gp`를 `.reginfo`(`ri_gp_value`)에서(문자열 참조 10 → 401/1241, 점프 테이블 0 → 45), MIPS branch-likely(`beql`·`bnel` …: 지연 슬롯의 쓰기를 조건부 `x = c ? new : x`로, 손으로 쓴 `bnel` 함수의 의사 코드를 호스트에서 컴파일해 결과 비교), 따옴표 문자열 패치(`--bytes '"/bin/ls\0"'`, GUI 패치 창도), 64비트 주소를 나르는 Qt 시그널을 `object`로(PE64 주소 0x140001000이 0x40001000으로 잘려 이동하던 버그, 레지스터 편집 창의 64비트 값), 응답에 번호가 없는 watchpoint는 `DebugError`, 쓰이지 않던 `decode_block`·`has_load`·`_defs` 래퍼 제거. 옮기지 않은 것(main 쪽이 이미 같거나 더 나음): 디버거 watchpoint·레지스터 편집, ruff, MIPS GOT·점프 테이블·리프터 구조, 나눗셈 복원, 패치·콘솔. 일반 if-conversion은 테스트 2개를 깨고 읽기 좋은 `if`를 삼항식으로 바꿔 보류
-- [x] Windows(PE) 디버깅: Linux에서 PE를 열면 대상이 `wine`(자동) — wine이 gdb-mingw-w64-target의 `gdbserver.exe`(win32·win64)를 띄우고 gdb가 원격으로 붙음; 입출력은 파이프(pty면 wine이 콘솔을 흉내 내 제어 문자가 섞임), 환경 변수·입력 파일, 세션과 함께 종료; 주소 범위 없는 DLL 모듈 목록 줄도 읽음; Debugger target 창에 wine 항목; CI `test-wine` 잡. 디버거 영역 README 100%
-- [x] RISC-V RV32GC(ILP32D): 리프터를 XLEN(32/64)으로 매개변수화(FPR은 64비트), 호출 규약 `riscv32-ilp32d`, non-PIC 점프 테이블(`lui`로 만든 표, RV32 `lw`의 절대 주소 항목), 재배치 객체의 RV32 재배치; fa0-fa7을 다 쓴 뒤의 double을 정수 레지스터 쌍으로 — 피호출자는 두 워드를 나란히 저장하고 `fld`로 읽는 것을 보고 64비트 매개변수 하나로(`join_pair_params`), 호출 지점은 쌍의 값을 합침(`fsd` 뒤 `lw` 두 개로 읽은 반쪽 → 원래 double), 가변 인자 double은 짝수 정렬 쌍; double 변수의 워드는 `((unsigned int *)&x)[k]`, double 슬롯 안의 워드 접근은 겹치는 변수 대신 `((int *)&var)[1]`; 디버거 qemu-riscv32. 테스트: flow·floats(재배치 객체) 변형, 의사 코드를 자체 최소 런타임(`tests/src/rv32rt.c`: 출력·입력·getenv·수학 함수)과 함께 RV32로 컴파일해 qemu-riscv32에서 원본과 비교, qemu 디버깅. 프로세서 영역 README 80%
-- [x] Mach-O 로더(`relic/loader/macho.py`): 헤더·로드 명령(32/64비트, 빅·리틀 엔디언), 유니버설 파일(요청한 슬라이스, 없으면 x86-64, 없으면 첫 슬라이스), 세그먼트·섹션(Apple 이름 그대로), nlist 심볼(앞 밑줄 제거, 데이터는 크기 없음, `__mh_execute_header`는 함수 아님), 간접 심볼 표로 stub·포인터 슬롯마다 import(라이브러리는 n_desc의 서수), `LC_MAIN`(main 자체)·`LC_UNIXTHREAD` 진입점, `LC_FUNCTION_STARTS`, dylib·install name·rpath·UUID·플랫폼·코드 서명·FairPlay 암호화 표시; checksec; Apple arm64 호출 규약(가변 인자는 스택); clang 관용구 두 가지(-O0 카나리 실패 분기가 점프만 있는 블록을 거침, 큰 상수 나눗셈 `x / 100000`의 제수 후보 범위). 테스트는 clang·ld64.lld로 libSystem 텍스트 스텁(`tests/src/libSystem.tbd`)에 링크해 만든 x86-64·arm64 실행 파일·유니버설·dylib·stripped. 파일 포맷 영역 README 85%
-- [x] Mach-O 재배치 객체(`relic/loader/machoobj.py`: x86-64·arm64 재배치, 외부 심볼 스텁·GOT, common 심볼)와 chained fixups(rebase·bind 체인, 포인터 형식 64/64_OFFSET/32/arm64e); x86 `cdq; idiv` 나머지(`edx:eax % c`)를 원래 `x % c`로(나머지 후보에 이미 있는 상수 `%`의 제수). 파일 포맷 영역 README 90%
-- [x] Objective-C(`relic/loader/objc.py`): 클래스·메서드·ivar·속성·카테고리·selector/class 참조를 메타데이터에서 읽어 메서드 구현에 `-[Class sel:]` 이름(stripped도); `objc_msgSend` 호출의 인자 수를 셀렉터에서, 의사 코드는 `[recv sel:arg]`·`[[Cls alloc] init]`; clang -O2가 objc_msgSend를 레지스터에 담아 부르는 호출·꼬리 점프를 import로 추적(x86-64); 메서드 매개변수 `self`·`_cmd`, 타입 인코딩의 `void` 반환, ivar 접근 `self->ivar`(루프 밖으로 끌어낸 오프셋도). 테스트 바이너리 `tests/bins/`는 이제 전부 무시(앞서 들어간 Mach-O 빌드 결과 제거). 파일 포맷 영역 README 100%
-- [x] 자동 분석: `.eh_frame` FDE(진입 상태의 CFA로 `.cold` 조각·PLT 제외)를 늦은 시드·함수 경계·꼬리 호출 판정에 사용, gcc `.cold` 심볼은 함수 아님; x86 점프 테이블은 테이블을 읽는 레지스터의 `lea`만, 끌어낸 기준 레지스터는 함수 시작부터 순서대로 찾음, 음수 case 범위(`cmp x, -5; jb`); 에필로그 뒤 `jmp reg`는 함수 포인터 꼬리 호출, 식으로 전달된 인자도 인자로. stripped bash: 함수 재현율 99.9%, 해석 안 된 간접 점프 103 → 12, 다른 함수를 삼킨 3306블록짜리 함수 해소. 자동 분석 영역 README 70%
-- [x] x87 부동소수점(32비트 x86, `relic/decompiler/lift/x87.py`): 레지스터 스택을 깊이로 이름 붙임(`x87_k`는 아래에서 k번째 값 — 함수마다 명령 앞의 스택 깊이를 구함, 호출 뒤는 0, `float`를 돌려주는 호출 뒤는 1: libc 원형·내부 피호출자의 코드, 아니면 호출 뒤 코드가 넣지 않은 값을 읽는 것으로), `fld`/`fild`/`fst(p)`/`fist(p)`·사칙 연산(st(i) 형식의 방향은 opcode로)·`fxch`·`fchs`/`fabs`/`fsqrt`/`frndint`·`fcmov`·`fcomi(p)`(comisd와 같은 플래그)·`fcom` + `fnstsw ax` + `sahf`, C 캐스트를 위한 제어 워드 저장·설정·복원은 상수로(쓰레기 지역 변수 없음); cdecl의 `float`/`double` 결과는 `x87_0`(모든 `ret`에서 깊이 1이면 실수 결과, 호출자가 `fstp dword`로 받거나 결과가 float 연산이면 `float`), 스택으로 받은 `double` 매개변수(-O0의 워드 단위 복사도 하나로)·호출 인자(64비트 저장, 두 워드, libc 형식 문자열의 `%f`), float 연산을 double로 보이는 식은 float 식으로(`a1 * a2 + 1.5f`); 공통: 아무도 읽지 않는 스택 변수 쓰기 제거(역방향 활성 분석), 같은 블록에서 상수를 넣은 스택 변수 읽기는 그 상수로(호출 순서의 상수를 프레임에 두는 -O2), `low(c ? K : x)` 단순화, `pop ss`에서 리프터가 멈추던 것. `floats.c` -m32 -O0/-O2와 `-march=i386`(fnstsw 경로)을 디컴파일해 다시 컴파일한 결과가 원본과 비트 단위로 같음(C의 excess precision 규칙, `-fexcess-precision=standard`). `long double`(80비트 메모리 피연산자)은 그대로 `__asm`
-- [x] 자동 이름(차별점): stripped 함수 — `assert()`의 함수 이름 인자(`__assert_fail` 등, 디컴파일러가 복원한 호출 인자로 모든 아키텍처), 자기 이름을 담은 로그 메시지(밑줄·camelCase 식별자, 함수당 하나, libc 이름·프로그램 공통 접두사 제외), 점프 썽크 `j_X`(호출자는 X의 원형을 씀), 할당 래퍼 `xmalloc`(작은 함수, 할당 한 번, 돌아오지 않는 호출 — 이름 없는 `xalloc_die`도), `usage`, `fatal`; 이유는 `relic funcs`의 `[auto: ...]`. 변수(`relic/decompiler/varnames.py`) — `for` 카운터 `i`·`j`·`k`(중첩 순서), 알려진 호출의 결과(`fd`·`fp`·`len`·`buf`·`nread`, `getenv("HOME")` → `home`, 내부 함수 `get_config`/`count_lines` → `config`/`lines`), 타입(`FILE *fp`, `struct stat st`), 매개변수 위치(`read(fd, buf, count)`, 스택 버퍼도), `count`/`total`/`result`; 사용자 이름 우선, 다른 변수·함수·libc·키워드와 겹치지 않음, 저장은 생성된 이름 그대로. View ▸ Automatic names, `--no-auto-names`, `RELIC_AUTO_NAMES=0`. 함께: -O0의 매개변수 복사 슬롯을 매개변수 자체로(`var_1c = argc` 제거), 스택 배열 첨자 변수가 포인터로 추론되던 것(`i[buf]`). stripped `/bin/ls`에서 `sort_files`·`usage`·`xmalloc`, `bash`에서 `shell_getc`·`execute_coproc`·`vidomove_dispatch` 등; 제안된 이름으로 floats 샘플을 다시 컴파일해 비트 단위로 같음
-- [x] 1.1.1 수정: `assert()` 이름을 호출 블록의 인자 레지스터 상수에서 먼저 읽음(x86-64 `lea rcx, [rip + __func__]`, AArch64 `adrp`+`add` 접기) — 함수와 그 피호출자 전체를 디컴파일하지 않아 stripped `gdb` 분석에서 30초 넘게 줄어듦(이름은 같음, 못 찾으면 디컴파일러로); 변수 이름의 동사 접두사를 단어로만(`initialize_table` → `ialize_table`, `calculate_sum` → `ulate_sum`이던 것); 변수 제안이 자동 함수 이름과 겹치지 않음; 서로를 가리키는 구조체(A → B → A)에서 `StructView._use`가 무한 재귀하던 것(`bash` 일부 함수); GUI의 자동 이름 기본값이 `RELIC_AUTO_NAMES`를 따름
-- [x] 속도 개선(알고리즘·출력 그대로 — 샘플·ls·find·make·bash·gdb 49개 바이너리의 함수 목록·xref·문자열·모든 의사 코드가 바이트 단위로 같음): gap 스캔이 한 번 본 gap을 다시 탐색하지 않음(시작은 바이트로만 정해짐)·drain이 더한 함수는 dict 끝에서(전체 집합 차 대신)·`next_gap` 루프 — stripped `gdb` 분석 34초 → 23초; 구조화기의 지배 관계를 지배 트리 전위 구간으로 O(1), `_join`은 첫 후보에서 멈춤; `drop_dead_locals`가 문장별 읽기·kill을 한 번만; IR 핵심(`transform`·`walk`·`_fold_node`·`_simp_node`·`_add_uses`의 리프 단축, 타입 디스패치 `rebuild`, 제너레이터 없는 `has`, `_rewrite`의 `Assign` 단축, `_known_zext`, copyreg 없는 `copy_stmt`) — 전체 디컴파일 ls 15.2→12.2초, find 20.9→14.9초, make 32.6→25.2초, MinGW PE 19.0→10.8초
-- [x] 속도 개선 2차(출력 그대로): gap 스캔이 이미 탐색한 gap을 걷지 않고 바뀔 수 있는 곳(새 블록 옆·재개 지점·가장 멀리 탐색한 곳 너머)만 봄(`_walk_gaps`, 단순 순회와 같은 탐색·순서를 무작위 테스트로 확인), x86 피연산자 텍스트 파싱 캐시, xref 직접 추가 — stripped `gdb` 분석 28.9 → 21.3초(최선 3회); 일괄 디컴파일(`decompile --all`, `-o` 내보내기)에서 구조체 스캔이 준비한 함수를 그 함수의 디컴파일에 한 번 재사용(`pipeline.prepared_once`, 스레드 한정·GUI 미사용; 47개 바이너리의 588개 함수에서 스캔 때 준비한 것과 나중에 새로 준비한 것이 같음) — `decompile --all` make 44.6 → 29.4초, MinGW PE 27.0 → 14.5초, find 28.9 → 19.6초, ls 22.1 → 16.7초. 함께 고침: `decompile --all`이 디컴파일할 수 없는 함수(MinGW `__CTOR_LIST__` — `.text`의 데이터에 붙은 심볼)에서 traceback으로 멈추던 것 — 그 자리에 이유를 쓰고 계속
+- GitHub Actions CI: Python 3.10, 3.12, 3.13에서 pytest를 돌린다. ARM, AArch64, MIPS, RISC-V, PowerPC 크로스
+  컴파일러가 필요한 테스트는 따로 job을 두고, 거기서 빌드한 샘플을 본 테스트 job에 넘긴다. Windows 디버깅은
+  wine job에서 확인한다.
+- 테스트는 샘플 바이너리를 그때그때 빌드한다. 병렬 워커가 같은 샘플을 동시에 빌드하다 덜 쓴 파일을 읽는 일이
+  있어서, 임시 파일에 쓰고 이름을 바꾸게 했다.
+- 디컴파일 결과를 다시 컴파일해서 원본과 같은 입력으로 돌려 비교하는 테스트가 아키텍처마다 있다. 다른
+  아키텍처는 qemu-user로 돌린다.
+- ruff 린트(E/F/W/B). 포맷터와 import 정렬은 기존 줄바꿈 스타일과 맞지 않아서 쓰지 않는다.
+- 릴리스는 Actions의 Release 워크플로로 만든다. 버전을 확인하고, Windows, Linux, macOS용 실행 파일(PyInstaller)과
+  wheel을 빌드해 시험한 뒤, 태그를 달고 `docs/releases/<버전>.md`를 노트로 게시한다.
