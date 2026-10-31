@@ -10,14 +10,14 @@ The goal is admittedly ambitious: something as good as IDA Pro with Hex-Rays, an
 can manage it. It isn't there yet. But for the everyday stuff it already works well: opening an
 x86-64 or ARM binary, finding your way around, naming things, reading the pseudocode, and
 measuring an overflow offset in the debugger. The current release is
-[1.1.3](https://github.com/ljw097/relic/releases/tag/v1.1.3).
+[1.1.4](https://github.com/ljw097/relic/releases/tag/v1.1.4).
 
 ![The Relic debugger stopped in vuln() right after gets(): the AAAA… input shows up in the registers and the stack telescope](docs/screenshots/debugger.png)
 
 ## Installing
 
 Grab the executable for your system from the
-[release page](https://github.com/ljw097/relic/releases/tag/v1.1.3) and run it. There's nothing
+[release page](https://github.com/ljw097/relic/releases/tag/v1.1.4) and run it. There's nothing
 to install:
 
 - **Windows**: `relic-<version>-windows-x86_64.exe`
@@ -34,7 +34,7 @@ If you have Python 3.10 or newer, you can install the wheel from the release pag
 
 ```sh
 python3 -m venv .venv
-.venv/bin/pip install https://github.com/ljw097/relic/releases/download/v1.1.3/relic_re-1.1.3-py3-none-any.whl
+.venv/bin/pip install https://github.com/ljw097/relic/releases/download/v1.1.4/relic_re-1.1.4-py3-none-any.whl
 .venv/bin/relic
 ```
 

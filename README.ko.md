@@ -9,13 +9,13 @@ GUI는 PySide6, 명령어 디코딩은 capstone을 쓰고, 그 위에 올라가�
 목표는 솔직히 좀 거창합니다. IDA Pro + Hex-Rays만큼, 할 수 있다면 그보다 낫게 만드는 겁니다. 아직 거기까지는
 멀었지만, x86-64나 ARM 바이너리를 열어서 함수를 훑어보고, 이름을 붙이고, 의사 코드를 읽고, 디버거로
 오버플로 오프셋을 재는 정도는 지금도 충분히 됩니다. 현재 버전은
-[1.1.3](https://github.com/ljw097/relic/releases/tag/v1.1.3)입니다.
+[1.1.4](https://github.com/ljw097/relic/releases/tag/v1.1.4)입니다.
 
 ![Relic 디버거: vuln()에서 gets() 직후에 멈춘 화면. 입력한 AAAA…가 레지스터와 스택 telescope에 보인다](docs/screenshots/debugger.png)
 
 ## 설치
 
-[릴리스 페이지](https://github.com/ljw097/relic/releases/tag/v1.1.3)에서 운영체제에 맞는 실행 파일을 받아
+[릴리스 페이지](https://github.com/ljw097/relic/releases/tag/v1.1.4)에서 운영체제에 맞는 실행 파일을 받아
 실행하면 됩니다. 설치 과정은 없습니다.
 
 - **Windows**: `relic-<버전>-windows-x86_64.exe`
@@ -31,7 +31,7 @@ Python 3.10 이상이 있다면 릴리스 페이지의 wheel을 설치해도 됩
 
 ```sh
 python3 -m venv .venv
-.venv/bin/pip install https://github.com/ljw097/relic/releases/download/v1.1.3/relic_re-1.1.3-py3-none-any.whl
+.venv/bin/pip install https://github.com/ljw097/relic/releases/download/v1.1.4/relic_re-1.1.4-py3-none-any.whl
 .venv/bin/relic
 ```
 
