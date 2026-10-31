@@ -116,7 +116,7 @@ matters to me when I'm actually reversing something. Right now it comes to **abo
 | Auto-analysis (14) | 100% | Finds 99.9% of the functions in stripped bash, and 99.96% even with `.eh_frame` removed. C++ classes from RTTI, virtual and indirect call targets, data mixed into code. bash takes about 7 seconds |
 | Library identification (8) | 100% | Names 83–94% of the original functions in stripped static test binaries, with no wrong names |
 | Type system (10) | 90% | libc flags print as their constants (`PROT_READ \| PROT_WRITE`), header `#define` groups become enums. Structs passed or returned by value aren't supported yet |
-| Decompiler (20) | 60% | Half as many gotos as when I started measuring; most of the rest are in big state machines like gnulib's `quotearg`. SSE/AVX shows as intrinsics, x87 works except `long double` |
+| Decompiler (20) | 60% | Half as many gotos as when I started measuring; most of the rest are in big state machines like gnulib's `quotearg`. SSE/AVX shows as intrinsics, x87 works, `long double` included |
 | Interactive UI (12) | 100% | |
 | Scripting & extensions (8) | 100% | |
 | Debugger (7) | 100% | Windows programs run under wine with Windows' own gdbserver.exe |

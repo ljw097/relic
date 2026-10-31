@@ -24,7 +24,8 @@ _X64_SCRATCH = ("rax", "rcx", "rdx", "rsi", "rdi", "r8", "r9", "r10", "r11", *FL
 X64_SYSV = ArchInfo(
     "x64-sysv", 64, "rsp", "rax",
     call_reads=("rdi", "rsi", "rdx", "rcx", "r8", "r9", "rax", "rsp", *(f"xmm{k}" for k in range(8))),
-    call_clobbers=_X64_SCRATCH,
+    # (the x87 stack: a long double result comes back in x87_0)
+    call_clobbers=(*_X64_SCRATCH, *(f"x87_{k}" for k in range(8))),
     syscall_reads=("rax", "rdi", "rsi", "rdx", "r10", "r8", "r9"),
     syscall_clobbers=("rax", "rcx", "r11"),
 )

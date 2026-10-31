@@ -119,7 +119,9 @@ def _prepare(fn: IRFunction, arch: ArchInfo) -> IRFunction:
     for s in fn.stmts():
         if isinstance(s, CallStmt) and not s.uses and not s.defs:
             s.uses = [(r, reg(r)) for r in arch.call_reads if not r.startswith("xmm") or r in _seen(fn)]
-            s.defs = [(r, reg(r)) for r in arch.call_clobbers if (not r.startswith("xmm") or r in _seen(fn))
+            # (x86-64's x87 registers too: only in the functions that use them, for long doubles)
+            s.defs = [(r, reg(r)) for r in arch.call_clobbers
+                      if (not r.startswith(("xmm", "x87_")) or r in _seen(fn) or arch.bits == 32)
                       and (s.clobbers is None or r in s.clobbers)]
         elif isinstance(s, Return) and s.value is None:
             s.value = reg(arch.ret)

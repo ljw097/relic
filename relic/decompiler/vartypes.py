@@ -22,9 +22,10 @@ from .ir import (Assign, BinOp, Call, CallStmt, Cast, Const, Expr, IRFunction, I
 if TYPE_CHECKING:
     from .sigs import Sig
 
-_INT = {1: "bool", 8: "char", 16: "short", 32: "int", 64: "int64_t", 128: "__int128"}
+# (80 bits: only ever an x87 long double)
+_INT = {1: "bool", 8: "char", 16: "short", 32: "int", 64: "int64_t", 80: "long double", 128: "__int128"}
 _UINT = {1: "bool", 8: "unsigned char", 16: "unsigned short", 32: "unsigned int", 64: "uint64_t",
-         128: "unsigned __int128"}
+         80: "long double", 128: "unsigned __int128"}
 
 
 def int_type(bits: int, unsigned: bool = False) -> str:

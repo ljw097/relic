@@ -258,9 +258,10 @@ def _strip(e):
 
 
 def _result_reg(w: "CWriter", s: CallStmt) -> str:
-    from .fpabi import callee_ret, fp_ret_reg, is_fp_arch
+    from .fpabi import callee_ret, fp_result_reg, is_fp_arch
     arch = w.p.arch
-    return fp_ret_reg(arch) if is_fp_arch(arch) and callee_ret(w.an, s) else arch.ret
+    bits = callee_ret(w.an, s) if is_fp_arch(arch) else None
+    return fp_result_reg(arch, bits) if bits else arch.ret
 
 
 def _result_name(an, callee: str | None, call: ir.Call) -> str | None:

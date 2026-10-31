@@ -163,9 +163,9 @@ def _read_form(e: Expr, reg: str):
     if isinstance(e, Extract) and isinstance(e.a, Reg) and e.a.name == reg:
         return "whole"
     from .ir import Intrinsic
-    if isinstance(e, Intrinsic) and e.name == "fpconv" and e.bits == 32 and reg.startswith("x87_") and \
+    if isinstance(e, Intrinsic) and e.name == "fpconv" and e.bits in (32, 80) and reg.startswith("x87_") and \
             isinstance(e.args[0], Reg) and e.args[0].name == reg:
-        return 32                       # (an x87 register holds a float result as a double)
+        return e.bits                   # (an x87 register holds a float result as a double)
     if isinstance(e, Reg) and e.name == reg:
         return "whole"
     forms = [f for f in (_read_form(k, reg) for k in children(e)) if f is not None]

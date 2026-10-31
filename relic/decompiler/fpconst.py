@@ -13,7 +13,7 @@ if TYPE_CHECKING:
 
 
 def _ro_value(an: "Analysis", e: Expr) -> Const | None:
-    if not (isinstance(e, Load) and isinstance(e.addr, Const) and e.bits in (32, 64)):
+    if not (isinstance(e, Load) and isinstance(e.addr, Const) and e.bits in (32, 64, 80)):
         return None
     sec = an.bin.section_at(e.addr.value)
     if sec is None or sec.w or sec.x or not sec.loaded:
@@ -73,12 +73,13 @@ def fold_float_constants(an: "Analysis", fn: IRFunction, extra=()) -> int:
 
 
 def float_types(fn: IRFunction, params_fp: dict[str, int], ret_float: bool,
-                callee_ret=lambda stmt: None, ret_reg: str = "xmm0") -> dict[str, int]:
+                callee_ret=lambda stmt: None, ret_reg="xmm0") -> dict[str, int]:
     """Variables (register Vars and stack locals) that hold floats -> width (64 double, 32 float).
 
     A variable is a float when a floating-point operation reads or produces it, when it is a
     float parameter or the float result of a call, is returned as the float result, or is a copy
-    of (or copied to) one."""
+    of (or copied to) one. `ret_reg`: the register a call's float result is in, or a function of
+    its width giving it."""
     from .ir import Assign, Call, Cast, CallStmt, Return, StackVar, Store, Var, stmt_exprs, walk
     out: dict[str, int] = dict(params_fp)
 
@@ -89,7 +90,7 @@ def float_types(fn: IRFunction, params_fp: dict[str, int], ret_float: bool,
 
     def mark(e: Expr, w: int):
         v = name_of(e)
-        if v is not None and w in (32, 64):
+        if v is not None and w in (32, 64, 80):
             out.setdefault(v.name, w)
 
     copies = []
@@ -118,7 +119,10 @@ def float_types(fn: IRFunction, params_fp: dict[str, int], ret_float: bool,
             src = s.src
             inner = src.a if isinstance(src, Cast) and src.kind == "zext" else src
             if is_float_expr(inner):
-                mark(s.dst, inner.bits)
+                # an x87 register given a long double holds all of it (the lifter models it as a
+                # double); a double in memory is rounded to one
+                ld = isinstance(inner, Intrinsic) and inner.name == "fpconv" and inner.args[0].bits == 80
+                mark(s.dst, 80 if ld and isinstance(s.dst, Var) else inner.bits)
             elif name_of(src) is not None and name_of(s.dst) is not None:
                 copies.append((name_of(s.dst), name_of(src)))
             elif isinstance(inner, Ite) and (is_float_expr(inner.a) or is_float_expr(inner.b)):
@@ -126,8 +130,9 @@ def float_types(fn: IRFunction, params_fp: dict[str, int], ret_float: bool,
         if isinstance(s, CallStmt):
             w = callee_ret(s)
             if w is not None:
+                reg = ret_reg(w) if callable(ret_reg) else ret_reg
                 for r, d in s.defs:
-                    if r == ret_reg:
+                    if r == reg:
                         mark(d, w)
         for top in stmt_exprs(s):
             for x in walk(top):
@@ -147,7 +152,37 @@ def float_types(fn: IRFunction, params_fp: dict[str, int], ret_float: bool,
             elif src.name in out and d.name not in out and d.name not in ints:
                 out[d.name] = out[src.name]
                 changed = True
+    _long_double_registers(fn, out, copies)
     return out
+
+
+def _long_double_registers(fn: IRFunction, out: dict[str, int], copies) -> None:
+    """x87 values (registers, not memory) computed from a long double are long doubles: the x87
+    keeps all 80 bits (`s += table[i]` sums in long double; the lifter models the register as
+    a double). Upgrades those of `out` in place."""
+    from .ir import Assign, Var, stmt_exprs, walk
+    if 80 not in out.values() and not any(isinstance(x, Intrinsic) and x.name == "fpconv" and x.args[0].bits == 80
+                                          for s in fn.stmts() for top in stmt_exprs(s) for x in walk(top)):
+        return
+    assigns = [(s.dst, s.src) for s in fn.stmts() if isinstance(s, Assign) and isinstance(s.dst, Var)
+               and out.get(s.dst.name) == 64 and is_float_expr(s.src)]
+
+    def long_double(e: Expr) -> bool:
+        return any(isinstance(x, Intrinsic) and x.name == "fpconv" and x.args[0].bits == 80 or
+                   isinstance(x, Var) and out.get(x.name) == 80 for x in walk(e))
+    changed = True
+    while changed:
+        changed = False
+        for d, src in assigns:
+            if out[d.name] == 64 and long_double(src):
+                out[d.name] = 80
+                changed = True
+        for d, src in copies:
+            if isinstance(d, Var) and isinstance(src, Var):
+                for a, b in ((d, src), (src, d)):
+                    if out.get(a.name) == 80 and out.get(b.name) == 64:
+                        out[b.name] = 80
+                        changed = True
 
 
 def float_pointees(fn: IRFunction, ftypes: dict[str, int], is_addr=lambda v: False) -> dict[str, int]:
@@ -161,7 +196,7 @@ def float_pointees(fn: IRFunction, ftypes: dict[str, int], is_addr=lambda v: Fal
     def mem(load: Expr):
         if isinstance(load, Cast) and load.kind in ("low", "zext"):
             load = load.a
-        if isinstance(load, Load) and load.bits in (32, 64):
+        if isinstance(load, Load) and load.bits in (32, 64, 80):
             b = _addr_base(load.addr, is_addr)
             if b is not None:
                 out.setdefault(b.name, load.bits)
@@ -177,7 +212,7 @@ def float_pointees(fn: IRFunction, ftypes: dict[str, int], is_addr=lambda v: Fal
                             mem(x.args[k])
         if isinstance(s, Assign) and isinstance(s.dst, (Var, StackVar)) and s.dst.name in ftypes:
             mem(s.src)
-        if isinstance(s, Store) and s.src.bits in (32, 64):
+        if isinstance(s, Store) and s.src.bits in (32, 64, 80):
             v = s.src.a if isinstance(s.src, Cast) and s.src.kind == "low" else s.src
             if is_float_expr(v) or isinstance(v, (Var, StackVar)) and v.name in ftypes:
                 b = _addr_base(s.dst, is_addr)
