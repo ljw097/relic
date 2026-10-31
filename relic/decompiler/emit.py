@@ -1137,6 +1137,15 @@ class CWriter:
                     return f"(char *){self.expr(b, PREC_UNARY)} + {self.expr(a, p + 1)}", p
             elif self._ptr_size(a) > 1:   # byte offset that is not a whole element
                 return f"(char *){self.expr(a, PREC_UNARY)} {op} {self.expr(b, p + 1)}", p
+        if e.op in ("+", "-"):
+            for x, y in ((a, b), (b, a)) if e.op == "+" else ((a, b),):
+                if isinstance(x, (Const, StackAddr)) and not isinstance(y, (Const, StackAddr)) or \
+                        isinstance(x, StackAddr) and isinstance(y, Const):
+                    obj = self.expr(x)
+                    if obj.startswith("&"):
+                        # a byte offset from an object's address: C would scale `&table + n` (and
+                        # `&var_9c + 4`) by the size of the whole object
+                        return f"(char *){obj} {op} {self.expr(y, p + 1)}", p
         if e.op == "+" and isinstance(b, Const) and b.signed < 0 and b.bits >= 8:
             return f"{self.expr(a, p)} - {number(-b.signed)}", p
         if e.op == "-" and isinstance(b, Const) and b.signed < 0 and b.bits >= 8 and -b.signed < 0x10000:

@@ -223,3 +223,30 @@ def test_unknown_instructions_are_kept():
     assert [u.text for u in fn.unknowns()] == ["fxam"]
     assert isinstance(fn.unknowns()[0], Unknown)
     assert 'cpuid()' in str(fn) and '__asm("fxam")' in str(fn)
+
+
+_OBJ_OFFSETS_C = r"""
+int tab[8];
+int main(int argc, char **argv) {
+    tab[argc & 7] = 3;
+    return *(int *)((char *)tab + (argc * 4 + 3) / 2 * 2);
+}
+"""
+
+
+def test_byte_offsets_from_an_objects_address_are_bytes(tmp_path):
+    """`&tab + n` in C counts whole arrays: a byte offset from an object's address prints as
+    `(char *)&tab + n`."""
+    import shutil
+    import subprocess
+
+    from relic.decompiler.emit import decompile
+    if not shutil.which("gcc"):
+        pytest.skip("no gcc")
+    src, exe = tmp_path / "o.c", tmp_path / "o"
+    src.write_text(_OBJ_OFFSETS_C)
+    subprocess.run(["gcc", "-O1", "-no-pie", "-fno-stack-protector", "-o", str(exe), str(src)], check=True)
+    an = analyze(str(exe))
+    text = decompile(an, an.function_by_name("main")).text
+    assert "(char *)&tab + " in text, text
+    assert "+ &tab" not in text and "&tab +" not in text.replace("(char *)&tab +", ""), text
