@@ -44,6 +44,12 @@ def fp_ret_reg(arch: ArchInfo) -> str:
     return FP_RET
 
 
+def fp_result_reg(arch: ArchInfo, bits: int | None) -> str:
+    """The register a float result of this width comes back in: x86-64 returns a long double on
+    the x87 stack, everything else in fp_ret_reg."""
+    return "x87_0" if bits == 80 else fp_ret_reg(arch)
+
+
 def fp_part(name: str) -> tuple[str, int, int | None]:
     """(register holding it, low bit, width or None for the whole) of an FP argument location:
     ARM `s5` is the high half of `d2`; `d2`, `xmm3`, `v3` are themselves; RISC-V `=a1` (a float
@@ -79,6 +85,12 @@ FP_SIGS = {
     "lround": ("d", "long"), "lrint": ("d", "long"),
     "atof": ("s", "double"), "strtod": ("sp", "double"), "strtof": ("sp", "float"), "drand48": ("", "double"),
     "difftime": ("ii", "double"),
+    # long double (x86 / x86-64: the x87's 80 bits)
+    "sqrtl": ("L", "long double"), "fabsl": ("L", "long double"), "floorl": ("L", "long double"),
+    "ceill": ("L", "long double"), "truncl": ("L", "long double"), "roundl": ("L", "long double"),
+    "expl": ("L", "long double"), "logl": ("L", "long double"), "log10l": ("L", "long double"),
+    "sinl": ("L", "long double"), "cosl": ("L", "long double"), "powl": ("LL", "long double"),
+    "fmodl": ("LL", "long double"), "strtold": ("sp", "long double"),
 }
 
 
@@ -95,7 +107,7 @@ def ret_bits_of(name: str | None) -> int | None:
     s = fp_sig(name)
     if s is None:
         return None
-    return {"double": 64, "float": 32}.get(s[1])
+    return {"double": 64, "float": 32, "long double": 80}.get(s[1])
 
 
 def _width(e: Expr) -> int | None:
@@ -146,7 +158,8 @@ def _cache(an: "Analysis", key: str) -> dict:
 
 
 def fp_return(an: "Analysis", func: "Function") -> int | None:
-    """Width (64 double, 32 float) of a floating-point result `func` returns in xmm0, else None."""
+    """Width (64 double, 32 float, 80 long double) of a floating-point result `func` returns (in
+    xmm0, or the register fp_result_reg names), else None."""
     from .arch import arch_for
     try:
         arch = arch_for(an.bin)
@@ -179,13 +192,14 @@ def set_fp_returns(an: "Analysis", func: "Function", fn: IRFunction) -> int | No
     w = fp_return(an, func)
     if w is not None:
         from .arch import arch_for
-        reg = fp_ret_reg(arch_for(an.bin))
+        reg = fp_result_reg(arch_for(an.bin), w)
         ppc = an.bin.arch.startswith("ppc")
         for s in fn.stmts():
             if isinstance(s, Return) and s.value is None:
-                if (ppc or reg.startswith("x87_")) and w == 32:     # a float result is the double form's value
+                if (ppc or reg.startswith("x87_")) and w in (32, 80):
+                    # a float result is the double form's value (an x87 register: a long double)
                     from .ir import Intrinsic
-                    s.value = Intrinsic("fpconv", (Reg(reg, 64),), 32)
+                    s.value = Intrinsic("fpconv", (Reg(reg, 64),), w)
                 else:
                     s.value = Cast("low", Reg(reg, reg_bits(reg)), w) if w < reg_bits(reg) else Reg(reg, w)
     return w
@@ -195,6 +209,8 @@ def _fp_return(an, func, arch) -> int | None:
     from .cleanup import _lifted, result_reads
     if arch.name == "x86-cdecl":
         return _x87_return(an, func, arch)
+    if arch.name.startswith("x64") and _x87_leaves_one(an, func, only=80):
+        return 80                   # x86-64 returns a long double on the x87 stack, the rest in xmm0
     xr = result_reads(an, func, fp_ret_reg(arch))
     ir_ = result_reads(an, func, arch.ret)
     xmm_w = [r for r in xr if isinstance(r, int)]
@@ -230,26 +246,60 @@ def _x87_return(an, func, arch) -> int | None:
     """x87: a function returns a float exactly when it leaves one value on the stack at every
     `ret` (the ABI hands back an empty stack otherwise) -- or tail-calls one that does. A float
     when callers store it as one (`fstp dword`) or its values are float arithmetic, else a double."""
-    from ..disasm import RET
     from .cleanup import result_reads
+    if not _x87_leaves_one(an, func):
+        return None
+    every = result_reads(an, func, fp_ret_reg(arch))
+    reads = [r for r in every if isinstance(r, int)]
+    if reads and all(r == 32 for r in reads) or not reads and _x87_float_result(an, func, arch):
+        return 32
+    # (a caller storing it whole, `fstp qword`, takes a double)
+    if reads and all(r == 80 for r in reads) or not reads and "whole" not in every and _x87_long_double(func):
+        return 80
+    return 64
+
+
+def _x87_leaves_one(an, func, only: int | None = None) -> bool:
+    """Whether the function leaves one value on the x87 stack at every `ret`, or tail-calls one
+    that does: its float result (32-bit x86), its long double one (x86-64: `only` = 80, the one
+    width the x87 returns there)."""
+    from ..disasm import RET
     from .lift.x87 import depths
+    if not any(i.mnemonic.startswith("f") for b in func.blocks.values() for i in b.insns) and \
+            not getattr(func, "tail_calls", ()):
+        return False                    # (no x87 instruction: no walk)
     try:
         d = depths(an, func)
     except Exception:  # noqa: BLE001 - no x87 summary for a function that does not decode
-        return None
+        return False
     exits = [d.get(i.addr) for b in func.blocks.values() for i in b.insns if i.kind == RET]
     tails = [an.functions.get(t) for t in getattr(func, "tail_calls", ())]
     if not exits and not tails:
-        return None
+        return False
     if any(x != 1 for x in exits):
-        return None
-    if any(t is None or t.is_import and ret_bits_of(an.name(t.addr)) is None or
-           not t.is_import and fp_return(an, t) is None for t in tails):
-        return None
-    reads = [r for r in result_reads(an, func, fp_ret_reg(arch)) if isinstance(r, int)]
-    if reads and all(r == 32 for r in reads) or not reads and _x87_float_result(an, func, arch):
-        return 32
-    return 64
+        return False
+    def width(t):
+        return ret_bits_of(an.name(t.addr)) if t.is_import else fp_return(an, t)
+    return not any(t is None or width(t) is None or only is not None and width(t) != only for t in tails)
+
+
+def _x87_long_double(func) -> bool:
+    """32-bit x86: the function reads or writes a long double (`fld tbyte`, `fstp tbyte`) -- what
+    it leaves on the x87 stack is one too, when no caller says otherwise -- and does not reload
+    its result from a double or a float just before returning (how a long double is rounded to
+    the `double` the function returns)."""
+    from ..disasm import OP_MEM, RET
+    from .lift.x87 import is_x87
+    mem = lambda i: next((o.size for o in i.cs.operands if o.type == OP_MEM), None)
+    if not any(is_x87(i.mnemonic) and mem(i) == 10 for b in func.blocks.values() for i in b.insns):
+        return False
+    for b in func.blocks.values():
+        if not b.insns or b.insns[-1].kind != RET:
+            continue
+        last = next((i for i in reversed(b.insns) if is_x87(i.mnemonic)), None)
+        if last is not None and last.mnemonic == "fld" and mem(last) in (4, 8):
+            return False
+    return True
 
 
 def _x87_float_result(an, func, arch) -> bool:
@@ -529,12 +579,16 @@ def join_pair_params(fn, pairs: list[str]):
         b.stmts = [s for s in stmts if s is not None]
 
 
-def arg_classes(sig, fmt: str | None, fsig=None, scan: bool = False, wide: bool = False) -> list[str] | None:
+def arg_classes(sig, fmt: str | None, fsig=None, scan: bool = False, wide: bool = False,
+                ldouble: bool = False) -> list[str] | None:
     """`i` / `d` / `f` per argument of a libc call, in order: the signature's fixed arguments and,
     for printf-style formats, one per conversion (`%f` and friends take a double). With `wide`,
-    `q` for a 64-bit integer conversion (`%lld`, `%jd`: two words on a 32-bit stack)."""
+    `q` for a 64-bit integer conversion (`%lld`, `%jd`: two words on a 32-bit stack). With
+    `ldouble` (x86, x86-64), `L` for a long double (`%Lf`), which goes on the stack; else it is
+    a double."""
     if fsig is not None:
-        return ["d" if ch == "d" else "f" if ch == "f" else "i" for ch in fsig[0]]
+        return ["d" if ch == "d" else "f" if ch == "f" else ("L" if ldouble else "d") if ch == "L" else "i"
+                for ch in fsig[0]]
     if sig is None:
         return None
     from .sigs import _CONV
@@ -549,7 +603,10 @@ def arg_classes(sig, fmt: str | None, fsig=None, scan: bool = False, wide: bool 
             continue
         out += ["i"] * ((m.group(2) == "*") + (m.group(4) == "*"))
         wide_int = wide and not scan and m.group(5) in ("ll", "j") and conv in "diouxX"
-        out.append("d" if conv in FLOAT_CONVS and not scan else "q" if wide_int else "i")
+        if conv in FLOAT_CONVS and not scan:
+            out.append("L" if ldouble and m.group(5) == "L" else "d")
+        else:
+            out.append("q" if wide_int else "i")
     return out
 
 
@@ -638,7 +695,9 @@ def place_args(arch: ArchInfo, classes: list[str], int_regs: tuple[str, ...],
         return out
     ni = nf = 0
     for c in classes:
-        if c in "df":
+        if c == "L":
+            out.append(None)                # a long double: always in memory (SysV x86-64)
+        elif c in "df":
             out.append(fpr[nf] if nf < len(fpr) else None)
             nf += 1
         else:

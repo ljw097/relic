@@ -13,7 +13,10 @@ signatures and the internal callee's own code, else from the code after the call
 reading a value it did not push.
 
 Values are modelled as doubles. The hardware keeps 80 bits and rounds when
-storing; `long double` memory operands (`fld tbyte`) stay opaque.
+storing; a `long double` in memory (`fld tbyte`, `fstp tbyte`) is converted
+from and to that double (`fpconv`, 80 bits), which the C output shows as the
+implicit conversion it is. x86-64 uses the x87 for `long double` only, and
+returns one in `x87_0` as well (fpabi.fp_result_reg).
 """
 from __future__ import annotations
 
@@ -81,15 +84,20 @@ def _st_index(i: "Insn") -> int | None:
 
 
 def _call_returns_float(an: "Analysis", i: "Insn") -> bool:
+    """Whether the call leaves its result on the x87 stack: any float result on 32-bit x86, only
+    a long double on x86-64 (the others come back in xmm0)."""
     from ..fpabi import fp_return, ret_bits_of
     t = i.target
     if t is None:
         return False
-    if ret_bits_of(an.name(t)) is not None:
-        return True
+    x64 = an.bin.bits == 64
+    w = ret_bits_of(an.name(t))
+    if w is not None:
+        return w == 80 or not x64
     f = an.functions.get(t)
     if f is not None and not f.is_import:
-        return fp_return(an, f) is not None
+        w = fp_return(an, f)
+        return w is not None and (w == 80 or not x64)
     return False
 
 
@@ -204,7 +212,9 @@ class X87Mixin:
             return Intrinsic("fpconv", (v,), 64)
         if w == 64:
             return v
-        raise self._lift_error("80-bit float")
+        if w == 80:
+            return Intrinsic("fpconv", (v,), 64)        # a long double (fld tbyte)
+        raise self._lift_error(f"{w}-bit float")
 
     def lift_x87(self, i, m: str):
         d = self._x87_depth()
@@ -223,9 +233,9 @@ class X87Mixin:
         elif m in ("fst", "fstp"):
             if mem is not None:
                 w = mem.size * 8
-                if w not in (32, 64):
-                    raise self._lift_error("80-bit float")
-                v = st(0) if w == 64 else Intrinsic("fpconv", (st(0),), 32)
+                if w not in (32, 64, 80):
+                    raise self._lift_error(f"{w}-bit float")
+                v = st(0) if w == 64 else Intrinsic("fpconv", (st(0),), w)
                 self.emit(Store(i.addr, self.addr_of(mem), v))
             else:
                 k = _st(i, regs[0])
@@ -246,6 +256,8 @@ class X87Mixin:
             self.assign(st(0), UnOp("fneg", st(0), 64))
         elif m in ("fabs", "fsqrt", "frndint"):
             name = {"fabs": "fabs", "fsqrt": "sqrt", "frndint": "rint"}[m]
+            if self.an.bin.bits == 64:
+                name += "l"                 # (x86-64 uses the x87 for long doubles only: sqrtl)
             self.assign(st(0), Intrinsic(name, (st(0),), 64))
         elif m in ("fcomi", "fucomi", "fcomip", "fucomip", "fcompi", "fucompi"):
             self._x87_flags(st(0), st(_st(i, regs[-1]) if regs else 1))

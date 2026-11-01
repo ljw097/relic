@@ -7,12 +7,24 @@ comment saying why instead of stopping the export. Progress goes through `relic.
 """
 from __future__ import annotations
 
+import re
 from typing import TYPE_CHECKING, TextIO
 
 from ..progress import Cancelled, checkpoint, report
 
 if TYPE_CHECKING:
     from ..analysis import Analysis, Function
+
+
+_DECL = re.compile(r"(struct|union|enum) (\w+) \{")
+
+
+def _decl_key(block: list[str]) -> object:
+    """What identifies a declaration block: a struct / union / enum by its name (a recovered
+    struct is shared between functions and grows as more of them are decompiled, so the same
+    name comes with more fields later on), anything else by its first line."""
+    m = _DECL.match(block[0])
+    return (m.group(1), m.group(2)) if m else block[0]
 
 
 def _split(an: "Analysis", func: "Function", d) -> tuple[list[list[str]], list[str]]:
@@ -45,7 +57,7 @@ def export_c(an: "Analysis", out: TextIO, funcs: list["Function"] | None = None,
     from .emit import decompile
     if funcs is None:
         funcs = [f for f in sorted(an.functions.values(), key=lambda f: f.addr) if not f.is_import]
-    structs: dict[str, list[str]] = {}            # first line -> block (one per struct)
+    structs: dict[object, list[str]] = {}         # declaration -> block (one per struct)
     bodies: list[list[str]] = []
     failed: list[str] = []
     total = len(funcs)
@@ -63,7 +75,9 @@ def export_c(an: "Analysis", out: TextIO, funcs: list["Function"] | None = None,
             continue
         blocks, body = _split(an, f, d)
         for blk in blocks:
-            structs.setdefault(blk[0], blk)
+            # (the latest: the struct as every function decompiled so far has seen it; it keeps the
+            # place of the first, ahead of whatever uses it by value)
+            structs[_decl_key(blk)] = blk
         bodies.append([f"// {name} @ {f.addr:#x}"] + body)
     report("export", total, total)
     out.write(f"/* {an.bin.path}: pseudocode by relic ({an.bin.describe()}) */\n\n")

@@ -140,6 +140,25 @@ BIN = {"||": ("||", 4), "&&": ("&&", 5), "|": ("|", 6), "^": ("^", 7), "&": ("&"
 FLIP = {"<": ">", "<=": ">="}
 
 
+def _x87_conv(e: Expr) -> bool:
+    """`fpconv` between a long double and a double (lift/x87.py: `fld tbyte`, `fstp tbyte`)."""
+    if not (isinstance(e, Intrinsic) and e.name == "fpconv" and len(e.args) == 1):
+        return False
+    x = e.args[0]
+    # (a call's result is in the x87 register whatever width the call expression has)
+    return {e.bits, x.bits} == {64, 80} or e.bits == 80 and isinstance(x, ir.Call)
+
+
+def float_ctype(bits: int) -> str:
+    return {32: "float", 80: "long double"}.get(bits, "double")
+
+
+def _mem_type(bits: int) -> str:
+    """The type memory of this width is read as when nothing says more: an integer, but ten bytes
+    can only be an x87 long double."""
+    return "long double" if bits == 80 else int_type(bits)
+
+
 class CWriter:
     _bf_vars: set[str] = frozenset()     # reads only a bit-field store used: see _bitfield_stores
 
@@ -166,21 +185,21 @@ class CWriter:
         # and results (fpconst.float_types)
         from .fpabi import callee_ret, fp_params
         from .fpconst import float_types
-        from .fpabi import fp_ret_reg
+        from .fpabi import fp_result_reg
         fparams = dict(fp_params(an, prep.arch, prep.fn.addr))
         self.ftypes = float_types(prep.fn, fparams, prep.ret_float, lambda st: callee_ret(an, st),
-                                  fp_ret_reg(prep.arch))
+                                  lambda w: fp_result_reg(prep.arch, w))
         for name, w in list(self.ftypes.items()):
             cur = self.types.get(name)
             if cur is not None and cur.ptr and name not in fparams:
                 del self.ftypes[name]                # dereferenced: a pointer, whatever is copied to it
                 continue
-            self.types[name] = CType("double" if w == 64 else "float")
+            self.types[name] = CType(float_ctype(w))
         from .fpconst import float_pointees
         for name, w in float_pointees(prep.fn, self.ftypes, self.is_addr).items():
             cur = self.types.get(name)
             if cur is not None and cur.ptr == 1 and cur.base in (int_type(w), int_type(w, True)):
-                self.types[name] = CType("double" if w == 64 else "float", 1)
+                self.types[name] = CType(float_ctype(w), 1)
         self.shown_structs: dict[str, str] = {}
         self.shown_fields: dict[str, list] = {}
         self.names: dict[str, str] = {}
@@ -772,6 +791,8 @@ class CWriter:
     def mem(self, addr: Expr, bits: int) -> str:
         """An lvalue/rvalue for the `bits`-wide memory at `addr`."""
         size = bits // 8
+        if bits == 80:                  # a long double: ten bytes, twelve or sixteen apart in arrays
+            size = 16 if self.ptr_bits == 64 else 12
         if isinstance(addr, Const):
             sym = self.symbol(addr.value)
             if sym:
@@ -787,7 +808,7 @@ class CWriter:
             if self.string(addr.value) is not None and not self.an.string_at(addr.value):
                 # data read whole that happens to look like text (a stripped `stdout`'s
                 # pointer bytes): an address, not a string literal
-                return f"*({int_type(bits)} *){number(addr.value)}"
+                return f"*({_mem_type(bits)} *){number(addr.value)}"
         if isinstance(addr, Load) and isinstance(addr.addr, Const):
             # through a GOT slot: `*(*(stdout@got))` is the imported object itself
             imp = self.an.bin.imports_by_got.get(addr.addr.value)
@@ -811,7 +832,7 @@ class CWriter:
         if self.an.bin.endian == "little":
             pa = self.structs.part_of_field(addr, bits)
             if pa is not None and not self._bit_unit(*pa[1:]):     # the low bytes of a wider field
-                return f"*({int_type(bits)} *)&{self.expr(pa[0], PREC_POSTFIX)}->{self.fname(*pa[1:])}"
+                return f"*({_mem_type(bits)} *)&{self.expr(pa[0], PREC_POSTFIX)}->{self.fname(*pa[1:])}"
         idx = self._indexed(addr, size)
         if idx is not None:
             base, i = idx
@@ -822,18 +843,19 @@ class CWriter:
             if slot is not None and slot.kind != "buffer" and \
                     addr.a.offset not in self.__dict__.get("stack_structs", {}):
                 # a word of a wider local (`((int *)&var_20)[1]`: the high half of a double)
-                return f"(({int_type(bits)} *)&{self.vname(addr.a.name)})[{addr.b.value // size}]"
+                return f"(({_mem_type(bits)} *)&{self.vname(addr.a.name)})[{addr.b.value // size}]"
         base = addr if isinstance(addr, (Var, StackVar)) else None
         if base is not None:
             t = self.types.get(base.name)
-            if t is not None and t.ptr == 1 and (t.base == int_type(bits) or self._float_of(t.base, bits)) \
+            if t is not None and t.ptr == 1 and (t.base == _mem_type(bits) or self._float_of(t.base, bits)) \
                     or t is not None and t.ptr >= 2 and bits == self.ptr_bits:
                 return f"*{self.expr(base, PREC_UNARY)}"
-        return f"*({int_type(bits)} *){self.expr(addr, PREC_UNARY)}"
+        return f"*({_mem_type(bits)} *){self.expr(addr, PREC_UNARY)}"
 
     @staticmethod
     def _float_of(base: str, bits: int) -> bool:
-        return base == "double" and bits == 64 or base == "float" and bits == 32
+        return base == "double" and bits == 64 or base == "float" and bits == 32 or \
+            base == "long double" and bits == 80
 
     def _indexed(self, addr: Expr, size: int):
         """(base text, index) for `base + i*size` where base is a symbol or a matching pointer."""
@@ -890,17 +912,22 @@ class CWriter:
             if sp is not None:
                 return self.vname(sp)
         e = self._unwrap_float(e, True)
+        while _x87_conv(e) and not isinstance(self._unwrap_float(e.args[0], True), (Const, Load)):
+            e = self._unwrap_float(e.args[0], True)         # (see _fintrinsic)
+        if _x87_conv(e):
+            e, w = self._unwrap_float(e.args[0], True), e.args[0].bits
         if isinstance(e, Const):
             from .fp import literal
-            v = literal(e.value & ((1 << min(w, 64)) - 1), 32 if w == 32 else 64)
+            fw = 32 if w == 32 else 80 if w == 80 and e.bits == 80 else 64    # (a double where a long double goes)
+            v = literal(e.value & ((1 << fw) - 1), fw)
             return f"({v})" if v.startswith("-") and prec > PREC_UNARY else v
-        if isinstance(e, Load) and e.bits in (32, 64):
+        if isinstance(e, Load) and e.bits in (32, 64, 80):
             from .fpconst import _ro_value
             c = _ro_value(self.an, e)
             if c is not None and self.symbol(e.addr.value) is None:      # a constant in .rodata
                 return self.fexpr(c, prec, e.bits)
             text = self.mem(e.addr, e.bits)
-            ft = "double" if e.bits == 64 else "float"
+            ft = float_ctype(e.bits)
             raw = f"*({int_type(e.bits)} *)"
             if text.startswith(raw):
                 text = f"*({ft} *)" + text[len(raw):]
@@ -949,11 +976,25 @@ class CWriter:
         if e.name in ("fptosi", "fptoui"):
             return f"({int_type(e.bits, e.name == 'fptoui')}){self.fexpr(x, PREC_UNARY)}", PREC_UNARY
         if e.name == "fpconv":
-            t = "double" if e.bits == 64 else "float"
+            t = float_ctype(e.bits)
             if isinstance(x, (Var, StackVar)) and self.ftypes.get(x.name) == e.bits:
                 return self._expr(x)               # (PowerPC: a float variable held as a double)
+            if _x87_conv(e):
+                # a long double and the double the x87 lifter models its registers as: C converts
+                # implicitly, and the x87 computes in long double anyway
+                if isinstance(self._unwrap_float(x, True), (Const, Load)):
+                    return self.fexpr(x, PREC_UNARY), PREC_UNARY
+                return self._expr(x)
             return f"({t}){self.fexpr(x, PREC_UNARY)}", PREC_UNARY
-        return f"{e.name}({', '.join(self.fexpr(a) for a in e.args)})", PREC_POSTFIX
+        name = e.name
+        if name in ("sqrt", "fabs", "rint", "floor", "ceil", "trunc") and self._long_double(x):
+            name += "l"                 # (32-bit x86: the x87 serves doubles and long doubles alike)
+        return f"{name}({', '.join(self.fexpr(a) for a in e.args)})", PREC_POSTFIX
+
+    def _long_double(self, e: Expr) -> bool:
+        """`e` computes with a long double: an x87 conversion of one or a long double variable."""
+        return any(_x87_conv(x) and x.args[0].bits == 80 or isinstance(x, Load) and x.bits == 80 or
+                   isinstance(x, (Var, StackVar)) and self.ftypes.get(x.name) == 80 for x in ir.walk(e))
 
     def _vfp_param(self, e: Expr) -> str | None:
         """ARM hard-float: `low32(d1)` / the high half of `d1` read on entry is the float
@@ -1137,6 +1178,15 @@ class CWriter:
                     return f"(char *){self.expr(b, PREC_UNARY)} + {self.expr(a, p + 1)}", p
             elif self._ptr_size(a) > 1:   # byte offset that is not a whole element
                 return f"(char *){self.expr(a, PREC_UNARY)} {op} {self.expr(b, p + 1)}", p
+        if e.op in ("+", "-"):
+            for x, y in ((a, b), (b, a)) if e.op == "+" else ((a, b),):
+                if isinstance(x, (Const, StackAddr)) and not isinstance(y, (Const, StackAddr)) or \
+                        isinstance(x, StackAddr) and isinstance(y, Const):
+                    obj = self.expr(x)
+                    if obj.startswith("&"):
+                        # a byte offset from an object's address: C would scale `&table + n` (and
+                        # `&var_9c + 4`) by the size of the whole object
+                        return f"(char *){obj} {op} {self.expr(y, p + 1)}", p
         if e.op == "+" and isinstance(b, Const) and b.signed < 0 and b.bits >= 8:
             return f"{self.expr(a, p)} - {number(-b.signed)}", p
         if e.op == "-" and isinstance(b, Const) and b.signed < 0 and b.bits >= 8 and -b.signed < 0x10000:
@@ -1161,6 +1211,8 @@ class CWriter:
         if isinstance(e, (Var, StackVar)):
             t = self.types.get(e.name)
             if t is not None and t.ptr == 1:
+                if t.base == "long double":             # (x87: ten bytes padded to 12 or 16)
+                    return 16 if self.ptr_bits == 64 else 12
                 return self._SIZES.get(t.base, 0)
             if t is not None and t.ptr >= 2:           # a pointer to pointers
                 return self.ptr_bits // 8
@@ -1352,7 +1404,7 @@ class CWriter:
                 name = self._enum_text(s.dst, b) if src.op in ("&", "|", "^") else None
                 return f"{lhs} {BIN[src.op][0]}= {name or self.expr(b)};"
             if self._float_var(s.dst):
-                return f"{lhs} = {self.fexpr(src, 0, s.dst.bits if s.dst.bits in (32, 64) else None)};"
+                return f"{lhs} = {self.fexpr(src, 0, s.dst.bits if s.dst.bits in (32, 64, 80) else None)};"
             name = self._enum_text(s.dst, _bare(src))
             if name is not None:
                 return f"{lhs} = {name};"
@@ -1366,8 +1418,9 @@ class CWriter:
         if isinstance(s, CallStmt):
             text = self.call(s.call)
             from .fpabi import callee_ret
-            from .fpabi import fp_ret_reg, is_fp_arch
-            reg = fp_ret_reg(self.p.arch) if is_fp_arch(self.p.arch) and callee_ret(self.an, s) else self.p.arch.ret
+            from .fpabi import fp_result_reg, is_fp_arch
+            w = callee_ret(self.an, s) if is_fp_arch(self.p.arch) else None
+            reg = fp_result_reg(self.p.arch, w) if w else self.p.arch.ret
             ret = next((v for r, v in s.defs if r == reg), None)
             if ret is not None:
                 text = f"{self.expr(ret)} = {text}"
@@ -1522,7 +1575,7 @@ class CWriter:
         elif self.p.returns:
             vals = [s.value for s in fn.stmts() if isinstance(s, Return) and s.value is not None]
             if self.p.ret_float:
-                ret = "double" if self.p.ret_bits == 64 else "float"
+                ret = float_ctype(self.p.ret_bits)
             elif self.p.ret_bits is not None:
                 ret = int_type(self.p.ret_bits)
             else:

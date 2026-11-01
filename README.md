@@ -10,14 +10,14 @@ The goal is admittedly ambitious: something as good as IDA Pro with Hex-Rays, an
 can manage it. It isn't there yet. But for the everyday stuff it already works well: opening an
 x86-64 or ARM binary, finding your way around, naming things, reading the pseudocode, and
 measuring an overflow offset in the debugger. The current release is
-[1.1.2](https://github.com/ljw097/relic/releases/tag/v1.1.2).
+[1.1.4](https://github.com/ljw097/relic/releases/tag/v1.1.4).
 
 ![The Relic debugger stopped in vuln() right after gets(): the AAAA… input shows up in the registers and the stack telescope](docs/screenshots/debugger.png)
 
 ## Installing
 
 Grab the executable for your system from the
-[release page](https://github.com/ljw097/relic/releases/tag/v1.1.2) and run it. There's nothing
+[release page](https://github.com/ljw097/relic/releases/tag/v1.1.4) and run it. There's nothing
 to install:
 
 - **Windows**: `relic-<version>-windows-x86_64.exe`
@@ -34,7 +34,7 @@ If you have Python 3.10 or newer, you can install the wheel from the release pag
 
 ```sh
 python3 -m venv .venv
-.venv/bin/pip install https://github.com/ljw097/relic/releases/download/v1.1.2/relic_re-1.1.2-py3-none-any.whl
+.venv/bin/pip install https://github.com/ljw097/relic/releases/download/v1.1.4/relic_re-1.1.4-py3-none-any.whl
 .venv/bin/relic
 ```
 
@@ -116,7 +116,7 @@ matters to me when I'm actually reversing something. Right now it comes to **abo
 | Auto-analysis (14) | 100% | Finds 99.9% of the functions in stripped bash, and 99.96% even with `.eh_frame` removed. C++ classes from RTTI, virtual and indirect call targets, data mixed into code. bash takes about 7 seconds |
 | Library identification (8) | 100% | Names 83–94% of the original functions in stripped static test binaries, with no wrong names |
 | Type system (10) | 90% | libc flags print as their constants (`PROT_READ \| PROT_WRITE`), header `#define` groups become enums. Structs passed or returned by value aren't supported yet |
-| Decompiler (20) | 60% | Half as many gotos as when I started measuring; most of the rest are in big state machines like gnulib's `quotearg`. SSE/AVX shows as intrinsics, x87 works except `long double` |
+| Decompiler (20) | 60% | Half as many gotos as when I started measuring; most of the rest are in big state machines like gnulib's `quotearg`. SSE/AVX shows as intrinsics, x87 works, `long double` included |
 | Interactive UI (12) | 100% | |
 | Scripting & extensions (8) | 100% | |
 | Debugger (7) | 100% | Windows programs run under wine with Windows' own gdbserver.exe |

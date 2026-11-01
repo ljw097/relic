@@ -1,7 +1,7 @@
 """Floating point in the IR: operators, their concrete semantics, and comparison folding.
 
-Values stay bit patterns (an IEEE single in 32 bits, a double in 64) so the
-rest of the IR needs no new value kind; the operators say how to read them:
+Values stay bit patterns (an IEEE single in 32 bits, a double in 64, an x87 `long double` in
+80) so the rest of the IR needs no new value kind; the operators say how to read them:
 
 - `f+ f- f* f/` (BinOp, operands and result of one width) and `fneg` (UnOp);
 - comparisons, 1-bit results. A comparison of two floats has four outcomes --
@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import math
 import struct
+from fractions import Fraction
 
 from .ir import BinOp, Const, Expr, UnOp
 
@@ -44,13 +45,44 @@ def is_fp_op(op: str) -> bool:
 
 
 # ------------------------------------------------------------------ bit patterns
+def _from_x87(v: int) -> float:
+    """The value of an x87 extended-precision pattern (80 bits: sign, 15-bit exponent, 64-bit
+    significand with an explicit integer bit), rounded to a double."""
+    mant, exp, sign = v & ((1 << 64) - 1), (v >> 64) & 0x7FFF, -1.0 if v >> 79 & 1 else 1.0
+    if exp == 0x7FFF:
+        return sign * math.inf if mant << 1 & ((1 << 64) - 1) == 0 else math.nan
+    if mant == 0:
+        return sign * 0.0
+    try:
+        return sign * math.ldexp(float(Fraction(mant, 1 << 63)), (exp or 1) - 16383)
+    except OverflowError:
+        return sign * math.inf
+
+
+def _to_x87(x: float) -> int:
+    """The extended-precision pattern of a double (exact: every double is one)."""
+    sign = (1 << 79) if math.copysign(1.0, x) < 0 else 0
+    if math.isnan(x):
+        return sign | 0x7FFF << 64 | 0xC000000000000000
+    if math.isinf(x):
+        return sign | 0x7FFF << 64 | 1 << 63
+    if x == 0:
+        return sign
+    m, e = math.frexp(abs(x))                  # abs(x) = m * 2**e, 0.5 <= m < 1
+    return sign | (e - 1 + 16383) << 64 | int(m * (1 << 64))
+
+
 def to_float(v: int, bits: int) -> float:
+    if bits == 80:
+        return _from_x87(v)
     if bits == 32:
         return struct.unpack("<f", struct.pack("<I", v & 0xFFFFFFFF))[0]
     return struct.unpack("<d", struct.pack("<Q", v & 0xFFFFFFFFFFFFFFFF))[0]
 
 
 def from_float(x: float, bits: int) -> int:
+    if bits == 80:
+        return _to_x87(x)
     if bits == 32:
         try:
             return struct.unpack("<I", struct.pack("<f", x))[0]
@@ -121,6 +153,7 @@ def _fma(x: float, y: float, z: float) -> float:
 
 
 def apply_fintrinsic(name: str, args: list[int], bits: int) -> int:
+    name = _LONG.get(name, name)
     x = to_float(args[0], bits)
     base = name[:-1] if bits == 32 and name.endswith("f") and name not in ("fabsf",) else name
     if base in ("fma",):
@@ -195,11 +228,14 @@ def as_float(e: Expr) -> Expr | None:
 
 
 FP_INTRINSICS = ("sqrt", "sqrtf", "fabs", "fabsf", "floor", "floorf", "ceil", "ceilf", "trunc", "truncf",
-                 "rint", "rintf", "round", "roundf", "fma", "fmaf", "fmax", "fmaxf", "fmin", "fminf")
+                 "rint", "rintf", "round", "roundf", "fma", "fmaf", "fmax", "fmaxf", "fmin", "fminf",
+                 "sqrtl", "fabsl", "rintl")      # (x86-64's x87: long double only)
+_LONG = {"sqrtl": "sqrt", "fabsl": "fabs", "rintl": "rint"}   # evaluated as the double form (see lift/x87.py)
 
 
 def literal(v: int, bits: int) -> str:
-    """C literal for a float bit pattern: `1.5`, `0.1f`, `-2.0`, `1e+300`."""
+    """C literal for a float bit pattern: `1.5`, `0.1f`, `-2.0`, `1e+300`, `2.5L` (a long double,
+    to the precision of a double)."""
     x = to_float(v, bits)
     if math.isnan(x):
         return "NAN" if bits == 64 else "NAN"
@@ -218,7 +254,7 @@ def literal(v: int, bits: int) -> str:
         s = repr(x)
     if "e" not in s and "." not in s and "n" not in s:
         s += ".0"
-    return s + ("f" if bits == 32 else "")
+    return s + ("f" if bits == 32 else "L" if bits == 80 else "")
 
 
 # ------------------------------------------------------------- comparison folding

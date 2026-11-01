@@ -143,7 +143,7 @@ def _own_writes(an: "Analysis", f, canon):
                 written = ()
             for r in written:
                 regs.update(canon(i.cs.reg_name(r)))
-            if an.bin.arch == "x86":
+            if an.bin.arch in ("x86", "x64"):
                 from .lift.x87 import REGS, is_x87
                 if is_x87(i.mnemonic):
                     regs.update(REGS)               # (the lifter names x87 registers by depth)

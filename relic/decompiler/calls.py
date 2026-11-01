@@ -12,7 +12,7 @@ from __future__ import annotations
 from typing import TYPE_CHECKING
 
 from .arch import ArchInfo
-from .ir import (Assign, Call, CallStmt, Cast, Const, Reg, Expr, Extract, IRFunction, Phi, Return, Var, children,
+from .ir import (Assign, BinOp, Call, CallStmt, Cast, Const, Reg, Expr, Extract, IRFunction, Phi, Return, Var, children,
                  stmt_exprs, walk)
 from .fpabi import arg_classes, float_int_params, fp_params, fp_part, fp_sig, is_fp_arch, is_fp_reg, place_args
 from .sigs import arg_count, lookup
@@ -394,18 +394,69 @@ def stack_param_count(an: "Analysis", arch: ArchInfo, target: int) -> int:
                             floats[(off - base) // word - shadow] = k.bits
     if word == 4:
         _paired_doubles(ssa, frame, base, word, floats, loaded)
+    for rel in _forwarded_long_doubles(an, arch, ssa, frame, target, base):
+        rel -= shadow * word
+        sizes[rel] = 10
+        floats[rel // word] = 80
     top = max(0, top - shadow)
     an.__dict__.setdefault("_stack_param_floats", {})[target] = floats
-    # the parameters as slots: a double on a 32-bit target spans two words
+    # the parameters as slots: a double on a 32-bit target spans two words, a long double three
+    # (sixteen bytes on x86-64)
     slots, w = [], 0
     while w < top:
         rel = w * word
-        size = word * 2 if word == 4 and (sizes.get(rel) == 8 or floats.get(w) == 64) else word
+        if sizes.get(rel) == 10 or floats.get(w) == 80:
+            size = 12 if word == 4 else 16
+            floats[w] = 80
+        else:
+            size = word * 2 if word == 4 and (sizes.get(rel) == 8 or floats.get(w) == 64) else word
         slots.append((rel, size, floats.get(w)))
         w += size // word
     an.__dict__.setdefault("_stack_param_slots", {})[target] = slots
     cache[target] = top
     return top
+
+
+def _forwarded_long_doubles(an: "Analysis", arch: ArchInfo, ssa, frame, target: int, base: int) -> list[int]:
+    """Stack parameters (offsets from `base`) only handed on, word by word, to a callee that
+    takes a long double there (`push qword [rsp+0x28]` twice, then `call`): long doubles too."""
+    from .fpabi import stack_arg_base
+    from .ir import Load, Store
+    if not arch.name.startswith(("x86", "x64-sysv")):
+        return []
+    word = arch.bits // 8
+    out = []
+    defs = None
+    for b in ssa.blocks.values():
+        for k, s in enumerate(b.stmts):
+            if not isinstance(s, CallStmt) or not isinstance(s.call.target, Const) or s.call.target.value == target:
+                continue
+            g = an.functions.get(s.call.target.value)
+            if g is None or g.is_import:
+                continue
+            slots = [rel for rel, _, fw in stack_param_slots(an, arch, g.addr) if fw == 80]
+            sp = dict(s.uses).get(arch.sp)
+            sp_off = frame.offset_of(sp) if sp is not None and slots else None
+            if sp_off is None:
+                continue
+            outgoing = sp_off + (stack_arg_base(arch) if arch.bits == 64 else 0)
+            if defs is None:
+                defs = {t.dst: t.src for t in ssa.stmts() if isinstance(t, Assign) and isinstance(t.dst, Var)}
+            srcs: dict[int, int] = {}           # outgoing slot -> the parameter word copied there
+            for t in reversed(b.stmts[:k]):
+                if isinstance(t, CallStmt):
+                    break
+                v = defs.get(t.src, t.src) if isinstance(t, Store) else None     # (`push`: through a temporary)
+                if isinstance(v, Load) and v.bits == word * 8:
+                    d, p = frame.offset_of(t.dst), frame.offset_of(v.addr)
+                    if d is not None and p is not None and p >= base and d not in srcs:
+                        srcs[d] = p
+            for rel in slots:
+                p = srcs.get(outgoing + rel)
+                if p is not None and all(srcs.get(outgoing + rel + n * word) == p + n * word
+                                         for n in range(1, (10 + word - 1) // word)):
+                    out.append(p - base)
+    return out
 
 
 def _paired_doubles(ssa, frame, base: int, word: int, floats: dict, loaded):
@@ -524,6 +575,42 @@ def stack_param_floats(an: "Analysis", arch: ArchInfo, target: int) -> dict[int,
     return an.__dict__.get("_stack_param_floats", {}).get(target, {})
 
 
+def _long_double_copy(b, stores: dict, off: int, word: int, frame) -> tuple[Expr, list[int]] | None:
+    """A long double argument copied into its stack slot word by word (`push qword [rsp+0x18]`
+    twice on x86-64, three dwords on x86): the long double those words were read from, and the
+    stores of the words past the first."""
+    from .ir import Load
+    first = b.stmts[stores[off]].src
+    if not isinstance(first, Load) or first.bits != word * 8:
+        return None
+    src = frame.offset_of(first.addr)
+    split = _split_addr(first.addr)
+    more = []
+    for k in range(1, (10 + word - 1) // word):
+        j = stores.get(off + k * word)
+        if j is None:
+            return None
+        v = b.stmts[j].src
+        if not isinstance(v, Load) or v.bits != word * 8:
+            return None
+        if src is not None:             # (a stack slot: by its frame offset, whatever register says so)
+            if frame.offset_of(v.addr) != src + k * word:
+                return None
+        else:
+            nxt = _split_addr(v.addr)
+            if nxt[0] != split[0] or nxt[1] != split[1] + k * word:
+                return None
+        more.append(j)
+    return Load(first.addr, 80), more
+
+
+def _split_addr(addr: Expr) -> tuple[Expr, int]:
+    """(base, constant offset) of an address: `p + 8` is (p, 8)."""
+    if isinstance(addr, BinOp) and addr.op == "+" and isinstance(addr.b, Const):
+        return addr.a, addr.b.value
+    return addr, 0
+
+
 def _arg_stores(b, k: int, frame, base: int, word: int) -> dict[int, int]:
     """Most recent store to each word-aligned outgoing argument slot at or above `base` (frame
     offsets) since the previous call in the block: offset -> statement index."""
@@ -579,11 +666,17 @@ def _recover_cdecl(fn: IRFunction, an: "Analysis", arch: ArchInfo):
                         break
                     # passed straight through: the caller's own parameter slot, unchanged
                     delta = base + rel - sp_off
-                    v = Load(BinOp("+", sp, Const(delta, arch.bits), arch.bits), size * 8)
+                    v = Load(BinOp("+", sp, Const(delta, arch.bits), arch.bits), 80 if fw == 80 else size * 8)
                 else:
                     v = b.stmts[j].src
                     idx.append(j)
-                    if size == 8 and v.bits == 32:            # a double stored as two words
+                    if fw == 80 and v.bits != 80:
+                        copy = _long_double_copy(b, stores, base + rel, word, frame)
+                        if copy is None:
+                            break
+                        v, more = copy
+                        idx += more
+                    elif size == 8 and v.bits == 32:            # a double stored as two words
                         j2 = stores.get(base + rel + 4)
                         if j2 is None:
                             break
@@ -616,13 +709,13 @@ def _cdecl_slots(an: "Analysis", arch: ArchInfo, s: CallStmt, b, stores: dict, b
     fsig = fp_sig(name)
     classes = None
     if fsig is not None:
-        classes = arg_classes(None, None, fsig)
+        classes = arg_classes(None, None, fsig, ldouble=True)
     elif sig is not None:
         fmt = None
         if sig.fmt is not None and base + sig.fmt * word in stores:
             fmt = _read_format(an, b.stmts[stores[base + sig.fmt * word]].src)
         if not sig.variadic or fmt is not None:
-            classes = arg_classes(sig, fmt, scan="scanf" in (name or ""), wide=True)
+            classes = arg_classes(sig, fmt, scan="scanf" in (name or ""), wide=True, ldouble=True)
             if not sig.variadic or fmt is None:
                 classes = classes[:arg_count(sig, fmt)]
     elif f is not None and not f.is_import:
@@ -630,8 +723,8 @@ def _cdecl_slots(an: "Analysis", arch: ArchInfo, s: CallStmt, b, stores: dict, b
     if classes is not None:
         out, off = [], 0
         for c in classes:
-            size = 8 if c in "dq" else word
-            out.append((off, size, 64 if c == "d" else 32 if c == "f" else None))
+            size = 12 if c == "L" else 8 if c in "dq" else word
+            out.append((off, size, {"d": 64, "f": 32, "L": 80}.get(c)))
             off += size
         return out
     # unknown callee: as many as were stored, a 64-bit store taking two words
@@ -680,13 +773,13 @@ def recover_calls(fn: IRFunction, an: "Analysis", arch: ArchInfo) -> IRFunction:
                 n = 2 + sel.count(":")
                 placed = list(argregs[:n]) + [None] * (n - len(argregs))
             elif fsig is not None:
-                classes = arg_classes(None, None, fsig)
+                classes = arg_classes(None, None, fsig, ldouble=arch.name == "x64-sysv")
                 placed = place_args(arch, classes, argregs)
             elif sig is not None:
                 fmt = _read_format(an, uses.get(argregs[sig.fmt])) if sig.fmt is not None and \
                     sig.fmt < len(argregs) else None
                 if is_fp_arch(arch) and (fmt is not None or any(t in ("double", "float") for t in sig.types)):
-                    classes = arg_classes(sig, fmt, scan="scanf" in (name or ""))
+                    classes = arg_classes(sig, fmt, scan="scanf" in (name or ""), ldouble=arch.name == "x64-sysv")
                     placed = place_args(arch, classes, argregs, variadic=fmt is not None,
                                         fixed=sig.fmt + 1 if sig.fmt is not None else None)
                 else:
@@ -710,7 +803,7 @@ def recover_calls(fn: IRFunction, an: "Analysis", arch: ArchInfo) -> IRFunction:
                     placed = selected + [r for r, _ in fps] + ["=" + r for r in fints] + [None] * len(slots)
                     classes = ["i"] * len(selected) + ["d"] * len(fps) + \
                         ["f" if w == 32 else "d" for w in fints.values()] + \
-                        [("f" if fw == 32 else "d") if fw else "i" for _, _, fw in slots]
+                        [{32: "f", 80: "L"}.get(fw, "d") if fw else "i" for _, _, fw in slots]
                     order = positional_order(arch, selected, fps)
                     if order is not None:            # (the parameters' C order: see pipeline)
                         head = len(selected) + len(fps)
@@ -736,7 +829,7 @@ def recover_calls(fn: IRFunction, an: "Analysis", arch: ArchInfo) -> IRFunction:
                 if stack_offs is None:
                     on_stack = [c for c, r in zip(classes or ["i"] * len(placed), placed) if r is None]
                     stack_offs = stack_offsets(arch, on_stack)
-                    stack_sizes = [8 if c == "d" else arch.bits // 8 for c in on_stack]
+                    stack_sizes = [_stack_size(arch, c) for c in on_stack]
                 stack_vals = _stack_values(b, k, s, frame, arch, stack_offs, consumed, stack_sizes)
             args = []
             fargs = []
@@ -745,7 +838,9 @@ def recover_calls(fn: IRFunction, an: "Analysis", arch: ArchInfo) -> IRFunction:
                     v = next(stack_vals, None)
                     if v is None:
                         break
-                    if pos < len(classes) and classes[pos] in "df":
+                    if pos < len(classes) and classes[pos] == "L":
+                        fargs.append((len(args), 80))
+                    elif pos < len(classes) and classes[pos] in "df":
                         fargs.append((len(args), 32 if classes[pos] == "f" else 64))
                         v = Cast("low", v, 64) if v.bits > 64 else v
                     args.append(v)
@@ -864,16 +959,27 @@ def _split_addr(a: Expr) -> tuple[Expr, int]:
 
 def stack_offsets(arch: ArchInfo, classes: list[str]) -> list[int]:
     """Offsets of stack arguments of these classes, in order: a word each, a double two words
-    aligned to eight bytes on 32-bit targets."""
+    aligned to eight bytes on 32-bit targets, a long double twelve bytes (x86) or sixteen aligned
+    to sixteen (x86-64)."""
     word = arch.bits // 8
     out, off = [], 0
     for c in classes:
-        size = 8 if c == "d" else word
+        size = _stack_size(arch, c)
         if size == 8 and word == 4:
             off = (off + 7) & ~7
+        elif c == "L" and word == 8:
+            off = (off + 15) & ~15      # (a long double: sixteen bytes, aligned to sixteen)
         out.append(off)
         off += size
     return out
+
+
+def _stack_size(arch: ArchInfo, c: str) -> int:
+    """Bytes a stack argument of class `c` takes (fpabi.arg_classes)."""
+    word = arch.bits // 8
+    if c == "L":
+        return 12 if word == 4 else 16
+    return 8 if c == "d" else word
 
 
 def _stack_values(b, k: int, s: CallStmt, frame, arch: ArchInfo, offs: list[int], consumed: set[int],
@@ -895,8 +1001,14 @@ def _stack_values(b, k: int, s: CallStmt, frame, arch: ArchInfo, offs: list[int]
         j = stores.get(base + rel)
         if j is None:
             return
-        consumed.add(j)
         v = b.stmts[j].src
+        if sizes is not None and sizes[n] == 16 and v.bits != 80:
+            copy = _long_double_copy(b, stores, base + rel, word, frame)
+            if copy is None:
+                return
+            v, more = copy
+            consumed.update(more)
+        consumed.add(j)
         if word == 4 and sizes is not None and sizes[n] == 8 and v.bits == 32:   # a double stored as two words
             j2 = stores.get(base + rel + 4)
             if j2 is None:

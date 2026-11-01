@@ -107,6 +107,11 @@ VARIANTS = {
     "floats_arm_O2": ["-O2", "-marm", "-fno-tree-vectorize"],
     "floats_thumb_O2": ["-O2", "-mthumb", "-fno-tree-vectorize"],
     "floats_a64_O2": ["-O2", "-fno-tree-vectorize"],
+    # long double (the x87's 80 bits, x86-64 and x86)
+    "ldouble_O0": ["-O0", "-no-pie", "-fno-stack-protector"],
+    "ldouble_O2": ["-O2", "-no-pie", "-fno-stack-protector", "-fno-tree-vectorize"],
+    "ldouble32_O0": ["-m32", "-O0", "-no-pie", "-fno-stack-protector"],
+    "ldouble32_O2": ["-m32", "-O2", "-no-pie", "-fno-stack-protector", "-fno-tree-vectorize"],
     # C declarations imported from a header (enums, structs, prototypes)
     "types_O0": ["-O0", "-fno-stack-protector", "-no-pie"],
     "types_O2": ["-O2", "-fno-stack-protector", "-no-pie"],
@@ -143,6 +148,8 @@ SOURCES = {"structs_O0": os.path.join(HERE, "src", "structs.c"), "structs_O2": o
                                                                 "floats_rv64_O2", "floats_rv32_O0", "floats_rv32_O2",
                                                                 "floats_ppc_O0", "floats_ppc_O2",
                                                                 "floats_ppc64_O0", "floats_ppc64_O2")},
+           **{n: os.path.join(HERE, "src", "ldouble.c") for n in ("ldouble_O0", "ldouble_O2", "ldouble32_O0",
+                                                                 "ldouble32_O2")},
            "libcalls_O1": os.path.join(HERE, "src", "libcalls.c"),
            "types_O0": os.path.join(HERE, "src", "types.c"), "types_O2": os.path.join(HERE, "src", "types.c"),
            "flow_O0": FLOW_SRC, "flow_O2": FLOW_SRC, "flow32_O0": FLOW_SRC, "flow32_O2": FLOW_SRC,
@@ -265,6 +272,10 @@ autonames_O2_stripped = _fixture("autonames_O2_stripped")
 floats32_O0 = _fixture("floats32_O0")
 floats32_O2 = _fixture("floats32_O2")
 floats32_i386_O2 = _fixture("floats32_i386_O2")
+ldouble_O0 = _fixture("ldouble_O0")
+ldouble_O2 = _fixture("ldouble_O2")
+ldouble32_O0 = _fixture("ldouble32_O0")
+ldouble32_O2 = _fixture("ldouble32_O2")
 floats_a64_O0 = _fixture("floats_a64_O0")
 floats_a64_O2 = _fixture("floats_a64_O2")
 floats_arm_O0 = _fixture("floats_arm_O0")
