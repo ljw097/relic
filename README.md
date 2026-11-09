@@ -26,6 +26,10 @@ to install:
   each with a `Relic.app` inside. It isn't signed, so the first time you open it, right-click it
   and choose Open.
 
+Each release also has a `SHA256SUMS` file, and the same hashes are at the end of its notes. To
+check a download, run `sha256sum -c SHA256SUMS --ignore-missing` (on macOS,
+`shasum -a 256 -c SHA256SUMS`).
+
 It starts without a file. Open one with File > Open (`Ctrl+O`) or File > Open Recent, or just
 drop it on the window. The same executable also runs all the commands below (`relic info FILE`,
 `Relic.exe decompile FILE`, and so on).

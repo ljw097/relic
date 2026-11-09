@@ -23,6 +23,9 @@ GUI는 PySide6, 명령어 디코딩은 capstone을 쓰고, 그 위에 올라가�
 - **macOS**: Apple 실리콘은 `relic-<버전>-macos-arm64.zip`, Intel은 `-macos-x86_64.zip`이고 안에 `Relic.app`이
   들어 있습니다. 서명이 안 되어 있어서 처음 한 번은 오른쪽 클릭 후 "열기"를 골라야 합니다.
 
+릴리스마다 `SHA256SUMS` 파일이 있고, 릴리스 노트 끝에도 같은 해시가 있습니다. 받은 파일은
+`sha256sum -c SHA256SUMS --ignore-missing`(macOS는 `shasum -a 256 -c SHA256SUMS`)로 확인할 수 있습니다.
+
 처음에는 빈 창으로 열립니다. File > Open(`Ctrl+O`)이나 File > Open Recent로 열거나, 파일을 창에 끌어다
 놓으면 됩니다. 같은 실행 파일로 아래에 나오는 명령도 쓸 수 있습니다(`relic info FILE`,
 `Relic.exe decompile FILE` 등).

@@ -476,3 +476,6 @@ gdb를 GDB/MI로 부리고, 화면은 pwndbg처럼 꾸몄다.
 - ruff 린트(E/F/W/B). 포맷터와 import 정렬은 기존 줄바꿈 스타일과 맞지 않아서 쓰지 않는다.
 - 릴리스는 Actions의 Release 워크플로로 만든다. 버전을 확인하고, Windows, Linux, macOS용 실행 파일(PyInstaller)과
   wheel을 빌드해 시험한 뒤, 태그를 달고 `docs/releases/<버전>.md`를 노트로 게시한다.
+- 1.2.1부터 릴리스마다 모든 파일의 SHA-256을 `SHA256SUMS`로 올리고 노트 끝에도 적는다. "add missing" 옵션은
+  이미 있는 릴리스를 태그에서 다시 빌드해 빠진 파일만 올리고 해시를 다시 만든다(1.2.0의 macOS arm64처럼
+  러너가 뜨지 않은 경우).
