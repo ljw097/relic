@@ -14,6 +14,7 @@
     relic ir FILE [WHERE]         decompiler IR of a function (debugging aid)
     relic opt FILE [WHERE]        optimised SSA IR, with strings/xrefs resolved
     relic decompile FILE [WHERE]  structured C-like pseudocode of a function
+    relic diff OLD NEW            functions matched between two builds: changed, added, removed
     relic search FILE --bytes P   byte pattern (`48 8b ?? 05`), --text, --imm or --insn REGEX
     relic sigs build LIB.a... -o OUT.sig   library signatures (name functions of static binaries)
     relic sigs list               the signature files analyses use
@@ -31,7 +32,7 @@ import sys
 from . import __version__
 
 COMMANDS = ("info", "checksec", "funcs", "disasm", "cfg", "strings", "imports", "classes", "xrefs", "vulns", "ir",
-            "opt", "decompile", "search", "patch", "script", "sigs", "types", "project", "lumina", "gui")
+            "opt", "decompile", "diff", "search", "patch", "script", "sigs", "types", "project", "lumina", "gui")
 
 
 def _parser() -> argparse.ArgumentParser:
@@ -95,6 +96,12 @@ def _parser() -> argparse.ArgumentParser:
     s.add_argument("--author", help="commit: who (default: the login name)")
     s.add_argument("--theirs", action="store_true", help="merge: where both differ, take the other file's value")
     s.add_argument("--force", action="store_true", help="merge: even if the project is for another binary")
+    s = add("diff", "match the functions of two builds: what changed, was added or removed (patch diffing)")
+    s.add_argument("new", metavar="NEW", help="the other build (FILE is the old one)")
+    s.add_argument("-f", "--func", metavar="NAME", help="show how one function changed (a name or address in either)")
+    s.add_argument("-d", "--decompile", action="store_true", help="with --func: compare pseudocode, not instructions")
+    s.add_argument("-a", "--all", action="store_true", help="also list the functions that did not change")
+    s.add_argument("--json", action="store_true", help="the whole result as JSON")
     s = add("search", "search bytes, text, immediates or instructions")
     how = s.add_mutually_exclusive_group(required=True)
     how.add_argument("--bytes", metavar="PATTERN", help="hex bytes, `??` for any byte: '48 8b ?? 05'")
@@ -603,6 +610,39 @@ def cmd_lumina(args):
     print(f"{len(got['applied'])} function(s) from {got['matched']} match(es)")
     if got["applied"] and not args.no_save:
         an.save_project()
+
+
+def cmd_diff(args):
+    import json
+    from .analysis.bindiff import diff, function_diff
+    old = _analyze(args)
+    args.file = args.new
+    new = _analyze(args)
+    d = diff(old, new)
+    if args.func:
+        m = d.find(args.func)
+        if m is None:
+            sys.exit(f"relic: '{args.func}' is not a function matched in both builds")
+        lines = function_diff(d, m, args.decompile)
+        print(f"{m.name}: {m.old:#x} -> {m.new:#x}, {m.similarity:.0%} alike (matched by {m.how})")
+        print("\n".join(lines) if lines else "(the same code)")
+        return
+    if args.json:
+        print(json.dumps(d.to_json(), indent=1))
+        return
+    s = d.summary()
+    print(f"{len(d.matches)} matched ({s['identical']} identical, {s['changed']} changed), "
+          f"{s['added']} added, {s['removed']} removed")
+    rows = d.changed() + ([m for m in d.matches if m.identical] if args.all else [])
+    if rows:
+        print(f"\n{'similar':>7}  {'old':>10}  {'new':>10}  {'how':<7}  name")
+        for m in rows:
+            print(f"{m.similarity:>7.1%}  {m.old:>10x}  {m.new:>10x}  {m.how:<7}  {m.name}")
+    for title, an, addrs in (("added", new, d.added), ("removed", old, d.removed)):
+        if addrs:
+            print(f"\n{title}:")
+            for a in addrs:
+                print(f"  {a:>10x}  {an.name(a) or f'sub_{a:x}'}  ({an.functions[a].size} bytes)")
 
 
 def cmd_search(args):

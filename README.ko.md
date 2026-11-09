@@ -9,13 +9,13 @@ GUI는 PySide6, 명령어 디코딩은 capstone을 쓰고, 그 위에 올라가�
 목표는 솔직히 좀 거창합니다. IDA Pro + Hex-Rays만큼, 할 수 있다면 그보다 낫게 만드는 겁니다. 아직 거기까지는
 멀었지만, x86-64나 ARM 바이너리를 열어서 함수를 훑어보고, 이름을 붙이고, 의사 코드를 읽고, 디버거로
 오버플로 오프셋을 재는 정도는 지금도 충분히 됩니다. 현재 버전은
-[1.1.4](https://github.com/ljw097/relic/releases/tag/v1.1.4)입니다.
+[1.2.0](https://github.com/ljw097/relic/releases/tag/v1.2.0)입니다.
 
 ![Relic 디버거: vuln()에서 gets() 직후에 멈춘 화면. 입력한 AAAA…가 레지스터와 스택 telescope에 보인다](docs/screenshots/debugger.png)
 
 ## 설치
 
-[릴리스 페이지](https://github.com/ljw097/relic/releases/tag/v1.1.4)에서 운영체제에 맞는 실행 파일을 받아
+[릴리스 페이지](https://github.com/ljw097/relic/releases/tag/v1.2.0)에서 운영체제에 맞는 실행 파일을 받아
 실행하면 됩니다. 설치 과정은 없습니다.
 
 - **Windows**: `relic-<버전>-windows-x86_64.exe`
@@ -31,7 +31,7 @@ Python 3.10 이상이 있다면 릴리스 페이지의 wheel을 설치해도 됩
 
 ```sh
 python3 -m venv .venv
-.venv/bin/pip install https://github.com/ljw097/relic/releases/download/v1.1.4/relic_re-1.1.4-py3-none-any.whl
+.venv/bin/pip install https://github.com/ljw097/relic/releases/download/v1.2.0/relic_re-1.2.0-py3-none-any.whl
 .venv/bin/relic
 ```
 
@@ -96,6 +96,10 @@ glibc 힙 청크를 볼 수 있습니다.
 **포너블 도우미.** checksec, 위험한 함수 호출, 상수가 아닌 포맷 문자열, 폭 지정 없는 `scanf("%s")`,
 ret2win 후보를 찾아 줍니다. IDA에는 기본으로 없는 기능이라 따로 넣었습니다.
 
+**바이너리 비교.** `relic diff OLD NEW`는 BinDiff처럼 두 빌드의 함수를 짝지어서, 어떤 함수가 바뀌었고
+어떤 함수가 새로 생기거나 없어졌는지 알려 줍니다. stripped 바이너리에서도 되기 때문에, 패치가 무엇을
+고쳤는지 알아볼 때 여기서 시작하면 됩니다.
+
 ### IDA와 비교하면 어디쯤인지
 
 정확히 잰 값이 아니라 제 어림값입니다. 영역마다 "IDA가 하는 일 중에서 Relic이 비슷한 수준으로 하는 비율"로
@@ -145,6 +149,7 @@ relic patch     ./chall main+0x2f --invert       # 조건 분기를 뒤집어 ./
 relic script    ./chall rename_all.py
 relic sigs build /usr/lib/x86_64-linux-gnu/libc.a -o ~/.relic/sigs/glibc-x64.sig
 relic project   ./chall commit -m "named the parser"
+relic diff      ./chall ./chall_fixed            # 패치로 바뀐 함수 (-f FUNC: 어떻게 바뀌었는지)
 relic disasm    sc.bin --arch x64 --base 0x1000 -n 30   # 셸코드 같은 raw 데이터
 ```
 
@@ -202,6 +207,41 @@ struct s_notes {  // recovered, 12 bytes
 ```
 
 GUI에서 `N`으로 이 구조체를 `struct note { char *data; int size; }`처럼 고치면 다른 함수의 의사 코드에도 바로 반영됩니다.
+
+패치가 무엇을 바꿨는지 알고 싶으면 두 빌드를 비교합니다. 아래 `chall_fixed`는 같은 소스에서 `gets`를 `fgets`로
+바꾸고 함수 하나를 더한 것이고, `chall`처럼 strip했습니다.
+
+```
+$ relic diff chall chall_fixed
+17 matched (16 identical, 1 changed), 1 added, 0 removed
+
+similar         old         new  how      name
+  92.0%      40160c      40160c  calls    sub_40160c
+
+added:
+      401708  sub_401708  (25 bytes)
+
+$ relic diff chall chall_fixed -f sub_40160c -d
+sub_40160c: 0x40160c -> 0x40160c, 92% alike (matched by calls)
+--- old:sub_40160c @ 0x40160c
++++ new:sub_40160c @ 0x40160c
+@@ -1,8 +1,8 @@
+ void sub_40160c(void)
+ {
+-    char buf_48[64];  // ret-0x48
++    char line[64];  // ret-0x48
+ 
+     puts("name?");
+-    gets(buf_48);
+-    printf("hello %s (%d)\n", buf_48, sub_401539(buf_48));
++    fgets(line, 64, stdin);
++    printf("hello %s (%d)\n", line, sub_401539(line));
+ }
+```
+
+함수는 주소를 지운 코드로 비교하므로 위치만 옮겨진 함수는 같은 것으로 봅니다. 짝은 똑같은 코드, 이름, 호출
+그래프(이미 짝지은 함수의 호출 대상과 호출자), 유사도 순서로 찾습니다. `-d` 없이 `-f`만 주면 의사 코드 대신
+명령어를 비교하고, `--json`은 결과 전체를 스크립트에 넘기기 좋게 출력합니다.
 
 ## GUI
 

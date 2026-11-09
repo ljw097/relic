@@ -10,14 +10,14 @@ The goal is admittedly ambitious: something as good as IDA Pro with Hex-Rays, an
 can manage it. It isn't there yet. But for the everyday stuff it already works well: opening an
 x86-64 or ARM binary, finding your way around, naming things, reading the pseudocode, and
 measuring an overflow offset in the debugger. The current release is
-[1.1.4](https://github.com/ljw097/relic/releases/tag/v1.1.4).
+[1.2.0](https://github.com/ljw097/relic/releases/tag/v1.2.0).
 
 ![The Relic debugger stopped in vuln() right after gets(): the AAAA… input shows up in the registers and the stack telescope](docs/screenshots/debugger.png)
 
 ## Installing
 
 Grab the executable for your system from the
-[release page](https://github.com/ljw097/relic/releases/tag/v1.1.4) and run it. There's nothing
+[release page](https://github.com/ljw097/relic/releases/tag/v1.2.0) and run it. There's nothing
 to install:
 
 - **Windows**: `relic-<version>-windows-x86_64.exe`
@@ -34,7 +34,7 @@ If you have Python 3.10 or newer, you can install the wheel from the release pag
 
 ```sh
 python3 -m venv .venv
-.venv/bin/pip install https://github.com/ljw097/relic/releases/download/v1.1.4/relic_re-1.1.4-py3-none-any.whl
+.venv/bin/pip install https://github.com/ljw097/relic/releases/download/v1.2.0/relic_re-1.2.0-py3-none-any.whl
 .venv/bin/relic
 ```
 
@@ -103,6 +103,11 @@ running process. It shows registers, a stack telescope, the memory map and glibc
 **Pwn helpers.** checksec, dangerous calls, non-constant format strings, `scanf("%s")` without a
 width, and ret2win candidates. IDA doesn't do these out of the box, so I added them.
 
+**Binary diffing.** `relic diff OLD NEW` matches the functions of two builds the way BinDiff
+does and tells you which ones changed, which were added and which were removed. It works on
+stripped binaries too, which makes it the place to start when you want to know what a patch
+fixed.
+
 ### How far along it is compared to IDA
 
 These numbers are my own rough estimates. Each one is the share of what IDA does in that area
@@ -152,6 +157,7 @@ relic patch     ./chall main+0x2f --invert       # flip the branch, write ./chal
 relic script    ./chall rename_all.py
 relic sigs build /usr/lib/x86_64-linux-gnu/libc.a -o ~/.relic/sigs/glibc-x64.sig
 relic project   ./chall commit -m "named the parser"
+relic diff      ./chall ./chall_fixed            # which functions a patch changed (-f FUNC: how)
 relic disasm    sc.bin --arch x64 --base 0x1000 -n 30   # a raw blob such as shellcode
 ```
 
@@ -207,6 +213,42 @@ struct s_notes {  // recovered, 12 bytes
 ```
 
 Rename it in the GUI with `N` (say, `struct note { char *data; int size; }`) and every other function picks up the new names.
+
+To find what a patch changed, diff the two builds. Here `chall_fixed` is the same source, stripped like `chall`, with
+`gets` replaced by `fgets` and one function added:
+
+```
+$ relic diff chall chall_fixed
+17 matched (16 identical, 1 changed), 1 added, 0 removed
+
+similar         old         new  how      name
+  92.0%      40160c      40160c  calls    sub_40160c
+
+added:
+      401708  sub_401708  (25 bytes)
+
+$ relic diff chall chall_fixed -f sub_40160c -d
+sub_40160c: 0x40160c -> 0x40160c, 92% alike (matched by calls)
+--- old:sub_40160c @ 0x40160c
++++ new:sub_40160c @ 0x40160c
+@@ -1,8 +1,8 @@
+ void sub_40160c(void)
+ {
+-    char buf_48[64];  // ret-0x48
++    char line[64];  // ret-0x48
+ 
+     puts("name?");
+-    gets(buf_48);
+-    printf("hello %s (%d)\n", buf_48, sub_401539(buf_48));
++    fgets(line, 64, stdin);
++    printf("hello %s (%d)\n", line, sub_401539(line));
+ }
+```
+
+Functions are compared by their code with addresses taken out, so a function that only moved counts as identical.
+They are matched by identical code first, then by name, then through the call graph (the callees and callers of
+functions already matched), and last by similarity. Without `-d`, `-f` compares instructions instead of pseudocode,
+and `--json` gives the whole result to a script.
 
 ## GUI
 
