@@ -73,7 +73,7 @@ jobs:
             asset: relic-${{ inputs.version }}-linux-x86_64
           - os: windows-latest
             asset: relic-${{ inputs.version }}-windows-x86_64
-          - os: macos-14
+          - os: macos-15                # (Apple silicon; GitHub retired the macos-14 image)
             asset: relic-${{ inputs.version }}-macos-arm64
           - os: macos-15-intel
             asset: relic-${{ inputs.version }}-macos-x86_64
