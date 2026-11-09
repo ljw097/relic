@@ -105,3 +105,60 @@ def test_cli(patched, vuln64):
     assert r.returncode == 0 and "+    call fgets" in r.stdout
     r = _relic("diff", *patched, "-f", "nowhere_at_all")
     assert r.returncode != 0 and "not a function matched" in r.stderr
+
+
+SHIFT = """#include <stdio.h>
+int work(int x, int y) {
+    int r = 0;
+    if (x > 10) r += 1;
+    if (y > 20) r += 2;
+    if (x + y > 30) r += 4;
+    if (x * y > 40) r += 8;
+    if (x - y > 50) r += 16;
+    if (y - x > 60) r += 32;
+    for (int i = 0; i < x; i++) r ^= i;
+    return r;
+}
+int main(int c, char **v) { printf("%d\\n", work(c, c * 3)); return 0; }
+"""
+
+
+def test_a_block_added_early_is_a_small_change(tmp_path):
+    """One `if` at the top renumbers every later block: that alone is not a change of the
+    lines that branch to them (similarity, and the lines the diff shows)."""
+    cc = shutil.which("gcc")
+    if cc is None:
+        pytest.skip("no gcc")
+    exes = []
+    for k, src in enumerate((SHIFT, SHIFT.replace("    int r = 0;\n", "    int r = 0;\n    if (x < 0) return -1;\n"))):
+        (tmp_path / f"s{k}.c").write_text(src)
+        exes.append(str(tmp_path / f"s{k}"))
+        subprocess.run([cc, "-O0", "-no-pie", str(tmp_path / f"s{k}.c"), "-o", exes[-1]], check=True)
+    d = diff(analyze(exes[0]), analyze(exes[1]))
+    [m] = d.changed()
+    assert m.name == "work" and m.how == "name" and m.similarity > 0.9
+    lines = function_diff(d, m)
+    removed = [ln for ln in lines if ln.startswith("-") and not ln.startswith("---")]
+    added = [ln for ln in lines if ln.startswith("+") and not ln.startswith("+++")]
+    assert removed == [] and 4 <= len(added) <= 8          # the new compare, branch, return value, jump
+
+
+def test_comparable_drops_block_numbers():
+    from relic.analysis.bindiff import comparable
+    assert comparable(["B3", "jle L12", "mov eax, 0xb1"]) == ["B", "jle L", "mov eax, 0xb1"]
+
+
+def test_pseudocode_diff_survives_a_function_that_does_not_decompile(patched, monkeypatch):
+    import relic.decompiler.emit as emit
+    old, new = analyze(patched[0]), analyze(patched[1])
+    d = diff(old, new)
+    real = emit.decompile
+
+    def new_side_fails(an, f):
+        if an is new:
+            raise NotImplementedError("no lifter")
+        return real(an, f)
+    monkeypatch.setattr(emit, "decompile", new_side_fails)
+    lines = function_diff(d, d.changed()[0], decompiled=True)
+    assert "+// not decompiled (NotImplementedError: no lifter)" in lines
+    assert any(ln.startswith("-    gets(") for ln in lines)
