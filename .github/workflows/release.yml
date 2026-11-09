@@ -4,15 +4,23 @@ name: Release
 # package, builds stand-alone executables for Windows, Linux and macOS (PyInstaller) plus the
 # sdist and wheel, smoke-tests them, tags v<version> and publishes a GitHub release with
 # docs/releases/<version>.md as its notes.
+#
+# With "add missing" it instead rebuilds an existing release from its tag and uploads only the
+# files that release lacks (say, a runner that never started); the files it has stay as they are.
+# Either way the release gets a SHA256SUMS file of all its files, listed in its notes too.
 on:
   workflow_dispatch:
     inputs:
       version:
         description: "Version (must equal pyproject.toml's)"
         required: true
-        default: "1.2.0"
+        default: "1.2.1"
       prerelease:
         description: "Mark as a pre-release (beta)"
+        type: boolean
+        default: false
+      add_missing:
+        description: "Add missing files to the existing release v<version> (built from its tag)"
         type: boolean
         default: false
 
@@ -24,6 +32,8 @@ jobs:
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v5
+        with:
+          ref: ${{ inputs.add_missing && format('v{0}', inputs.version) || '' }}
       - uses: actions/setup-python@v6
         with:
           python-version: "3.12"
@@ -33,7 +43,11 @@ jobs:
           test "$v" = "${{ inputs.version }}" || { echo "pyproject.toml says $v"; exit 1; }
           grep -q "__version__ = \"$v\"" relic/__init__.py
           test -f "docs/releases/$v.md"
-          ! git ls-remote --exit-code --tags origin "v$v"
+          if [ "${{ inputs.add_missing }}" = "true" ]; then
+            git ls-remote --exit-code --tags origin "v$v" > /dev/null || { echo "no tag v$v to add to"; exit 1; }
+          else
+            ! git ls-remote --exit-code --tags origin "v$v"
+          fi
       - name: Build the sdist and wheel
         run: |
           pip install build
@@ -66,6 +80,8 @@ jobs:
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v5
+        with:
+          ref: ${{ inputs.add_missing && format('v{0}', inputs.version) || '' }}
       - uses: actions/setup-python@v6
         with:
           python-version: "3.12"
@@ -112,6 +128,8 @@ jobs:
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v5
+        with:
+          ref: ${{ inputs.add_missing && format('v{0}', inputs.version) || '' }}
       - uses: actions/download-artifact@v7
         with:
           path: assets
@@ -122,8 +140,39 @@ jobs:
         run: |
           v=${{ inputs.version }}
           ls -la assets
+          # SHA256SUMS next to the files, and the same list at the end of the notes
+          sums() { (cd "$1" && sha256sum -- $(ls | grep -vxF SHA256SUMS | sort)) > "$1/SHA256SUMS"; }
+          notes() {
+            cat "docs/releases/$v.md"
+            printf '\n## SHA-256\n\n'
+            printf 'Check a download with `sha256sum -c SHA256SUMS --ignore-missing` (macOS: `shasum -a 256 -c`).\n\n'
+            printf '```\n'; cat "$1/SHA256SUMS"; printf '```\n'
+          }
+          if [ "${{ inputs.add_missing }}" = "true" ]; then
+            have=$(gh release view "v$v" --json assets -q '.assets[].name')
+            add=()
+            for f in assets/*; do
+              grep -qxF "$(basename "$f")" <<< "$have" || add+=("$f")
+            done
+            if [ ${#add[@]} -gt 0 ]; then
+              echo "adding: ${add[*]}"
+              gh release upload "v$v" "${add[@]}"
+            fi
+            # the sums cover what the release has now, its earlier files as published
+            mkdir published
+            gh release download "v$v" -D published
+            sums published
+            cat published/SHA256SUMS
+            gh release upload "v$v" published/SHA256SUMS --clobber
+            notes published > notes.md
+            gh release edit "v$v" --notes-file notes.md
+            exit 0
+          fi
           ls assets | grep -q linux-x86_64 && ls assets | grep -q windows-x86_64 || { echo "Linux / Windows builds missing"; exit 1; }
+          sums assets
+          cat assets/SHA256SUMS
+          notes assets > notes.md
           flags=""
           if [ "${{ inputs.prerelease }}" = "true" ]; then flags="--prerelease"; title="Relic $v (beta)"; else title="Relic $v"; fi
           gh release create "v$v" assets/* --target "$GITHUB_SHA" --title "$title" \
-            --notes-file "docs/releases/$v.md" $flags
+            --notes-file notes.md $flags
