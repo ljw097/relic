@@ -23,27 +23,30 @@ if TYPE_CHECKING:
 MIN_INSNS = 6                 # shorter functions look alike: neither pushed nor pulled
 _NUM = re.compile(r"(?<![\w.])(-?)(0x[0-9a-fA-F]+|\d+)(?![\w.])")
 _PCREL = re.compile(r"\b(rip|eip|pc)\b")
+_BLOCK = re.compile(r"B\d+")
 
 
 def default_store() -> str:
     return os.environ.get("RELIC_LUMINA") or os.path.join(os.path.expanduser("~"), ".relic", "lumina.json")
 
 
-def fingerprint(an: "Analysis", f: "Function") -> str | None:
-    """A hash of the function's code that is the same wherever it is linked; None for imported
-    stubs and functions too short to tell apart."""
+def normalized(an: "Analysis", f: "Function", callee=None) -> list[str]:
+    """The function's code with what depends on where it is linked taken out: a `B<k>` line
+    for each block in address order, then its instructions, with branch targets as the block
+    they go to (`L<k>`, `F` outside the function), mapped addresses as `A` and pc-relative
+    displacements as `D`. Empty for imported stubs. `callee(addr)`, when given, names a target
+    outside the function instead of `F` (None: still `F`). (The fingerprint and `relic diff`.)"""
     if f.is_import or not f.blocks:
-        return None
+        return []
     blocks = sorted(f.blocks)
     index = {a: k for k, a in enumerate(blocks)}
-    parts, n = [an.bin.arch], 0
+    lines = []
     for a in blocks:
-        parts.append(f"B{index[a]}")
+        lines.append(f"B{index[a]}")
         for i in f.blocks[a].insns:
-            n += 1
             ops = i.op_str
             if i.target is not None:
-                tgt = f"L{index[i.target]}" if i.target in index else "F"
+                tgt = f"L{index[i.target]}" if i.target in index else (callee and callee(i.target)) or "F"
                 ops = _NUM.sub(lambda m, t=i.target, s=tgt: s if int(m.group(2), 0) == t else m.group(0), ops)
             pcrel = bool(_PCREL.search(ops))
 
@@ -54,10 +57,18 @@ def fingerprint(an: "Analysis", f: "Function") -> str | None:
                 if pcrel and v >= 0x100:
                     return "D"
                 return m.group(0)
-            parts.append(f"{i.mnemonic} {_NUM.sub(norm, ops)}")
-    if n < MIN_INSNS:
+            lines.append(f"{i.mnemonic} {_NUM.sub(norm, ops)}")
+    return lines
+
+
+def fingerprint(an: "Analysis", f: "Function", lines: list[str] | None = None) -> str | None:
+    """A hash of the function's code that is the same wherever it is linked; None for imported
+    stubs and functions too short to tell apart. `lines`: its `normalized` code, if at hand."""
+    if lines is None:
+        lines = normalized(an, f)
+    if sum(1 for ln in lines if not _BLOCK.fullmatch(ln)) < MIN_INSNS:
         return None
-    return hashlib.sha256("\n".join(parts).encode()).hexdigest()[:32]
+    return hashlib.sha256("\n".join([an.bin.arch, *lines]).encode()).hexdigest()[:32]
 
 
 def metadata(an: "Analysis", f: "Function") -> dict | None:

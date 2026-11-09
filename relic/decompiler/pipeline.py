@@ -81,22 +81,51 @@ def prepared(an: "Analysis", func: "Function") -> Prepared:
 
 
 def prepare(an: "Analysis", func: "Function") -> Prepared:
-    from .calls import _livein_arg_regs
     arch = arch_for(an.bin)
     fn = copy.deepcopy(cached_ir(an, func))
+    _join_abi_pieces(an, func, fn, arch)
+    from .cleanup import stack_guards
+    frame = analyze_frame(fn, arch, stack_guards(an))
+    hide_canary(fn, frame)
+    fret, rets, user_ret = _result(an, func, fn, arch)
+    if not rets:
+        drop_return_values(fn)
+    _locals_out_of_ssa(fn, frame)
+    fn = out_of_ssa(fn)
+    forward_empty_blocks(fn)
+    params = _params(an, func, frame, arch)
+    from .calls import narrow_call_args
+    from .cleanup import fold_param_spills
+    fold_param_spills(fn, params)           # -O0: `var_1c = argc` once on entry, then var_1c read
+    narrow_library_results(fn)
+    narrow_call_args(an, arch, fn)
+    w = _result_width(an, func, fn, arch, fret, user_ret, rets)
+    _simplify(an, fn, arch)
+    st = Structurer(fn)
+    tree = st.run()
+    from .chains import switchify
+    tree = switchify(tree, frozenset(st.gotos))     # compare chains on one value -> switch
+    return Prepared(fn, arch, frame, params, rets, tree, st.gotos, w, fret is not None, frozenset(st.hidden))
+
+
+def _join_abi_pieces(an: "Analysis", func: "Function", fn: IRFunction, arch: ArchInfo):
+    """Values the ABI splits over several registers / stack words, made one again: RV32's
+    doubles in integer register pairs, x86's word-by-word copies of a wide argument."""
     if arch.bits == 32 and arch.name.startswith("riscv"):
         from .fpabi import float_int_params, join_pair_params
         pairs = [r for r, _ in float_int_params(an, arch, func.addr) if ":" in r]
         if pairs:
             join_pair_params(fn, pairs)
-    from .cleanup import stack_guards
     if arch.name == "x86-cdecl":
         from .calls import merge_word_copies
         if merge_word_copies(fn, arch):
             _dce(fn)
-    frame = analyze_frame(fn, arch, stack_guards(an))
-    hide_canary(fn, frame)
-    from .fpabi import fp_params, fp_return
+
+
+def _result(an: "Analysis", func: "Function", fn: IRFunction, arch: ArchInfo):
+    """(the float result's width or None, whether the function returns a value, the user's /
+    a header's return type or None)."""
+    from .fpabi import fp_return
     fret = fp_return(an, func)
     rets = fret is not None or returns_value(an, func, fn, arch.ret)
     user_ret = an.var_types.get(func.addr, {}).get("@return")       # the user's / a header's type
@@ -105,83 +134,92 @@ def prepare(an: "Analysis", func: "Function") -> Prepared:
         user_ret = "void"                       # an Objective-C method's type encoding says so
     if user_ret is not None and fret is None:
         rets = user_ret != "void"
-    if not rets:
-        drop_return_values(fn)
+    return fret, rets, user_ret
+
+
+def _locals_out_of_ssa(fn: IRFunction, frame: Frame):
+    """Stack slots as named locals, the stack pointer's own arithmetic and dead stores gone."""
+    from .cleanup import drop_dead_locals
     rewrite_locals(fn, frame)
     drop_stack_pointer_chains(fn, frame)
-    from .cleanup import drop_dead_locals
     drop_dead_locals(fn)
     _dce(fn)
-    fn = out_of_ssa(fn)
-    forward_empty_blocks(fn)
+
+
+def _params(an: "Analysis", func: "Function", frame: Frame, arch: ArchInfo) -> list[str]:
+    """The function's parameters in C order: registers (by name) and stack slots (by local)."""
+    from .calls import int_arg_regs, stack_param_slots
     if arch.name == "x86-cdecl":
         # stack parameters: [esp_0 + 4], [esp_0 + 8], ... are a1, a2, ...
-        from .calls import stack_param_slots
         word = arch.bits // 8
         # (a double takes two words: one parameter)
-        params = [frame.slots[word + rel].name() if word + rel in frame.slots else f"arg_{word + rel:x}"
-                  for rel, _, _ in stack_param_slots(an, arch, func.addr)]
-    elif (an.name(func.addr) or "") == "main":
+        return [frame.slots[word + rel].name() if word + rel in frame.slots else f"arg_{word + rel:x}"
+                for rel, _, _ in stack_param_slots(an, arch, func.addr)]
+    if (an.name(func.addr) or "") == "main":
         # main(argc, argv, envp): an unused argc before a used argv is still the first parameter
-        from .calls import int_arg_regs, livein_regs
+        from .calls import livein_regs
         regs = int_arg_regs(arch)[:3]
         live = livein_regs(an, arch, func.addr)
-        params = list(regs[:max((k + 1 for k, r in enumerate(regs) if r in live), default=0)])
-    else:
-        from .fpabi import float_int_params
-        fints = [r for r, _ in float_int_params(an, arch, func.addr)]       # RISC-V: floats past fa7
-        halves = {x for r in fints for x in r.split(":")}
-        ints = [r for r in _livein_arg_regs(an, arch, func.addr) if r not in halves]
-        fpl = fp_params(an, arch, func.addr)
-        fints = [r.split(":")[0] for r in fints]          # (RV32: a pair is named after its low register)
-        from .emit import objc_method
-        m = objc_method(an.name(func.addr) or "")
-        if m is not None and not fpl:
-            # an Objective-C method: self, _cmd, then one per `:` of its selector, used or not
-            from .calls import int_arg_regs
-            n = 2 + m[2].count(":")
-            ints = list(int_arg_regs(arch)[:n]) + [r for r in ints if r not in int_arg_regs(arch)[:n]]
-        params = ints + [r for r, _ in fpl] + fints
-        from .calls import positional_order
-        order = positional_order(arch, ints, fpl)
-        if order is not None:                   # PowerPC64: in the order C had them
-            params = [params[k] for k in order] + fints
-        from .calls import param_base, stack_params_used
-        if stack_params_used(arch):
-            # parameters past the registers, on the stack (above the return address on x86-64,
-            # and past Win64's home space for the four register parameters)
-            from .fpabi import stack_arg_base
-            word = arch.bits // 8
-            # (PowerPC's offset from the caller's r1 is the same from this function's entry r1)
-            first = param_base(arch) + (0 if arch.name.startswith("ppc") else stack_arg_base(arch))
-            from .calls import stack_param_slots
-            params += [frame.slots[first + rel].name() if first + rel in frame.slots else f"arg_{first + rel:x}"
-                       for rel, _, _ in stack_param_slots(an, arch, func.addr)]
-    from .cleanup import fold_param_spills
-    fold_param_spills(fn, params)           # -O0: `var_1c = argc` once on entry, then var_1c read
-    narrow_library_results(fn)
-    from .calls import narrow_call_args
-    narrow_call_args(an, arch, fn)
-    w = None
+        return list(regs[:max((k + 1 for k, r in enumerate(regs) if r in live), default=0)])
+    from .calls import _livein_arg_regs, param_base, positional_order, stack_params_used
+    from .emit import objc_method
+    from .fpabi import float_int_params, fp_params
+    fints = [r for r, _ in float_int_params(an, arch, func.addr)]       # RISC-V: floats past fa7
+    halves = {x for r in fints for x in r.split(":")}
+    ints = [r for r in _livein_arg_regs(an, arch, func.addr) if r not in halves]
+    fpl = fp_params(an, arch, func.addr)
+    fints = [r.split(":")[0] for r in fints]          # (RV32: a pair is named after its low register)
+    m = objc_method(an.name(func.addr) or "")
+    if m is not None and not fpl:
+        # an Objective-C method: self, _cmd, then one per `:` of its selector, used or not
+        n = 2 + m[2].count(":")
+        ints = list(int_arg_regs(arch)[:n]) + [r for r in ints if r not in int_arg_regs(arch)[:n]]
+    params = ints + [r for r, _ in fpl] + fints
+    order = positional_order(arch, ints, fpl)
+    if order is not None:                   # PowerPC64: in the order C had them
+        params = [params[k] for k in order] + fints
+    if stack_params_used(arch):
+        # parameters past the registers, on the stack (above the return address on x86-64,
+        # and past Win64's home space for the four register parameters)
+        from .fpabi import stack_arg_base
+        # (PowerPC's offset from the caller's r1 is the same from this function's entry r1)
+        first = param_base(arch) + (0 if arch.name.startswith("ppc") else stack_arg_base(arch))
+        params += [frame.slots[first + rel].name() if first + rel in frame.slots else f"arg_{first + rel:x}"
+                   for rel, _, _ in stack_param_slots(an, arch, func.addr)]
+    return params
+
+
+def _result_width(an: "Analysis", func: "Function", fn: IRFunction, arch: ArchInfo, fret, user_ret, rets: bool):
+    """The result's width in bits (None: unknown); an integer result narrower than a register
+    is narrowed where it is returned."""
     if fret is not None:
-        w = fret
-    elif user_ret is not None:
+        return fret
+    if user_ret is not None:
         w = _type_bits(user_ret, arch.bits)
         if w is not None and w < arch.bits:
             narrow_returns(fn, w)
-    elif rets:
+        return w
+    if rets:
         w = return_width(an, func, arch.ret)
         if w is not None:
             narrow_returns(fn, w)
+        return w
+    return None
+
+
+def _simplify(an: "Analysis", fn: IRFunction, arch: ArchInfo):
+    """Narrowing, constants, temporaries inlined, divisions by constants, short circuits: the
+    clean-up between out-of-SSA and structuring."""
+    from .arch import sext_ints
     from .calls import int_arg_regs
+    from .cleanup import fold_unsigned_conversions, propagate_ro_loads
+    from .fpconst import fold_float_constants
+    from .passes import _redundant_masks
     # RISC-V and MIPS n64 pass an `int` sign-extended to 64 bits: a parameter read as its low half and
     # otherwise only compared is one
-    from .arch import sext_ints
-    narrow(fn, sext_params=set(int_arg_regs(arch)) if sext_ints(arch) else frozenset())
-    from .passes import _redundant_masks
+    sext_params = frozenset(int_arg_regs(arch)) if sext_ints(arch) else frozenset()
+    narrow(fn, sext_params=set(sext_params))
     _redundant_masks(fn)                    # (narrowing leaves `(int)c & 0xff` of a loaded byte)
-    from .fpconst import fold_float_constants
-    from .cleanup import propagate_ro_loads
     if arch.name.startswith("riscv"):
         propagate_ro_loads(an, fn)          # `fld` of a constant into a register used several times
     fold_float_constants(an, fn)
@@ -195,7 +233,6 @@ def prepare(an: "Analysis", func: "Function") -> Prepared:
         from .fpconst import narrow_x87
         narrow_x87(fn)      # x87: float arithmetic computed as doubles of floats
     _fold_pass(fn)          # constants exposed by narrowing and inlining
-    sext_params = frozenset(int_arg_regs(arch)) if sext_ints(arch) else frozenset()
     if recover_division(fn, sext_params):       # magic-number multiplies -> x / c, x % c
         _fold_pass(fn)
         if sext_params:                         # (a 32-bit dividend now read only as its low half)
@@ -203,15 +240,9 @@ def prepare(an: "Analysis", func: "Function") -> Prepared:
             narrow(fn, sext_params=set(sext_params))
             _fold_pass(fn)
     _dce(fn)
-    from .cleanup import fold_unsigned_conversions
     if fold_unsigned_conversions(an, fn):       # `(double)(uint64_t)x` from the compiler's two-way code
         _dce(fn)
     fold_short_circuits(fn)
-    st = Structurer(fn)
-    tree = st.run()
-    from .chains import switchify
-    tree = switchify(tree, frozenset(st.gotos))     # compare chains on one value -> switch
-    return Prepared(fn, arch, frame, params, rets, tree, st.gotos, w, fret is not None, frozenset(st.hidden))
 
 
 def _type_bits(ctype: str, ptr_bits: int) -> int | None:
