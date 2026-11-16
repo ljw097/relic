@@ -394,6 +394,7 @@ class Analysis:
                 info = dict(s.uses).get("r8")
                 word = arch.bits // 8
                 m = self.bin.read_int(info.value + word, word) if isinstance(info, Const) else None
+                m = getattr(self.bin, "func_descriptors", {}).get(m, m)     # (ELFv1: main's descriptor)
                 v = Const(m, arch.bits) if m is not None else None
             if isinstance(v, Load) and isinstance(v.addr, Const):
                 v = self.bin.read_int(v.addr.value, v.bits // 8)

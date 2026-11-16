@@ -36,8 +36,6 @@ tar의 `main`은 20초 동안 158개 함수를 준비합니다.
 
 ## P1 — 분석
 
-- [ ] **PowerPC64 ELFv1(빅 엔디언).** 가상 호출은 다른 아키텍처처럼 되지만, stripped 빌드에서 `main`을 못 찾고
-  PLT 스텁을 import(`__dynamic_cast` 등)로 풀지 못해서 그 둘에 기대는 것이 빠집니다.
 - [ ] **라이브러리 식별에서 남은 것.** 코드가 똑같은 짧은 스텁 가운데 참조로도 구분되지 않는 것들이 있습니다
   (`__chk_fail`과 `__fortify_fail` 같은 것, 어셈블러가 분기 하나로 줄여 버린 Thumb `fopen`). 정적 링크된
   stripped MIPS 바이너리에서 `main`을 못 찾는 문제도 있습니다. `_start`가 GOT를 거쳐 `__libc_start_main`을

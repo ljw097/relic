@@ -308,8 +308,13 @@ def _ppc_call_stubs(b: Binary, got_names: dict[int, str], found: dict[int, str])
         if pos is None:
             return None
         insns, k = pos
-        seq = insns[k:k + 6]
+        seq = insns[k:k + 8]
         n = next((j for j, i in enumerate(seq) if i.mnemonic == "bctr"), None)
+        # (ELFv1: the callee's TOC and environment pointer are loaded between `mtctr` and `bctr`)
+        while n is not None and n >= 3 and seq[n - 1].mnemonic == "ld" and seq[n - 1].operands and \
+                seq[n - 1].reg_name(seq[n - 1].operands[0].reg) in ("r2", "r11"):
+            seq = seq[:n - 1] + seq[n:]
+            n -= 1
         if n is None or n < 2 or seq[n - 1].mnemonic != "mtctr":
             return None
         ld = seq[n - 2]

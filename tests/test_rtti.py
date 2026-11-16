@@ -185,13 +185,14 @@ def test_a64_virtual_calls(a64):
 
 
 CROSS = ["arm-linux-gnueabihf", "mipsel-linux-gnu", "mips-linux-gnu", "riscv64-linux-gnu", "powerpc64le-linux-gnu",
-         "powerpc-linux-gnu"]
+         "powerpc64-linux-gnu", "powerpc-linux-gnu"]
 
 
 @pytest.fixture(scope="module", params=[(t, o) for t in CROSS for o in ("O0", "O2")], ids=lambda p: f"{p[0]}-{p[1]}")
 def cross(request, tmp_path_factory):
     """tests/src/classes.cpp for ARM (Thumb), MIPS (both byte orders), RISC-V, PowerPC64 ELFv2 and
-    32-bit PowerPC (not PIC: libstdc++'s typeinfo vtables copied into the program), stripped."""
+    ELFv1 (function descriptors), 32-bit PowerPC (not PIC: libstdc++'s typeinfo vtables copied into
+    the program), stripped."""
     triple, opt = request.param
     gxx = shutil.which(f"{triple}-g++")
     if gxx is None:

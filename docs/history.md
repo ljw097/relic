@@ -136,9 +136,10 @@ RISC-V에서는 부호 확장된 값끼리 비교할 때 폭을 잘못 고르던
   레지스터(`r31`, `s0`, `r7`)가 -O2에서는 객체를 담기도 해서, 객체가 들어 있으면 슬롯으로 보지 않는다.
   덤으로 클래스 복원의 버그 셋을 고쳤다. ARM vtable 슬롯에 Thumb 비트가 남아 메서드 이름이 안 붙었고,
   PowerPC64 ELFv1은 슬롯이 함수 서술자를 가리켜서 vtable을 끝까지 못 읽었고, PIC가 아닌 32비트 PowerPC는
-  libstdc++의 typeinfo vtable이 copy 재배치로 프로그램 안에 복사돼서 클래스 다섯 중 셋을 놓쳤다. PowerPC64
-  ELFv1(빅 엔디언)은 `show()` 같은 함수 안의 호출만 찾는다. stripped 빌드에서 `main`을 못 찾고 PLT를 import로
-  풀지 못해서다.
+  libstdc++의 typeinfo vtable이 copy 재배치로 프로그램 안에 복사돼서 클래스 다섯 중 셋을 놓쳤다.
+- **PowerPC64 ELFv1 glibc 프로그램(1.3.1).** 호출 스텁이 `mtctr`과 `bctr` 사이에서 호출 대상의 TOC를 읽어서
+  (`ld r2, a+8(r2)`) 스텁으로 알아보지 못했고, 그래서 import가 하나도 이름이 없었다. `_start`가
+  `__libc_start_main`에 넘기는 블록의 `main`은 함수 서술자라서 stripped 빌드에서 `main`도 못 찾았다. 둘 다 고쳤다.
 
 ### 코드와 데이터 구분
 
