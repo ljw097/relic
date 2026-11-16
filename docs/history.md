@@ -140,6 +140,10 @@ RISC-V에서는 부호 확장된 값끼리 비교할 때 폭을 잘못 고르던
 - **PowerPC64 ELFv1 glibc 프로그램(1.3.1).** 호출 스텁이 `mtctr`과 `bctr` 사이에서 호출 대상의 TOC를 읽어서
   (`ld r2, a+8(r2)`) 스텁으로 알아보지 못했고, 그래서 import가 하나도 이름이 없었다. `_start`가
   `__libc_start_main`에 넘기는 블록의 `main`은 함수 서술자라서 stripped 빌드에서 `main`도 못 찾았다. 둘 다 고쳤다.
+- **정적 링크된 stripped 프로그램의 `main`(1.3.1).** 그 libc의 시그니처가 없으면 `__libc_start_main`에 이름이
+  없어서 `main`을 못 찾았다(MIPS, RISC-V). 이름이 없어도 `_start`에서 돌아오지 않는 호출이 하나뿐이면 그것이
+  `__libc_start_main`이고 첫 인자가 `main`이다. MIPS는 그 인자가 GOT 칸을 읽은 변수라서 정의를 따라간다.
+  MIPS 양쪽 바이트 순서, RISC-V, ARM, 32비트 PowerPC, PowerPC64 ELFv1에서 -O0과 -O2 모두 맞는 `main`을 찾는다.
 
 ### 코드와 데이터 구분
 

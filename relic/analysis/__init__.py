@@ -376,7 +376,7 @@ class Analysis:
         try:
             from ..decompiler.arch import arch_for
             from ..decompiler.calls import int_arg_regs
-            from ..decompiler.ir import CallStmt, Const, Load
+            from ..decompiler.ir import Assign, CallStmt, Const, Load, Var
             from ..decompiler.lift import lift_function
             from ..decompiler.passes import optimize
             from ..decompiler.ssa import to_ssa
@@ -385,10 +385,16 @@ class Analysis:
             ir = optimize(to_ssa(lift_function(self, start), arch), arch)
         except Exception:  # noqa: BLE001 - no lifter for this target, or it failed: no main
             return None
-        for s in ir.stmts():
-            if not (isinstance(s, CallStmt) and (s.name or "").split("@")[0] == "__libc_start_main"):
-                continue
+        calls = [s for s in ir.stmts() if isinstance(s, CallStmt)]
+        named = [s for s in calls if (s.name or "").split("@")[0] == "__libc_start_main"]
+        # a static stripped binary without signatures for its libc: `_start`'s one call (the one
+        # that does not return, after RISC-V's `load_gp`) is still __libc_start_main(main, argc,
+        # argv, ...) -- when its first argument is code
+        defs = {a.dst: a.src for a in ir.stmts() if isinstance(a, Assign)}
+        stops = [s for s in calls if s.noreturn]
+        for s in named or (stops if len(stops) == 1 else calls if len(calls) == 1 else []):
             v = dict(s.uses).get(regs[0]) if regs else None
+            v = defs.get(v, v) if isinstance(v, Var) else v       # (`a0_1 = [GOT slot]`)
             if arch.name.startswith("ppc"):
                 # PowerPC glibc: r8 points at `{sda_base, main, init, fini}`
                 info = dict(s.uses).get("r8")
