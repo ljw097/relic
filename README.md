@@ -10,14 +10,14 @@ The goal is admittedly ambitious: something as good as IDA Pro with Hex-Rays, an
 can manage it. It isn't there yet. But for the everyday stuff it already works well: opening an
 x86-64 or ARM binary, finding your way around, naming things, reading the pseudocode, and
 measuring an overflow offset in the debugger. The current release is
-[1.2.1](https://github.com/ljw097/relic/releases/tag/v1.2.1).
+[1.3.0](https://github.com/ljw097/relic/releases/tag/v1.3.0).
 
 ![The Relic debugger stopped in vuln() right after gets(): the AAAA… input shows up in the registers and the stack telescope](docs/screenshots/debugger.png)
 
 ## Installing
 
 Grab the executable for your system from the
-[release page](https://github.com/ljw097/relic/releases/tag/v1.2.1) and run it. There's nothing
+[release page](https://github.com/ljw097/relic/releases/tag/v1.3.0) and run it. There's nothing
 to install:
 
 - **Windows**: `relic-<version>-windows-x86_64.exe`
@@ -38,7 +38,7 @@ If you have Python 3.10 or newer, you can install the wheel from the release pag
 
 ```sh
 python3 -m venv .venv
-.venv/bin/pip install https://github.com/ljw097/relic/releases/download/v1.2.1/relic_re-1.2.1-py3-none-any.whl
+.venv/bin/pip install https://github.com/ljw097/relic/releases/download/v1.3.0/relic_re-1.3.0-py3-none-any.whl
 .venv/bin/relic
 ```
 
@@ -110,7 +110,7 @@ width, and ret2win candidates. IDA doesn't do these out of the box, so I added t
 **Binary diffing.** `relic diff OLD NEW` matches the functions of two builds the way BinDiff
 does and tells you which ones changed, which were added and which were removed. It works on
 stripped binaries too, which makes it the place to start when you want to know what a patch
-fixed.
+fixed. With `--port` it carries your names, comments and variable names over to the new build.
 
 ### How far along it is compared to IDA
 
@@ -253,6 +253,25 @@ Functions are compared by their code with addresses taken out, so a function tha
 They are matched by identical code first, then by name, then through the call graph (the callees and callers of
 functions already matched), and last by similarity. Without `-d`, `-f` compares instructions instead of pseudocode,
 and `--json` gives the whole result to a script.
+
+When a new version of something you already reversed comes out, `--port` carries your work over. Each matched
+function gets its name (yours, or the old build's symbol when the new build is stripped), the comments, bookmarks
+and number formats on the instructions that didn't change, and its variable names and types (all of them if the
+code is identical, only the arguments if it changed). Globals that unchanged instructions use get their old names
+too. What the new build already has is kept unless you add `--overwrite`, and the result goes to the new build's
+project file (`--no-save` only lists it). In the GUI it's File > Port from older build, and in a script
+`port_from("old_build")`. Say you had named three functions and the `notes` array in `chall` and put three
+comments in `read_name`, one of them on the `gets` call the fix replaced:
+
+```
+$ relic diff chall chall_fixed --port
+0x40133b  add_note
+0x401539  hash_string
+0x40160c  read_name
+0x4040a0  notes  (global)
+ported 3 function name(s), 1 global(s), 2 comment(s), 1 on changed code not placed
+saved chall_fixed.relic.json
+```
 
 ## GUI
 

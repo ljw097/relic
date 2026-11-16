@@ -102,6 +102,11 @@ def _parser() -> argparse.ArgumentParser:
     s.add_argument("-d", "--decompile", action="store_true", help="with --func: compare pseudocode, not instructions")
     s.add_argument("-a", "--all", action="store_true", help="also list the functions that did not change")
     s.add_argument("--json", action="store_true", help="the whole result as JSON")
+    s.add_argument("--port", action="store_true",
+                   help="carry FILE's names, comments, bookmarks and variable names / types over to "
+                        "NEW's matching functions, and save NEW's project")
+    s.add_argument("--overwrite", action="store_true", help="with --port: replace what NEW already has")
+    s.add_argument("--no-save", action="store_true", help="with --port: only list, do not save")
     s = add("search", "search bytes, text, immediates or instructions")
     how = s.add_mutually_exclusive_group(required=True)
     how.add_argument("--bytes", metavar="PATTERN", help="hex bytes, `??` for any byte: '48 8b ?? 05'")
@@ -619,6 +624,22 @@ def cmd_diff(args):
     args.file = args.new
     new = _analyze(args)
     d = diff(old, new)
+    if args.port:
+        edits = len(new.edit_undo)
+        got = new.port_from(old, args.overwrite, matched=d)
+        for a, n in got["functions"]:
+            print(f"{a:#x}  {n}")
+        for a, n in got["globals"]:
+            print(f"{a:#x}  {n}  (global)")
+        lost = f", {got['lost']} on changed code not placed" if got["lost"] else ""
+        print(f"ported {len(got['functions'])} function name(s), {len(got['globals'])} global(s), "
+              f"{got['comments']} comment(s){lost}")
+        if len(new.edit_undo) == edits:
+            print("nothing to port")
+        elif not args.no_save:
+            new.save_project()
+            print(f"saved {new.project_path}")
+        return
     if args.func:
         m = d.find(args.func)
         if m is None:

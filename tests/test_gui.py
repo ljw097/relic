@@ -1041,6 +1041,27 @@ def test_merge_project_from_another_analyst(win, vuln64, tmp_path):
     assert f not in win.an.renames
 
 
+def test_port_from_older_build(win, vuln64, tmp_path):
+    """File > Port from older build: another build's names and comments, analysed in the background."""
+    old_dir = tmp_path / "old"
+    old_dir.mkdir()
+    shutil.copy(vuln64, old_dir / "vuln64")
+    from relic.analysis import analyze
+    old = analyze(str(old_dir / "vuln64"))
+    f = old.function_by_name("main").addr
+    old.rename(f, "entry_point")
+    old.comment(f, "ported")
+    old.save_project()
+    t = win.port_from(str(old_dir / "vuln64"))
+    assert t.wait(60000)
+    from PySide6.QtWidgets import QApplication
+    QApplication.processEvents()
+    assert win.an.renames[f] == "entry_point" and win.an.comments[f] == "ported"
+    assert "ported 1 names" in win.statusBar().currentMessage()
+    win.an.undo()
+    assert f not in win.an.renames
+
+
 def test_heap_panel_lists_chunks_and_tcache(app, win):
     from relic.gui.debugger import Snapshot
     from test_heap import BASE, _heap, _reader, _tcache_struct

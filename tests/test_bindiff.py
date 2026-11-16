@@ -162,3 +162,105 @@ def test_pseudocode_diff_survives_a_function_that_does_not_decompile(patched, mo
     lines = function_diff(d, d.changed()[0], decompiled=True)
     assert "+// not decompiled (NotImplementedError: no lifter)" in lines
     assert any(ln.startswith("-    gets(") for ln in lines)
+
+
+# ------------------------------------------------------------------ porting annotations
+def _insns(an, name_or_addr):
+    f = an.function_at(an.resolve(name_or_addr) if isinstance(name_or_addr, str) else name_or_addr)
+    return [i for b in sorted(f.blocks) for i in f.blocks[b].insns]
+
+
+def _annotate(old):
+    """An analyst's work on the old build: names, comments, a bookmark, variable names."""
+    v, cs = old.function_by_name("vuln").addr, old.function_by_name("checksum").addr
+    old.rename(v, "read_name")
+    gets = next(i.addr for i in _insns(old, v) if i.mnemonic == "call" and "gets" in old.label(i.target or 0))
+    ret = _insns(old, v)[-1].addr
+    old.comment(v, "asks for a name")
+    old.comment(gets, "overflows buf")              # (this call is what the fix changed)
+    old.comment(ret, "back to main")
+    old.bookmark(v, "the bug")
+    old.rename(cs, "hash_string")
+    old.rename_var(cs, "a1", "text")
+    old.rename_var(cs, "var_c", "acc")
+    old.rename_var(v, "a1", "unused_arg")
+    old.rename_var(v, "var_18", "buf")
+    old.repeatable_comment(cs, "djb-like hash")
+    return v, cs, gets, ret
+
+
+def test_port_carries_names_and_comments_to_a_stripped_update(patched, vuln64):
+    old, new = analyze(vuln64), analyze(patched[1])     # symbols and annotations -> stripped, fixed
+    v, cs, gets, ret = _annotate(old)
+    d = diff(old, new)
+    nv, ncs = d.find(hex(v)).new, d.find(hex(cs)).new
+    got = new.port_from(old, matched=d)
+    names = dict(got["functions"])
+    # the user's names, and the old build's symbols where the stripped build has none
+    assert names[nv] == "read_name" and names[ncs] == "hash_string"
+    for sym in ("add_note", "show_note", "del_note", "classify", "win", "menu"):
+        assert new.name(new.resolve(sym)) == sym and sym in names.values()
+    assert not any(a in d.added for a in names)             # (the added function stays sub_...)
+    # comments go to the instructions that line up; the one on the changed call has nowhere to go
+    new_ret = _insns(new, nv)[-1].addr
+    assert new.comments[nv] == "asks for a name" and new.comments[new_ret] == "back to main"
+    assert "overflows buf" not in new.comments.values()
+    assert got["comments"] == 2 and got["lost"] == 1
+    assert new.bookmarks[nv] == "the bug" and new.rcomments[ncs] == "djb-like hash"
+    # variables: all of them in identical code, only the arguments in changed code
+    assert new.var_names[ncs] == {"a1": "text", "var_c": "acc"}
+    assert new.var_names[nv] == {"a1": "unused_arg"}
+    # globals that unchanged instructions refer to
+    globs = dict(got["globals"])
+    assert "notes" in globs.values() and new.name(next(a for a, n in globs.items() if n == "notes")) == "notes"
+    # one undo step
+    new.undo()
+    assert nv not in new.renames and nv not in new.comments and ncs not in new.var_names
+
+
+def test_port_keeps_what_the_new_build_has(patched, vuln64):
+    old, new = analyze(vuln64), analyze(patched[1])
+    v, cs, *_ = _annotate(old)
+    d = diff(old, new)
+    nv, ncs = d.find(hex(v)).new, d.find(hex(cs)).new
+    new.rename(nv, "mine")
+    new.comment(nv, "my comment")
+    new.rename_var(ncs, "a1", "s")
+    new.port_from(old, matched=d)
+    assert new.renames[nv] == "mine" and new.comments[nv] == "my comment"
+    assert new.var_names[ncs] == {"a1": "s", "var_c": "acc"}
+    new.port_from(old, overwrite=True, matched=d)
+    assert new.renames[nv] == "read_name" and new.comments[nv] == "asks for a name"
+    assert new.var_names[ncs]["a1"] == "text"
+
+
+def test_port_does_not_reuse_a_name(patched, vuln64):
+    """A name the new build already has (on another function) is not given a second time."""
+    old, new = analyze(vuln64), analyze(patched[1])
+    v, *_ = _annotate(old)
+    d = diff(old, new)
+    added = d.added[0]
+    new.rename(added, "read_name")
+    got = new.port_from(old, matched=d)
+    assert "read_name" not in dict(got["functions"]).values()
+    assert new.renames[added] == "read_name" and d.find(hex(v)).new not in new.renames
+    with pytest.raises(ValueError):
+        old.port_from(new, matched=d)
+
+
+def test_cli_port(patched, vuln64, tmp_path):
+    shutil.copy(vuln64, tmp_path / "old")
+    shutil.copy(patched[1], tmp_path / "new")
+    old = analyze(str(tmp_path / "old"))
+    _annotate(old)
+    old.save_project()
+    r = _relic("diff", str(tmp_path / "old"), str(tmp_path / "new"), "--port", "--no-save")
+    assert r.returncode == 0, r.stderr
+    assert "read_name" in r.stdout and "1 on changed code not placed" in r.stdout
+    assert not os.path.exists(analyze(str(tmp_path / "new")).project_path)
+    r = _relic("diff", str(tmp_path / "old"), str(tmp_path / "new"), "--port")
+    assert r.returncode == 0 and "saved " in r.stdout
+    new = analyze(str(tmp_path / "new"))                # (its project file)
+    assert new.function_by_name("read_name") is not None or "read_name" in new.renames.values()
+    r = _relic("diff", str(tmp_path / "old"), str(tmp_path / "new"), "--port")
+    assert "nothing to port" in r.stdout

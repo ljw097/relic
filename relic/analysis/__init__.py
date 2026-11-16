@@ -924,6 +924,16 @@ class Analysis:
         from .lumina import Store, push
         return push(self, Store(store))
 
+    def port_from(self, old: "Analysis", overwrite: bool = False, matched=None) -> dict:
+        """Carry the annotations of `old`, an analysed earlier build of this binary, over to the
+        functions they match here (one undo step): see bindiff.port. `matched`: their
+        bindiff.diff(old, self), if at hand."""
+        from .bindiff import diff, port
+        d = matched if matched is not None else diff(old, self)
+        if d.new is not self:
+            raise ValueError("the diff is not against this binary")
+        return port(d, overwrite)
+
     def names(self) -> list[tuple[int, str, str]]:
         """Every named address: (address, name as shown, kind: function / import / library /
         data / label)."""
@@ -1107,7 +1117,7 @@ for _name in ("rename", "rename_var", "rename_struct", "rename_field", "set_var_
               "add_field", "remove_field", "comment", "bookmark", "import_header", "set_return_type",
               "clear_imported_types", "restore_snapshot", "merge_project", "set_operand_format",
               "set_number_format", "repeatable_comment", "define_data", "undefine", "create_function",
-              "delete_function", "lumina_pull", "checkout", "load_type_library"):
+              "delete_function", "lumina_pull", "checkout", "load_type_library", "port_from"):
     setattr(Analysis, _name, _undoable(getattr(Analysis, _name)))
 
 

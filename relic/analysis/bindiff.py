@@ -59,6 +59,8 @@ class BinDiff:
     matches: list[Match] = field(default_factory=list)
     removed: list[int] = field(default_factory=list)    # only in the old binary
     added: list[int] = field(default_factory=list)      # only in the new binary
+    # each side's `comparable` code by function address, as the matching computed it
+    keys: tuple[dict, dict] | None = field(default=None, repr=False, compare=False)
 
     def changed(self) -> list[Match]:
         """Matched functions whose code differs, the most changed first."""
@@ -211,7 +213,7 @@ class _Matcher:
 
     def result(self) -> BinDiff:
         A, B = self.A, self.B
-        out = BinDiff(A.an, B.an)
+        out = BinDiff(A.an, B.an, keys=(A.keys, B.keys))
         for a, (b, how) in sorted(self.pairs.items(), key=lambda p: p[1][0]):
             if A.hash[a] == B.hash[b]:
                 s = 1.0
@@ -290,4 +292,118 @@ def function_diff(d: BinDiff, m: Match, decompiled: bool = False) -> list[str]:
     return out
 
 
-__all__ = ["BinDiff", "Match", "comparable", "diff", "function_diff", "similarity"]
+# ------------------------------------------------------------------ porting annotations
+_ARG = re.compile(r"a\d+")
+
+
+def insn_map(d: BinDiff, m: Match) -> dict[int, int]:
+    """Old instruction address -> new one, for the instructions of a matched function that
+    line up unchanged (the same lines of `comparable` code, in order)."""
+    def side(an, a, k):
+        f = an.functions[a]
+        addrs = []
+        for b in sorted(f.blocks):
+            addrs.append(None)                  # (the block's own `B<k>` line)
+            addrs += [i.addr for i in f.blocks[b].insns]
+        keys = d.keys[k].get(a) if d.keys is not None else None
+        return addrs, keys if keys is not None else comparable(code_lines(an, f))
+    (aa, la), (ab, lb) = side(d.old, m.old, 0), side(d.new, m.new, 1)
+    if len(aa) != len(la) or len(ab) != len(lb):    # (cannot happen: one line per block / insn)
+        return {}
+    if la == lb:
+        return {x: y for x, y in zip(aa, ab) if x is not None}
+    out = {}
+    for tag, i1, i2, j1, _ in difflib.SequenceMatcher(None, la, lb, autojunk=False).get_opcodes():
+        if tag == "equal":
+            for k in range(i2 - i1):
+                x, y = aa[i1 + k], ab[j1 + k]
+                if x is not None and y is not None:
+                    out[x] = y
+    return out
+
+
+def port(d: BinDiff, overwrite: bool = False) -> dict:
+    """Carry the old build's annotations over to the new one (BinDiff's "port symbols"): for
+    every matched function its name (the user's, unless the new build has one of the user's
+    too; or the old build's symbol when the new build has none -- a stripped update),
+    comments, repeatable comment, bookmarks and number formats on the instructions that did
+    not change, and the names and types of its decompiler
+    variables (all of them for identical code, else only the arguments `a1`, `a2`, ...).
+    Globals that unchanged instructions refer to get the old build's names too.
+
+    What the new build already has (the user's names and comments, its own symbols) is kept
+    unless `overwrite`. Modifies `d.new`; returns {"functions": [(new address, name)],
+    "globals": [(new address, name)], "comments": n placed, "lost": n on changed code}."""
+    old, new = d.old, d.new
+    taken = {n for a in new.functions if (n := real_name(new, a))}
+    taken |= set(new.renames.values()) | {s.name for s in new.bin.symbols.values()}
+    funcs, globs, placed, lost = [], [], 0, 0
+
+    def name_free(n: str, addr: int) -> bool:
+        return n not in taken or new.renames.get(addr) == n
+
+    for m in sorted(d.matches, key=lambda m: m.new):
+        a, b = m.old, m.new
+        fa = old.functions[a]
+        amap = insn_map(d, m)
+        amap.setdefault(a, b)
+        # the function's name
+        # (the user's name over the new build's symbol, as over the old one's; a symbol only
+        # where the new build has no name)
+        n = old.renames.get(a) or real_name(old, a)
+        free = b not in new.renames if a in old.renames else real_name(new, b) is None
+        if n and (overwrite or free) and name_free(n, b) and new.name(b) != n:
+            new.renames[b] = n
+            taken.add(n)
+            funcs.append((b, n))
+        # comments, bookmarks, operand formats on the instructions that line up
+        for src, dst in ((old.comments, new.comments), (old.bookmarks, new.bookmarks),
+                         (old.op_formats, new.op_formats)):
+            for x, v in src.items():
+                if not fa.addr <= x < fa.end or not fa.block_at(x):
+                    continue
+                y = amap.get(x)
+                if y is None:
+                    if src is old.comments:
+                        lost += 1
+                    continue
+                if overwrite or y not in dst:
+                    dst[y] = v if isinstance(v, str) else dict(v)
+                    placed += src is old.comments
+        if a in old.rcomments and (overwrite or b not in new.rcomments):
+            new.rcomments[b] = old.rcomments[a]
+        if m.identical and a in old.num_formats and (overwrite or b not in new.num_formats):
+            new.num_formats[b] = dict(old.num_formats[a])
+        # decompiler variables: their generated names only mean the same in the same code
+        for attr in ("var_names", "var_types"):
+            got = {k: v for k, v in getattr(old, attr).get(a, {}).items() if m.identical or _ARG.fullmatch(k)}
+            if got:
+                cur = getattr(new, attr).setdefault(b, {})
+                for k, v in got.items():
+                    if overwrite or k not in cur:
+                        cur[k] = v
+        # globals: the data an unchanged instruction refers to is the same variable
+        for x, y in amap.items():
+            ta = [r.to for r in old.xrefs_from.get(x, ()) if r.kind == "data"]
+            tb = [r.to for r in new.xrefs_from.get(y, ()) if r.kind == "data"]
+            if len(ta) != len(tb):
+                continue
+            for t, u in zip(ta, tb):
+                if t in old.functions or u in new.functions:
+                    continue
+                n = old.renames.get(t) or old.bin.name_of(t)
+                named = u in new.renames or new.bin.name_of(u) is not None
+                if not n or (named and not overwrite) or new.name(u) == n or not name_free(n, u):
+                    continue
+                new.renames[u] = n
+                taken.add(n)
+                globs.append((u, n))
+                if t in old.rcomments and (overwrite or u not in new.rcomments):
+                    new.rcomments[u] = old.rcomments[t]
+    for attr in ("var_names", "var_types"):
+        for k in [k for k, v in getattr(new, attr).items() if not v]:
+            del getattr(new, attr)[k]
+    return {"functions": funcs, "globals": sorted(set(globs)), "comments": placed, "lost": lost}
+
+
+__all__ = ["BinDiff", "Match", "comparable", "diff", "function_diff", "insn_map", "port", "similarity"]

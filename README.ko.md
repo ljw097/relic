@@ -9,13 +9,13 @@ GUI는 PySide6, 명령어 디코딩은 capstone을 쓰고, 그 위에 올라가�
 목표는 솔직히 좀 거창합니다. IDA Pro + Hex-Rays만큼, 할 수 있다면 그보다 낫게 만드는 겁니다. 아직 거기까지는
 멀었지만, x86-64나 ARM 바이너리를 열어서 함수를 훑어보고, 이름을 붙이고, 의사 코드를 읽고, 디버거로
 오버플로 오프셋을 재는 정도는 지금도 충분히 됩니다. 현재 버전은
-[1.2.1](https://github.com/ljw097/relic/releases/tag/v1.2.1)입니다.
+[1.3.0](https://github.com/ljw097/relic/releases/tag/v1.3.0)입니다.
 
 ![Relic 디버거: vuln()에서 gets() 직후에 멈춘 화면. 입력한 AAAA…가 레지스터와 스택 telescope에 보인다](docs/screenshots/debugger.png)
 
 ## 설치
 
-[릴리스 페이지](https://github.com/ljw097/relic/releases/tag/v1.2.1)에서 운영체제에 맞는 실행 파일을 받아
+[릴리스 페이지](https://github.com/ljw097/relic/releases/tag/v1.3.0)에서 운영체제에 맞는 실행 파일을 받아
 실행하면 됩니다. 설치 과정은 없습니다.
 
 - **Windows**: `relic-<버전>-windows-x86_64.exe`
@@ -34,7 +34,7 @@ Python 3.10 이상이 있다면 릴리스 페이지의 wheel을 설치해도 됩
 
 ```sh
 python3 -m venv .venv
-.venv/bin/pip install https://github.com/ljw097/relic/releases/download/v1.2.1/relic_re-1.2.1-py3-none-any.whl
+.venv/bin/pip install https://github.com/ljw097/relic/releases/download/v1.3.0/relic_re-1.3.0-py3-none-any.whl
 .venv/bin/relic
 ```
 
@@ -101,7 +101,7 @@ ret2win 후보를 찾아 줍니다. IDA에는 기본으로 없는 기능이라 �
 
 **바이너리 비교.** `relic diff OLD NEW`는 BinDiff처럼 두 빌드의 함수를 짝지어서, 어떤 함수가 바뀌었고
 어떤 함수가 새로 생기거나 없어졌는지 알려 줍니다. stripped 바이너리에서도 되기 때문에, 패치가 무엇을
-고쳤는지 알아볼 때 여기서 시작하면 됩니다.
+고쳤는지 알아볼 때 여기서 시작하면 됩니다. `--port`를 주면 붙여 둔 이름, 주석, 변수 이름을 새 빌드로 옮겨 줍니다.
 
 ### IDA와 비교하면 어디쯤인지
 
@@ -245,6 +245,24 @@ sub_40160c: 0x40160c -> 0x40160c, 92% alike (matched by calls)
 함수는 주소를 지운 코드로 비교하므로 위치만 옮겨진 함수는 같은 것으로 봅니다. 짝은 똑같은 코드, 이름, 호출
 그래프(이미 짝지은 함수의 호출 대상과 호출자), 유사도 순서로 찾습니다. `-d` 없이 `-f`만 주면 의사 코드 대신
 명령어를 비교하고, `--json`은 결과 전체를 스크립트에 넘기기 좋게 출력합니다.
+
+이미 분석해 둔 프로그램의 새 버전이 나오면 `--port`로 작업한 것을 옮길 수 있습니다. 짝지은 함수마다 이름(직접
+붙인 이름, 새 빌드가 stripped면 옛 빌드의 심벌), 바뀌지 않은 명령어에 단 주석·북마크·숫자 표시 형식, 변수
+이름과 타입(코드가 똑같으면 전부, 바뀌었으면 인자만)이 넘어갑니다. 바뀌지 않은 명령어가 쓰는 전역 변수에도 옛
+이름이 붙습니다. 새 빌드에 이미 있는 것은 `--overwrite`를 주지 않는 한 그대로 두고, 결과는 새 빌드의 프로젝트
+파일에 저장합니다(`--no-save`면 목록만 보여 줍니다). GUI에서는 File > Port from older build, 스크립트에서는
+`port_from("old_build")`입니다. 예를 들어 `chall`에서 함수 세 개와 `notes` 배열에 이름을 붙이고 `read_name`에
+주석 세 개를 달았는데 그중 하나가 패치로 바뀐 `gets` 호출에 있었다면 이렇게 나옵니다.
+
+```
+$ relic diff chall chall_fixed --port
+0x40133b  add_note
+0x401539  hash_string
+0x40160c  read_name
+0x4040a0  notes  (global)
+ported 3 function name(s), 1 global(s), 2 comment(s), 1 on changed code not placed
+saved chall_fixed.relic.json
+```
 
 ## GUI
 
