@@ -182,3 +182,44 @@ def test_a64_virtual_calls(a64):
     assert any(cl["Parrot"].vtables[1].slots[0] in t for t in got)
     sound = frozenset(slots[n][2] for n in slots)
     assert sum(t == sound for _, (t, _) in an.icalls.items()) >= 2          # (show() and speak())
+
+
+CROSS = ["arm-linux-gnueabihf", "mipsel-linux-gnu", "mips-linux-gnu", "riscv64-linux-gnu", "powerpc64le-linux-gnu",
+         "powerpc-linux-gnu"]
+
+
+@pytest.fixture(scope="module", params=[(t, o) for t in CROSS for o in ("O0", "O2")], ids=lambda p: f"{p[0]}-{p[1]}")
+def cross(request, tmp_path_factory):
+    """tests/src/classes.cpp for ARM (Thumb), MIPS (both byte orders), RISC-V, PowerPC64 ELFv2 and
+    32-bit PowerPC (not PIC: libstdc++'s typeinfo vtables copied into the program), stripped."""
+    triple, opt = request.param
+    gxx = shutil.which(f"{triple}-g++")
+    if gxx is None:
+        pytest.skip(f"needs {triple}-g++")
+    out = str(tmp_path_factory.mktemp("cross") / f"classes-{triple}-{opt}")
+    subprocess.run([gxx, f"-{opt}", "-o", out, os.path.join(HERE, "src", "classes.cpp")], check=True)
+    subprocess.run([shutil.which(f"{triple}-strip") or "strip", out], check=True)
+    return out
+
+
+def test_cross_virtual_calls(cross):
+    """The same calls as on x86 and AArch64: main's speak() and destructor on make()'s object,
+    Named::name() on the dynamic_cast result, and show()'s sound() / legs() on its argument --
+    through `blx r3`, `jalr $t9` (and its delay slot), `c.jalr a5`, `mtctr` + `bctrl`; vtables
+    and typeinfos from the GOT, the TOC or `lis` + `addi`."""
+    an = analyze(cross)
+    cl = an.classes
+    assert {"Animal", "Dog", "Bird", "Named", "Parrot"} <= set(cl)
+    slots = {n: cl[n].vtables[0].slots for n in ("Dog", "Bird", "Parrot")}
+    assert all(an.functions.get(m) is not None for s in slots.values() for m in s if m)   # (ARM: no Thumb bit)
+    main = an.function_by_name("main")
+    got = [t for a, (t, _) in an.icalls.items() if main.block_at(a) is not None]
+    assert frozenset({slots["Dog"][4]}) in got and frozenset(slots[n][1] for n in slots) in got
+    assert any(cl["Parrot"].vtables[1].slots[0] in t for t in got)
+    sound, legs = (frozenset(slots[n][k] for n in slots) for k in (2, 3))
+    per: dict[int, set] = {}
+    for a, (t, _) in an.icalls.items():
+        per.setdefault(an.function_at(a).addr, set()).add(t)
+    assert {sound, legs} in per.values()
+    methods = {m for c in cl.values() for v in c.vtables for m in v.slots}
+    assert all(t <= methods for t, _ in an.icalls.values())

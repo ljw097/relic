@@ -127,6 +127,18 @@ RISC-V에서는 부호 확장된 값끼리 비교할 때 폭을 잘못 고르던
   (인라인된 생성자, SSE 두 워드 저장 포함), `__dynamic_cast` 결과에서 온다. 함수가 돌려주는 객체, 모든 호출
   지점이 같은 객체를 넘기는 인자, 가상 메서드 안의 `this`도 근거가 된다. x86-64, x86, AArch64에서 -O0과 -O2
   모두 된다.
+- **다른 아키텍처의 가상 호출(1.3.1).** ARM(Thumb), MIPS(양쪽 바이트 순서, MIPS64), RISC-V, PowerPC(32비트,
+  64비트 ELFv2)는 처리기 하나(`block_risc`)로 한다. 워드 로드·저장, 복사, 상수 더하기, 레지스터 호출(`blx r3`,
+  `jalr $t9`, `c.jalr a5`, `mtctr` + `bctrl`)과 프레임 슬롯만 보고, 아키텍처마다 다른 것은 ABI 표(`_RISC`)에
+  둔다. MIPS 지연 슬롯 명령은 앞의 분기·호출보다 먼저 처리한다. 주소는 상수 전파가 붙인 `refs`, GOT에서 읽은
+  vtable(`_ZTV` 시작 주소에 8을 더함)·typeinfo, PowerPC64의 TOC(`r2`), `lis`/`lui` + `addi`에서 온다. MIPS는
+  `__dynamic_cast`도 GOT를 거쳐 `jalr $t9`로 부르니 GOT 칸으로 import를 알아본다. -O0에서 프레임 포인터인
+  레지스터(`r31`, `s0`, `r7`)가 -O2에서는 객체를 담기도 해서, 객체가 들어 있으면 슬롯으로 보지 않는다.
+  덤으로 클래스 복원의 버그 셋을 고쳤다. ARM vtable 슬롯에 Thumb 비트가 남아 메서드 이름이 안 붙었고,
+  PowerPC64 ELFv1은 슬롯이 함수 서술자를 가리켜서 vtable을 끝까지 못 읽었고, PIC가 아닌 32비트 PowerPC는
+  libstdc++의 typeinfo vtable이 copy 재배치로 프로그램 안에 복사돼서 클래스 다섯 중 셋을 놓쳤다. PowerPC64
+  ELFv1(빅 엔디언)은 `show()` 같은 함수 안의 호출만 찾는다. stripped 빌드에서 `main`을 못 찾고 PLT를 import로
+  풀지 못해서다.
 
 ### 코드와 데이터 구분
 

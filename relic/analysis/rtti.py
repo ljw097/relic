@@ -58,12 +58,24 @@ def recover_classes(an, finder=None) -> dict[str, CppClass]:
     ptr = b.bits // 8
     kinds: dict[int, str] = {}
     pure: set[int] = set()
+    copied: dict[int, str] = {}              # address point of a typeinfo vtable copied in -> kind
     for r in getattr(b, "relocs", ()):
         k = _KINDS.get(r.name)
-        if k is not None:
+        sym = b.symbols.get(r.addr)
+        if k is not None and sym is not None and sym.name.split("@")[0] == r.name:
+            copied[r.addr + 2 * ptr] = k         # (a copy relocation, non-PIC: typeinfos point at the copy)
+        elif k is not None:
             kinds[r.addr] = k
         elif r.name in _PURE:
             pure.add(r.addr)
+    if copied:
+        for sec in b.sections:
+            if not sec.loaded or sec.x or sec.size == 0 or sec.name.startswith((".bss", ".sbss", ".tbss")):
+                continue
+            for a in range(sec.addr + (-sec.addr % ptr), sec.end - ptr + 1, ptr):
+                k = copied.get(b.read_ptr(a))
+                if k is not None:
+                    kinds.setdefault(a, k)
     if not kinds:
         return {}
     by_ti: dict[int, CppClass] = {}
@@ -229,12 +241,14 @@ def _vtables(an, by_ti: dict[int, CppClass], inside: set[int], pure: set[int], p
                 continue
             vt = VTable(a + ptr, off, start=a - ptr)
             s = a + ptr
+            descs = getattr(b, "func_descriptors", None) or {}
             while s + ptr <= sec.end:
                 v = b.read_ptr(s) or 0
+                v = descs.get(v, v)                      # (PowerPC64 ELFv1: a function descriptor)
                 if s in pure:
                     vt.slots.append(0)
                 elif v and b.is_exec(v & ~1):
-                    vt.slots.append(v)
+                    vt.slots.append(v & ~1 if b.arch == "arm" else v)     # (Thumb: the address, not bit 0)
                 else:
                     break
                 s += ptr
@@ -322,8 +336,14 @@ class _Types:
         self.ret = "x0" if self.a64 else "rax" if self.x64 else "eax"
         self.saved = _SAVED.get((b.arch, pe), set()) if not self.a64 else \
             {f"x{n}" for n in range(19, 30)} | {"sp"}
+        self.risc = _RISC.get(_risc_arch(b.arch))       # ARM, MIPS, RISC-V, PowerPC: one handler
+        if self.risc is not None:
+            self.this, self.ret = self.risc["args"][0], self.risc["ret"]
+            self.saved = set(self.risc["saved"])
         self.classes = classes
         self.vt: dict[int, str] = {}             # primary vtable address point -> class
+        # where vtable objects start (`_ZTV...`: what a GOT entry holds, the code adds the offset)
+        self.vstarts = {v.start for c in classes.values() for v in c.vtables if v.start}
         self.ti: dict[int, str] = {c.typeinfo: c.name for c in classes.values()}
         methods = set()
         for c in classes.values():
@@ -354,6 +374,8 @@ class _Types:
                         ("x64", True): ["rcx", "rdx", "r8", "r9"], ("x86", True): ["ecx"]}.get((b.arch, pe), [])
         if self.a64:
             self.argregs = [f"x{n}" for n in range(8)]
+        elif self.risc is not None:
+            self.argregs = list(self.risc["args"])
         self.params: dict[int, dict[str, tuple]] = {}
         self._passed: dict[int, list[tuple]] = {}
         taken = {m for c in classes.values() for v in c.vtables for m in v.slots}
@@ -485,6 +507,8 @@ class _Types:
     def block(self, f, insns, st: dict, rets: list) -> dict:
         if self.a64:
             return self.block_a64(f, insns, st, rets)
+        if self.risc is not None:
+            return self.block_risc(f, insns, st, rets)
         ptr = self.ptr
         for i in insns:
             ops = [o.strip() for o in i.op_str.split(",")] if i.op_str else []
@@ -654,7 +678,129 @@ class _Types:
                 st[dst] = v
         return st
 
-    def call(self, i, ops, st: dict):
+    def block_risc(self, f, insns, st: dict, rets: list) -> dict:
+        """ARM / Thumb, MIPS, RISC-V, PowerPC: word loads and stores (`ldr r3, [r0]`,
+        `lw $v0, 8($a0)`, `c.ld a5, 0x20(a5)`, `ld r9, 0(r3)`), copies, adding a constant (an
+        address when constant propagation gave the instruction one), register calls (`blx r3`,
+        `jalr $t9`, `c.jalr a5`, `mtctr r12; bctrl`), frame slots. A MIPS delay-slot
+        instruction runs before the branch, call or return it follows."""
+        r = self.risc
+        ptr = self.ptr
+        loads, stores = r["loads"][ptr], r["stores"][ptr]
+        toc = getattr(self.b, "ppc_toc", None)
+        if toc is not None:
+            st["r2"] = ("addr", toc)                   # (PowerPC64: the TOC, however it is reloaded)
+        insns = list(insns)
+        for k in range(len(insns) - 1):
+            if insns[k + 1].delay and not insns[k].delay:
+                insns[k], insns[k + 1] = insns[k + 1], insns[k]
+        for i in insns:
+            ops = _a64_ops(i.op_str)
+            m = i.mnemonic.removeprefix("c.").split(".")[0]
+            if i.kind == CALL_KIND:
+                reg = "ctr" if m.startswith("bctr") else (ops[-1] if ops and i.target is None else None)
+                v = st.get(reg) if reg else None
+                if i.target is None and v and v[0] == "fn":
+                    self.sites[i.addr] = v[1]
+                self.call(i, [], st, dyncast=bool(v and v == ("imp", "__dynamic_cast")))
+                continue
+            if i.kind == RET_KIND:
+                rets.append(st.get(self.ret))
+                continue
+            if i.kind in (CJMP_KIND, JMP_KIND):
+                continue
+            if m in ("push", "pop", "ldm", "ldmia", "pop", "vpop"):
+                for x in ops:
+                    for reg in x.strip("{}").split(","):
+                        if m != "push":
+                            st.pop(reg.strip(), None)
+                continue
+            if m == "mtctr" and ops:
+                v = st.get(ops[0])
+                st.pop("ctr", None)
+                if v is not None:
+                    st["ctr"] = v
+                continue
+            if toc is not None and ops and ops[0] == "r2":
+                continue
+            if m in loads and len(ops) >= 2:
+                base, disp = _risc_mem(", ".join(ops[1:]), r)
+                v = None
+                got = self.b.read_ptr(i.refs[-1]) if i.refs else None
+                bv = st.get(base) if base is not None else None
+                if bv is not None and bv[0] == "fn" and disp == 0 and getattr(self.b, "func_descriptors", None):
+                    st[ops[0]] = bv                     # (ELFv1: the code address in the method's descriptor)
+                    continue
+                if bv is not None and bv[0] not in ("obj", "vptr"):
+                    bv = None              # (r31, s0, r7: a frame base at -O0, an object's register at -O2)
+                imp = self.b.imports_by_got.get(i.refs[-1]) if i.refs else None
+                if imp is not None:
+                    v = ("imp", imp.name)                # (MIPS: `lw $t9, ...($gp)`, then `jalr $t9`)
+                elif got in self.vt or got in self.vstarts or got in self.ti:   # (PIC: from the GOT)
+                    v = ("ti", self.ti[got]) if got in self.ti else ("addr", got)
+                elif bv is None and base in r["frame"] and disp is not None:
+                    v = st.get(("slot", base, disp))
+                elif bv is not None and disp is not None:
+                    if bv[0] == "obj" and disp == 0:
+                        v = ("vptr", bv[1], bv[2], 0)
+                    elif bv[0] == "vptr":
+                        t = self.slot(bv[1], bv[2], (bv[3] + disp) // ptr)
+                        v = ("fn", t) if t else None
+                st.pop(ops[0], None)
+                if v is not None:
+                    st[ops[0]] = v
+                continue
+            if (m in stores and len(ops) == 2) or (m in ("strd", "stp") and len(ops) == 3):
+                base, disp = _risc_mem(ops[-1], r)     # (`strd r2, r3, [r0]`: the first word is r2)
+                v = st.get(ops[0])
+                if ops[0] in r["zero"]:
+                    v = ("null",)
+                bv = st.get(base) if base is not None else None
+                if base in r["frame"] and disp is not None and not (bv and bv[0] in ("obj", "ptr", "this")):
+                    if v is not None:
+                        st[("slot", base, disp)] = v
+                    else:
+                        st.pop(("slot", base, disp), None)
+                elif base is not None and disp == 0 and v is not None and v[0] in ("addr", "addrs"):
+                    self.construct(f, st, base, v[1])
+                continue
+            if not ops or not _risc_reg(ops[0]) or m.startswith(("cmp", "tst", "cmn", "st")):
+                continue
+            dst = ops[0]
+            v = None
+            if m in ("mov", "movs", "mv", "move", "mr", "li") and len(ops) == 2:
+                if _risc_reg(ops[1]):
+                    v = ("null",) if ops[1] in r["zero"] else st.get(ops[1])
+                elif ops[1].lstrip("#") in ("0", "0x0"):
+                    v = ("null",)
+            elif m in ("add", "adds", "addi", "addis", "addiu", "daddiu", "addw") and len(ops) in (2, 3):
+                src = st.get(ops[1] if len(ops) == 3 else dst)
+                try:
+                    k = int(ops[-1].lstrip("#"), 0) << (16 if m == "addis" else 0)
+                except ValueError:
+                    k = None
+                if i.refs and (src is None or src[0] != "vptr"):
+                    a = i.refs[-1]
+                    v = ("ti", self.ti[a]) if a in self.ti else ("addr", a)
+                elif k is not None and src and src[0] == "addr":
+                    a = (src[1] + k) & ((1 << self.b.bits) - 1)
+                    v = ("ti", self.ti[a]) if a in self.ti else ("addr", a)
+                elif k is not None and src and src[0] == "vptr":
+                    v = ("vptr", src[1], src[2], src[3] + k)
+            elif m in ("lis", "lui") and len(ops) == 2 and not i.refs:
+                try:                                    # (the high part of an address: `addi` adds the rest)
+                    v = ("addr", (int(ops[1], 0) << (12 if self.b.arch.startswith("riscv") else 16))
+                         & ((1 << self.b.bits) - 1))
+                except ValueError:
+                    v = None
+            elif m == "or" and len(ops) == 3 and ops[1] == ops[2]:
+                v = st.get(ops[1])                     # (PowerPC `mr.`: `or. r9, r3, r3`)
+            st.pop(dst, None)
+            if v is not None:
+                st[dst] = v
+        return st
+
+    def call(self, i, ops, st: dict, dyncast: bool = False):
         ptr = self.ptr
         targets = None
         if i.target is None and ops:
@@ -676,8 +822,9 @@ class _Types:
         this = st.get(self.this)
         ctor = self.ctors.get(i.target) if i.target is not None else None
         result = None
-        if i.target in self.dyncast:                  # __dynamic_cast(obj, src type, dst type, hint)
-            dst = st.get("x2" if self.a64 else "rdx" if self.x64 else None)
+        if dyncast or i.target in self.dyncast:      # __dynamic_cast(obj, src type, dst type, hint)
+            dst = st.get("x2" if self.a64 else self.argregs[2] if self.risc is not None
+                         else "rdx" if self.x64 else None)
             if dst and dst[0] == "ti":
                 result = ("obj", frozenset(self.derived.get(dst[1], {dst[1]})), dst[1])
         elif i.target is not None and i.target in self.returns:
@@ -785,8 +932,60 @@ def _base_disp(inner: str) -> tuple[str | None, int | None]:
     return None, None
 
 
+# ARM, MIPS, RISC-V and PowerPC (System V / AAPCS / o32 / ELF ABIs): argument registers (the
+# first is `this`), the result register, registers a call keeps, frame base registers, the
+# word loads and stores by pointer size, zero registers
+_RISC = {
+    "arm": {"args": ("r0", "r1", "r2", "r3"), "ret": "r0",
+            "saved": ("r4", "r5", "r6", "r7", "r8", "r9", "r10", "r11", "sb", "sl", "fp", "sp"),
+            "frame": ("sp", "r7", "r11", "fp"), "loads": {4: ("ldr",)}, "stores": {4: ("str",)}, "zero": ()},
+    "mips": {"args": ("$a0", "$a1", "$a2", "$a3"), "ret": "$v0",
+             "saved": tuple(f"$s{n}" for n in range(8)) + ("$fp", "$sp", "$gp", "$s8"),
+             "frame": ("$sp", "$fp", "$s8"), "loads": {4: ("lw",), 8: ("ld",)}, "stores": {4: ("sw",), 8: ("sd",)},
+             "zero": ("$zero", "$0")},
+    "riscv": {"args": tuple(f"a{n}" for n in range(8)), "ret": "a0",
+              "saved": tuple(f"s{n}" for n in range(12)) + ("sp", "fp"),
+              "frame": ("sp", "s0", "fp"), "loads": {4: ("lw", "lwsp"), 8: ("ld", "ldsp")},
+              "stores": {4: ("sw", "swsp"), 8: ("sd", "sdsp")}, "zero": ("zero", "x0")},
+    "ppc": {"args": tuple(f"r{n}" for n in range(3, 11)), "ret": "r3",
+            "saved": tuple(f"r{n}" for n in range(14, 32)) + ("r1", "r2"),
+            "frame": ("r1", "r31"), "loads": {4: ("lwz",), 8: ("ld",)}, "stores": {4: ("stw",), 8: ("std",)},
+            "zero": ()},
+}
+
+
+def _risc_arch(arch: str) -> str | None:
+    if arch == "arm":
+        return "arm"
+    for k in ("mips", "riscv", "ppc"):
+        if arch.startswith(k):
+            return k
+    return None
+
+
+def _risc_reg(op: str) -> bool:
+    return bool(op) and (op.isalnum() or op[0] == "$" and op[1:].isalnum()) and not op[:1].isdigit()
+
+
+def _risc_mem(op: str, r: dict) -> tuple[str | None, int | None]:
+    """`[r3, #8]`, `[r0]` (ARM), `0x20(a5)`, `($v0)`, `-8(r31)` -> (base, displacement); an index
+    register or a pre / post-indexed form -> (None, None)."""
+    op = op.strip()
+    if op.startswith("["):
+        if op.endswith("!"):
+            return None, None
+        return _a64_mem(op)
+    if op.endswith(")") and "(" in op:
+        off, _, base = op[:-1].partition("(")
+        try:
+            return base.strip(), int(off.strip() or "0", 0)
+        except ValueError:
+            return None, None
+    return None, None
+
+
 def object_calls(an, classes: dict[str, CppClass]) -> dict[int, tuple[frozenset[int], bool]]:
-    if an.bin.arch not in ("x64", "x86", "arm64") or not classes:
+    if (an.bin.arch not in ("x64", "x86", "arm64") and _risc_arch(an.bin.arch) is None) or not classes:
         return {}
     t = _Types(an, classes)
     if t.this is None:
