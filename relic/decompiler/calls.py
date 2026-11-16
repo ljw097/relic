@@ -432,7 +432,7 @@ def _forwarded_long_doubles(an: "Analysis", arch: ArchInfo, ssa, frame, target: 
             if not isinstance(s, CallStmt) or not isinstance(s.call.target, Const) or s.call.target.value == target:
                 continue
             g = an.functions.get(s.call.target.value)
-            if g is None or g.is_import:
+            if g is None or g.is_import or g.addr not in _long_double_users(an):
                 continue
             slots = [rel for rel, _, fw in stack_param_slots(an, arch, g.addr) if fw == 80]
             sp = dict(s.uses).get(arch.sp)
@@ -456,6 +456,29 @@ def _forwarded_long_doubles(an: "Analysis", arch: ArchInfo, ssa, frame, target: 
                 if p is not None and all(srcs.get(outgoing + rel + n * word) == p + n * word
                                          for n in range(1, (10 + word - 1) // word)):
                     out.append(p - base)
+    return out
+
+
+def _long_double_users(an: "Analysis") -> set[int]:
+    """The functions that may take a long double on the stack: the ones with an 80-bit memory
+    operand (`fld xword ptr [rsp + 8]`), and their callers, which may only hand one on. Any
+    other callee has no long double slot, and is not lifted (with all it calls) to find out."""
+    got = an.__dict__.get("_long_double_users")
+    if got is not None:
+        return got
+    out = {a for a, f in an.functions.items() if not f.is_import
+           and any("xword" in i.op_str for b in f.blocks.values() for i in b.insns)}
+    callers: dict[int, set[int]] = {}
+    for a, f in an.functions.items():
+        for t in f.calls | f.tail_calls:
+            callers.setdefault(t, set()).add(a)
+    work = list(out)
+    while work:
+        for c in callers.get(work.pop(), ()):
+            if c not in out:
+                out.add(c)
+                work.append(c)
+    an.__dict__["_long_double_users"] = out
     return out
 
 
