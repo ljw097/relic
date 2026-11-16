@@ -231,6 +231,8 @@ def test_port_keeps_what_the_new_build_has(patched, vuln64):
     assert new.var_names[ncs] == {"a1": "s", "var_c": "acc"}
     new.port_from(old, overwrite=True, matched=d)
     assert new.renames[nv] == "read_name" and new.comments[nv] == "asks for a name"
+    again = new.port_from(old, overwrite=True, matched=d)       # (nothing left to change)
+    assert again["functions"] == [] and again["comments"] == 0
     assert new.var_names[ncs]["a1"] == "text"
 
 
