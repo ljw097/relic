@@ -217,6 +217,17 @@ class Api:
             self.win._after_edit()
         return got
 
+    def port_from(self, old, overwrite: bool = False) -> dict:
+        """Names, comments, bookmarks and variable names / types of an earlier build (a path or
+        an Analysis, its project file loaded) put on the functions they match here."""
+        if isinstance(old, str):
+            from .analysis import analyze
+            old = analyze(old)
+        got = self.an.port_from(old, overwrite)
+        if self.win is not None:
+            self.win._after_edit()
+        return got
+
     def lumina_push(self, store: str | None = None) -> dict:
         """Send the functions' names / comments / variable names to a shared store."""
         return self.an.lumina_push(store)
@@ -396,7 +407,7 @@ def namespace(an: "Analysis", win=None) -> dict:
     for n in ("addr", "here", "goto", "name", "rename", "rename_struct", "rename_field", "set_type",
               "set_field_type", "add_field", "remove_field", "comment", "func", "import_header", "set_return_type",
               "export", "snapshot", "restore_snapshot", "merge", "op_format", "number_format", "rcomment", "names",
-              "lumina_pull", "lumina_push", "read", "read_int", "sections", "insn", "define", "undefine",
+              "lumina_pull", "lumina_push", "port_from", "read", "read_int", "sections", "insn", "define", "undefine",
               "make_function", "delete_function", "bookmark", "callers", "callees", "load_type_library",
               "toolchain", "functions", "xrefs_to", "xrefs_from",
               "disasm", "decompile", "strings", "search", "patch", "nop", "invert", "assemble", "revert", "save"):

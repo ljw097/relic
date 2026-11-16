@@ -148,6 +148,22 @@ class SearchThread(WorkThread):
                        else f"immediate {self.query:#x}")
 
 
+class PortThread(WorkThread):
+    """Analyses an earlier build and matches its functions to this one's (relic.analysis.bindiff);
+    the annotations are carried over on the GUI thread."""
+
+    done = Signal(object)               # BinDiff
+
+    def __init__(self, an: Analysis, path: str, parent=None):
+        super().__init__(parent)
+        self.an, self.path = an, path
+
+    def work(self):
+        from ..analysis import analyze
+        from ..analysis.bindiff import diff
+        self.done.emit(diff(analyze(self.path), self.an))
+
+
 class Table(QTableView):
     """Read-only sortable table; double-click emits the row's address."""
 
@@ -447,6 +463,7 @@ class MainWindow(QMainWindow):
         act(m, "Sna&pshots...", None, self.show_snapshots)
         act(m, "&History...", None, self.show_history)
         act(m, "&Merge project...", None, self.merge_dialog)
+        act(m, "P&ort from older build...", None, self.port_dialog)
         lm = m.addMenu("&Lumina")
         act(lm, "&Pull function names", None, self.lumina_pull)
         act(lm, "Pu&sh function names", None, self.lumina_push)
@@ -707,7 +724,7 @@ class MainWindow(QMainWindow):
 
     def running_work(self) -> list[WorkThread]:
         return [t for t in (self.thread, self.vulns_thread, getattr(self, "search_thread", None),
-                            getattr(self, "export_thread", None))
+                            getattr(self, "export_thread", None), getattr(self, "port_thread", None))
                 if t is not None and t.isRunning()]
 
     def _work_finished(self):
@@ -1836,6 +1853,38 @@ class MainWindow(QMainWindow):
         self.statusBar().showMessage(msg, 8000)
         if got["added"] or got["conflicts"] and theirs:
             self._after_edit()
+        return got
+
+    def port_dialog(self):
+        """Pick an earlier build of this binary (with its project file): its names, comments and
+        variable names go to the functions that match here."""
+        if getattr(self, "port_thread", None) is not None and self.port_thread.isRunning():
+            self.statusBar().showMessage("already porting", 3000)
+            return
+        path, _ = QFileDialog.getOpenFileName(self, "Port from older build", os.path.dirname(self.an.bin.path))
+        if path:
+            self.port_from(path)
+
+    def port_from(self, path: str) -> "PortThread":
+        t = PortThread(self.an, path, self)
+        t.done.connect(self._ported)
+        t.failed.connect(lambda msg: QMessageBox.warning(self, "Port from older build", msg.split("\n\n")[0]))
+        t.cancelled.connect(lambda: self.statusBar().showMessage("port cancelled", 4000))
+        self.port_thread = t
+        self._track(t, "port")
+        t.start()
+        return t
+
+    def _ported(self, d) -> dict | None:
+        if d.new is not self.an:                # (another binary was opened meanwhile)
+            return None
+        got = self.an.port_from(d.old, matched=d)
+        lost = f", {got['lost']} on changed code not placed" if got["lost"] else ""
+        self.statusBar().showMessage(
+            f"{os.path.basename(d.old.bin.path)}: {len(d.matches)} functions matched; ported "
+            f"{len(got['functions'])} names, {len(got['globals'])} globals, {got['comments']} comments{lost}", 10000)
+        self._after_edit()
+        self._fill_functions()
         return got
 
     def header_dialog(self):

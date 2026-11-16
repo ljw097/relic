@@ -39,6 +39,7 @@ script) and in plugin callbacks. Besides these: `an` (the Analysis), `bin` (its 
 - `number_format(func, value: int, fmt: str)` -- Show the constant `value` in a function's pseudocode as hex / dec / char / bin.
 - `op_format(addr, index: int, fmt: str)` -- Show operand `index` of the instruction at `addr` as hex / dec / char / bin / offset ("" resets).
 - `patch(where, data: bytes | str)` -- Write bytes (or hex text `90 90`) at an address; the analysis runs again.
+- `port_from(old, overwrite: bool = False) -> dict` -- Names, comments, bookmarks and variable names / types of an earlier build (a path or an Analysis, its project file loaded) put on the functions they match here.
 - `rcomment(addr, text: str)` -- A repeatable comment: shown at `addr` and wherever it is referred to ("" removes it).
 - `read(where, n: int) -> bytes` -- `n` bytes of the loaded image (with patches) at an address or name.
 - `read_int(where, size: int | None = None, signed: bool = False) -> int | None` -- A little/big-endian integer (the binary's byte order) of `size` bytes (default: a pointer).
