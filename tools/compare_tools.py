@@ -2,8 +2,8 @@
 a stripped binary's functions each finds (recall), how many of what it reports are real
 functions (precision), and how long it takes.
 
-    python tools/compare_tools.py CORPUS_DIR [--angr-python PY] [--tools relic,angr,r2,lief]
-                                  [--timeout SECONDS] [--json OUT.json]
+    python tools/compare_tools.py CORPUS_DIR [--angr-python PY] [--tools relic,angr,r2,lief,ghidra]
+                                  [--ghidra GHIDRA_DIR] [--timeout SECONDS] [--json OUT.json]
 
 CORPUS_DIR holds pairs `NAME` (with symbols) and `NAME.stripped`. The ground truth is the
 unstripped build's function symbols inside `.text`, read with binutils'
@@ -55,6 +55,54 @@ print(json.dumps({"funcs": sorted({f.address for f in b.functions}), "base": 0})
 }
 
 
+GHIDRA_SCRIPT = r'''
+// The functions Ghidra's auto-analysis found (not external or thunks) as JSON, to args[0]; "base"
+// is its load address of the entry point minus the link-time one (args[1]).
+import ghidra.app.script.GhidraScript;
+import ghidra.program.model.listing.Function;
+import java.io.*;
+
+public class RelicListFunctions extends GhidraScript {
+    @Override
+    public void run() throws Exception {
+        String[] a = getScriptArgs();
+        long base = currentProgram.getSymbolTable().getSymbols("entry").next().getAddress().getOffset()
+            - Long.parseLong(a[1]);
+        StringBuilder b = new StringBuilder("{\"base\": " + base + ", \"funcs\": [");
+        boolean first = true;
+        for (Function f : currentProgram.getFunctionManager().getFunctions(true)) {
+            if (f.isExternal() || f.isThunk()) continue;
+            b.append(first ? "" : ", ").append(f.getEntryPoint().getOffset());
+            first = false;
+        }
+        try (PrintWriter out = new PrintWriter(new FileWriter(a[0]))) {
+            out.println(b.append("]}"));
+        }
+    }
+}
+'''
+
+
+def run_ghidra(ghidra: str, path: str, entry: int, timeout: int) -> dict:
+    """Ghidra headless: import with auto-analysis, then RelicListFunctions.java."""
+    import tempfile
+    with tempfile.TemporaryDirectory() as tmp:
+        with open(os.path.join(tmp, "RelicListFunctions.java"), "w") as fp:
+            fp.write(GHIDRA_SCRIPT)
+        result = os.path.join(tmp, "out.json")
+        os.makedirs(os.path.join(tmp, "proj"))
+        subprocess.run([os.path.join(ghidra, "support", "analyzeHeadless"), os.path.join(tmp, "proj"), "p",
+                        "-import", path, "-scriptPath", tmp, "-postScript", "RelicListFunctions.java", result,
+                        str(entry), "-deleteProject"], capture_output=True, text=True, timeout=timeout)
+        with open(result) as fp:
+            return json.load(fp)
+
+
+def entry_of(path: str) -> int:
+    out = subprocess.run(["readelf", "-hW", path], capture_output=True, text=True).stdout
+    return int(re.search(r"Entry point address:\s+0x([0-9a-f]+)", out).group(1), 16)
+
+
 def text_range(path: str) -> tuple[int, int]:
     out = subprocess.run(["readelf", "-SW", path], capture_output=True, text=True, check=True).stdout
     for line in out.splitlines():
@@ -86,10 +134,12 @@ def truth(path: str) -> set[int]:
     return starts
 
 
-def run_worker(tool: str, path: str, python: str, timeout: int) -> dict:
+def run_worker(tool: str, path: str, python: str, timeout: int, ghidra: str | None = None) -> dict:
     t = time.monotonic()
     try:
-        if tool == "r2":
+        if tool == "ghidra":
+            got = run_ghidra(ghidra, path, entry_of(path), timeout)
+        elif tool == "r2":
             r = subprocess.run(["r2", "-q", "-e", "scr.color=0", "-c", "aaa; aflj", path], capture_output=True,
                                text=True, timeout=timeout)
             data = json.loads(r.stdout.strip().splitlines()[-1] or "[]")
@@ -103,7 +153,7 @@ def run_worker(tool: str, path: str, python: str, timeout: int) -> dict:
             got = json.loads(r.stdout.strip().splitlines()[-1])
     except subprocess.TimeoutExpired:
         return {"error": f"timeout ({timeout} s)", "seconds": timeout}
-    except (ValueError, IndexError, KeyError) as e:
+    except (ValueError, IndexError, KeyError, OSError) as e:
         return {"error": f"bad output: {e}", "seconds": round(time.monotonic() - t, 2)}
     got["seconds"] = round(time.monotonic() - t, 2)
     return got
@@ -121,7 +171,8 @@ def main(argv=None) -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("corpus")
     ap.add_argument("--angr-python", default=sys.executable, help="a Python with angr and lief installed")
-    ap.add_argument("--tools", default="relic,angr,r2,lief")
+    ap.add_argument("--tools", default="relic,angr,r2,lief", help="also: ghidra (with --ghidra)")
+    ap.add_argument("--ghidra", help="Ghidra's install directory (holds support/analyzeHeadless)")
     ap.add_argument("--timeout", type=int, default=1800)
     ap.add_argument("--json")
     args = ap.parse_args(argv)
@@ -137,7 +188,7 @@ def main(argv=None) -> int:
         row = {"functions": len(true)}
         for tool in tools:
             py = sys.executable if tool == "relic" else args.angr_python
-            got = run_worker(tool, stripped, py, args.timeout)
+            got = run_worker(tool, stripped, py, args.timeout, args.ghidra)
             if "error" in got:
                 row[tool] = {"error": got["error"], "seconds": got["seconds"]}
             else:

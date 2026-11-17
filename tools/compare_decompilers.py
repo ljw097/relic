@@ -71,6 +71,22 @@ typedef unsigned char uchar; typedef unsigned short ushort; typedef unsigned int
 typedef unsigned long ulong; typedef long long longlong; typedef unsigned long long ulonglong;
 typedef __int128 int128_t; typedef unsigned __int128 uint128_t;
 """
+# the built-in types and calling-convention words each tool's own output uses
+TOOL_PRELUDE = {
+    "ghidra": """typedef unsigned char undefined; typedef unsigned char undefined1; typedef unsigned short undefined2;
+typedef unsigned int undefined3; typedef unsigned int undefined4; typedef unsigned long undefined5;
+typedef unsigned long undefined6; typedef unsigned long undefined7; typedef unsigned long undefined8;
+typedef unsigned __int128 undefined16; typedef unsigned char byte; typedef signed char sbyte;
+typedef unsigned short word; typedef short sword; typedef unsigned int dword; typedef int sdword;
+typedef unsigned long qword; typedef long sqword; typedef long double float10; typedef void code;
+#define processEntry
+#define __cdecl
+#define __stdcall
+#define __fastcall
+#define __thiscall
+""",
+    "retdec": "#include <stdio.h>\n#include <stdlib.h>\n#include <unistd.h>\n",   # (what its output includes)
+}
 _NOT_C = re.compile(r"error: (?!.*(undeclared|implicit declaration|unknown type name|storage size|"
                     r"invalid use of undefined type|dereferencing pointer to incomplete type|"
                     r"has no member named|incomplete type))")
@@ -181,7 +197,8 @@ def run_ghidra(ghidra: str, path: str, entry: int, addrs: list[int], timeout: in
 
 def run_retdec(retdec: str, path: str, ranges: dict[int, int], timeout: int) -> dict:
     """RetDec on the whole list in one run (`--select-ranges`), its output split per function
-    (`function_1440(...) {` to the `}` in column 0); each function's time is the run's split evenly."""
+    (from its `// Address range: 0x1440 - ...` comment to the `}` in column 0); each function's
+    time is the run's split evenly."""
     with tempfile.TemporaryDirectory() as tmp:
         out_c = os.path.join(tmp, "out.c")
         sel = ",".join(f"0x{a:x}-0x{a + max(size, 1) - 1:x}" for a, size in ranges.items())
@@ -194,8 +211,8 @@ def run_retdec(retdec: str, path: str, ranges: dict[int, int], timeout: int) -> 
         each = (time.perf_counter() - t) / max(len(ranges), 1)
         text = open(out_c, errors="replace").read() if os.path.exists(out_c) else ""
     found = {}
-    for m in re.finditer(r"^\S[^\n;]*\bfunction_([0-9a-f]+)\([^\n;]*\{\n.*?^\}", text, re.S | re.M):
-        found[int(m.group(1), 16)] = m.group(0)
+    for m in re.finditer(r"^// Address range: 0x([0-9a-f]+) - 0x[0-9a-f]+\n(.*?^\})", text, re.S | re.M):
+        found[int(m.group(1), 16)] = m.group(2)
     return {a: {"addr": a, "text": found.get(a), "error": None if a in found else "not in output", "seconds": each}
             for a in ranges}
 
@@ -234,10 +251,10 @@ def sizes_of(path: str) -> dict[int, int]:
     return sizes
 
 
-def valid_c(text: str) -> bool:
+def valid_c(text: str, tool: str = "") -> bool:
     """The pseudocode is C apart from what it refers to without declaring it."""
     with tempfile.NamedTemporaryFile("w", suffix=".c", delete=False) as fp:
-        fp.write(PRELUDE + text + "\n")
+        fp.write(PRELUDE + TOOL_PRELUDE.get(tool, "") + text + "\n")
         name = fp.name
     try:
         r = subprocess.run(["gcc", "-fsyntax-only", "-w", "-fpermissive", "-std=gnu11", name], capture_output=True,
@@ -286,7 +303,7 @@ def main(argv=None) -> int:
             done = [got[a] for a in both if got[a]["text"]]
             row[tool] = {"decompiled": len(done), "failed": len(both) - len(done),
                          "seconds_total": round(sum(got[a]["seconds"] for a in both), 2),
-                         "valid_c": sum(1 for d in done if valid_c(d["text"])),
+                         "valid_c": sum(1 for d in done if valid_c(d["text"], tool)),
                          "gotos": sum(len(re.findall(r"\bgoto\b", d["text"])) for d in done),
                          "lines": sum(d["text"].count("\n") + 1 for d in done)}
             print(f"{name:20} {tool:6} {json.dumps(row[tool])}", flush=True)
