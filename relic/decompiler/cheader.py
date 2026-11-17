@@ -106,6 +106,7 @@ class Prototype:
     ret: CType
     params: list[tuple[str, CType]]
     variadic: bool = False
+    consts: list[bool] = field(default_factory=list)    # a parameter points to const (`const char *s`)
 
 
 @dataclass
@@ -181,6 +182,7 @@ class _Parser:
         self.k = 0
         self.m = model
         self.h = into
+        self._consts: dict[int, list[bool]] = {}     # parameter list -> which point to const
 
     # -- token helpers
     def peek(self, d: int = 0) -> str:
@@ -268,7 +270,8 @@ class _Parser:
                     base = ctype
                 self.h.typedefs[name] = ctype
             elif params is not None and name is not None and ctype.func:
-                self.h.prototypes[name] = Prototype(name, params[2], params[0], params[1])
+                self.h.prototypes[name] = Prototype(name, params[2], params[0], params[1],
+                                                    self._consts.get(id(params[0]), []))
             if self.peek() == "{":                   # a function definition: skip its body
                 self.skip_braces()
                 return
@@ -506,15 +509,22 @@ class _Parser:
         if self.peek() == "void" and self.peek(1) == ")":
             self.k += 2
             return params, variadic
+        consts: list[bool] = []
         while not self.accept(")"):
             if self.accept("..."):
                 variadic = True
                 continue
+            start = self.k
             base = self.specifiers()
             pname, ptype, _ = self.declarator(base)
             if ptype.dims:                             # array parameters are pointers
                 ptype = CType(ptype.base, ptype.ptr + 1, ptype.dims[1:])
             params.append((pname or f"p{len(params) + 1}", ptype))
+            # `const` before the first `*`: what it points to is const (spelled so in signatures)
+            toks = [t[1] for t in self.t[start:self.k]]
+            star = toks.index("*") if "*" in toks else len(toks)
+            consts.append(ptype.ptr > 0 and "const" in toks[:star])
+            self._consts[id(params)] = consts
             if not self.accept(","):
                 self.expect(")")
                 break

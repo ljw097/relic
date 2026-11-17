@@ -69,7 +69,10 @@ def _entry_ssa(an: "Analysis", arch: ArchInfo, target: int):
             from .lift import lift_function
             from .ssa import to_ssa
             try:
-                ssa = to_ssa(lift_function(an, f), arch)
+                from .aggabi import set_struct_returns
+                fn = lift_function(an, f)
+                set_struct_returns(an, f, fn)       # (a struct result in rax:rdx: all of it is returned)
+                ssa = to_ssa(fn, arch)
             except Exception:  # noqa: BLE001 - no summary for a function that does not lift
                 ssa = None
         cache[target] = ssa
@@ -179,6 +182,8 @@ def _entry_opt(an: "Analysis", arch: ArchInfo, target: int):
                 else:
                     fn = lift_function(an, f)
                     set_fp_returns(an, f, fn)   # a float result keeps the computation of it alive
+                    from .aggabi import set_struct_returns
+                    set_struct_returns(an, f, fn)
                     opt = optimize(to_ssa(fn, arch), arch)
                 if not fp_return_pending(an, target):
                     done.add(target)
@@ -795,6 +800,8 @@ def recover_calls(fn: IRFunction, an: "Analysis", arch: ArchInfo) -> IRFunction:
             if sel is not None:
                 n = 2 + sel.count(":")
                 placed = list(argregs[:n]) + [None] * (n - len(argregs))
+            elif _agg_call(an, arch, fn, b, k, s, name, uses, consumed):
+                continue                            # (structs by value: see aggabi)
             elif fsig is not None:
                 classes = arg_classes(None, None, fsig, ldouble=arch.name == "x64-sysv")
                 placed = place_args(arch, classes, argregs)
@@ -913,6 +920,185 @@ def recover_calls(fn: IRFunction, an: "Analysis", arch: ArchInfo) -> IRFunction:
         if consumed:
             b.stmts = [t for j, t in enumerate(b.stmts) if j not in consumed]
     return fn
+
+
+def _agg_call(an: "Analysis", arch: ArchInfo, fn: IRFunction, b, k: int, s: CallStmt, name: str | None,
+              uses: dict, consumed: set) -> bool:
+    """A call to a function whose prototype passes or returns structs by value (aggabi): its
+    arguments where the prototype puts them, a struct's parts gathered into one value
+    (`Intrinsic("struct:pt", (x, y))`), the result pointer first. Whether it was one."""
+    from .aggabi import STRUCT, STRUCT_COPY, plan
+    from .ir import Intrinsic
+    from .sigs import base_name
+    p = plan(an, arch, base_name(name)) if name else None
+    if p is None:
+        return False
+    stack = sorted({loc for loc in p.locs() if isinstance(loc, int)})
+    got: dict[int, Expr] = {}
+    frame = None
+    if stack:
+        from .stack import Frame, _build_spoff
+        frame = Frame(arch, _build_spoff(fn, arch))
+        vals = list(_stack_values(b, k, s, frame, arch, stack, set(), [8] * len(stack)))   # (consumed below)
+        got = dict(zip(stack, vals))
+
+    def value(loc, bits: int, fl: bool):
+        v = got.get(loc) if isinstance(loc, int) else uses.get(loc)
+        if v is None:
+            return None
+        if fl and v.bits > bits or not fl and v.bits > bits and bits < 64:
+            v = Cast("low", v, bits)
+        return v
+
+    args, fargs = [], []
+    if p.ret_memory:
+        if p.ret_ptr not in uses:
+            return False
+        args.append(uses[p.ret_ptr])
+    for prm in p.params:
+        if prm.ref is not None:             # by reference (AArch64): the struct the pointer points to
+            if prm.ref not in uses:
+                return False
+            from .aggabi import struct_of
+            st = struct_of(an, prm.ctype)
+            args.append(Intrinsic(STRUCT_COPY + an.resolve_type(prm.ctype).strip()[7:].strip(), (uses[prm.ref],),
+                                  st.size * 8 if st is not None else 64))
+            continue
+        if prm.is_struct and isinstance(prm.pieces[0].loc, int):
+            # on the stack: most often a copy of a local struct (`movdqa` + `movups`, ...)
+            copied = _struct_copy(fn, b, k, s, frame, arch, prm.pieces[0].loc,
+                                  prm.pieces[-1].loc + prm.pieces[-1].bits // 8 - prm.pieces[0].loc)
+            if copied is not None:
+                addr, js = copied
+                consumed.update(js)
+                args.append(Intrinsic(STRUCT_COPY + an.resolve_type(prm.ctype).strip()[7:].strip(), (addr,),
+                                      sum(x.bits for x in prm.pieces)))
+                continue
+        if prm.is_struct and isinstance(prm.pieces[0].loc, int):
+            # filled field by field (some copied from a local, some stored as they are)
+            built = _stack_struct_fields(fn, b, k, s, frame, arch, prm.pieces)
+            if built is None:
+                return False
+            vals, js = built
+            consumed.update(js)
+            args.append(Intrinsic(STRUCT + an.resolve_type(prm.ctype).strip()[7:].strip(), tuple(vals),
+                                  sum(x.bits for x in prm.pieces)))
+            continue
+        if prm.is_struct:
+            parts = [value(x.loc, x.bits, x.float) for x in prm.pieces]
+            if any(v is None for v in parts):
+                return False
+            args.append(Intrinsic(STRUCT + an.resolve_type(prm.ctype).strip()[7:].strip(), tuple(parts),
+                                  sum(x.bits for x in prm.pieces)))
+            continue
+        fl = isinstance(prm.loc, str) and prm.loc.startswith("xmm")
+        v = value(prm.loc, 32 if an.resolve_type(prm.ctype).strip() == "float" else 64, fl)
+        if v is None:
+            return False
+        if fl:
+            fargs.append((len(args), v.bits))
+        args.append(v)
+    if got and not any(isinstance(a, Intrinsic) and a.name.startswith(STRUCT_COPY) for a in args):
+        list(_stack_values(b, k, s, frame, arch, sorted(got), consumed, [8] * len(got)))  # (stores: arguments)
+    s.call = Call(s.call.target, tuple(args), s.call.bits, tuple(fargs))
+    s.struct_result = bool(p.ret_pieces) or p.ret_memory      # (the C writer shows it as one: see emit)
+    regs = [loc for loc in p.locs() if isinstance(loc, str)]
+    s.uses = [(r, uses[r]) for r in regs if r in uses]
+    return True
+
+
+def _stack_struct_fields(fn: IRFunction, b, k: int, s: CallStmt, frame, arch: ArchInfo, pieces):
+    """The fields of a struct argument on the stack (aggabi pieces: one per field), from the stores
+    before call `s` that fill its bytes: a field inside a copied word reads the source's bytes
+    there, one stored on its own is that value. (values, the stores' indices), or None."""
+    from .fpabi import stack_arg_base
+    from .ir import BinOp, Load, Store
+    sp = dict(s.uses).get(arch.sp)
+    sp_off = frame.offset_of(sp) if sp is not None else None
+    if sp_off is None or s.tail:
+        return None
+    base = sp_off + stack_arg_base(arch)
+    lo, hi = base + pieces[0].loc, base + pieces[-1].loc + pieces[-1].bits // 8
+    stores: dict[int, int] = {}
+    for j in range(k - 1, -1, -1):
+        t = b.stmts[j]
+        if isinstance(t, CallStmt):
+            break
+        if isinstance(t, Store):
+            off = frame.offset_of(t.dst)
+            if off is not None and lo <= off < hi and off not in stores:
+                stores[off] = j
+    defs = {x.dst: x.src for x in fn.stmts() if isinstance(x, Assign) and isinstance(x.dst, Var)}
+    vals, used = [], set()
+    for x in pieces:
+        at = base + x.loc
+        cover = next(((o, j) for o, j in stores.items() if o <= at and at + x.bits // 8 <= o + b.stmts[j].bits // 8),
+                     None)
+        if cover is None:
+            return None
+        o, j = cover
+        used.add(j)
+        v = b.stmts[j].src
+        for _ in range(4):
+            if isinstance(v, Var) and v in defs:
+                v = defs[v]
+            elif isinstance(v, Cast) and v.kind in ("low", "zext", "sext") and isinstance(v.a, (Var, Load)):
+                v = v.a
+            else:
+                break
+        if isinstance(v, Load) and v.bits == b.stmts[j].bits:
+            addr = v.addr if at == o else BinOp("+", v.addr, Const(at - o, v.addr.bits), v.addr.bits)
+            vals.append(Load(addr, x.bits))
+        elif at == o and b.stmts[j].bits == x.bits:
+            vals.append(b.stmts[j].src)
+        else:
+            return None
+    # every store into the argument is part of it (none left over to show on its own)
+    return vals, sorted(used)
+
+
+def _struct_copy(fn: IRFunction, b, k: int, s: CallStmt, frame, arch: ArchInfo, rel: int, size: int):
+    """A struct argument on the stack copied from one place (a local struct, or memory a pointer
+    points to): the stores before call `s` filling the `size` bytes from outgoing offset `rel`
+    load, in order, from consecutive addresses. (the address of the source, the stores' indices)."""
+    from .fpabi import stack_arg_base
+    from .ir import Load
+    sp = dict(s.uses).get(arch.sp)
+    sp_off = frame.offset_of(sp) if sp is not None else None
+    if sp_off is None or s.tail:
+        return None
+    base = sp_off + stack_arg_base(arch)
+    stores = _arg_stores(b, k, frame, base, 8)
+    defs = None
+    first, start, js = None, None, []
+    o = base + rel
+    while o < base + rel + size:
+        j = stores.get(o)
+        if j is None:
+            return None
+        t = b.stmts[j]
+        v = t.src
+        for _ in range(4):          # (through a register, and `low32(zext64(...))` of a 32-bit word)
+            if isinstance(v, Var):
+                if defs is None:
+                    defs = {x.dst: x.src for x in fn.stmts() if isinstance(x, Assign) and isinstance(x.dst, Var)}
+                v = defs.get(v, v)
+            elif isinstance(v, Cast) and v.kind in ("low", "zext", "sext"):
+                v = v.a
+            else:
+                break
+        if not isinstance(v, Load) or v.bits != t.bits:
+            return None
+        src = frame.offset_of(v.addr)
+        if src is None:
+            return None
+        if first is None:
+            first, start = v.addr, src
+        elif src != start + (o - base - rel):
+            return None
+        js.append(j)
+        o += t.bits // 8
+    return (first, js) if first is not None and o == base + rel + size else None
 
 
 def objc_selector(an: "Analysis", fn: IRFunction, name: str | None, sel_value) -> str | None:

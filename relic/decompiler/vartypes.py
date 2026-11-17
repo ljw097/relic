@@ -325,12 +325,25 @@ def infer_types(fn: IRFunction, ptr_bits: int, is_addr=lambda v: False,
     signed: set[str] = set()
     copies: list[tuple[str, str]] = []
 
+    def base(a: Expr):
+        """`_addr_base`, a known type deciding `p + i` (both variables): the pointer, or the
+        other one than a known integer."""
+        if hints and isinstance(a, BinOp) and a.op == "+" and all(isinstance(x, (Var, StackVar)) for x in (a.a, a.b)):
+            known = [hints.get(x.name) for x in (a.a, a.b)]
+            for x, t in zip((a.a, a.b), known):
+                if t is not None and t.ptr:
+                    return x
+            for other, t in ((a.b, known[0]), (a.a, known[1])):
+                if t is not None and not t.ptr:
+                    return other
+        return _addr_base(a, is_addr)
+
     def note(e: Expr):
         for x in walk(e):
             if isinstance(x, (Var, StackVar)):
                 widths.setdefault(x.name, x.bits)
             if isinstance(x, Load):
-                b = _addr_base(x.addr, is_addr)
+                b = base(x.addr)
                 if b is not None and b.bits == ptr_bits:
                     pointee.setdefault(b.name, x.bits)
             if isinstance(x, BinOp) and x.op in ("<u", "<=u", "<s", "<=s", "/u", "/s", ">>u", ">>s", "%u", "%s"):
@@ -342,7 +355,7 @@ def infer_types(fn: IRFunction, ptr_bits: int, is_addr=lambda v: False,
         for top in stmt_exprs(s):
             note(top)
         if isinstance(s, Store):
-            b = _addr_base(s.dst, is_addr)
+            b = base(s.dst)
             if b is not None and b.bits == ptr_bits:
                 pointee.setdefault(b.name, s.src.bits)
         if isinstance(s, Assign) and isinstance(s.dst, (Var, StackVar)) and isinstance(s.src, (Var, StackVar)) \

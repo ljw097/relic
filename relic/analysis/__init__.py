@@ -864,12 +864,30 @@ class Analysis:
             # a printf-like function's arguments counted from its format), result
             protos[name] = {"ret": proto.ret.spell(), "params": params, "variadic": proto.variadic,
                             "names": [n for n, _ in proto.params]}
+            if any(proto.consts):          # (`const char *`: how the function's signature spells it)
+                protos[name]["spelled"] = [("const " if c else "") + p for c, p in zip(proto.consts, params)]
             if f is None:
                 if name not in before[3]:
                     out["imports"].append(name)
                 continue
             ints = [t for _, t in proto.params if t.ptr or t.base not in ("float", "double", "long double")]
             floats = [t for _, t in proto.params if not t.ptr and t.base in ("float", "double")]
+            from ..decompiler.aggabi import plan_proto, struct_of
+            by_value = any(struct_of(self, t.spell()) for _, t in proto.params) or struct_of(self, proto.ret.spell())
+            shown = False
+            if by_value:
+                from ..decompiler.arch import arch_for
+                try:
+                    shown = plan_proto(self, arch_for(self.bin), protos[name]) is not None
+                except NotImplementedError:
+                    shown = False
+            if shown:
+                ints, floats = [t for _, t in proto.params], []     # (structs by value: named in C order)
+            elif by_value:
+                # not shown as structs (another ABI, two fields in one register): which register
+                # holds which parameter is not known (a struct takes one or two, a hidden result
+                # pointer comes first) -- no parameter types rather than wrong ones
+                ints, floats = [], []
             types = self.var_types.setdefault(f.addr, {})
             for k, t in enumerate(ints + floats):
                 try:
@@ -877,7 +895,8 @@ class Analysis:
                 except ValueError:
                     continue
             try:
-                types["@return"] = str(parse_ctype(proto.ret.spell()))
+                if shown or not by_value or not struct_of(self, proto.ret.spell()):
+                    types["@return"] = str(parse_ctype(proto.ret.spell()))
             except ValueError:
                 pass
             if not types:

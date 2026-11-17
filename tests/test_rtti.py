@@ -212,7 +212,9 @@ def test_cross_virtual_calls(cross):
     cl = an.classes
     assert {"Animal", "Dog", "Bird", "Named", "Parrot"} <= set(cl)
     slots = {n: cl[n].vtables[0].slots for n in ("Dog", "Bird", "Parrot")}
-    assert all(an.functions.get(m) is not None for s in slots.values() for m in s if m)   # (ARM: no Thumb bit)
+    # every slot of every vtable is a function (ARM: no Thumb bit; a vtable ends where a typeinfo starts)
+    assert all(an.functions.get(m) is not None and an.functions[m].blocks
+               for c in cl.values() for v in c.vtables for m in v.slots if m)
     main = an.function_by_name("main")
     got = [t for a, (t, _) in an.icalls.items() if main.block_at(a) is not None]
     assert frozenset({slots["Dog"][4]}) in got and frozenset(slots[n][1] for n in slots) in got

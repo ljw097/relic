@@ -9,13 +9,13 @@ GUI는 PySide6, 명령어 디코딩은 capstone을 쓰고, 그 위에 올라가�
 목표는 솔직히 좀 거창합니다. IDA Pro + Hex-Rays만큼, 할 수 있다면 그보다 낫게 만드는 겁니다. 아직 거기까지는
 멀었지만, x86-64나 ARM 바이너리를 열어서 함수를 훑어보고, 이름을 붙이고, 의사 코드를 읽고, 디버거로
 오버플로 오프셋을 재는 정도는 지금도 충분히 됩니다. 현재 버전은
-[1.4.0](https://github.com/ljw097/relic/releases/tag/v1.4.0)입니다.
+[1.5.0](https://github.com/ljw097/relic/releases/tag/v1.5.0)입니다.
 
 ![Relic 디버거: vuln()에서 gets() 직후에 멈춘 화면. 입력한 AAAA…가 레지스터와 스택 telescope에 보인다](docs/screenshots/debugger.png)
 
 ## 설치
 
-[릴리스 페이지](https://github.com/ljw097/relic/releases/tag/v1.4.0)에서 운영체제에 맞는 실행 파일을 받아
+[릴리스 페이지](https://github.com/ljw097/relic/releases/tag/v1.5.0)에서 운영체제에 맞는 실행 파일을 받아
 실행하면 됩니다. 설치 과정은 없습니다.
 
 - **Windows**: `relic-<버전>-windows-x86_64.exe`
@@ -34,7 +34,7 @@ Python 3.10 이상이 있다면 릴리스 페이지의 wheel을 설치해도 됩
 
 ```sh
 python3 -m venv .venv
-.venv/bin/pip install https://github.com/ljw097/relic/releases/download/v1.4.0/relic_re-1.4.0-py3-none-any.whl
+.venv/bin/pip install https://github.com/ljw097/relic/releases/download/v1.5.0/relic_re-1.5.0-py3-none-any.whl
 .venv/bin/relic
 ```
 
@@ -52,6 +52,14 @@ python3 -m venv .venv
   디버깅하려면 `gdb-multiarch`와 `qemu-user`도 설치하세요.
 - 어셈블리를 입력해서 패치하는 기능(`Ctrl+Alt+A`)은 keystone이 필요합니다. `pip install 'relic-re[asm]'`로
   따로 설치합니다.
+
+## 버전 규칙
+
+릴리스는 [유의적 버전(Semantic Versioning)](https://semver.org/lang/ko/)을 따릅니다. 공개 인터페이스는
+명령과 그 옵션, `--json` 출력, 스크립팅·플러그인 API([docs/scripting.md](docs/scripting.md)), 프로젝트
+파일입니다. MAJOR 버전은 이것들을 호환되지 않게 바꿀 수 있고, MINOR 버전은 기능을 더하고, PATCH 버전은 버그만
+고칩니다. 이전 버전의 프로젝트 파일은 계속 열립니다. 의사 코드와 리스팅 텍스트는 인터페이스가 아닙니다. 릴리스마다
+나아집니다. 릴리스별 변경 사항은 [docs/releases](docs/releases/)에 있습니다.
 
 ## 할 수 있는 것
 
@@ -115,7 +123,7 @@ ret2win 후보를 찾아 줍니다. IDA에는 기본으로 없는 기능이라 �
 | 프로세서 (8) | 100% | 디컴파일: x86/x64, ARM/Thumb, AArch64, MIPS32/64, RISC-V, PowerPC 32/64. 디스어셈블만: SPARC, SystemZ, M68K, SH, TriCore, eBPF, WebAssembly |
 | 자동 분석 (14) | 100% | stripped bash 함수의 99.9%, `.eh_frame`을 지워도 99.96%를 찾습니다. RTTI로 C++ 클래스 복원, 가상·간접 호출 대상 해석, 코드 사이 데이터 구분. bash 분석에 약 7초 |
 | 라이브러리 식별 (8) | 100% | 테스트용 stripped 정적 바이너리에서 원래 함수의 83~94%에 이름을 붙이고, 틀린 이름은 없습니다 |
-| 타입 시스템 (10) | 90% | libc 플래그는 상수 이름으로(`PROT_READ \| PROT_WRITE`), 헤더의 `#define` 묶음은 열거형으로. 구조체를 값으로 넘기고 돌려받는 경우는 아직 안 됩니다 |
+| 타입 시스템 (10) | 95% | libc 플래그는 상수 이름으로(`PROT_READ \| PROT_WRITE`), 헤더의 `#define` 묶음은 열거형으로. 구조체를 값으로 넘기고 돌려받는 것은 x86-64 Linux와 AArch64에서 됩니다(헤더의 원형으로). 다른 ABI와, 필드 둘이 레지스터 하나에 들어가는 경우는 아직입니다 |
 | 디컴파일러 (20) | 60% | goto가 처음 재기 시작했을 때의 절반이고, 남은 것은 대부분 gnulib `quotearg` 같은 큰 상태 기계에 있습니다. SSE/AVX는 intrinsic으로, x87은 `long double`까지 됩니다 |
 | 대화형 UI (12) | 100% | |
 | 스크립팅·확장 (8) | 100% | |

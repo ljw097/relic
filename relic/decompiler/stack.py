@@ -15,7 +15,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 
 from .arch import ArchInfo
-from .ir import (Assign, BinOp, CallStmt, Const, Expr, IRFunction, Load, Phi, Reg, Return, Store, Var,
+from .ir import (Assign, BinOp, CallStmt, Const, Expr, Intrinsic, IRFunction, Load, Phi, Reg, Return, Store, Var,
                  stmt_exprs, walk)
 
 _CANARY_OFF = 0x28  # glibc thread-pointer offset of the stack guard
@@ -194,6 +194,10 @@ def analyze_frame(fn: IRFunction, arch: ArchInfo, guards=frozenset()) -> Frame:
     def slot(off: int) -> Slot:
         return frame.slots.setdefault(off, Slot(off))
 
+    from .aggabi import STRUCT_COPY
+    extents: dict[int, int] = {}            # a struct passed by value from the stack: its size
+    kinds: dict[int, set] = {}              # ... and which structs (several: a reused place)
+
     if arch.name.startswith(("x64", "x86")):
         # the return address `call` pushed; elsewhere it stays in a register (lr / ra) and the
         # entry stack pointer is the caller's frame (MIPS o32: the argument home slots)
@@ -236,9 +240,29 @@ def analyze_frame(fn: IRFunction, arch: ArchInfo, guards=frozenset()) -> Frame:
         elif isinstance(s, Assign) and s.dst not in frame.spoff:
             escaped.append(s.src)
         for e in escaped:
+            if isinstance(e, Intrinsic) and e.name.startswith(STRUCT_COPY) and e.args:
+                # a struct passed by value from here (aggabi): its whole size is one object
+                off = frame.offset_of(e.args[0])
+                if off is not None:
+                    slot(off).taken = True
+                    extents[off] = max(extents.get(off, 0), e.bits // 8)
+                    kinds.setdefault(off, set()).add(e.name)
+                continue
             off = frame.offset_of(e)
             if off is not None:
                 slot(off).taken = True
+
+    # a place the compiler reuses for structs of different types, each passed by value from there:
+    # the slots inside are parts of one buffer (with one type, the C writer shows that struct and
+    # its fields instead)
+    for off, size in extents.items():
+        if len(kinds.get(off, ())) < 2:
+            continue
+        for o in [o for o in frame.slots if off < o < off + size and frame.slots[o].kind == "local"]:
+            del frame.slots[o]
+        sl = frame.slots.get(off)
+        if sl is not None and sl.kind == "local":
+            sl.width = max(sl.width, 1)
 
     # `buf[1]` read directly (an inlined loop over a char buffer, peeled): a byte slot that is
     # only loaded, right after an address-taken byte buffer, is part of that buffer
@@ -252,7 +276,9 @@ def analyze_frame(fn: IRFunction, arch: ArchInfo, guards=frozenset()) -> Frame:
             continue
         buf = sl if sl.kind == "local" and sl.taken and sl.width <= 1 else None
     # the high word of a double slot read on its own (RV32 copies a double through two core
-    # registers): part of that slot, not a variable overlapping it
+    # registers), part of a slot read on its own (a struct's two ints stored as one word, a
+    # register spilled whole and read back a byte at a time): part of that slot, not a variable
+    # overlapping it
     wide = None
     for off in sorted(frame.slots):
         sl = frame.slots[off]
@@ -260,7 +286,7 @@ def analyze_frame(fn: IRFunction, arch: ArchInfo, guards=frozenset()) -> Frame:
                 off + sl.width <= wide.offset + wide.width:
             del frame.slots[off]
             continue
-        wide = sl if sl.kind == "local" and sl.width > frame.arch.bits // 8 else None
+        wide = sl if sl.kind == "local" and sl.width >= 2 else None
     # size each slot by the distance to the next slot above it; classify leftovers
     offs = sorted(frame.slots)
     for i, off in enumerate(offs):

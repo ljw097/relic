@@ -203,6 +203,9 @@ class CallStmt(Stmt):
     defs: list[tuple[str, Expr]] = field(default_factory=list)
     # registers the callee can change (a local function, see clobbers.py); None: the ABI's set
     clobbers: frozenset | None = None
+    # returns a struct in registers (aggabi): kept a statement of its own, its result registers
+    # read as that struct's fields
+    struct_result: bool = False
 
 
 @dataclass(slots=True)

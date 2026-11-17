@@ -1,7 +1,7 @@
 name: Release
 
 # Run by hand (Actions > Release > Run workflow) on main: checks that the version matches the
-# package, builds stand-alone executables for Windows, Linux and macOS (PyInstaller) plus the
+# package and follows semantic versioning (tools/semver_check.py), builds stand-alone executables for Windows, Linux and macOS (PyInstaller) plus the
 # sdist and wheel, smoke-tests them, tags v<version> and publishes a GitHub release with
 # docs/releases/<version>.md as its notes.
 #
@@ -14,7 +14,7 @@ on:
       version:
         description: "Version (must equal pyproject.toml's)"
         required: true
-        default: "1.4.0"
+        default: "1.5.0"
       prerelease:
         description: "Mark as a pre-release (beta)"
         type: boolean
@@ -47,6 +47,9 @@ jobs:
             git ls-remote --exit-code --tags origin "v$v" > /dev/null || { echo "no tag v$v to add to"; exit 1; }
           else
             ! git ls-remote --exit-code --tags origin "v$v"
+            # semantic versioning: MAJOR.MINOR.PATCH[-PRERELEASE], newer than every release so far
+            git ls-remote --tags origin | python tools/semver_check.py "$v" --tags-from - \
+              ${{ inputs.prerelease && '--prerelease' || '' }}
           fi
       - name: Build the sdist and wheel
         run: |

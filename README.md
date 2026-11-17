@@ -10,14 +10,14 @@ The goal is admittedly ambitious: something as good as IDA Pro with Hex-Rays, an
 can manage it. It isn't there yet. But for the everyday stuff it already works well: opening an
 x86-64 or ARM binary, finding your way around, naming things, reading the pseudocode, and
 measuring an overflow offset in the debugger. The current release is
-[1.4.0](https://github.com/ljw097/relic/releases/tag/v1.4.0).
+[1.5.0](https://github.com/ljw097/relic/releases/tag/v1.5.0).
 
 ![The Relic debugger stopped in vuln() right after gets(): the AAAA… input shows up in the registers and the stack telescope](docs/screenshots/debugger.png)
 
 ## Installing
 
 Grab the executable for your system from the
-[release page](https://github.com/ljw097/relic/releases/tag/v1.4.0) and run it. There's nothing
+[release page](https://github.com/ljw097/relic/releases/tag/v1.5.0) and run it. There's nothing
 to install:
 
 - **Windows**: `relic-<version>-windows-x86_64.exe`
@@ -38,7 +38,7 @@ If you have Python 3.10 or newer, you can install the wheel from the release pag
 
 ```sh
 python3 -m venv .venv
-.venv/bin/pip install https://github.com/ljw097/relic/releases/download/v1.4.0/relic_re-1.4.0-py3-none-any.whl
+.venv/bin/pip install https://github.com/ljw097/relic/releases/download/v1.5.0/relic_re-1.5.0-py3-none-any.whl
 .venv/bin/relic
 ```
 
@@ -56,6 +56,16 @@ Analysis and decompilation work the same everywhere. A few features need extra t
   you'll also want `gdb-multiarch` and `qemu-user`.
 - Patching by typing assembly (`Ctrl+Alt+A`) needs keystone, which is an optional extra:
   `pip install 'relic-re[asm]'`.
+
+## Versioning
+
+Releases follow [Semantic Versioning](https://semver.org). The public interface is the commands
+and their options, the `--json` output, the scripting and plugin API
+([docs/scripting.md](docs/scripting.md)) and project files. A MAJOR version can change those
+incompatibly, a MINOR version adds to them (new features), and a PATCH version only fixes bugs.
+Project files from older versions keep opening. The pseudocode and listing text aren't part of
+the interface: they get better from release to release. Each release's changes are in
+[docs/releases](docs/releases/).
 
 ## What it does
 
@@ -124,7 +134,7 @@ matters to me when I'm actually reversing something. Right now it comes to **abo
 | Processors (8) | 100% | Decompiles x86/x64, ARM/Thumb, AArch64, MIPS32/64, RISC-V and PowerPC 32/64. Disassembles SPARC, SystemZ, M68K, SH, TriCore, eBPF and WebAssembly |
 | Auto-analysis (14) | 100% | Finds 99.9% of the functions in stripped bash, and 99.96% even with `.eh_frame` removed. C++ classes from RTTI, virtual and indirect call targets, data mixed into code. bash takes about 7 seconds |
 | Library identification (8) | 100% | Names 83–94% of the original functions in stripped static test binaries, with no wrong names |
-| Type system (10) | 90% | libc flags print as their constants (`PROT_READ \| PROT_WRITE`), header `#define` groups become enums. Structs passed or returned by value aren't supported yet |
+| Type system (10) | 95% | libc flags print as their constants (`PROT_READ \| PROT_WRITE`), header `#define` groups become enums. Structs passed and returned by value work on x86-64 Linux and AArch64 (from a header's prototypes), not yet on other ABIs or when two fields share a register |
 | Decompiler (20) | 60% | Half as many gotos as when I started measuring; most of the rest are in big state machines like gnulib's `quotearg`. SSE/AVX shows as intrinsics, x87 works, `long double` included |
 | Interactive UI (12) | 100% | |
 | Scripting & extensions (8) | 100% | |
