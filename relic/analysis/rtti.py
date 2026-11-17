@@ -242,7 +242,7 @@ def _vtables(an, by_ti: dict[int, CppClass], inside: set[int], pure: set[int], p
             vt = VTable(a + ptr, off, start=a - ptr)
             s = a + ptr
             descs = getattr(b, "func_descriptors", None) or {}
-            while s + ptr <= sec.end:
+            while s + ptr <= sec.end and s not in inside:     # (a typeinfo object right after it)
                 v = b.read_ptr(s) or 0
                 v = descs.get(v, v)                      # (PowerPC64 ELFv1: a function descriptor)
                 if s in pure:
