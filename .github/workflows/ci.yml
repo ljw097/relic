@@ -104,6 +104,7 @@ jobs:
           pytest -q -rs tests/test_libsigs.py -k cross
           pytest -q -rs tests/test_autoanalysis.py -k cross
           pytest -q -rs tests/test_rtti.py -k "a64 or cross"
+          pytest -q -rs tests/test_structval.py -k cross
           pytest -q -rs tests/test_debug_targets.py -k qemu
       - uses: actions/upload-artifact@v6
         with:
