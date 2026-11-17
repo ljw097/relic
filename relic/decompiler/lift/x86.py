@@ -912,9 +912,24 @@ class X86Lifter(X87Mixin):
         self._shift(ops, "ror")
 
     def _double_shift(self, ops, name):
+        """`shrd a, b, n`: a shifted right by n, the bits coming in from b's low end --
+        `(a >> n) | (b << (w - n))`; `shld` the other way. A count of 0 changes nothing."""
         a, b = self.read(ops[0]), self.read(ops[1])
         cnt = self.read(ops[2]) if len(ops) > 2 else self.read_reg("cl")
-        self.write(ops[0], Intrinsic(name, (a, b, self.resize(cnt, 8)), a.bits))
+        w = a.bits
+        cmask = 0x3F if w == 64 else 0x1F
+        right = name == "shrd"
+        if isinstance(cnt, Const):
+            n = cnt.value & cmask
+            if n == 0 or n >= w:                # (a 16-bit operand's count past 15: undefined)
+                return
+            self.write(ops[0], BinOp("|", BinOp(">>u" if right else "<<", a, Const(n, 8), w),
+                                     BinOp("<<" if right else ">>u", b, Const(w - n, 8), w), w))
+            return
+        n = self.tmp(BinOp("&", self.resize(cnt, 8), Const(cmask, 8), 8))
+        moved = BinOp("|", BinOp(">>u" if right else "<<", a, n, w),
+                      BinOp("<<" if right else ">>u", b, BinOp("-", Const(w, 8), n, 8), w), w)
+        self.write(ops[0], Ite(BinOp("==", n, Const(0, 8), 1), a, moved, w))
 
     def _i_shld(self, i, ops):
         self._double_shift(ops, "shld")
