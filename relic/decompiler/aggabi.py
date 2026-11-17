@@ -105,10 +105,8 @@ def packed(st: _Struct) -> bool:
     xmm0): their parts are bits of a register, which -O0 spills and reads back in halves and -O2
     takes apart with shifts -- not shown as a struct yet (the frame would need overlapping slots
     and the lifter `shrd`)."""
-    return st.size <= 16 and classify(st) is not None and any(
-        sum(1 for o, _, _, _ in st.fields if e <= o < e + 8) > 1 for e in range(0, st.size, 8)) or \
-        st.size <= 16 and any(sum(1 for o, _, ct, _ in st.fields if e <= o < e + 8 and ct in _FLOATS) > 1
-                              for e in range(0, st.size, 8))
+    return st.size <= 16 and any(sum(1 for o, _, ct, _ in st.fields if e <= o < e + 8 and ct in _FLOATS) > 1
+                                 for e in range(0, st.size, 8))
 
 
 def classify(st: _Struct) -> list[tuple[str, int]] | None:

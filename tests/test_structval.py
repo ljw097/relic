@@ -83,24 +83,36 @@ def test_recompiled_pseudocode_runs_like_the_program(built, tmp_path):
         assert got == want, src.read_text()
 
 
-def test_fields_sharing_a_register_keep_the_usual_parameters(tmp_path):
-    """`struct pair { int a, b; }` travels in one register: not shown as a struct yet (its halves
-    are spilled and read back separately at -O0, shifted apart at -O2), and its prototype puts no
-    struct type on that register -- the pseudocode stays what it was, and consistent."""
+@pytest.mark.parametrize("opt", ["O0", "O1", "O2"])
+def test_fields_sharing_a_register(opt, tmp_path):
+    """`struct pair { int a, b; }` travels in one register (`tri`'s first two ints too, `name`'s
+    eight chars): its fields are that register's bits -- read back as `a1.b`, built as
+    `(struct pair){ a1.b, a1.a + 1 }` -- and the pseudocode compiled again runs like the program."""
     if shutil.which("gcc") is None:
         pytest.skip("no gcc")
-    src = tmp_path / "p.c"
-    src.write_text("struct pair { int a; int b; };\n"
-                   "__attribute__((noinline)) struct pair swap(struct pair p)\n"
-                   "{ struct pair r = { p.b, p.a }; return r; }\n"
-                   "int main(int c, char **v) { return swap((struct pair){ c, 7 }).a; }\n")
+    src, hdr = (os.path.join(HERE, "src", n) for n in ("structval_packed.c", "structval_packed.h"))
     exe = str(tmp_path / "p")
-    subprocess.run(["gcc", "-O0", "-o", exe, str(src)], check=True)
+    subprocess.run(["gcc", f"-{opt}", "-fno-inline", "-fno-tree-vectorize", "-o", exe, src], check=True)
     an = analyze(exe)
-    an.import_header("struct pair { int a; int b; };\nstruct pair swap(struct pair p);\n")
-    code = decompile(an, an.function_by_name("swap")).text
-    assert "struct pair a1" not in code and not code.startswith("struct pair swap"), code
-    assert "no struct pair to apply" not in code
+    with open(hdr) as fp:
+        header = fp.read()
+    an.import_header(header)
+    funcs = ["swap", "tsum", "first", "mk", "main"]
+    code = {f: decompile(an, an.function_by_name(f)).text for f in funcs}
+    assert code["swap"].splitlines()[0] == "struct pair swap(struct pair a1)"
+    if opt != "O0":
+        assert "return (struct pair){ a1.b, a1.a + 1 };" in code["swap"], code["swap"]
+        assert "a1.x" in code["tsum"] and "a1.y" in code["tsum"] and "a1.z" in code["tsum"], code["tsum"]
+    body = [re.sub(r"(?ms)^struct \w+ \{.*?^\};\n\n?", "", code[f]) for f in funcs]
+    re_c = tmp_path / "re.c"
+    re_c.write_text("#include <stdio.h>\n#include <stdint.h>\nextern int __printf_chk(int, const char *, ...);\n"
+                    + header + "\n" + "\n".join(body))
+    out = str(tmp_path / "re")
+    r = subprocess.run(["gcc", "-w", "-o", out, str(re_c)], capture_output=True, text=True)
+    assert r.returncode == 0, r.stderr + re_c.read_text()
+    for args in ([], ["x", "y", "z"]):
+        want = subprocess.run([exe, *args], capture_output=True, text=True).stdout
+        assert subprocess.run([out, *args], capture_output=True, text=True).stdout == want and want, re_c.read_text()
 
 
 FUNCS2 = ["v2add", "v2dot", "v3cross", "v3scale", "span_from", "span_skip", "span_count", "parse", "rgba_sum", "main"]
@@ -146,7 +158,8 @@ def test_classify():
     assert classify(_Struct("big", 24, 8, [(0, 8, "long", "a"), (8, 8, "long", "b"), (16, 8, "long", "c")])) is None
     ff = _Struct("ff", 8, 4, [(0, 4, "float", "u"), (4, 4, "float", "v")])
     assert classify(ff) is None and packed(ff)
-    assert packed(_Struct("pair", 8, 4, [(0, 4, "", "a"), (4, 4, "", "b")]))
+    # two ints in one register: passed as that register's bits, shown as the struct
+    assert not packed(_Struct("pair", 8, 4, [(0, 4, "", "a"), (4, 4, "", "b")]))
 
 
 def _gcc(tmp_path, src: str, opt: str = "-O0") -> str:

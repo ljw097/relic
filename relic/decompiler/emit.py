@@ -1210,7 +1210,61 @@ class CWriter:
         k = int(hi) ^ (getattr(self.an.bin, "endian", "little") == "big")
         return f"((unsigned int *)&{self.vname(x.name)})[{k}]"
 
+    def _packed_field(self, e: Expr) -> str | None:
+        """A field read out of a struct parameter's register that several fields share (aggabi):
+        `(int)P` -> `a1.a`, `(int)(P >> 32)` -> `a1.b`, `P >> 32` (the top field, widened) ->
+        `(int64_t)a1.b`. None: not such a read."""
+        if not self.__dict__.get("agg_fields"):
+            return None
+        if isinstance(e, Cast) and e.kind == "low" and isinstance(e.a, BinOp) and \
+                e.a.op in ("+", "-", "*", "&", "|", "^") and not getattr(self, "_in_packed", False):
+            # the low bits of `P + 1` are those of `P`, plus one (`a1.a + 1`): truncation
+            # distributes over these operations
+            def cut(x):
+                return Const(x.value & ((1 << e.bits) - 1), e.bits) if isinstance(x, Const) else Cast("low", x, e.bits)
+            low = BinOp(e.a.op, cut(e.a.a), cut(e.a.b), e.bits)
+            self._in_packed = True
+            try:
+                if any(self._packed_field(x) is not None for x in (low.a, low.b)):
+                    return self.expr(low)
+            finally:
+                self._in_packed = False
+            return None
+        bits, shift, base = e.bits, 0, e
+        if isinstance(base, Cast) and base.kind == "low":
+            base = base.a
+        elif isinstance(base, BinOp) and base.op in (">>u", ">>s") and isinstance(base.b, Const):
+            pass
+        else:
+            return None
+        widen = None
+        if isinstance(base, BinOp) and base.op in (">>u", ">>s") and isinstance(base.b, Const):
+            shift = base.b.value
+            if e is base:                       # (the top field, widened: no low cast around it)
+                widen, bits = e.bits, base.a.bits - shift
+            base = base.a
+        if not isinstance(base, (Var, StackVar)):
+            return None
+        agg = self.agg_fields.get(base.name)
+        if agg is None or agg[1].field is not None or agg[1].float:
+            return None
+        root, piece = agg
+        from .aggabi import struct_of
+        st = struct_of(self.an, self._agg.params[int(root[5:])].ctype) if self._agg and root.startswith("__agg") \
+            else None
+        if st is None:
+            return None
+        f = next(((name, b * 8, ct) for o, b, ct, name in st.fields if o == piece.off + shift // 8 and shift % 8 == 0),
+                 None)
+        if f is None or f[1] != bits:
+            return None
+        text = f"{self.vname(root)}.{f[0]}"
+        return f"({int_type(widen)}){text}" if widen else text
+
     def _expr(self, e: Expr) -> tuple[str, int]:
+        packed = self._packed_field(e) if isinstance(e, (Cast, BinOp)) else None
+        if packed is not None:
+            return packed, PREC_UNARY if packed.startswith("(") else PREC_POSTFIX
         if isinstance(e, (Cast, Extract, Var)) and self.p.arch.name == "arm-aapcs-vfp":
             s = self._vfp_param(e)
             if s is not None:
@@ -1335,11 +1389,20 @@ class CWriter:
             if fl or len(fields) <= 1 and not (fields and fields[0][0]):
                 parts.append(self.fexpr(a, 0, min(a.bits, 64)) if fl else self.expr(a))
                 continue
-            # several fields in one register: each from its bits (`(int)p`, `(int)(p >> 32)`)
+            # several fields in one register: each from its bits (`(int)p`, `(int)(p >> 32)`) -- out
+            # of `x | y << 32` the term that holds them (`y`)
             for shift, bits, ct in fields:
                 t = ct or int_type(bits)
-                v = self.expr(a, PREC_UNARY) if not shift else f"({self.expr(a, PREC_UNARY + 1)} >> {shift})"
-                parts.append(f"({t}){v}")
+                term, at = _bits_term(a, shift, bits)
+                if at == 0:
+                    x = Cast("low", term, bits) if term.bits > bits else term
+                    v = self.expr(x, PREC_UNARY)
+                    if self._packed_field(x) is not None or isinstance(x, BinOp) and x.bits == bits:
+                        parts.append(v)             # (already the field's width: `a1.b`, `a1.a + 1`)
+                        continue
+                else:
+                    v = f"({self.expr(term, PREC_UNARY + 1)} >> {at})"
+                parts.append(v if v.startswith(f"({t})") else f"({t}){v}")
         return f"(struct {name}){{ {', '.join(parts)} }}"
 
     def _binop(self, e: BinOp) -> tuple[str, int]:
@@ -2088,6 +2151,52 @@ def _tidy(items):
 
 
 # ----------------------------------------------------------------- entry
+def _bit_range(e: Expr) -> tuple[int, int]:
+    """[low, high) of the bits value `e` can have set (a safe over-estimate)."""
+    if isinstance(e, Const):
+        return (0, e.value.bit_length())
+    if isinstance(e, Cast) and e.kind == "zext":
+        return _bit_range(e.a)[0], min(_bit_range(e.a)[1], e.a.bits)
+    if isinstance(e, Cast) and e.kind == "low":
+        lo, hi = _bit_range(e.a)
+        return min(lo, e.bits), min(hi, e.bits)
+    if isinstance(e, BinOp) and e.op == "<<" and isinstance(e.b, Const):
+        lo, hi = _bit_range(e.a)
+        return min(lo + e.b.value, e.bits), min(hi + e.b.value, e.bits)
+    if isinstance(e, BinOp) and e.op == ">>u" and isinstance(e.b, Const):
+        lo, hi = _bit_range(e.a)
+        return max(lo - e.b.value, 0), max(hi - e.b.value, 0)
+    if isinstance(e, BinOp) and e.op == "&" and isinstance(e.b, Const):
+        return 0, min(_bit_range(e.a)[1], e.b.value.bit_length())
+    if isinstance(e, BinOp) and e.op in ("|", "^"):
+        (a0, a1), (b0, b1) = _bit_range(e.a), _bit_range(e.b)
+        return min(a0, b0), max(a1, b1)
+    return 0, e.bits
+
+
+def _bits_term(e: Expr, shift: int, bits: int) -> tuple[Expr, int]:
+    """Out of `x | y << k` (a struct's fields packed into one register), the term that holds bits
+    [shift, shift + bits) and where they are in it: (`y`, shift - k), or (`e`, shift) when no
+    single term does."""
+    if isinstance(e, BinOp) and e.op == "|":
+        terms, todo = [], [e]
+        while todo:
+            t = todo.pop()
+            if isinstance(t, BinOp) and t.op == "|":
+                todo += [t.a, t.b]
+            else:
+                terms.append(t)
+        hit = [t for t in terms if _bit_range(t)[0] < shift + bits and _bit_range(t)[1] > shift]
+        if len(hit) == 1:
+            t = hit[0]
+            if isinstance(t, BinOp) and t.op == "<<" and isinstance(t.b, Const) and t.b.value <= shift:
+                return _bits_term(t.a, shift - t.b.value, bits)
+            return _bits_term(t, shift, bits) if t is not e else (t, shift)
+    if isinstance(e, Cast) and e.kind == "zext" and shift + bits <= e.a.bits:
+        return _bits_term(e.a, shift, bits)
+    return e, shift
+
+
 def decompile(an: "Analysis", func: "Function") -> Decompiled:
     from .pipeline import prepared
     prep = prepared(an, func)
