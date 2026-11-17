@@ -189,3 +189,21 @@ def test_a_register_read_back_a_byte_at_a_time_is_one_variable(tmp_path):
                     "int main(int n, char **v) { printf(\"%u\\n\", sum(1 | 2 << 8 | n << 16 | 4 << 24)); }\n")
     subprocess.run(["gcc", "-w", "-o", str(tmp_path / "re"), str(re_c)], check=True)
     assert subprocess.run([str(tmp_path / "re"), "x", "y"], capture_output=True, text=True).stdout == want
+
+
+def test_other_abis_get_no_misplaced_types(tmp_path):
+    """Win64 (MinGW): structs by value are not shown there yet, and the prototype must not type
+    the registers by position either -- `make`'s first register is its hidden result pointer,
+    not `long n`."""
+    cc = shutil.which("x86_64-w64-mingw32-gcc")
+    if cc is None:
+        pytest.skip("needs x86_64-w64-mingw32-gcc")
+    exe = str(tmp_path / "sv.exe")
+    subprocess.run([cc, "-O1", "-o", exe, SRC], check=True)
+    an = analyze(exe)
+    with open(HDR) as fp:
+        an.import_header(fp.read())
+    code = decompile(an, an.function_by_name("make")).text
+    sig = next(ln for ln in code.splitlines() if "make(" in ln)
+    assert "long a1" not in sig and "struct big" not in sig, code
+    assert "no struct" not in decompile(an, an.function_by_name("add")).text

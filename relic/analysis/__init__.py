@@ -884,9 +884,10 @@ class Analysis:
             if shown:
                 ints, floats = [t for _, t in proto.params], []     # (structs by value: named in C order)
             elif by_value:
-                # not shown as structs (another ABI, two fields in one register): no struct types on
-                # registers that hold parts of one
-                ints = [t for t in ints if not struct_of(self, t.spell())]
+                # not shown as structs (another ABI, two fields in one register): which register
+                # holds which parameter is not known (a struct takes one or two, a hidden result
+                # pointer comes first) -- no parameter types rather than wrong ones
+                ints, floats = [], []
             types = self.var_types.setdefault(f.addr, {})
             for k, t in enumerate(ints + floats):
                 try:
