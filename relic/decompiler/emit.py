@@ -1394,6 +1394,10 @@ class CWriter:
             for shift, bits, ct in fields:
                 t = ct or int_type(bits)
                 term, at = _bits_term(a, shift, bits)
+                if isinstance(term, Const):     # (a constant's bits there: `7`)
+                    v = (term.value >> at) & ((1 << bits) - 1)
+                    parts.append(self._num(Const(v, bits)))
+                    continue
                 if at == 0:
                     x = Cast("low", term, bits) if term.bits > bits else term
                     v = self.expr(x, PREC_UNARY)
@@ -2154,7 +2158,8 @@ def _tidy(items):
 def _bit_range(e: Expr) -> tuple[int, int]:
     """[low, high) of the bits value `e` can have set (a safe over-estimate)."""
     if isinstance(e, Const):
-        return (0, e.value.bit_length())
+        v = e.value
+        return ((v & -v).bit_length() - 1 if v else 0), v.bit_length()
     if isinstance(e, Cast) and e.kind == "zext":
         return _bit_range(e.a)[0], min(_bit_range(e.a)[1], e.a.bits)
     if isinstance(e, Cast) and e.kind == "low":
@@ -2167,7 +2172,9 @@ def _bit_range(e: Expr) -> tuple[int, int]:
         lo, hi = _bit_range(e.a)
         return max(lo - e.b.value, 0), max(hi - e.b.value, 0)
     if isinstance(e, BinOp) and e.op == "&" and isinstance(e.b, Const):
-        return 0, min(_bit_range(e.a)[1], e.b.value.bit_length())
+        lo, hi = _bit_range(e.a)
+        m = e.b.value
+        return max(lo, (m & -m).bit_length() - 1 if m else 0), min(hi, m.bit_length())
     if isinstance(e, BinOp) and e.op in ("|", "^"):
         (a0, a1), (b0, b1) = _bit_range(e.a), _bit_range(e.b)
         return min(a0, b0), max(a1, b1)
@@ -2194,6 +2201,10 @@ def _bits_term(e: Expr, shift: int, bits: int) -> tuple[Expr, int]:
             return _bits_term(t, shift, bits) if t is not e else (t, shift)
     if isinstance(e, Cast) and e.kind == "zext" and shift + bits <= e.a.bits:
         return _bits_term(e.a, shift, bits)
+    if isinstance(e, BinOp) and e.op == "&" and isinstance(e.b, Const):
+        want = ((1 << bits) - 1) << shift
+        if e.b.value & want == want:            # (the mask keeps those bits: what they come from)
+            return _bits_term(e.a, shift, bits)
     return e, shift
 
 

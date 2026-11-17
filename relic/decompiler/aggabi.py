@@ -168,8 +168,8 @@ def _a64_regs_ok(st: _Struct) -> bool:
     struct when each holds one integer field (a double there would need its bits reinterpreted)."""
     for e in range(0, st.size, 8):
         inside = [f for f in st.fields if e <= f[0] < e + 8]
-        if len(inside) > 1 or any(ct in _FLOATS or ct == "long double" for _, _, ct, _ in inside):
-            return False
+        if any(ct in _FLOATS or ct == "long double" for _, _, ct, _ in inside):
+            return False                # (integer fields sharing one: its bits, as on x86-64)
     return True
 
 
@@ -186,9 +186,11 @@ def _a64_pieces(st: _Struct, xs: list, vs: list) -> list[Piece] | None:
     for e in range(0, st.size, 8):
         inside = [f for f in st.fields if e <= f[0] < e + 8]
         reg = xs.pop(0)
-        if inside:
+        if len(inside) == 1 and inside[0][0] == e:
             o, b, ct, name = inside[0]
-            out.append(Piece(reg, e, name if o == e else None, b * 8 if o == e else 64, False, ct if o == e else ""))
+            out.append(Piece(reg, e, name, b * 8, False, ct))
+        elif inside:                    # (several fields: the register's bits, read as fields by the C writer)
+            out.append(Piece(reg, e, None, min(64, (st.size - e) * 8), False, ""))
     return out
 
 

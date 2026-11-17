@@ -223,6 +223,38 @@ def test_other_abis_get_no_misplaced_types(tmp_path):
 
 
 @pytest.mark.parametrize("opt", ["O0", "O1", "O2"])
+def test_cross_aarch64_fields_sharing_a_register(opt, tmp_path):
+    """AArch64: `struct pair` in one x register (gcc packs it with `bfi`, takes it apart with
+    `lsr` / `asr`): read and built as fields, and the pseudocode runs like the program."""
+    cc, qemu = shutil.which("aarch64-linux-gnu-gcc"), shutil.which("qemu-aarch64")
+    if cc is None or qemu is None or not os.path.isdir("/usr/aarch64-linux-gnu"):
+        pytest.skip("needs aarch64-linux-gnu-gcc and qemu-aarch64")
+    src, hdr = (os.path.join(HERE, "src", n) for n in ("structval_packed.c", "structval_packed.h"))
+    exe = str(tmp_path / "p")
+    subprocess.run([cc, f"-{opt}", "-fno-inline", "-fno-tree-vectorize", "-o", exe, src], check=True)
+    an = analyze(exe)
+    with open(hdr) as fp:
+        header = fp.read()
+    an.import_header(header)
+    funcs = ["swap", "tsum", "first", "mk", "main"]
+    code = {f: decompile(an, an.function_by_name(f)).text for f in funcs}
+    assert code["swap"].splitlines()[0] == "struct pair swap(struct pair a1)"
+    if opt != "O0":
+        assert "a1.b" in code["swap"] and "a1.y" in code["tsum"], code
+    body = [re.sub(r"(?ms)^struct \w+ \{.*?^\};\n\n?", "", code[f]) for f in funcs]
+    re_c = tmp_path / "re.c"
+    re_c.write_text("#include <stdio.h>\n#include <stdint.h>\nextern int __printf_chk(int, const char *, ...);\n"
+                    + header + "\n" + "\n".join(body))
+    out = str(tmp_path / "re")
+    r = subprocess.run([cc, "-w", "-o", out, str(re_c)], capture_output=True, text=True)
+    assert r.returncode == 0, r.stderr + re_c.read_text()
+    run = [qemu, "-L", "/usr/aarch64-linux-gnu"]
+    for args in ([], ["x", "y"]):
+        want = subprocess.run([*run, exe, *args], capture_output=True, text=True).stdout
+        assert subprocess.run([*run, out, *args], capture_output=True, text=True).stdout == want and want
+
+
+@pytest.mark.parametrize("opt", ["O0", "O1", "O2"])
 def test_cross_aarch64_recompiles(opt, tmp_path):
     """AAPCS64: two-register structs in x0..x7, an HFA of doubles in v0.., a struct over 16 bytes
     by reference (the callee reads it through the pointer: `a1.b`), a big result through x8 --
