@@ -864,6 +864,8 @@ class Analysis:
             # a printf-like function's arguments counted from its format), result
             protos[name] = {"ret": proto.ret.spell(), "params": params, "variadic": proto.variadic,
                             "names": [n for n, _ in proto.params]}
+            if any(proto.consts):          # (`const char *`: how the function's signature spells it)
+                protos[name]["spelled"] = [("const " if c else "") + p for c, p in zip(proto.consts, params)]
             if f is None:
                 if name not in before[3]:
                     out["imports"].append(name)

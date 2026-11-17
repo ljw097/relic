@@ -167,7 +167,7 @@ class CWriter:
         self.an = an
         self.p = prep
         self.ptr_bits = prep.arch.bits
-        self.types: dict[str, CType] = infer_types(prep.fn, self.ptr_bits, self.is_addr)
+        self.types: dict[str, CType] = infer_types(prep.fn, self.ptr_bits, self.is_addr, self._param_hints())
         # library calls name what plain integers really are (`strlen(a1)`: a1 is a `char *`); a
         # pointer type recovered from how memory is accessed says more and is kept
         lib_structs: dict[str, str] = {}
@@ -623,6 +623,36 @@ class CWriter:
                         self.types[st.dst.name] = t
                         todo.append(st.dst.name)
 
+    def _param_hints(self) -> dict[str, CType]:
+        """The parameters' types a prototype gives (a header's, the user's), by variable: `p + i`
+        then reads `p[i]` (type inference alone may take the index for the pointer)."""
+        wanted = self.an.var_types.get(self.p.fn.addr, {})
+        out: dict[str, CType] = {}
+
+        def put(var: str, t: str):
+            try:
+                ct = parse_ctype(self.an.resolve_type(t))
+            except ValueError:
+                return
+            if not ct.base.startswith(("struct ", "enum ")) or ct.ptr:
+                out[var] = ct
+        plan = self._agg
+        if plan is not None:
+            for prm in plan.params:
+                for x in prm.pieces:
+                    if x.ctype:
+                        put(self._agg_vars[x.loc], x.ctype)
+                if not prm.is_struct:
+                    put(self._agg_vars[prm.loc], prm.ctype)
+            return out
+        if self._is_main():
+            return out
+        for k, r in enumerate(self.p.params):
+            t = wanted.get(f"a{k + 1}")
+            if t:
+                put(r, t)
+        return out
+
     @property
     def _agg(self):
         """The prototype's structs by value (aggabi.Plan), or None."""
@@ -769,6 +799,7 @@ class CWriter:
                     at[off + k * bits // 8] = (label if count == 1 else f"{label}[{k}]", bits)
             if 0 in at:
                 self.base_fields[base_slot.name()] = at[0]
+                self._field_float(base_slot.name(), entry, 0, at[0][1], base_slot.width * 8)
             for off, sl in self.p.frame.slots.items():
                 rel = off - base
                 if off == base or not 0 < rel < size or sl.kind not in ("local", "buffer"):
@@ -777,6 +808,15 @@ class CWriter:
                 f = at.get(rel)
                 if f is not None and f[1] == sl.width * 8:
                     self.stack_fields[sl.name()] = f"{base_slot.name()}.{f[0]}"
+                    self._field_float(sl.name(), entry, rel, f[1], sl.width * 8)
+
+    def _field_float(self, slot: str, entry: dict, rel: int, bits: int, width: int):
+        """A stack struct's float / double field: the slot holding it is one (`var_b8.x = 1.0`,
+        not the constant's bits)."""
+        ct = (entry.get("layout", {}).get(f"{rel:#x}") or [0, ""])[1]
+        if ct in ("float", "double") and bits == width and slot not in self.ftypes:
+            self.ftypes[slot] = bits
+            self.types[slot] = CType(ct)
 
     def vname(self, name: str) -> str:
         """Display name of a variable: the user's name, else the generated one (`v3`, `a1`, `var_c`)."""
@@ -1735,6 +1775,7 @@ class CWriter:
             name = short_name(name)
         params = []
         plan = self._agg
+        spelled_agg = (self.an.user_types.get("prototypes", {}).get(name) or {}).get("spelled") if plan else None
         if plan is not None:
             for k, prm in enumerate(plan.params):
                 if prm.is_struct:
@@ -1742,10 +1783,11 @@ class CWriter:
                     continue
                 r = self._agg_vars[prm.loc]
                 t = self.types.get(r) or CType(int_type(self.ptr_bits))
-                params.append(t.decl(self.vname(r)))
-        for r in [] if plan is not None else self.p.params:
+                params.append(self._as_declared(spelled_agg[k] if spelled_agg else prm.ctype, t, self.vname(r)))
+        spelled = self._proto_spellings(name) if plan is None else None
+        for k, r in enumerate([] if plan is not None else self.p.params):
             t = self.types.get(r) or CType(int_type(self.ptr_bits))
-            params.append(t.decl(self.vname(r)))
+            params.append(self._as_declared(spelled[k], t, self.vname(r)) if spelled else t.decl(self.vname(r)))
         ret = "void"
         if self.ret_type:
             ret = self.ret_type
@@ -1758,6 +1800,31 @@ class CWriter:
             else:
                 ret = self._ret_type(vals[0]) if vals else "int"
         return f"{ret}{'' if ret.endswith('*') else ' '}{name}({', '.join(params) or 'void'})"
+
+    def _as_declared(self, spelled: str | None, t: CType, name: str) -> str:
+        """A parameter as its prototype spells it (`const char *s`) when that is the type it has
+        here, else as the type says."""
+        try:
+            bare = spelled.replace("const ", "", 1) if spelled and spelled.startswith("const ") else spelled
+            same = spelled is not None and str(parse_ctype(self.an.resolve_type(bare))) == str(t) and \
+                "(" not in spelled and "[" not in spelled
+        except ValueError:
+            same = False
+        if not same:
+            return t.decl(name)
+        s = spelled.strip()
+        return f"{s}{name}" if s.endswith("*") else f"{s} {name}"
+
+    def _proto_spellings(self, name: str) -> list[str] | None:
+        """The prototype's parameter types (a header's), when they line up with the parameters
+        one to one (no float ones: those come after the integer ones here)."""
+        proto = self.an.user_types.get("prototypes", {}).get(name)
+        if not proto or len(proto.get("params", [])) != len(self.p.params):
+            return None
+        ps = list(proto.get("spelled") or proto["params"])
+        if any(self.an.resolve_type(t).strip() in ("float", "double", "long double") for t in ps):
+            return None
+        return ps
 
     def _ret_type(self, v: Expr) -> str:
         v = _bare(v)

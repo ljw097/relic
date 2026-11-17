@@ -103,6 +103,38 @@ def test_fields_sharing_a_register_keep_the_usual_parameters(tmp_path):
     assert "no struct pair to apply" not in code
 
 
+FUNCS2 = ["v2add", "v2dot", "v3cross", "v3scale", "span_from", "span_skip", "span_count", "parse", "rgba_sum", "main"]
+
+
+@pytest.mark.parametrize("opt", ["O0", "O1", "O2"])
+def test_everyday_program_recompiles(opt, tmp_path):
+    """Vector math (two doubles in SSE registers, three in memory), a `const char *` + length
+    span, a result with a flag, and a struct of four chars (shown the usual way): the pseudocode,
+    compiled again, prints what the program prints."""
+    src2, hdr2 = (os.path.join(HERE, "src", n) for n in ("structval2.c", "structval2.h"))
+    if shutil.which("gcc") is None:
+        pytest.skip("no gcc")
+    exe = str(tmp_path / "v")
+    subprocess.run(["gcc", f"-{opt}", "-fno-inline", "-fno-tree-vectorize", "-o", exe, src2], check=True,
+                   capture_output=True)
+    an = analyze(exe)
+    with open(hdr2) as fp:
+        header = fp.read()
+    an.import_header(header)
+    body = [re.sub(r"(?ms)^struct \w+ \{.*?^\};\n\n?", "", decompile(an, an.function_by_name(f)).text)
+            for f in FUNCS2]
+    src = tmp_path / "re.c"
+    src.write_text("#include <stdio.h>\n#include <stdint.h>\n#include <string.h>\n"
+                   "extern int __printf_chk(int, const char *, ...);\n" + header + "\n" + "\n".join(body))
+    out = str(tmp_path / "re")
+    r = subprocess.run(["gcc", "-w", "-o", out, str(src)], capture_output=True, text=True)
+    assert r.returncode == 0, r.stderr + src.read_text()
+    for args in ([], ["77,1,,2"], ["x", "9"]):
+        want = subprocess.run([exe, *args], capture_output=True, text=True).stdout
+        got = subprocess.run([out, *args], capture_output=True, text=True).stdout
+        assert got == want, src.read_text()
+
+
 def test_classify():
     """System V classes: two INTEGER eightbytes, two SSE, one of each; more than 16 bytes and
     floats packed in one register are not passed as parts."""
@@ -115,3 +147,45 @@ def test_classify():
     ff = _Struct("ff", 8, 4, [(0, 4, "float", "u"), (4, 4, "float", "v")])
     assert classify(ff) is None and packed(ff)
     assert packed(_Struct("pair", 8, 4, [(0, 4, "", "a"), (4, 4, "", "b")]))
+
+
+def _gcc(tmp_path, src: str, opt: str = "-O0") -> str:
+    if shutil.which("gcc") is None:
+        pytest.skip("no gcc")
+    (tmp_path / "t.c").write_text(src)
+    exe = str(tmp_path / "t")
+    subprocess.run(["gcc", opt, "-w", "-o", exe, str(tmp_path / "t.c")], check=True)
+    return exe
+
+
+def test_header_types_decide_pointer_and_index(tmp_path):
+    """`p[i]` at -O0 is `p + i` of two 64-bit values: the prototype's `const char *p` says which is
+    the pointer (inference alone took the index for it: `count[a1]`), and the signature keeps
+    the header's `const`."""
+    exe = _gcc(tmp_path, "#include <stddef.h>\n__attribute__((noinline)) size_t cnt(const char *p, size_t n, char c)\n"
+                         "{ size_t k = 0; for (size_t i = 0; i < n; i++) k += p[i] == c; return k; }\n"
+                         "int main(int a, char **v) { return cnt(v[0], 3, 'x'); }\n")
+    an = analyze(exe)
+    an.import_header("#include <stddef.h>\nsize_t cnt(const char *p, size_t n, char c);\n")
+    code = decompile(an, an.function_by_name("cnt")).text
+    assert code.splitlines()[0] == "size_t cnt(const char *a1, size_t a2, char a3)", code
+    assert re.search(r"a1\[\w+\]", code) and not re.search(r"\w+\[a1\]", code), code
+
+
+def test_a_register_read_back_a_byte_at_a_time_is_one_variable(tmp_path):
+    """-O0 spills a 4-byte struct (in edi) whole and reads its bytes back one at a time: those
+    are bytes of that one slot, not variables of their own (which nothing writes)."""
+    src = ("#include <stdio.h>\nstruct rgba { unsigned char r, g, b, a; };\n"
+           "__attribute__((noinline)) unsigned sum(struct rgba c) { return c.r + c.g * 3 + c.b * 5 + c.a * 7; }\n"
+           "int main(int n, char **v) { struct rgba c = { 1, 2, (unsigned char)n, 4 };"
+           " printf(\"%u\\n\", sum(c)); return 0; }\n")
+    exe = _gcc(tmp_path, src)
+    an = analyze(exe)
+    code = decompile(an, an.function_by_name("sum")).text
+    assert "char var_" not in code, code              # (no byte variables beside the spilled word)
+    want = subprocess.run([exe, "x", "y"], capture_output=True, text=True).stdout
+    re_c = tmp_path / "re.c"
+    re_c.write_text("#include <stdio.h>\n#include <stdint.h>\n" + code + "\n"
+                    "int main(int n, char **v) { printf(\"%u\\n\", sum(1 | 2 << 8 | n << 16 | 4 << 24)); }\n")
+    subprocess.run(["gcc", "-w", "-o", str(tmp_path / "re"), str(re_c)], check=True)
+    assert subprocess.run([str(tmp_path / "re"), "x", "y"], capture_output=True, text=True).stdout == want
