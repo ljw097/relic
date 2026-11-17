@@ -236,3 +236,22 @@ def test_main_of_stripped_programs(kind, tmp_path):
         # the import thunk it ends with is named after its import, and known not to return
         ex = an.function_by_name("exit")
         assert ex is not None and ex.noreturn and ex.library
+
+
+@pytest.mark.parametrize("cc", ["mipsel-linux-gnu-gcc", "mips-linux-gnu-gcc", "riscv64-linux-gnu-gcc",
+                                "arm-linux-gnueabihf-gcc", "powerpc-linux-gnu-gcc", "powerpc64-linux-gnu-gcc",
+                                "powerpc64le-linux-gnu-gcc"])
+def test_cross_main_of_static_stripped_programs(cc, tmp_path):
+    """Static and stripped, with no signatures for that libc: nothing names __libc_start_main,
+    but `_start`'s one call that does not return is it, and its first argument is `main` (a GOT
+    slot `bal` + `$gp` reach on MIPS, a `j main` trampoline on RISC-V, a descriptor on ELFv1; on
+    PowerPC64 ELFv2 `_start` branches into it, so `r8` is worked out from the entry code)."""
+    from relic.loader import load
+    if shutil.which(cc) is None:
+        pytest.skip(f"needs {cc}")
+    full, stripped = str(tmp_path / "vuln"), str(tmp_path / "stripped")
+    subprocess.run([cc, "-O2", "-static", "-w", "-o", full, os.path.join(HERE, "src", "vuln.c")], check=True)
+    subprocess.run([shutil.which(cc.replace("-gcc", "-strip")) or "strip", "-o", stripped, full], check=True)
+    an = analyze(stripped, sigs=[])
+    main = an.function_by_name("main")
+    assert main is not None and main.addr == load(full).name_to_addr["main"]

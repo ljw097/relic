@@ -463,6 +463,7 @@ class MainWindow(QMainWindow):
         act(m, "Sna&pshots...", None, self.show_snapshots)
         act(m, "&History...", None, self.show_history)
         act(m, "&Merge project...", None, self.merge_dialog)
+        act(m, "Compare with older &build...", None, self.compare_dialog)
         act(m, "P&ort from older build...", None, self.port_dialog)
         lm = m.addMenu("&Lumina")
         act(lm, "&Pull function names", None, self.lumina_pull)
@@ -1865,9 +1866,31 @@ class MainWindow(QMainWindow):
         if path:
             self.port_from(path)
 
-    def port_from(self, path: str) -> "PortThread":
+    def compare_dialog(self):
+        """Pick an earlier build of this binary: which functions changed, were added or removed,
+        and how (File > Compare with older build)."""
+        if getattr(self, "port_thread", None) is not None and self.port_thread.isRunning():
+            self.statusBar().showMessage("already comparing", 3000)
+            return
+        path, _ = QFileDialog.getOpenFileName(self, "Compare with older build", os.path.dirname(self.an.bin.path))
+        if path:
+            self.compare_with(path)
+
+    def compare_with(self, path: str) -> "PortThread":
+        """Analyse `path` in the background, then open the compare window."""
+        return self.port_from(path, then=self._compared)
+
+    def _compared(self, d):
+        if d.new is not self.an:                # (another binary was opened meanwhile)
+            return None
+        from .compare import CompareDialog
+        self.compare_window = CompareDialog(self, d)
+        self.compare_window.show()
+        return self.compare_window
+
+    def port_from(self, path: str, then=None) -> "PortThread":
         t = PortThread(self.an, path, self)
-        t.done.connect(self._ported)
+        t.done.connect(then or self._ported)
         t.failed.connect(lambda msg: QMessageBox.warning(self, "Port from older build", msg.split("\n\n")[0]))
         t.cancelled.connect(lambda: self.statusBar().showMessage("port cancelled", 4000))
         self.port_thread = t

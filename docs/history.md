@@ -127,6 +127,25 @@ RISC-V에서는 부호 확장된 값끼리 비교할 때 폭을 잘못 고르던
   (인라인된 생성자, SSE 두 워드 저장 포함), `__dynamic_cast` 결과에서 온다. 함수가 돌려주는 객체, 모든 호출
   지점이 같은 객체를 넘기는 인자, 가상 메서드 안의 `this`도 근거가 된다. x86-64, x86, AArch64에서 -O0과 -O2
   모두 된다.
+- **다른 아키텍처의 가상 호출(1.4.0).** ARM(Thumb), MIPS(양쪽 바이트 순서, MIPS64), RISC-V, PowerPC(32비트,
+  64비트 ELFv2)는 처리기 하나(`block_risc`)로 한다. 워드 로드·저장, 복사, 상수 더하기, 레지스터 호출(`blx r3`,
+  `jalr $t9`, `c.jalr a5`, `mtctr` + `bctrl`)과 프레임 슬롯만 보고, 아키텍처마다 다른 것은 ABI 표(`_RISC`)에
+  둔다. MIPS 지연 슬롯 명령은 앞의 분기·호출보다 먼저 처리한다. 주소는 상수 전파가 붙인 `refs`, GOT에서 읽은
+  vtable(`_ZTV` 시작 주소에 8을 더함)·typeinfo, PowerPC64의 TOC(`r2`), `lis`/`lui` + `addi`에서 온다. MIPS는
+  `__dynamic_cast`도 GOT를 거쳐 `jalr $t9`로 부르니 GOT 칸으로 import를 알아본다. -O0에서 프레임 포인터인
+  레지스터(`r31`, `s0`, `r7`)가 -O2에서는 객체를 담기도 해서, 객체가 들어 있으면 슬롯으로 보지 않는다.
+  덤으로 클래스 복원의 버그 셋을 고쳤다. ARM vtable 슬롯에 Thumb 비트가 남아 메서드 이름이 안 붙었고,
+  PowerPC64 ELFv1은 슬롯이 함수 서술자를 가리켜서 vtable을 끝까지 못 읽었고, PIC가 아닌 32비트 PowerPC는
+  libstdc++의 typeinfo vtable이 copy 재배치로 프로그램 안에 복사돼서 클래스 다섯 중 셋을 놓쳤다.
+- **PowerPC64 ELFv1 glibc 프로그램(1.4.0).** 호출 스텁이 `mtctr`과 `bctr` 사이에서 호출 대상의 TOC를 읽어서
+  (`ld r2, a+8(r2)`) 스텁으로 알아보지 못했고, 그래서 import가 하나도 이름이 없었다. `_start`가
+  `__libc_start_main`에 넘기는 블록의 `main`은 함수 서술자라서 stripped 빌드에서 `main`도 못 찾았다. 둘 다 고쳤다.
+- **정적 링크된 stripped 프로그램의 `main`(1.4.0).** 그 libc의 시그니처가 없으면 `__libc_start_main`에 이름이
+  없어서 `main`을 못 찾았다(MIPS, RISC-V). 이름이 없어도 `_start`에서 돌아오지 않는 호출이 하나뿐이면 그것이
+  `__libc_start_main`이고 첫 인자가 `main`이다. MIPS는 그 인자가 GOT 칸을 읽은 변수라서 정의를 따라간다.
+  PowerPC64 ELFv2는 `_start`가 `__libc_start_main`으로 꼬리 분기해서 둘이 한 함수가 되므로, 진입 코드의
+  `lis`/`addis`/`addi`로 `r8`(`{sda_base, main, init, fini}`)을 직접 계산한다. MIPS 양쪽 바이트 순서, RISC-V, ARM,
+  PowerPC 32비트·ELFv1·ELFv2에서 -O0과 -O2 모두 맞는 `main`을 찾는다.
 
 ### 코드와 데이터 구분
 
@@ -365,6 +384,12 @@ IDA에 없는 기능이라 따로 신경 썼다. 사용자가 붙인 이름이 �
   편집이 끼어들 수 있으니 이 재사용은 명령줄에서만 한다. 그 밖에 지배 관계 질의를 O(1)로 바꾸고, 쓸데없이
   반복하던 계산들을 걷어냈다. stripped gdb 분석이 28.9초에서 21.3초가 됐고, `decompile --all`은 make가
   44.6초에서 29.4초, MinGW 프로그램은 27.0초에서 14.5초가 됐다.
+- **1.4.0.** 호출 대상이 스택으로 long double을 받는지 보려고(`_forwarded_long_doubles`) 대상의 대상까지 재귀로
+  들어가서, 함수 하나를 디컴파일하는데 호출 그래프 대부분을 lift하고 SSA로 만들었다. long double 매개변수는
+  80비트 메모리 피연산자(`fld xword ptr`)를 쓰는 함수나 그런 함수를 부르는 함수에만 있을 수 있으니, 그 집합을
+  호출 그래프에서 한 번 구해 두고 나머지는 들여다보지 않는다(`_long_double_users`). 출력은 바이트 단위로 같고,
+  bash `main`을 처음 여는 시간이 34.8초에서 27.8초가 됐다. find와 tar의 `main`은 그대로다(남은 시간은 구조체
+  분석이 준비하는 함수들의 `optimize`에 고르게 퍼져 있다).
 
 
 ## GUI
@@ -459,6 +484,10 @@ gdb를 GDB/MI로 부리고, 화면은 pwndbg처럼 꾸몄다.
   `if` 한 줄 더한 함수가 58%로 나오고 diff가 거의 전부 바뀐 것으로 보였다. 이제 94%, 더한 줄만 보인다. `-f -d`에서
   디컴파일이 안 되는 함수 때문에 죽던 것, 유사도로만 찾은 짝에서 호출 그래프를 따라가지 않던 것을 고치고,
   호출자가 아주 많은 함수에서 비교 수에 상한을 뒀다. 단계는 `_Matcher`의 메서드로 나눴다.
+- 비교 창(File ▸ Compare with older build, 1.4.0): `relic diff`의 GUI. 옛 빌드를 백그라운드에서 분석해서 바뀐
+  함수(많이 바뀐 것부터), 새 함수, 없어진 함수, 같은 함수를 나눠 보여 주고, 고른 함수의 diff를 명령어나 의사
+  코드로 색을 입혀 보여 준다. 두 번 클릭하면 그 함수로 가고, 버튼 하나로 주석을 옮긴다. 이름은 양쪽 중 진짜
+  이름(stripped 쪽의 `sub_...`는 마지막)을 쓴다.
 - 주석 옮기기(`relic diff --port`, File ▸ Port from older build, `port_from`, 1.3.0): BinDiff의 port
   symbols에 해당한다. 짝지은 함수의 이름, 주석, 반복 주석, 북마크, 숫자 표시 형식, 디컴파일러 변수 이름·타입을
   새 빌드로 옮긴다. 주석 같은 명령어 단위 정보는 두 함수의 `comparable` 코드를 줄 단위로 맞춰서 바뀌지 않은 명령어로만

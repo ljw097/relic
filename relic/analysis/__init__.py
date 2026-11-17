@@ -376,7 +376,7 @@ class Analysis:
         try:
             from ..decompiler.arch import arch_for
             from ..decompiler.calls import int_arg_regs
-            from ..decompiler.ir import CallStmt, Const, Load
+            from ..decompiler.ir import Assign, CallStmt, Const, Load, Var
             from ..decompiler.lift import lift_function
             from ..decompiler.passes import optimize
             from ..decompiler.ssa import to_ssa
@@ -385,22 +385,73 @@ class Analysis:
             ir = optimize(to_ssa(lift_function(self, start), arch), arch)
         except Exception:  # noqa: BLE001 - no lifter for this target, or it failed: no main
             return None
-        for s in ir.stmts():
-            if not (isinstance(s, CallStmt) and (s.name or "").split("@")[0] == "__libc_start_main"):
-                continue
+        calls = [s for s in ir.stmts() if isinstance(s, CallStmt)]
+        named = [s for s in calls if (s.name or "").split("@")[0] == "__libc_start_main"]
+        # a static stripped binary without signatures for its libc: `_start`'s one call (the one
+        # that does not return, after RISC-V's `load_gp`) is still __libc_start_main(main, argc,
+        # argv, ...) -- when its first argument is code
+        defs = {a.dst: a.src for a in ir.stmts() if isinstance(a, Assign)}
+        stops = [s for s in calls if s.noreturn]
+        for s in named or (stops if len(stops) == 1 else calls if len(calls) == 1 else []):
             v = dict(s.uses).get(regs[0]) if regs else None
+            v = defs.get(v, v) if isinstance(v, Var) else v       # (`a0_1 = [GOT slot]`)
             if arch.name.startswith("ppc"):
                 # PowerPC glibc: r8 points at `{sda_base, main, init, fini}`
                 info = dict(s.uses).get("r8")
                 word = arch.bits // 8
                 m = self.bin.read_int(info.value + word, word) if isinstance(info, Const) else None
+                m = getattr(self.bin, "func_descriptors", {}).get(m, m)     # (ELFv1: main's descriptor)
                 v = Const(m, arch.bits) if m is not None else None
             if isinstance(v, Load) and isinstance(v.addr, Const):
                 v = self.bin.read_int(v.addr.value, v.bits // 8)
                 v = Const(v, arch.bits) if v is not None else None
             if isinstance(v, Const) and v.value and self.bin.is_exec(v.value & ~1):
                 return self._through_trampoline(v.value)
+        if arch.name.startswith("ppc"):
+            return self._ppc_start_main()
         return None
+
+    def _ppc_start_main(self) -> int | None:
+        """PowerPC `_start` that branches (`b`, not `bl`) into an unnamed __libc_start_main: the
+        two are one function then, so nothing is a call to look at. `r8` still points at
+        `{sda_base, main, init, fini}` where the entry code leaves for it: worked out from its
+        `lis` / `addis` / `addi` / `ori` (r2: the TOC unless the code sets it)."""
+        b = self.bin
+        mask = (1 << b.bits) - 1
+        regs: dict[str, int] = {}
+        if getattr(b, "ppc_toc", None) is not None:
+            regs["r2"] = b.ppc_toc
+        a = b.entry
+        for _ in range(32):
+            i = self.dis.decode(a)
+            if i is None:
+                return None
+            ops = [o.strip() for o in i.op_str.split(",")] if i.op_str else []
+            try:
+                if i.mnemonic == "lis" and len(ops) == 2:
+                    regs[ops[0]] = (int(ops[1], 0) << 16) & mask
+                elif i.mnemonic in ("addis", "addi", "ori") and len(ops) == 3 and ops[1] in regs:
+                    k = int(ops[2], 0)
+                    v = regs[ops[1]]
+                    if i.mnemonic == "ori":
+                        v |= k
+                    else:
+                        v += k << 16 if i.mnemonic == "addis" else k
+                    regs[ops[0]] = v & mask
+                elif i.kind in (JMP, CALL):
+                    break
+                elif ops and ops[0] in regs:
+                    del regs[ops[0]]
+            except ValueError:
+                regs.pop(ops[0], None)
+            a = i.end
+        info = regs.get("r8")
+        if info is None:
+            return None
+        word = b.bits // 8
+        m = b.read_int(info + word, word)
+        m = getattr(b, "func_descriptors", {}).get(m, m)
+        return self._through_trampoline(m) if m and b.is_exec(m) else None
 
     def _through_trampoline(self, addr: int) -> int:
         """Where code that only jumps on (nops, then one direct jump: AArch64 glibc's

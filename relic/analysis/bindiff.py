@@ -367,7 +367,7 @@ def port(d: BinDiff, overwrite: bool = False) -> dict:
                     if src is old.comments:
                         lost += 1
                     continue
-                if overwrite or y not in dst:
+                if (overwrite or y not in dst) and dst.get(y) != v:
                     dst[y] = v if isinstance(v, str) else dict(v)
                     placed += src is old.comments
         if a in old.rcomments and (overwrite or b not in new.rcomments):

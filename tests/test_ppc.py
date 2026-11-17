@@ -159,3 +159,27 @@ def test_ppc64_function_descriptors(abi, tmp_path):
         subprocess.run([shutil.which("llvm-strip") or "strip", out], check=True)
         stripped = analyze(out)
         assert {f.addr for f in stripped.functions.values()} >= {helper.addr, an.function_by_name("square").addr}
+
+
+def test_ppc64_elfv1_glibc_stubs_and_main(tmp_path):
+    """A glibc program for big-endian PowerPC64 (ELFv1), stripped: its call stubs load the
+    callee's TOC between `mtctr` and `bctr` (`std r2; ld r12, a(r2); mtctr r12; ld r2, a+8(r2);
+    bctr`) -- they are still the imports -- and `_start` hands __libc_start_main a block whose
+    `main` is a descriptor."""
+    import os
+    import shutil
+    import subprocess
+    gcc = shutil.which("powerpc64-linux-gnu-gcc")
+    if gcc is None:
+        pytest.skip("needs powerpc64-linux-gnu-gcc")
+    out = str(tmp_path / "vuln")
+    subprocess.run([gcc, "-O0", "-w", "-o", out, os.path.join(os.path.dirname(__file__), "src", "vuln.c")],
+                   check=True)
+    subprocess.run([shutil.which("powerpc64-linux-gnu-strip") or "strip", out], check=True)
+    an = analyze(out)
+    names = {i.name for i in an.bin.imports if i.addr}
+    assert {"puts", "printf", "malloc", "__libc_start_main"} <= names
+    main = an.function_by_name("main")
+    assert main is not None and an.bin.is_exec(main.addr)
+    assert "puts" in {an.name(t) for t in an.functions[main.addr].calls} | \
+        {an.name(t) for f in an.functions.values() if f.addr in main.calls for t in f.calls}

@@ -10,14 +10,14 @@ The goal is admittedly ambitious: something as good as IDA Pro with Hex-Rays, an
 can manage it. It isn't there yet. But for the everyday stuff it already works well: opening an
 x86-64 or ARM binary, finding your way around, naming things, reading the pseudocode, and
 measuring an overflow offset in the debugger. The current release is
-[1.3.0](https://github.com/ljw097/relic/releases/tag/v1.3.0).
+[1.4.0](https://github.com/ljw097/relic/releases/tag/v1.4.0).
 
 ![The Relic debugger stopped in vuln() right after gets(): the AAAA… input shows up in the registers and the stack telescope](docs/screenshots/debugger.png)
 
 ## Installing
 
 Grab the executable for your system from the
-[release page](https://github.com/ljw097/relic/releases/tag/v1.3.0) and run it. There's nothing
+[release page](https://github.com/ljw097/relic/releases/tag/v1.4.0) and run it. There's nothing
 to install:
 
 - **Windows**: `relic-<version>-windows-x86_64.exe`
@@ -38,7 +38,7 @@ If you have Python 3.10 or newer, you can install the wheel from the release pag
 
 ```sh
 python3 -m venv .venv
-.venv/bin/pip install https://github.com/ljw097/relic/releases/download/v1.3.0/relic_re-1.3.0-py3-none-any.whl
+.venv/bin/pip install https://github.com/ljw097/relic/releases/download/v1.4.0/relic_re-1.4.0-py3-none-any.whl
 .venv/bin/relic
 ```
 
@@ -252,7 +252,8 @@ sub_40160c: 0x40160c -> 0x40160c, 92% alike (matched by calls)
 Functions are compared by their code with addresses taken out, so a function that only moved counts as identical.
 They are matched by identical code first, then by name, then through the call graph (the callees and callers of
 functions already matched), and last by similarity. Without `-d`, `-f` compares instructions instead of pseudocode,
-and `--json` gives the whole result to a script.
+and `--json` gives the whole result to a script. In the GUI, File > Compare with older build shows the same lists
+with each function's diff (instructions or pseudocode); double-click a function to go to it.
 
 When a new version of something you already reversed comes out, `--port` carries your work over. Each matched
 function gets its name (yours, or the old build's symbol when the new build is stripped), the comments, bookmarks

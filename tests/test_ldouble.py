@@ -159,3 +159,15 @@ def test_extended_precision_patterns():
     nan = to_float(0x7FFF_C000000000000000, 80)
     assert nan != nan
     assert literal(from_float(2.5, 80), 80) == "2.5L"
+
+
+def test_only_long_double_users_are_searched_for_long_double_slots(an):
+    """Callees are looked into for long double stack parameters only when they, or what they
+    call, use an 80-bit value: the rest of the call graph is not lifted for that."""
+    from relic.decompiler.calls import _long_double_users
+    _, a = an
+    users = {a.name(x) for x in _long_double_users(a)}
+    assert {"ld_scale", "ld_call", "ld_mix", "main"} <= users
+    plain = [f for f in a.functions.values() if not f.is_import and f.calls == set() and f.tail_calls == set()
+             and not any("xword" in i.op_str for b in f.blocks.values() for i in b.insns)]
+    assert plain and not any(f.addr in _long_double_users(a) for f in plain)
