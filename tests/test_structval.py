@@ -207,3 +207,37 @@ def test_other_abis_get_no_misplaced_types(tmp_path):
     sig = next(ln for ln in code.splitlines() if "make(" in ln)
     assert "long a1" not in sig and "struct big" not in sig, code
     assert "no struct" not in decompile(an, an.function_by_name("add")).text
+
+
+@pytest.mark.parametrize("opt", ["O0", "O1", "O2"])
+def test_cross_aarch64_recompiles(opt, tmp_path):
+    """AAPCS64: two-register structs in x0..x7, an HFA of doubles in v0.., a struct over 16 bytes
+    by reference (the callee reads it through the pointer: `a1.b`), a big result through x8 --
+    the pseudocode, built again for AArch64 and run under qemu, prints what the program prints."""
+    cc, qemu = shutil.which("aarch64-linux-gnu-gcc"), shutil.which("qemu-aarch64")
+    if cc is None or qemu is None or not os.path.isdir("/usr/aarch64-linux-gnu"):
+        pytest.skip("needs aarch64-linux-gnu-gcc and qemu-aarch64")
+    src, hdr = (os.path.join(HERE, "src", n) for n in ("structval_a64.c", "structval_a64.h"))
+    exe = str(tmp_path / "a")
+    subprocess.run([cc, f"-{opt}", "-fno-inline", "-fno-tree-vectorize", "-o", exe, src], check=True)
+    an = analyze(exe)
+    with open(hdr) as fp:
+        header = fp.read()
+    an.import_header(header)
+    funcs = ["add", "norm", "make", "total", "fill", "main"]
+    code = {f: decompile(an, an.function_by_name(f)).text for f in funcs}
+    assert next(ln for ln in code["total"].splitlines() if "total(" in ln) == "long total(struct big a1)"
+    assert "a1.b" in code["total"] and "return *result;" in code["make"], code
+    assert re.search(r"\w+ = make\(", code["main"]), code["main"]
+    body = [re.sub(r"(?ms)^struct \w+ \{.*?^\};\n\n?", "", code[f]) for f in funcs]
+    re_c = tmp_path / "re.c"
+    re_c.write_text("#include <stdio.h>\n#include <stdint.h>\n#include <math.h>\n"
+                    "extern int __printf_chk(int, const char *, ...);\n" + header + "\n" + "\n".join(body))
+    out = str(tmp_path / "re")
+    r = subprocess.run([cc, "-w", "-o", out, str(re_c), "-lm"], capture_output=True, text=True)
+    assert r.returncode == 0, r.stderr + re_c.read_text()
+    run = [qemu, "-L", "/usr/aarch64-linux-gnu"]
+    for args in ([], ["x", "y"]):
+        want = subprocess.run([*run, exe, *args], capture_output=True, text=True).stdout
+        got = subprocess.run([*run, out, *args], capture_output=True, text=True).stdout
+        assert got == want and want, re_c.read_text()

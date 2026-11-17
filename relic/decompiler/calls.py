@@ -952,10 +952,18 @@ def _agg_call(an: "Analysis", arch: ArchInfo, fn: IRFunction, b, k: int, s: Call
 
     args, fargs = [], []
     if p.ret_memory:
-        if "rdi" not in uses:
+        if p.ret_ptr not in uses:
             return False
-        args.append(uses["rdi"])
+        args.append(uses[p.ret_ptr])
     for prm in p.params:
+        if prm.ref is not None:             # by reference (AArch64): the struct the pointer points to
+            if prm.ref not in uses:
+                return False
+            from .aggabi import struct_of
+            st = struct_of(an, prm.ctype)
+            args.append(Intrinsic(STRUCT_COPY + an.resolve_type(prm.ctype).strip()[7:].strip(), (uses[prm.ref],),
+                                  st.size * 8 if st is not None else 64))
+            continue
         if prm.is_struct and isinstance(prm.pieces[0].loc, int):
             # on the stack: most often a copy of a local struct (`movdqa` + `movups`, ...)
             copied = _struct_copy(fn, b, k, s, frame, arch, prm.pieces[0].loc,
@@ -993,7 +1001,7 @@ def _agg_call(an: "Analysis", arch: ArchInfo, fn: IRFunction, b, k: int, s: Call
     if got and not any(isinstance(a, Intrinsic) and a.name.startswith(STRUCT_COPY) for a in args):
         list(_stack_values(b, k, s, frame, arch, sorted(got), consumed, [8] * len(got)))  # (stores: arguments)
     s.call = Call(s.call.target, tuple(args), s.call.bits, tuple(fargs))
-    s.struct_result = bool(p.ret_pieces)
+    s.struct_result = bool(p.ret_pieces) or p.ret_memory      # (the C writer shows it as one: see emit)
     regs = [loc for loc in p.locs() if isinstance(loc, str)]
     s.uses = [(r, uses[r]) for r in regs if r in uses]
     return True

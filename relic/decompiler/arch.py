@@ -49,7 +49,7 @@ X86_CDECL = ArchInfo(
 _A64_ARGS = tuple(f"x{k}" for k in range(8))
 ARM64 = ArchInfo(
     "arm64-aapcs", 64, "sp", "x0",
-    call_reads=(*_A64_ARGS, "sp", *(f"v{k}" for k in range(8))),
+    call_reads=(*_A64_ARGS, "x8", "sp", *(f"v{k}" for k in range(8))),     # (x8: where a struct result goes)
     # x0-x18 are caller-saved (x16/x17 are the linker's veneer scratch, x18 the platform
     # register); a call also overwrites the link register
     call_clobbers=(*(f"x{k}" for k in range(19)), "x30", *FLAGS, *(f"v{k}" for k in range(8)),
