@@ -407,7 +407,51 @@ class Analysis:
                 v = Const(v, arch.bits) if v is not None else None
             if isinstance(v, Const) and v.value and self.bin.is_exec(v.value & ~1):
                 return self._through_trampoline(v.value)
+        if arch.name.startswith("ppc"):
+            return self._ppc_start_main()
         return None
+
+    def _ppc_start_main(self) -> int | None:
+        """PowerPC `_start` that branches (`b`, not `bl`) into an unnamed __libc_start_main: the
+        two are one function then, so nothing is a call to look at. `r8` still points at
+        `{sda_base, main, init, fini}` where the entry code leaves for it: worked out from its
+        `lis` / `addis` / `addi` / `ori` (r2: the TOC unless the code sets it)."""
+        b = self.bin
+        mask = (1 << b.bits) - 1
+        regs: dict[str, int] = {}
+        if getattr(b, "ppc_toc", None) is not None:
+            regs["r2"] = b.ppc_toc
+        a = b.entry
+        for _ in range(32):
+            i = self.dis.decode(a)
+            if i is None:
+                return None
+            ops = [o.strip() for o in i.op_str.split(",")] if i.op_str else []
+            try:
+                if i.mnemonic == "lis" and len(ops) == 2:
+                    regs[ops[0]] = (int(ops[1], 0) << 16) & mask
+                elif i.mnemonic in ("addis", "addi", "ori") and len(ops) == 3 and ops[1] in regs:
+                    k = int(ops[2], 0)
+                    v = regs[ops[1]]
+                    if i.mnemonic == "ori":
+                        v |= k
+                    else:
+                        v += k << 16 if i.mnemonic == "addis" else k
+                    regs[ops[0]] = v & mask
+                elif i.kind in (JMP, CALL):
+                    break
+                elif ops and ops[0] in regs:
+                    del regs[ops[0]]
+            except ValueError:
+                regs.pop(ops[0], None)
+            a = i.end
+        info = regs.get("r8")
+        if info is None:
+            return None
+        word = b.bits // 8
+        m = b.read_int(info + word, word)
+        m = getattr(b, "func_descriptors", {}).get(m, m)
+        return self._through_trampoline(m) if m and b.is_exec(m) else None
 
     def _through_trampoline(self, addr: int) -> int:
         """Where code that only jumps on (nops, then one direct jump: AArch64 glibc's

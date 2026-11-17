@@ -143,7 +143,9 @@ RISC-V에서는 부호 확장된 값끼리 비교할 때 폭을 잘못 고르던
 - **정적 링크된 stripped 프로그램의 `main`(1.3.1).** 그 libc의 시그니처가 없으면 `__libc_start_main`에 이름이
   없어서 `main`을 못 찾았다(MIPS, RISC-V). 이름이 없어도 `_start`에서 돌아오지 않는 호출이 하나뿐이면 그것이
   `__libc_start_main`이고 첫 인자가 `main`이다. MIPS는 그 인자가 GOT 칸을 읽은 변수라서 정의를 따라간다.
-  MIPS 양쪽 바이트 순서, RISC-V, ARM, 32비트 PowerPC, PowerPC64 ELFv1에서 -O0과 -O2 모두 맞는 `main`을 찾는다.
+  PowerPC64 ELFv2는 `_start`가 `__libc_start_main`으로 꼬리 분기해서 둘이 한 함수가 되므로, 진입 코드의
+  `lis`/`addis`/`addi`로 `r8`(`{sda_base, main, init, fini}`)을 직접 계산한다. MIPS 양쪽 바이트 순서, RISC-V, ARM,
+  PowerPC 32비트·ELFv1·ELFv2에서 -O0과 -O2 모두 맞는 `main`을 찾는다.
 
 ### 코드와 데이터 구분
 

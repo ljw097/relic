@@ -239,11 +239,13 @@ def test_main_of_stripped_programs(kind, tmp_path):
 
 
 @pytest.mark.parametrize("cc", ["mipsel-linux-gnu-gcc", "mips-linux-gnu-gcc", "riscv64-linux-gnu-gcc",
-                                "arm-linux-gnueabihf-gcc", "powerpc-linux-gnu-gcc", "powerpc64-linux-gnu-gcc"])
+                                "arm-linux-gnueabihf-gcc", "powerpc-linux-gnu-gcc", "powerpc64-linux-gnu-gcc",
+                                "powerpc64le-linux-gnu-gcc"])
 def test_cross_main_of_static_stripped_programs(cc, tmp_path):
     """Static and stripped, with no signatures for that libc: nothing names __libc_start_main,
     but `_start`'s one call that does not return is it, and its first argument is `main` (a GOT
-    slot `bal` + `$gp` reach on MIPS, a `j main` trampoline on RISC-V, a descriptor on ELFv1)."""
+    slot `bal` + `$gp` reach on MIPS, a `j main` trampoline on RISC-V, a descriptor on ELFv1; on
+    PowerPC64 ELFv2 `_start` branches into it, so `r8` is worked out from the entry code)."""
     from relic.loader import load
     if shutil.which(cc) is None:
         pytest.skip(f"needs {cc}")

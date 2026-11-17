@@ -38,8 +38,8 @@ tar의 `main`은 20초 동안 158개 함수를 준비합니다.
 
 - [ ] **라이브러리 식별에서 남은 것.** 코드가 똑같은 짧은 스텁 가운데 참조로도 구분되지 않는 것들이 있습니다
   (`__chk_fail`과 `__fortify_fail` 같은 것, 어셈블러가 분기 하나로 줄여 버린 Thumb `fopen`). 정적 링크된
-  stripped PowerPC64 ELFv2(리틀 엔디언) 바이너리에서는 `main`을 못 찾습니다. `_start`가 `__libc_start_main`으로
-  `b`(꼬리 분기)해서 두 함수가 하나로 합쳐지기 때문입니다.
+  stripped PowerPC64 ELFv2에서는 `_start`가 이름 없는 `__libc_start_main`으로 `b`(꼬리 분기)해서 두 함수가
+  하나로 합쳐집니다. `main`은 찾지만 함수 경계는 틀립니다.
 
 
 ## 영역별 "100%"의 기준
