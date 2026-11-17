@@ -286,3 +286,34 @@ def test_cross_aarch64_recompiles(opt, tmp_path):
         want = subprocess.run([*run, exe, *args], capture_output=True, text=True).stdout
         got = subprocess.run([*run, out, *args], capture_output=True, text=True).stdout
         assert got == want and want, re_c.read_text()
+
+
+@pytest.mark.parametrize("opt", ["O0", "O1", "O2"])
+def test_cross_aarch64_result_pointer_without_a_header(opt, tmp_path):
+    """No header: a function returning a struct too big for registers writes it where x8 points.
+    It takes that pointer as a first parameter `result`; its caller passes the place, one object
+    as big as what the callee writes there (not three locals side by side)."""
+    cc, qemu = shutil.which("aarch64-linux-gnu-gcc"), shutil.which("qemu-aarch64")
+    if cc is None or qemu is None or not os.path.isdir("/usr/aarch64-linux-gnu"):
+        pytest.skip("needs aarch64-linux-gnu-gcc and qemu-aarch64")
+    src = tmp_path / "m.c"
+    src.write_text("#include <stdio.h>\nstruct big { long a; long b; long c; };\n"
+                   "__attribute__((noinline)) struct big make(long n, long k)\n"
+                   "{ struct big b = { n, n * k, n - k }; return b; }\n"
+                   "int main(int argc, char **argv) { struct big b = make(argc, 7);"
+                   " printf(\"%ld %ld %ld\\n\", b.a, b.b, b.c); return 0; }\n")
+    exe = str(tmp_path / "m")
+    subprocess.run([cc, f"-{opt}", "-fno-inline", "-o", exe, str(src)], check=True)
+    an = analyze(exe)
+    code = {f: decompile(an, an.function_by_name(f)).text for f in ("make", "main")}
+    assert code["make"].splitlines()[0] == "void make(int64_t *result, int64_t a1, int64_t a2)", code["make"]
+    assert not re.search(r"\bx8\b", code["make"]) and re.search(r"make\(&?buf_\w+, ", code["main"]), code
+    re_c = tmp_path / "re.c"
+    re_c.write_text("#include <stdio.h>\n#include <stdint.h>\nextern int __printf_chk(int, const char *, ...);\n"
+                    + code["make"] + "\n" + code["main"])
+    out = str(tmp_path / "re")
+    subprocess.run([cc, "-w", "-o", out, str(re_c)], check=True)
+    run = [qemu, "-L", "/usr/aarch64-linux-gnu"]
+    for args in ([], ["x", "y"]):
+        want = subprocess.run([*run, exe, *args], capture_output=True, text=True).stdout
+        assert subprocess.run([*run, out, *args], capture_output=True, text=True).stdout == want and want

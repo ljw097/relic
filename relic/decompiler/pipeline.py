@@ -100,6 +100,9 @@ def prepare(an: "Analysis", func: "Function") -> Prepared:
     agg = func_plan(an, func)
     agg_vars = _agg_vars(arch, frame, agg) if agg is not None else None
     params = list(agg_vars.values()) if agg_vars is not None else _params(an, func, frame, arch)
+    from .calls import indirect_result
+    if agg_vars is None and indirect_result(an, arch, func.addr):
+        params = ["x8"] + params                # (AArch64: the struct result's place, `result`)
     from .calls import narrow_call_args
     from .cleanup import fold_param_spills
     fold_param_spills(fn, params)           # -O0: `var_1c = argc` once on entry, then var_1c read

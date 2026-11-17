@@ -734,7 +734,11 @@ class CWriter:
         self.agg_fields: dict = {}
         self.ref_subst: dict[str, str] = {}
         agg = self._name_agg_params()
-        for k, r in enumerate([] if agg else self.p.params):
+        params = [] if agg else list(self.p.params)
+        if params[:1] == ["x8"] and self.p.arch.name.startswith("arm64"):
+            self.names["x8"] = "result"         # (AArch64: where the caller wants a struct result)
+            params = params[1:]
+        for k, r in enumerate(params):
             self.names[r] = self.MAIN_PARAMS[k][0] if main else f"a{k + 1}"
             if main:
                 self.types[r] = parse_ctype(self.MAIN_PARAMS[k][1])
@@ -1333,6 +1337,8 @@ class CWriter:
             return self._fintrinsic(e)
         if isinstance(e, Intrinsic) and e.name.startswith(STRUCT):
             return self._struct_value(e), PREC_POSTFIX
+        if isinstance(e, Intrinsic) and e.name.startswith("resultat:"):
+            return self._expr(e.args[0])             # (an indirect result's place: its address)
         if isinstance(e, Intrinsic) and e.name.startswith(STRUCT_COPY):
             # the struct there, by value: `buf_48` (a local of that struct), `*p`, else the bytes
             # there as one (`*(struct big *)&var_e0`: a place reused for structs of several types)

@@ -195,6 +195,7 @@ def analyze_frame(fn: IRFunction, arch: ArchInfo, guards=frozenset()) -> Frame:
         return frame.slots.setdefault(off, Slot(off))
 
     from .aggabi import STRUCT_COPY
+    from .calls import RESULT_AT
     extents: dict[int, int] = {}            # a struct passed by value from the stack: its size
     kinds: dict[int, set] = {}              # ... and which structs (several: a reused place)
 
@@ -240,6 +241,14 @@ def analyze_frame(fn: IRFunction, arch: ArchInfo, guards=frozenset()) -> Frame:
         elif isinstance(s, Assign) and s.dst not in frame.spoff:
             escaped.append(s.src)
         for e in escaped:
+            if isinstance(e, Intrinsic) and e.name.startswith(RESULT_AT) and e.args:
+                # where a callee writes its struct result (AArch64 x8): that many bytes, one object
+                off = frame.offset_of(e.args[0])
+                if off is not None:
+                    slot(off).taken = True
+                    extents[off] = max(extents.get(off, 0), int(e.name[len(RESULT_AT):]))
+                    kinds.setdefault(off, set()).update({e.name, "(untyped)"})
+                continue
             if isinstance(e, Intrinsic) and e.name.startswith(STRUCT_COPY) and e.args:
                 # a struct passed by value from here (aggabi): its whole size is one object
                 off = frame.offset_of(e.args[0])
