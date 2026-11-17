@@ -141,11 +141,22 @@ matters to me when I'm actually reversing something. Right now it comes to **abo
 | Debugger (7) | 100% | Windows programs run under wine with Windows' own gdbserver.exe |
 | Projects & collaboration (5) | 100% | Snapshots, version history, merging, Lumina-style name sharing |
 
-How Relic compares with angr, radare2 and LIEF (function detection, file parsing, decompiler
-output and speed) is in [docs/benchmarks.md](docs/benchmarks.md).
-
 What I count as 100% for each area, and what's still missing, is in [TODO.md](TODO.md). The
 log of finished work is in [docs/history.md](docs/history.md). Both are in Korean.
+
+### Compared with other open-source tools
+
+Stripped builds of brotli, Lua and zstd (and Relic's test programs) at -O0 and -O2, x86-64 and
+AArch64, against angr, radare2 and LIEF. Method, every number and the caveats:
+[docs/benchmarks.md](docs/benchmarks.md).
+
+![Function detection F1 by build: Relic 0.96–0.99 in every build; angr 0.89–0.97; radare2 0.73–0.90; LIEF 0.998 with .eh_frame and 0.018 without](docs/benchmarks/detection-f1.svg)
+
+![Function detection time: Relic 9–18 s per build, angr 19–50 s, radare2 5–19 s](docs/benchmarks/detection-time.svg)
+
+![Share of functions whose pseudocode is valid C, per binary, for Relic, angr and radare2](docs/benchmarks/decompiler-valid-c.svg)
+
+![Decompiler time per function: Relic 56–292 ms, angr 198–2,452 ms](docs/benchmarks/decompiler-time.svg)
 
 ## CLI
 

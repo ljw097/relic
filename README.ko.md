@@ -130,11 +130,22 @@ ret2win 후보를 찾아 줍니다. IDA에는 기본으로 없는 기능이라 �
 | 디버거 (7) | 100% | Windows 프로그램은 wine에서 Windows용 gdbserver.exe로 |
 | 프로젝트·협업 (5) | 100% | 스냅숏, 버전 기록, 병합, Lumina 방식의 이름 공유 |
 
-angr, radare2, LIEF와의 비교(함수 탐지, 파일 파싱, 디컴파일러 출력과 속도)는
-[docs/benchmarks.md](docs/benchmarks.md)에 있습니다(영어).
-
 영역마다 어디까지를 100%로 보는지, 무엇이 남았는지는 [TODO.md](TODO.md)에 적어 두었습니다.
 끝낸 작업의 기록은 [docs/history.md](docs/history.md)에 있습니다.
+
+### 다른 오픈소스 도구와의 비교
+
+brotli, Lua, zstd(와 Relic의 테스트 프로그램)를 -O0/-O2, x86-64/AArch64로 빌드해 strip한 뒤
+angr, radare2, LIEF와 비교했습니다. 방법, 전체 수치와 한계는
+[docs/benchmarks.md](docs/benchmarks.md)에 있습니다(영어).
+
+![빌드별 함수 탐지 F1: Relic은 모든 빌드에서 0.96–0.99, angr 0.89–0.97, radare2 0.73–0.90, LIEF는 .eh_frame이 있으면 0.998, 없으면 0.018](docs/benchmarks/detection-f1.svg)
+
+![함수 탐지 시간: Relic 빌드당 9–18초, angr 19–50초, radare2 5–19초](docs/benchmarks/detection-time.svg)
+
+![바이너리별로 의사코드가 올바른 C인 함수의 비율: Relic, angr, radare2](docs/benchmarks/decompiler-valid-c.svg)
+
+![함수당 디컴파일 시간: Relic 56–292ms, angr 198–2,452ms](docs/benchmarks/decompiler-time.svg)
 
 ## CLI
 

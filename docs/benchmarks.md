@@ -9,11 +9,14 @@ file loader agrees with LIEF's, and how its decompiler compares with angr's. Mea
 |---|---|---|
 | Relic | 1.5.0 + this branch | everything |
 | angr | 10.0.7 | function detection (`CFGFast`), decompiler |
-| radare2 | 5.5.0 | function detection (`aaa`) |
+| radare2 | 5.5.0 | function detection (`aaa`), its pseudocode (`pdc`) |
 | LIEF | 1.0.0 | function list from `.eh_frame`, file parsing |
 
-Ghidra was not compared: it couldn't be downloaded in this environment. The scripts are in
-`tools/`, so anyone can rerun them, Ghidra included once there's a worker for it.
+Ghidra (12.2) and RetDec (5.0) have workers in `tools/compare_decompilers.py`
+(`--tools ghidra --ghidra DIR`, `--tools retdec --retdec PROGRAM`) but aren't in these numbers
+yet: they were downloaded, but this environment's permission policy didn't allow running
+programs from outside its package manager. The scripts are in `tools/`, so anyone can rerun
+everything, and `tools/bench_charts.py` redraws the charts from their JSON output.
 
 ## Corpus
 
@@ -30,9 +33,13 @@ inside `.text`. Every tool sees only the stripped copy.
 
 Each in four builds: `-O0`, `-O2`, `-O2` without `.eh_frame` (`-fno-asynchronous-unwind-tables`;
 some toolchains and most hand-written or obfuscated code have no unwind tables), and `-O2` for
-AArch64 (lua and zstd only). 19 binaries, 7,393 functions.
+AArch64 (lua and zstd only). 17 binaries, 7,393 functions.
 
 ## Function detection
+
+![Function detection F1 by build](benchmarks/detection-f1.svg)
+
+![Function detection time by build](benchmarks/detection-time.svg)
 
 `python tools/compare_tools.py CORPUS --angr-python PY_WITH_ANGR_AND_LIEF --json out.json`
 
@@ -104,7 +111,11 @@ Relic's test binaries (ELF, PE, Mach-O, object files, several architectures).
 - **Speed.** LIEF is C++; Relic's loader is pure Python and does more on load (symbols,
   relocations, demangling): about 34× slower, 0.17 s per file on average.
 
-## Decompiler (Relic vs angr)
+## Decompiler (Relic vs angr and radare2)
+
+![Share of functions whose pseudocode is valid C](benchmarks/decompiler-valid-c.svg)
+
+![Decompiler time per function](benchmarks/decompiler-time.svg)
 
 `python tools/compare_decompilers.py CORPUS NAME... --angr-python PY --limit 300 --json out.json`
 
@@ -126,6 +137,9 @@ struct types) are not counted, only output that isn't C.
 | vuln, flow (-O0, -O2) | 84 | Relic | **84** | 78 | 3 | 1,346 | **1.3 s** |
 | | | angr | 80 | 80 | 1 | 1,239 | 7.6 s |
 
+- **radare2's `pdc`** decompiled every function but prints annotated pseudo-assembly
+  (`rsp -= 0x18`, `goto loc_0x1460`), never C: 0 valid. It isn't timed per function here (one run
+  for all of them, analysis included).
 - **Speed:** Relic decompiles 3.5–8.5× faster than angr.
 - **Valid C:** this benchmark found several places where Relic printed something gcc rejects;
   they are fixed on this branch (the table shows the fixed version). Before:

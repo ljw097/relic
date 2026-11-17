@@ -1,0 +1,34 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="760" height="308" viewBox="0 0 760 308" font-family="-apple-system,BlinkMacSystemFont,'Segoe UI',Helvetica,Arial,sans-serif">
+<rect width="760" height="308" rx="8" fill="#fcfcfb"/>
+<text x="20" y="30" font-size="17" font-weight="600" fill="#0b0b0b">Decompiler time per function</text>
+<text x="20" y="50" font-size="12.5" fill="#52514e">average, not counting the analysis before it; lower is better</text>
+<rect x="20" y="64" width="12" height="12" rx="3" fill="#2a78d6"/>
+<text x="37" y="74.5" font-size="12.5" fill="#0b0b0b">Relic</text>
+<rect x="99" y="64" width="12" height="12" rx="3" fill="#eb6834"/>
+<text x="116" y="74.5" font-size="12.5" fill="#0b0b0b">angr</text>
+<line x1="150.0" y1="86" x2="150.0" y2="290" stroke="#e4e3df" stroke-width="1"/>
+<line x1="285.0" y1="86" x2="285.0" y2="290" stroke="#e4e3df" stroke-width="1"/>
+<line x1="420.0" y1="86" x2="420.0" y2="290" stroke="#e4e3df" stroke-width="1"/>
+<line x1="555.0" y1="86" x2="555.0" y2="290" stroke="#e4e3df" stroke-width="1"/>
+<line x1="690.0" y1="86" x2="690.0" y2="290" stroke="#e4e3df" stroke-width="1"/>
+<text x="140" y="111.0" font-size="12.5" text-anchor="end" fill="#0b0b0b">brotli -O2</text>
+<rect x="150" y="92" width="57.3" height="14" rx="3" fill="#2a78d6"><title>Relic, brotli -O2: 260 ms</title></rect>
+<text x="212.3" y="103" font-size="11" fill="#52514e">260 ms</text>
+<rect x="150" y="108" width="463.6" height="14" rx="3" fill="#eb6834"><title>angr, brotli -O2: 2,105 ms</title></rect>
+<text x="618.6" y="119" font-size="11" fill="#52514e">2,105 ms</text>
+<text x="140" y="159.0" font-size="12.5" text-anchor="end" fill="#0b0b0b">zstd -O2</text>
+<rect x="150" y="140" width="64.4" height="14" rx="3" fill="#2a78d6"><title>Relic, zstd -O2: 292 ms</title></rect>
+<text x="219.4" y="151" font-size="11" fill="#52514e">292 ms</text>
+<rect x="150" y="156" width="540.0" height="14" rx="3" fill="#eb6834"><title>angr, zstd -O2: 2,452 ms</title></rect>
+<text x="695.0" y="167" font-size="11" fill="#52514e">2,452 ms</text>
+<text x="140" y="207.0" font-size="12.5" text-anchor="end" fill="#0b0b0b">lua -O2</text>
+<rect x="150" y="188" width="13.1" height="14" rx="3" fill="#2a78d6"><title>Relic, lua -O2: 60 ms</title></rect>
+<text x="168.1" y="199" font-size="11" fill="#52514e">60 ms</text>
+<rect x="150" y="204" width="46.9" height="14" rx="3" fill="#eb6834"><title>angr, lua -O2: 213 ms</title></rect>
+<text x="201.9" y="215" font-size="11" fill="#52514e">213 ms</text>
+<text x="140" y="255.0" font-size="12.5" text-anchor="end" fill="#0b0b0b">lua AArch64 -O2</text>
+<rect x="150" y="236" width="12.3" height="14" rx="3" fill="#2a78d6"><title>Relic, lua AArch64 -O2: 56 ms</title></rect>
+<text x="167.3" y="247" font-size="11" fill="#52514e">56 ms</text>
+<rect x="150" y="252" width="43.6" height="14" rx="3" fill="#eb6834"><title>angr, lua AArch64 -O2: 198 ms</title></rect>
+<text x="198.6" y="263" font-size="11" fill="#52514e">198 ms</text>
+</svg>

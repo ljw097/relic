@@ -1,0 +1,45 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="760" height="388" viewBox="0 0 760 388" font-family="-apple-system,BlinkMacSystemFont,'Segoe UI',Helvetica,Arial,sans-serif">
+<rect width="760" height="388" rx="8" fill="#fcfcfb"/>
+<text x="20" y="30" font-size="17" font-weight="600" fill="#0b0b0b">Decompiler output that is valid C</text>
+<text x="20" y="50" font-size="12.5" fill="#52514e">share of functions whose pseudocode passes gcc -fsyntax-only; higher is better</text>
+<rect x="20" y="64" width="12" height="12" rx="3" fill="#2a78d6"/>
+<text x="37" y="74.5" font-size="12.5" fill="#0b0b0b">Relic</text>
+<rect x="99" y="64" width="12" height="12" rx="3" fill="#eb6834"/>
+<text x="116" y="74.5" font-size="12.5" fill="#0b0b0b">angr</text>
+<rect x="170" y="64" width="12" height="12" rx="3" fill="#1baf7a"/>
+<text x="187" y="74.5" font-size="12.5" fill="#0b0b0b">radare2</text>
+<line x1="150.0" y1="86" x2="150.0" y2="354" stroke="#e4e3df" stroke-width="1"/>
+<line x1="285.0" y1="86" x2="285.0" y2="354" stroke="#e4e3df" stroke-width="1"/>
+<line x1="420.0" y1="86" x2="420.0" y2="354" stroke="#e4e3df" stroke-width="1"/>
+<line x1="555.0" y1="86" x2="555.0" y2="354" stroke="#e4e3df" stroke-width="1"/>
+<line x1="690.0" y1="86" x2="690.0" y2="354" stroke="#e4e3df" stroke-width="1"/>
+<text x="140" y="119.0" font-size="12.5" text-anchor="end" fill="#0b0b0b">brotli -O2</text>
+<rect x="150" y="92" width="433.7" height="14" rx="3" fill="#2a78d6"><title>Relic, brotli -O2: 80%</title></rect>
+<text x="588.7" y="103" font-size="11" fill="#52514e">80%</text>
+<rect x="150" y="108" width="262.4" height="14" rx="3" fill="#eb6834"><title>angr, brotli -O2: 49%</title></rect>
+<text x="417.4" y="119" font-size="11" fill="#52514e">49%</text>
+<rect x="150" y="124" width="2.0" height="14" rx="3" fill="#1baf7a"><title>radare2, brotli -O2: 0%</title></rect>
+<text x="157.0" y="135" font-size="11" fill="#52514e">0%</text>
+<text x="140" y="183.0" font-size="12.5" text-anchor="end" fill="#0b0b0b">zstd -O2</text>
+<rect x="150" y="156" width="495.0" height="14" rx="3" fill="#2a78d6"><title>Relic, zstd -O2: 92%</title></rect>
+<text x="650.0" y="167" font-size="11" fill="#52514e">92%</text>
+<rect x="150" y="172" width="219.6" height="14" rx="3" fill="#eb6834"><title>angr, zstd -O2: 41%</title></rect>
+<text x="374.6" y="183" font-size="11" fill="#52514e">41%</text>
+<rect x="150" y="188" width="2.0" height="14" rx="3" fill="#1baf7a"><title>radare2, zstd -O2: 0%</title></rect>
+<text x="157.0" y="199" font-size="11" fill="#52514e">0%</text>
+<text x="140" y="247.0" font-size="12.5" text-anchor="end" fill="#0b0b0b">lua -O2</text>
+<rect x="150" y="220" width="459.0" height="14" rx="3" fill="#2a78d6"><title>Relic, lua -O2: 85%</title></rect>
+<text x="614.0" y="231" font-size="11" fill="#52514e">85%</text>
+<rect x="150" y="236" width="473.4" height="14" rx="3" fill="#eb6834"><title>angr, lua -O2: 88%</title></rect>
+<text x="628.4" y="247" font-size="11" fill="#52514e">88%</text>
+<rect x="150" y="252" width="2.0" height="14" rx="3" fill="#1baf7a"><title>radare2, lua -O2: 0%</title></rect>
+<text x="157.0" y="263" font-size="11" fill="#52514e">0%</text>
+<text x="140" y="311.0" font-size="12.5" text-anchor="end" fill="#0b0b0b">lua AArch64 -O2</text>
+<rect x="150" y="284" width="489.6" height="14" rx="3" fill="#2a78d6"><title>Relic, lua AArch64 -O2: 91%</title></rect>
+<text x="644.6" y="295" font-size="11" fill="#52514e">91%</text>
+<rect x="150" y="300" width="491.4" height="14" rx="3" fill="#eb6834"><title>angr, lua AArch64 -O2: 91%</title></rect>
+<text x="646.4" y="311" font-size="11" fill="#52514e">91%</text>
+<rect x="150" y="316" width="2.0" height="14" rx="3" fill="#1baf7a"><title>radare2, lua AArch64 -O2: 0%</title></rect>
+<text x="157.0" y="327" font-size="11" fill="#52514e">0%</text>
+<text x="20" y="374" font-size="11.5" fill="#52514e">radare2&#x27;s pdc prints pseudo-assembly, not C.</text>
+</svg>

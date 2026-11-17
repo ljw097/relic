@@ -19,6 +19,7 @@ import re
 import subprocess
 import sys
 import tempfile
+import time
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
@@ -75,6 +76,130 @@ _NOT_C = re.compile(r"error: (?!.*(undeclared|implicit declaration|unknown type 
                     r"has no member named|incomplete type))")
 
 
+def run_r2(path: str, addrs: list[int], timeout: int) -> dict:
+    """radare2's own pseudocode (`pdc`) for each function, after `aaa`. One process for all of
+    them: each function's time is the whole run's split evenly."""
+    mark = "=RELICFN="
+    cmds = "aaa;" + "".join(f"s {a};af;?e {mark}{a};pdc;" for a in addrs)
+    t = time.perf_counter()
+    try:
+        r = subprocess.run(["r2", "-q", "-e", "scr.color=0", "-e", "scr.interactive=false", "-c", cmds, path],
+                           capture_output=True, text=True, timeout=timeout)
+        text = r.stdout
+    except subprocess.TimeoutExpired:
+        return {}
+    each = (time.perf_counter() - t) / max(len(addrs), 1)
+    out = {}
+    for part in text.split(mark)[1:]:
+        head, _, body = part.partition("\n")
+        body = body.strip()
+        out[int(head)] = {"addr": int(head), "text": body or None, "error": None if body else "no output",
+                          "seconds": each}
+    return out
+
+
+GHIDRA_SCRIPT = r'''
+// Decompile the functions at the link-time addresses listed in args[0]; one JSON line each to args[1].
+import ghidra.app.script.GhidraScript;
+import ghidra.app.decompiler.*;
+import ghidra.program.model.address.Address;
+import ghidra.program.model.listing.Function;
+import java.io.*;
+import java.nio.file.*;
+import java.util.*;
+
+public class RelicDecompileList extends GhidraScript {
+    private static String q(String s) {
+        StringBuilder b = new StringBuilder("\"");
+        for (char c : s.toCharArray()) {
+            if (c == '"' || c == '\\') b.append('\\').append(c);
+            else if (c == '\n') b.append("\\n");
+            else if (c < 0x20) b.append(String.format("\\u%04x", (int) c));
+            else b.append(c);
+        }
+        return b.append('"').toString();
+    }
+    @Override
+    public void run() throws Exception {
+        String[] a = getScriptArgs();
+        List<String> lines = Files.readAllLines(Paths.get(a[0]));
+        long delta = currentProgram.getSymbolTable().getSymbols("entry").next().getAddress().getOffset()
+            - Long.parseLong(lines.get(0).trim());
+        DecompInterface d = new DecompInterface();
+        d.openProgram(currentProgram);
+        try (PrintWriter out = new PrintWriter(new FileWriter(a[1]))) {
+            for (String line : lines.subList(1, lines.size())) {
+                long addr = Long.parseLong(line.trim());
+                Address ad = toAddr(addr + delta);
+                long t = System.nanoTime();
+                String text = null, err = null;
+                Function f = getFunctionAt(ad);
+                if (f == null) f = createFunction(ad, null);
+                if (f == null) err = "not a function";
+                else {
+                    DecompileResults r = d.decompileFunction(f, 120, monitor);
+                    if (r != null && r.decompileCompleted()) text = r.getDecompiledFunction().getC();
+                    else err = r == null ? "failed" : String.valueOf(r.getErrorMessage());
+                }
+                double sec = (System.nanoTime() - t) / 1e9;
+                out.println("{\"addr\": " + addr + ", \"text\": " + (text == null ? "null" : q(text))
+                    + ", \"error\": " + (err == null ? "null" : q(err)) + ", \"seconds\": " + sec + "}");
+                out.flush();
+            }
+        }
+    }
+}
+'''
+
+
+def run_ghidra(ghidra: str, path: str, entry: int, addrs: list[int], timeout: int) -> dict:
+    """Ghidra's decompiler (headless: import, auto-analysis, then RelicDecompileList.java)."""
+    out = {}
+    with tempfile.TemporaryDirectory() as tmp:
+        with open(os.path.join(tmp, "RelicDecompileList.java"), "w") as fp:
+            fp.write(GHIDRA_SCRIPT)
+        with open(os.path.join(tmp, "addrs.txt"), "w") as fp:
+            fp.write("\n".join(map(str, [entry, *addrs])) + "\n")
+        result = os.path.join(tmp, "out.jsonl")
+        os.makedirs(os.path.join(tmp, "proj"))
+        try:
+            subprocess.run([os.path.join(ghidra, "support", "analyzeHeadless"), os.path.join(tmp, "proj"), "p",
+                            "-import", path, "-scriptPath", tmp, "-postScript", "RelicDecompileList.java",
+                            os.path.join(tmp, "addrs.txt"), result, "-deleteProject"],
+                           capture_output=True, text=True, timeout=timeout)
+        except subprocess.TimeoutExpired:
+            pass
+        if os.path.exists(result):
+            for line in open(result):
+                try:
+                    d = json.loads(line)
+                except ValueError:
+                    continue
+                out[d["addr"]] = d
+    return out
+
+
+def run_retdec(retdec: str, path: str, ranges: dict[int, int], timeout: int) -> dict:
+    """RetDec on the whole list in one run (`--select-ranges`), its output split per function
+    (`function_1440(...) {` to the `}` in column 0); each function's time is the run's split evenly."""
+    with tempfile.TemporaryDirectory() as tmp:
+        out_c = os.path.join(tmp, "out.c")
+        sel = ",".join(f"0x{a:x}-0x{a + max(size, 1) - 1:x}" for a, size in ranges.items())
+        t = time.perf_counter()
+        try:
+            subprocess.run([retdec, path, "-o", out_c, "--select-ranges", sel, "--cleanup"], capture_output=True,
+                           text=True, timeout=timeout)
+        except subprocess.TimeoutExpired:
+            return {}
+        each = (time.perf_counter() - t) / max(len(ranges), 1)
+        text = open(out_c, errors="replace").read() if os.path.exists(out_c) else ""
+    found = {}
+    for m in re.finditer(r"^\S[^\n;]*\bfunction_([0-9a-f]+)\([^\n;]*\{\n.*?^\}", text, re.S | re.M):
+        found[int(m.group(1), 16)] = m.group(0)
+    return {a: {"addr": a, "text": found.get(a), "error": None if a in found else "not in output", "seconds": each}
+            for a in ranges}
+
+
 def run(code: str, python: str, path: str, addrs: list[int], timeout: int) -> dict:
     out = {}
     try:
@@ -91,6 +216,22 @@ def run(code: str, python: str, path: str, addrs: list[int], timeout: int) -> di
             continue
         out[d["addr"]] = d
     return out
+
+
+def entry(path: str) -> int:
+    out = subprocess.run(["readelf", "-hW", path], capture_output=True, text=True).stdout
+    return int(re.search(r"Entry point address:\s+0x([0-9a-f]+)", out).group(1), 16)
+
+
+def sizes_of(path: str) -> dict[int, int]:
+    """Function sizes from the unstripped build's symbols (RetDec decompiles address ranges)."""
+    out = subprocess.run(["readelf", "-sW", path], capture_output=True, text=True).stdout
+    sizes = {}
+    for line in out.splitlines():
+        p = line.split()
+        if len(p) >= 8 and p[3] == "FUNC" and p[6] != "UND":
+            sizes[int(p[1], 16)] = max(sizes.get(int(p[1], 16), 0), int(p[2], 0))
+    return sizes
 
 
 def valid_c(text: str) -> bool:
@@ -113,7 +254,9 @@ def main(argv=None) -> int:
     ap.add_argument("--angr-python", default=sys.executable)
     ap.add_argument("--limit", type=int, default=0)
     ap.add_argument("--timeout", type=int, default=3600)
-    ap.add_argument("--tools", default="relic,angr")
+    ap.add_argument("--tools", default="relic,angr", help="relic, angr, r2, ghidra, retdec")
+    ap.add_argument("--ghidra", help="Ghidra's install directory (holds support/analyzeHeadless)")
+    ap.add_argument("--retdec", help="the retdec-decompiler program")
     ap.add_argument("--json")
     args = ap.parse_args(argv)
     tools = args.tools.split(",")
@@ -129,6 +272,14 @@ def main(argv=None) -> int:
             res["relic"] = run(RELIC, sys.executable, full + ".stripped", funcs, args.timeout)
         if "angr" in tools:
             res["angr"] = run(ANGR, args.angr_python, full + ".stripped", funcs, args.timeout)
+        if "r2" in tools:
+            res["r2"] = run_r2(full + ".stripped", funcs, args.timeout)
+        if "ghidra" in tools:
+            res["ghidra"] = run_ghidra(args.ghidra, full + ".stripped", entry(full), funcs, args.timeout)
+        if "retdec" in tools:
+            sizes = sizes_of(full)
+            res["retdec"] = run_retdec(args.retdec, full + ".stripped", {a: sizes.get(a, 1) for a in funcs},
+                                       args.timeout)
         both = [a for a in funcs if all(a in res[t] for t in res)]
         row = {"functions": len(both)}
         for tool, got in res.items():
