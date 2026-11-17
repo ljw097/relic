@@ -141,6 +141,9 @@ matters to me when I'm actually reversing something. Right now it comes to **abo
 | Debugger (7) | 100% | Windows programs run under wine with Windows' own gdbserver.exe |
 | Projects & collaboration (5) | 100% | Snapshots, version history, merging, Lumina-style name sharing |
 
+How Relic compares with angr, radare2 and LIEF (function detection, file parsing, decompiler
+output and speed) is in [docs/benchmarks.md](docs/benchmarks.md).
+
 What I count as 100% for each area, and what's still missing, is in [TODO.md](TODO.md). The
 log of finished work is in [docs/history.md](docs/history.md). Both are in Korean.
 

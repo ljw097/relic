@@ -1009,7 +1009,7 @@ class CWriter:
         if fa is not None and not self._bit_unit(*fa[1:]):
             return f"{self.expr(fa[0], PREC_POSTFIX)}->{self.fname(*fa[1:])}"
         ar = self.structs.array_ref(addr, bits)
-        if ar is not None:
+        if ar is not None and not self._has_ptr(_bare(ar[3])):
             base, st, f, idx = ar
             return f"{self.expr(base, PREC_POSTFIX)}->{self.fname(st, f)}[{self.expr(_bare(idx))}]"
         if self.an.bin.endian == "little":
@@ -1017,7 +1017,7 @@ class CWriter:
             if pa is not None and not self._bit_unit(*pa[1:]):     # the low bytes of a wider field
                 return f"*({_mem_type(bits)} *)&{self.expr(pa[0], PREC_POSTFIX)}->{self.fname(*pa[1:])}"
         idx = self._indexed(addr, size)
-        if idx is not None:
+        if idx is not None and not self._has_ptr(idx[1]):   # (an index that is a pointer: not C)
             base, i = idx
             return f"{base}[{self.expr(i)}]"
         if isinstance(addr, BinOp) and addr.op == "+" and isinstance(addr.a, StackAddr) and \
@@ -1415,10 +1415,48 @@ class CWriter:
                 parts.append(v if v.startswith(f"({t})") else f"({t}){v}")
         return f"(struct {name}){{ {', '.join(parts)} }}"
 
+    def _offset(self, e: Expr, prec: int) -> str:
+        """An offset added to a pointer: a constant is a number there, never the string or the
+        symbol at that address (`(char *)a1 + 123`, not `(char *)a1 + "{"`)."""
+        return self._num(e) if isinstance(e, Const) else self.expr(e, prec)
+
+    _INT_ONLY = ("*", "/u", "/s", "%u", "%s", "&", "|", "^", "<<", ">>u", ">>s")
+
+    def _ptr_var(self, e: Expr) -> bool:
+        """A variable typed as a pointer (or a local array, which C turns into one)."""
+        if isinstance(e, (Var, StackVar)):
+            t = self.types.get(e.name)
+            return t is not None and t.ptr >= 1
+        if isinstance(e, StackAddr):
+            slot = self.p.frame.slots.get(e.offset)
+            return slot is not None and slot.kind == "buffer"
+        if isinstance(e, BinOp) and e.op in ("+", "-") and e.bits == self.ptr_bits:
+            # pointer plus / minus an integer is still a pointer (`(char *)buf + 8`)
+            a, b = self._ptr_var(e.a), self._ptr_var(e.b)
+            return a != b if e.op == "+" else a and not b
+        return False
+
+    def _has_ptr(self, e: Expr) -> bool:
+        """A pointer-typed variable is part of `e` (outside any cast to an integer)."""
+        if self._ptr_var(e):
+            return True
+        if isinstance(e, BinOp) and e.op in ("+", "-"):
+            return self._has_ptr(e.a) or self._has_ptr(e.b)
+        return False
+
     def _binop(self, e: BinOp) -> tuple[str, int]:
         bf = self.bitfield(e) if e.op in ("&", ">>u") else None
         if bf is not None:                        # `p->ihl`
             return bf, PREC_POSTFIX
+        ptrs = [x for x in (e.a, e.b) if self._ptr_var(x)]
+        if ptrs and e.op in BIN and (e.op in self._INT_ONLY or e.op in ("+", "-") and len(ptrs) == 2 or
+                                     e.op == "-" and ptrs == [e.b]):
+            # arithmetic C does not do on pointers (`p & -8`, `p * 2`), or two pointers added, or
+            # subtracted (C would count elements, the machine counts bytes): their integer values
+            op, p = BIN[e.op]
+            ta, tb = (f"({int_type(self.ptr_bits)}){self.expr(x, PREC_UNARY)}" if x in ptrs else
+                      self.expr(x, p + (x is e.b)) for x in (e.a, e.b))
+            return f"{ta} {op} {tb}", p
         if e.op in ("==", "!=") and isinstance(e.b, Const) and isinstance(e.a, BinOp) and e.a.op == "&" and \
                 isinstance(e.a.b, Const):
             # `(unit & 0xe0) == 0x40`: the bit-field there compared with 2
@@ -1481,7 +1519,7 @@ class CWriter:
             # a byte offset from a struct pointer (not a field: a loop's end pointer, say)
             if self._struct_ptr(b) and not self._struct_ptr(a):
                 a, b = b, a
-            return f"(char *){self.expr(a, PREC_UNARY)} {op} {self.expr(b, p + 1)}", p
+            return f"(char *){self.expr(a, PREC_UNARY)} {op} {self._offset(b, p + 1)}", p
         if e.op in ("+", "-"):
             ptr = self._scaled(a, b)
             if ptr is not None:
@@ -1491,9 +1529,9 @@ class CWriter:
                 if ptr is not None:
                     a, b = b, ptr
                 elif self._ptr_size(b) > 1:     # (a byte offset that is not a whole element)
-                    return f"(char *){self.expr(b, PREC_UNARY)} + {self.expr(a, p + 1)}", p
+                    return f"(char *){self.expr(b, PREC_UNARY)} + {self._offset(a, p + 1)}", p
             elif self._ptr_size(a) > 1:   # byte offset that is not a whole element
-                return f"(char *){self.expr(a, PREC_UNARY)} {op} {self.expr(b, p + 1)}", p
+                return f"(char *){self.expr(a, PREC_UNARY)} {op} {self._offset(b, p + 1)}", p
         if e.op in ("+", "-"):
             for x, y in ((a, b), (b, a)) if e.op == "+" else ((a, b),):
                 if isinstance(x, (Const, StackAddr)) and not isinstance(y, (Const, StackAddr)) or \
@@ -1644,7 +1682,13 @@ class CWriter:
         if getattr(self.an.bin, "func_descriptors", None) and isinstance(target, Load) and \
                 isinstance(target.addr, (Load, Var, StackVar)):
             target = target.addr                # (PowerPC64 ELFv1: through the function's descriptor)
-        name = self._callee_name(c) or f"(*{self.expr(target, PREC_UNARY)})"
+        name = self._callee_name(c)
+        if name is None:
+            fp = self.expr(target, PREC_UNARY)
+            t = self.types.get(target.name) if isinstance(target, (Var, StackVar)) else None
+            if t is not None and not t.ptr:     # (an integer variable holding the address: a function pointer in C)
+                fp = f"({int_type(c.bits) if c.bits else 'void'} (*)()){fp}"
+            name = f"(*{fp})"
         send = self._objc_send(name, c)
         if send is not None:
             return send

@@ -130,6 +130,9 @@ ret2win 후보를 찾아 줍니다. IDA에는 기본으로 없는 기능이라 �
 | 디버거 (7) | 100% | Windows 프로그램은 wine에서 Windows용 gdbserver.exe로 |
 | 프로젝트·협업 (5) | 100% | 스냅숏, 버전 기록, 병합, Lumina 방식의 이름 공유 |
 
+angr, radare2, LIEF와의 비교(함수 탐지, 파일 파싱, 디컴파일러 출력과 속도)는
+[docs/benchmarks.md](docs/benchmarks.md)에 있습니다(영어).
+
 영역마다 어디까지를 100%로 보는지, 무엇이 남았는지는 [TODO.md](TODO.md)에 적어 두었습니다.
 끝낸 작업의 기록은 [docs/history.md](docs/history.md)에 있습니다.
 

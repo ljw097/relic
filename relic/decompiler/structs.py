@@ -86,7 +86,8 @@ class Struct:
                 continue                     # overlaps the previous field: shown through casts
             t = ftype(f) or (f"struct {sname(f.child)} *" if f.child is not None else (f.ctype or int_type(f.bits)))
             sep = "" if t.endswith("*") else " "
-            dims = f"[{f.count if f.count is not None else ''}]" if f.array else ""
+            # (a flexible array as the only member is not C: GNU C's zero-length array instead)
+            dims = f"[{f.count if f.count is not None else ('' if len(out) > 1 else 0)}]" if f.array else ""
             out.append(f"    {t}{sep}{fname(f)}{dims};")
             pos = f.end
         out.append("};")
