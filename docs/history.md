@@ -541,6 +541,9 @@ gdb를 GDB/MI로 부리고, 화면은 pwndbg처럼 꾸몄다.
 - 디컴파일 결과를 다시 컴파일해서 원본과 같은 입력으로 돌려 비교하는 테스트가 아키텍처마다 있다. 다른
   아키텍처는 qemu-user로 돌린다.
 - ruff 린트(E/F/W/B). 포맷터와 import 정렬은 기존 줄바꿈 스타일과 맞지 않아서 쓰지 않는다.
+- 1.5.0부터 버전은 유의적 버전을 따른다(README의 "버전 규칙"). Release 워크플로가 `tools/semver_check.py`로
+  버전이 MAJOR.MINOR.PATCH 꼴인지, 프리릴리스 표시와 `-rc.1` 같은 꼬리가 맞는지, 지금까지의 어느 릴리스 태그보다
+  새로운지 확인하고 아니면 아무것도 빌드하지 않는다.
 - 릴리스는 Actions의 Release 워크플로로 만든다. 버전을 확인하고, Windows, Linux, macOS용 실행 파일(PyInstaller)과
   wheel을 빌드해 시험한 뒤, 태그를 달고 `docs/releases/<버전>.md`를 노트로 게시한다.
 - 1.2.1부터 릴리스마다 모든 파일의 SHA-256을 `SHA256SUMS`로 올리고 노트 끝에도 적는다. "add missing" 옵션은
