@@ -1062,6 +1062,53 @@ def test_port_from_older_build(win, vuln64, tmp_path):
     assert f not in win.an.renames
 
 
+def test_compare_with_older_build(win, tmp_path):
+    """File > Compare with older build: the functions that changed (the most changed first), were
+    added or removed; a function's diff, in instructions and in pseudocode; going to one; porting."""
+    import subprocess
+    from PySide6.QtWidgets import QApplication
+    if shutil.which("gcc") is None:
+        pytest.skip("no gcc")
+    src = (tmp_path / "old.c")
+    src.write_text("int keep(int x) { return x * 7 + 3; }\n"
+                   "int edit(int x) { if (x > 9) return x - 1; return x + 1; }\n"
+                   "int gone(int x) { return x ^ 0x55; }\n"
+                   "int main(int c, char **v) { return keep(c) + edit(c) + gone(c); }\n")
+    new_src = (tmp_path / "new.c")
+    fresh = "int fresh(int x) { int s = 0; for (int i = 0; i < x; i++) s += i * i % 7; return s; }\n"
+    new_src.write_text("int fresh(int x);\n" + src.read_text().replace("x - 1", "x - 2")
+                       .replace("int gone(int x) { return x ^ 0x55; }\n", "").replace(" + gone(c)", " + fresh(c)")
+                       + fresh)
+    old, new = str(tmp_path / "old"), str(tmp_path / "new")
+    subprocess.run(["gcc", "-O0", "-o", old, str(src)], check=True)
+    subprocess.run(["gcc", "-O0", "-s", "-o", new, str(new_src)], check=True)
+    win.open_file(new)
+    assert win.wait()
+    t = win.compare_with(old)
+    assert t.wait(60000)
+    QApplication.processEvents()
+    d = win.compare_window
+    groups = {k: [d.groups[k].child(i).text(0) for i in range(d.groups[k].childCount())] for k in d.groups}
+    # (main calls fresh() now, not gone(): it changed the most)
+    assert set(groups["Changed"]) == {"main", "edit"} and groups["Removed"] == ["gone"]
+    assert len(groups["Added"]) == 1 and "keep" in groups["Identical"]
+    edit = next(d.groups["Changed"].child(i) for i in range(2) if d.groups["Changed"].child(i).text(0) == "edit")
+    d.tree.setCurrentItem(edit)
+    text = d.text.toPlainText()
+    assert text.startswith("edit:") and any(ln.startswith("-    sub") for ln in text.splitlines())
+    d.pseudo.setChecked(True)
+    text = d.text.toPlainText()
+    assert any(ln.startswith("-") and "1" in ln for ln in text.splitlines()[3:])
+    assert any(ln.startswith("+") and "2" in ln for ln in text.splitlines()[3:])
+    m = d.current()[1]
+    assert d.go() and win.cur == m.new
+    d.tree.setCurrentItem(d.groups["Removed"].child(0))
+    assert not d.go() and d.text.toPlainText().startswith("gone @")       # (not in this build)
+    got = d.port()
+    assert "edit" in dict(got["functions"]).values() and win.an.name(m.new) == "edit"
+    d.close()
+
+
 def test_heap_panel_lists_chunks_and_tcache(app, win):
     from relic.gui.debugger import Snapshot
     from test_heap import BASE, _heap, _reader, _tcache_struct
