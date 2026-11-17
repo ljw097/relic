@@ -170,6 +170,11 @@ def fp_return(an: "Analysis", func: "Function") -> int | None:
     c = _cache(an, "ret")
     if func.addr in c:
         return c[func.addr]
+    from .aggabi import func_plan
+    p = func_plan(an, func)
+    if p is not None and an.resolve_type(p.ret).strip() not in ("float", "double"):
+        c[func.addr] = None                     # (its prototype says what it returns: a struct, ...)
+        return None
     busy = _cache(an, "busy")
     c[func.addr] = None                         # recursion guard
     busy[func.addr] = True

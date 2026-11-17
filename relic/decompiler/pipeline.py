@@ -43,6 +43,9 @@ class Prepared:
     ret_bits: int | None = None   # width of the result, when known
     ret_float: bool = False       # the result is a float / double (in xmm0)
     hidden: frozenset = frozenset()   # ids of statements the structurer made redundant
+    # a prototype with structs by value (aggabi.Plan), and the variable each location is here
+    agg: object = None
+    agg_vars: dict | None = None
 
 
 # functions prepared for another one's struct scan (structs._scan_function), kept for their own
@@ -93,7 +96,10 @@ def prepare(an: "Analysis", func: "Function") -> Prepared:
     _locals_out_of_ssa(fn, frame)
     fn = out_of_ssa(fn)
     forward_empty_blocks(fn)
-    params = _params(an, func, frame, arch)
+    from .aggabi import func_plan
+    agg = func_plan(an, func)
+    agg_vars = _agg_vars(arch, frame, agg) if agg is not None else None
+    params = list(agg_vars.values()) if agg_vars is not None else _params(an, func, frame, arch)
     from .calls import narrow_call_args
     from .cleanup import fold_param_spills
     fold_param_spills(fn, params)           # -O0: `var_1c = argc` once on entry, then var_1c read
@@ -105,7 +111,24 @@ def prepare(an: "Analysis", func: "Function") -> Prepared:
     tree = st.run()
     from .chains import switchify
     tree = switchify(tree, frozenset(st.gotos))     # compare chains on one value -> switch
-    return Prepared(fn, arch, frame, params, rets, tree, st.gotos, w, fret is not None, frozenset(st.hidden))
+    return Prepared(fn, arch, frame, params, rets, tree, st.gotos, w, fret is not None, frozenset(st.hidden),
+                    agg, agg_vars)
+
+
+def _agg_vars(arch: ArchInfo, frame: Frame, agg) -> dict:
+    """Location (a register, or an offset from the first stack parameter) -> the variable it is
+    in this function's IR, for a prototype with structs by value (aggabi)."""
+    from .calls import param_base
+    from .fpabi import stack_arg_base
+    first = param_base(arch) + stack_arg_base(arch)
+    out = {}
+    for loc in agg.locs():
+        if isinstance(loc, int):
+            slot = frame.slots.get(first + loc)
+            out[loc] = slot.name() if slot is not None else f"arg_{first + loc:x}"
+        else:
+            out[loc] = loc
+    return out
 
 
 def _join_abi_pieces(an: "Analysis", func: "Function", fn: IRFunction, arch: ArchInfo):

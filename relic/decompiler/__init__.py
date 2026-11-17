@@ -37,6 +37,8 @@ def decompile_ir(an, func, optimize: bool = True):
     else:
         fn = lift(an, func)
         set_fp_returns(an, func, fn)
+        from .aggabi import set_struct_returns
+        set_struct_returns(an, func, fn)
         fn = run_passes(to_ssa(fn, arch), arch)
     fn = recover_calls(fn, an, arch)
     _dce(fn)  # call uses not selected as arguments (stack pointer, scratch registers) are gone

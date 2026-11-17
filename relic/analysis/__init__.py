@@ -870,6 +870,21 @@ class Analysis:
                 continue
             ints = [t for _, t in proto.params if t.ptr or t.base not in ("float", "double", "long double")]
             floats = [t for _, t in proto.params if not t.ptr and t.base in ("float", "double")]
+            from ..decompiler.aggabi import plan_proto, struct_of
+            by_value = any(struct_of(self, t.spell()) for _, t in proto.params) or struct_of(self, proto.ret.spell())
+            shown = False
+            if by_value:
+                from ..decompiler.arch import arch_for
+                try:
+                    shown = plan_proto(self, arch_for(self.bin), protos[name]) is not None
+                except NotImplementedError:
+                    shown = False
+            if shown:
+                ints, floats = [t for _, t in proto.params], []     # (structs by value: named in C order)
+            elif by_value:
+                # not shown as structs (another ABI, two fields in one register): no struct types on
+                # registers that hold parts of one
+                ints = [t for t in ints if not struct_of(self, t.spell())]
             types = self.var_types.setdefault(f.addr, {})
             for k, t in enumerate(ints + floats):
                 try:
@@ -877,7 +892,8 @@ class Analysis:
                 except ValueError:
                     continue
             try:
-                types["@return"] = str(parse_ctype(proto.ret.spell()))
+                if shown or not by_value or not struct_of(self, proto.ret.spell()):
+                    types["@return"] = str(parse_ctype(proto.ret.spell()))
             except ValueError:
                 pass
             if not types:

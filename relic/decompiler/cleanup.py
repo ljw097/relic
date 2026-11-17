@@ -738,7 +738,8 @@ def inline_single_use(fn: IRFunction) -> bool:
                 cand = None
                 if isinstance(s, Assign) and isinstance(s.dst, Var) and not isinstance(s.src, Phi):
                     cand = (s.dst, s.src)
-                elif isinstance(s, _CS) and not s.tail and len(s.defs) == 1 and isinstance(s.defs[0][1], Var):
+                elif isinstance(s, _CS) and not s.tail and len(s.defs) == 1 and isinstance(s.defs[0][1], Var) and \
+                        not s.struct_result:
                     cand = (s.defs[0][1], s.call)
                 if cand is None:
                     k += 1

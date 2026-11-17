@@ -19,6 +19,7 @@ from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
 
 from . import ir
+from .aggabi import STRUCT, STRUCT_COPY
 from .ir import (Assign, BinOp, CallStmt, Cast, Const, Effect, Expr, Extract, Intrinsic, Ite, Load, Reg, Return,
                  StackAddr, StackVar, Store, UnOp, Unknown, Var)
 from .fp import FARITH, FCMP, FP_INTRINSICS
@@ -200,6 +201,7 @@ class CWriter:
             cur = self.types.get(name)
             if cur is not None and cur.ptr == 1 and cur.base in (int_type(w), int_type(w, True)):
                 self.types[name] = CType(float_ctype(w), 1)
+        self._agg_float_parts()
         self.shown_structs: dict[str, str] = {}
         self.shown_fields: dict[str, list] = {}
         self.names: dict[str, str] = {}
@@ -221,6 +223,8 @@ class CWriter:
                 user_types[name] = wanted[gen]
         for name, t in lib_structs.items():              # (the user's own type still wins)
             user_types.setdefault(name, t)
+        if self._agg is not None and self._agg.ret_memory:  # the struct result is written through it
+            user_types[self._agg_vars["rdi"]] = an.resolve_type(self._agg.ret).strip() + " *"
         # plain copies of a variable the user typed `struct X *` (`var_18 = a1` at -O0) point to X too
         todo = [n for n, t in user_types.items() if t.startswith("struct ") and t.count("*") == 1]
         while todo:
@@ -257,6 +261,11 @@ class CWriter:
             else:
                 self.types[name] = ct
         self.ret_type = an.var_types.get(prep.fn.addr, {}).get("@return")
+        if self._agg is not None and self._agg.ret_memory:
+            # (a hidden first argument: where the caller wants it -- as C, a struct of this function's)
+            ct = an.resolve_type(self._agg.ret).strip()
+            self.notes.append(f"{ct} *{self.vname(self._agg_vars['rdi'])} = &({ct}){{0}};  "
+                              "// the result (the caller's, passed as a hidden first argument)")
         self._spread_user_types([n for n, t in self.types.items() if t.base.startswith("enum ") and not t.ptr])
         if self.ret_type and self.ret_type.endswith("*"):
             # what is returned is a pointer of that type (`v1 = "idle"; ... return v1;`)
@@ -614,9 +623,76 @@ class CWriter:
                         self.types[st.dst.name] = t
                         todo.append(st.dst.name)
 
+    @property
+    def _agg(self):
+        """The prototype's structs by value (aggabi.Plan), or None."""
+        return getattr(self.p, "agg", None)
+
+    @property
+    def _agg_vars(self) -> dict:
+        return getattr(self.p, "agg_vars", None) or {}
+
+    def _name_agg_params(self) -> bool:
+        """A prototype with structs by value (aggabi): parameters by their place in C -- a struct's
+        registers / stack words are its fields (`a1.x`), the result pointer is `result`."""
+        plan, where = self._agg, self._agg_vars
+        if plan is None:
+            return False
+        if plan.ret_memory:
+            self.names[where["rdi"]] = "result"
+        for k, prm in enumerate(plan.params):
+            if not prm.is_struct:
+                self.names[where[prm.loc]] = f"a{k + 1}"
+                continue
+            base = f"__agg{k}"
+            self.names[base] = f"a{k + 1}"
+            for x in prm.pieces:
+                var = where[x.loc]
+                slot = next((sl for sl in self.p.frame.slots.values() if sl.name() == var), None) \
+                    if isinstance(x.loc, int) else None
+                if slot is not None and slot.width * 8 != x.bits:
+                    # a stack word that is not one field (gcc copies structs a word at a time): the
+                    # struct's bytes there
+                    from dataclasses import replace
+                    x = replace(x, field=None, bits=slot.width * 8)
+                self.agg_fields[var] = (base, x)
+                try:
+                    self.types[var] = parse_ctype(x.ctype) if x.ctype else CType(int_type(x.bits))
+                except ValueError:
+                    self.types[var] = CType(int_type(x.bits))
+        return True
+
+    def _name_agg_results(self):
+        """Calls of functions with structs by value (aggabi): which they are (`agg_calls`), and for a
+        struct result in registers a variable `r1` whose fields the result registers are."""
+        from .aggabi import plan
+        from .sigs import base_name
+        self.agg_calls: dict = {}
+        self.agg_locals: dict[str, str] = {}        # struct result variable -> its C type
+        for s in self.p.fn.stmts():
+            if not isinstance(s, CallStmt) or id(s) in self.p.hidden:
+                continue
+            name = base_name(self._callee_name(s.call) or s.name or "")
+            p = plan(self.an, self.p.arch, name) if name else None
+            if p is None or not (p.ret_pieces or p.ret_memory):
+                continue
+            base = f"__r{len(self.agg_calls)}"
+            self.agg_calls[id(s)] = (p, base)
+            if p.ret_memory:
+                continue
+            self.names[base] = f"r{len(self.agg_locals) + 1}"
+            self.agg_locals[base] = p.ret
+            defs = dict(s.defs)
+            for x in p.ret_pieces:
+                d = defs.get(x.loc)
+                if isinstance(d, Var):
+                    self.agg_fields[d.name] = (base, x)
+
     def _name_vars(self):
         main = self._is_main() and len(self.p.params) <= 3
-        for k, r in enumerate(self.p.params):
+        self.agg_fields: dict = {}
+        agg = self._name_agg_params()
+        for k, r in enumerate([] if agg else self.p.params):
             self.names[r] = self.MAIN_PARAMS[k][0] if main else f"a{k + 1}"
             if main:
                 self.types[r] = parse_ctype(self.MAIN_PARAMS[k][1])
@@ -627,12 +703,14 @@ class CWriter:
             self.names[self.p.params[0]], self.names[self.p.params[1]] = "self", "_cmd"
             self.types[self.p.params[0]] = CType(cls, 1) if kind == "-" else CType("Class")
             self.types[self.p.params[1]] = CType("SEL")
+        self._name_agg_results()
         n = 0
         for s in self.p.fn.stmts():
             if id(s) in self.p.hidden:
                 continue
             for d in ir.stmt_defs(s):
-                if isinstance(d, Var) and d.name.startswith("_v") and d.name not in self.names:
+                if isinstance(d, Var) and d.name.startswith("_v") and d.name not in self.names and \
+                        d.name not in self.agg_fields:
                     n += 1
                     self.names[d.name] = f"v{n}"
 
@@ -649,6 +727,13 @@ class CWriter:
         for st in self.p.fn.stmts():
             for top in ir.stmt_exprs(st):
                 for c in ir.walk(top):
+                    if isinstance(c, Intrinsic) and c.name.startswith(STRUCT_COPY) and \
+                            isinstance(c.args[0], StackAddr):
+                        # a local struct passed by value (aggabi): `struct q var_98;`
+                        name = c.name[len(STRUCT_COPY):]
+                        if name in self.an.struct_names:
+                            self.stack_structs[c.args[0].offset] = (name, c.bits // 8)
+                        continue
                     if not isinstance(c, ir.Call):
                         continue
                     sig = lookup(self._callee_name(c), self.an)
@@ -656,6 +741,10 @@ class CWriter:
                     if isinstance(c.target, Const) and c.target.value in self.an.functions:
                         wanted = self.an.var_types.get(c.target.value) or {}
                         types = types or [wanted.get(f"a{k + 1}", "") for k in range(len(c.args))]
+                    if isinstance(st, CallStmt) and id(st) in self.__dict__.get("agg_calls", {}) and \
+                            self.agg_calls[id(st)][0].ret_memory and c is st.call:
+                        # the result pointer of a function returning a struct in memory (aggabi)
+                        types = [self.an.resolve_type(self.agg_calls[id(st)][0].ret).strip() + " *"]
                     for k, a in enumerate(c.args):
                         t = types[k] if k < len(types) else ""
                         if isinstance(a, StackAddr) and t.startswith("struct ") and t.count("*") == 1:
@@ -664,23 +753,42 @@ class CWriter:
                             m = re.search(r"(\d+) bytes", (entry or {}).get("decl", [""])[0]) if entry else None
                             if m:
                                 self.stack_structs[a.offset] = (name, int(m.group(1)))
+        self.base_fields: dict[str, tuple[str, int]] = {}      # a struct's own slot read as its first field
         for base, (name, size) in self.stack_structs.items():
             entry = self.an.struct_names[name]
             base_slot = self.p.frame.slots.get(base)
             if base_slot is None:
                 continue
+            # the fields at each offset, an array's elements each (`w[1]`)
+            at: dict[int, tuple[str, int]] = {}
+            for key, spec in entry.get("layout", {}).items():
+                off, bits = int(key, 16), spec[0]
+                count = spec[2] if len(spec) > 2 and isinstance(spec[2], int) else 1
+                label = entry.get("fields", {}).get(f"f_{off:x}", f"f_{off:x}")
+                for k in range(max(count, 1)):
+                    at[off + k * bits // 8] = (label if count == 1 else f"{label}[{k}]", bits)
+            if 0 in at:
+                self.base_fields[base_slot.name()] = at[0]
             for off, sl in self.p.frame.slots.items():
                 rel = off - base
                 if off == base or not 0 < rel < size or sl.kind not in ("local", "buffer"):
                     continue
                 self._inner_slots.add(sl.name())
-                lay = entry.get("layout", {}).get(f"{rel:#x}")
-                if lay and lay[0] == sl.width * 8:
-                    field = entry["fields"].get(f"f_{rel:x}", f"f_{rel:x}")
-                    self.stack_fields[sl.name()] = f"{base_slot.name()}.{field}"
+                f = at.get(rel)
+                if f is not None and f[1] == sl.width * 8:
+                    self.stack_fields[sl.name()] = f"{base_slot.name()}.{f[0]}"
 
     def vname(self, name: str) -> str:
         """Display name of a variable: the user's name, else the generated one (`v3`, `a1`, `var_c`)."""
+        agg = self.__dict__.get("agg_fields", {}).get(name)
+        if agg is not None:                          # part of a struct parameter: `a1.x`
+            base, piece = agg
+            if piece.field is not None:
+                return f"{self.vname(base)}.{piece.field}"
+            t = int_type(piece.bits)
+            if piece.off * 8 % piece.bits == 0:
+                return f"(({t} *)&{self.vname(base)})[{piece.off * 8 // piece.bits}]"
+            return f"*({t} *)((char *)&{self.vname(base)} + {piece.off})"
         field = self.__dict__.get("stack_fields", {}).get(name)
         if field is not None:                        # a field of a stack struct: `buf_a8.st_size`
             base, _, rest = field.partition(".")
@@ -1048,6 +1156,9 @@ class CWriter:
         if isinstance(e, Reg):
             return e.name, PREC_POSTFIX
         if isinstance(e, StackVar):
+            f = self.__dict__.get("base_fields", {}).get(e.name)
+            if f is not None and f[1] == e.bits:      # (a stack struct's first field: `var_98.a`)
+                return f"{self.vname(e.name)}.{f[0]}", PREC_POSTFIX
             return self.vname(e.name), PREC_POSTFIX
         if isinstance(e, StackAddr):
             slot = self.p.frame.slots.get(e.offset)
@@ -1092,12 +1203,63 @@ class CWriter:
                     f"{sub(e.b, PREC_TERNARY)}"), PREC_TERNARY
         if isinstance(e, Intrinsic) and (e.name in self._FCASTS or e.name in FP_INTRINSICS):
             return self._fintrinsic(e)
+        if isinstance(e, Intrinsic) and e.name.startswith(STRUCT):
+            return self._struct_value(e), PREC_POSTFIX
+        if isinstance(e, Intrinsic) and e.name.startswith(STRUCT_COPY):
+            at = self.expr(e.args[0])                 # the struct there, by value: `buf_48`, `*p`
+            return (at[1:], PREC_POSTFIX) if at.startswith("&") else (f"*{self.expr(e.args[0], PREC_UNARY)}",
+                                                                        PREC_UNARY)
         if isinstance(e, Intrinsic):
             name = _sse_name(e.name, e.bits) or f"__{e.name}"
             return f"{name}({', '.join(self.expr(a) for a in e.args)})", PREC_POSTFIX
         if isinstance(e, ir.Call):
             return self.call(e), PREC_POSTFIX
         return str(e), PREC_POSTFIX
+
+    def _agg_call_stmt(self, s: CallStmt) -> str:
+        """A call returning a struct (aggabi): `r1 = add(...)` for a result in registers (its
+        parts read as `r1.x`, `r1.y`), `buf_48 = make(n)` for one written through the pointer the
+        caller passes (when it is a local's address), else `*p = make(n)`."""
+        plan, base = self.agg_calls[id(s)]
+        c = s.call
+        if plan.ret_memory:
+            rest = ir.Call(c.target, c.args[1:], c.bits, tuple((k - 1, w) for k, w in c.fargs if k))
+            dst = c.args[0] if c.args else None
+            target = self.expr(dst)
+            lhs = target[1:] if target.startswith("&") else f"*{self.expr(dst, PREC_UNARY)}"
+            return f"{lhs} = {self.call(rest)};"
+        return f"{self.vname(base)} = {self.call(c)};"
+
+    def _agg_float_parts(self):
+        """A variable passed as a struct's float / double part (aggabi) is one."""
+        from .aggabi import part_floats
+        for st in self.p.fn.stmts():
+            for top in ir.stmt_exprs(st):
+                for e in ir.walk(top):
+                    if not (isinstance(e, Intrinsic) and e.name.startswith(STRUCT)):
+                        continue
+                    for a, fl in zip(e.args, part_floats(self.an, e.name[len(STRUCT):], len(e.args))):
+                        if fl and isinstance(a, (Var, StackVar)) and a.bits in (32, 64) and a.name not in self.ftypes:
+                            self.ftypes[a.name] = a.bits
+                            self.types[a.name] = CType(float_ctype(a.bits))
+
+    def _struct_value(self, e: Intrinsic) -> str:
+        """A struct made of its registers (aggabi): `(struct pt){ a1.x + a2.x, a1.y * a2.y }`."""
+        from .aggabi import part_fields, part_floats
+        name = e.name[len(STRUCT):]
+        floats = part_floats(self.an, name, len(e.args))
+        layout = part_fields(self.an, name, len(e.args)) or [[]] * len(e.args)
+        parts = []
+        for a, fl, fields in zip(e.args, floats, layout):
+            if fl or len(fields) <= 1 and not (fields and fields[0][0]):
+                parts.append(self.fexpr(a, 0, min(a.bits, 64)) if fl else self.expr(a))
+                continue
+            # several fields in one register: each from its bits (`(int)p`, `(int)(p >> 32)`)
+            for shift, bits, ct in fields:
+                t = ct or int_type(bits)
+                v = self.expr(a, PREC_UNARY) if not shift else f"({self.expr(a, PREC_UNARY + 1)} >> {shift})"
+                parts.append(f"({t}){v}")
+        return f"(struct {name}){{ {', '.join(parts)} }}"
 
     def _binop(self, e: BinOp) -> tuple[str, int]:
         bf = self.bitfield(e) if e.op in ("&", ">>u") else None
@@ -1415,6 +1577,8 @@ class CWriter:
                 return ", ".join(t.rstrip(";") for t in bf) + ";"
             name = self._enum_text(ir.Load(s.dst, s.bits), _bare(s.src))
             return f"{self.mem(s.dst, s.bits)} = {name or self.expr(s.src)};"
+        if isinstance(s, CallStmt) and id(s) in self.agg_calls:
+            return self._agg_call_stmt(s)
         if isinstance(s, CallStmt):
             text = self.call(s.call)
             from .fpabi import callee_ret
@@ -1483,7 +1647,11 @@ class CWriter:
                     self.emit(text, s.addr, depth)
         elif isinstance(n, Ret):
             v = n.stmt.value
-            if v is not None and self.p.ret_float:
+            plan = self._agg
+            if plan is not None and plan.ret_memory and isinstance(_bare(v), Var) and \
+                    _bare(v).name == self._agg_vars["rdi"]:
+                text = f"return *{self.vname(_bare(v).name)};"     # (the struct written through it)
+            elif v is not None and self.p.ret_float:
                 text = f"return {self.fexpr(v, 0, self.p.ret_bits)};"
             else:
                 text = "return;" if v is None else f"return {self.expr(_bare(v))};"
@@ -1566,7 +1734,16 @@ class CWriter:
             from ..demangle import short_name
             name = short_name(name)
         params = []
-        for r in self.p.params:
+        plan = self._agg
+        if plan is not None:
+            for k, prm in enumerate(plan.params):
+                if prm.is_struct:
+                    params.append(f"{prm.ctype} {self.vname(f'__agg{k}')}")
+                    continue
+                r = self._agg_vars[prm.loc]
+                t = self.types.get(r) or CType(int_type(self.ptr_bits))
+                params.append(t.decl(self.vname(r)))
+        for r in [] if plan is not None else self.p.params:
             t = self.types.get(r) or CType(int_type(self.ptr_bits))
             params.append(t.decl(self.vname(r)))
         ret = "void"
@@ -1630,6 +1807,8 @@ class CWriter:
             else:
                 t = self.types.get(gen) or CType(int_type(slot.width * 8))
                 self.emit(f"{t.decl(name)};  {where}", None, depth)
+        for base, ctype in self.__dict__.get("agg_locals", {}).items():
+            self.emit(f"{ctype} {self.vname(base)};", None, depth)
         regs = sorted({v for v in self.names if v.startswith("_v") and v not in self.p.params},
                       key=lambda n: int(self.names[n][1:]))
         for v in regs:
