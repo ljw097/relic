@@ -86,7 +86,11 @@ class Struct:
                 continue                     # overlaps the previous field: shown through casts
             t = ftype(f) or (f"struct {sname(f.child)} *" if f.child is not None else (f.ctype or int_type(f.bits)))
             sep = "" if t.endswith("*") else " "
-            dims = f"[{f.count if f.count is not None else ''}]" if f.array else ""
+            # an array of unknown length: up to the next field, flexible ([]) when it is the last
+            # one -- not C as the only member: GNU C's zero-length array instead
+            later = [o for o in self.fields if o > off]
+            count = f.count if f.count is not None or not later else max((min(later) - off) // max(f.bits // 8, 1), 1)
+            dims = f"[{count if count is not None else ('' if len(out) > 1 else 0)}]" if f.array else ""
             out.append(f"    {t}{sep}{fname(f)}{dims};")
             pos = f.end
         out.append("};")
@@ -829,6 +833,14 @@ class StructView:
             apply_edits(self.an, st, self.ptr_bits)
             self._use(st)
         return st
+
+    def typed_as(self, load: Load, st: Struct) -> bool:
+        """Whether a pointer read from memory already has the type `st *` in the C: an element
+        of a global the struct belongs to (`notes[i]`), or a field pointing to `st`."""
+        if _global_of(_resolve(load, self.defs), self.ptr_bits) is not None:
+            return True
+        inner = self.field(load.addr, load.bits)
+        return inner is not None and inner[2].child is st
 
     def var_struct(self, name: str) -> Struct | None:
         """The struct a pointer variable points to (for its declaration): its own, or that of the

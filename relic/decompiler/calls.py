@@ -149,6 +149,63 @@ def narrow_call_args(an: "Analysis", arch: ArchInfo, fn) -> int:
 _INT32 = ("int", "unsigned int", "uid_t", "gid_t", "pid_t", "mode_t", "socklen_t")
 
 
+RESULT_AT = "resultat:"      # Intrinsic: an indirect result's place (its one argument), `size` bytes
+
+
+def indirect_result(an: "Analysis", arch: ArchInfo, target: int) -> int:
+    """AArch64: the function uses x8 as it came in -- the indirect result location, where its
+    caller wants a struct result too big for registers. Shown as a first parameter `result`.
+    How many bytes it writes there (at least 1), or 0: it does not."""
+    if arch.name not in ("arm64-aapcs", "arm64-apple"):
+        return 0
+    cache = an.__dict__.setdefault("_indirect_result", {})
+    if target not in cache:
+        cache[target] = _indirect_result_size(an, arch, target)
+    return cache[target]
+
+
+def _indirect_result_size(an: "Analysis", arch: ArchInfo, target: int) -> int:
+    """How many bytes a function writes where x8 pointed on entry (directly, or -O0: through a
+    copy of it spilled to the stack and loaded back); 0 when it does not write there at all
+    (x8 only flowing into a phi is a scratch register's old value, not a result pointer)."""
+    from .ir import Load, Store
+    ssa = _entry_ssa(an, arch, target)
+    if ssa is None:
+        return 0
+    x8 = Var("x8", 0, 64)
+    defs = {t.dst: t.src for t in ssa.stmts() if isinstance(t, Assign) and isinstance(t.dst, Var)}
+
+    def copy_of(v):
+        for _ in range(8):                      # (through plain copies: `mov x3, x8`)
+            if isinstance(v, Var) and isinstance(defs.get(v), Var):
+                v = defs[v]
+            else:
+                break
+        return v
+
+    def base_off(a):
+        """(base, offset) of an address `b` / `b + K`, its base through copies."""
+        a = copy_of(a)
+        a = defs.get(a, a) if isinstance(a, Var) else a
+        if isinstance(a, BinOp) and a.op == "+" and isinstance(a.b, Const):
+            return copy_of(a.a), a.b.value
+        return copy_of(a), 0
+
+    # where it is (x8 itself, the stack slots it was saved to, what is loaded back from them)
+    spills = [base_off(st.dst) for st in ssa.stmts() if isinstance(st, Store) and st.src == x8]
+    holders = {x8}
+    for v, src in defs.items():
+        if isinstance(src, Load) and base_off(src.addr) in spills:
+            holders.add(v)
+    size = 0
+    for st in ssa.stmts():
+        if isinstance(st, Store):
+            b, off = base_off(st.dst)
+            if b in holders and (b != x8 or st.src != x8):
+                size = max(size, off + st.bits // 8)
+    return size
+
+
 def livein_regs(an: "Analysis", arch: ArchInfo, target: int) -> set[str]:
     """Every argument register the callee really reads on entry (no prefix rule)."""
     return _compute_livein(an, arch, target, prefix=False)
@@ -823,6 +880,8 @@ def recover_calls(fn: IRFunction, an: "Analysis", arch: ArchInfo) -> IRFunction:
                             selected = more
             elif f is not None and not f.is_import:
                 selected = _livein_arg_regs(an, arch, tgt)
+                if indirect_result(an, arch, tgt):
+                    selected = ["x8"] + selected        # (where the struct result goes: first)
                 fps = fp_params(an, arch, tgt)
                 widths = dict(fps)
                 fints = dict(float_int_params(an, arch, tgt))      # RISC-V: floats past fa7
@@ -914,6 +973,11 @@ def recover_calls(fn: IRFunction, an: "Analysis", arch: ArchInfo) -> IRFunction:
                 elif slot is not None:                  # (called only through its GOT slot)
                     from .ir import Load
                     target = Load(Const(slot, target.bits), target.bits)
+            if placed[:1] == ["x8"] and args and f is not None:
+                size = indirect_result(an, arch, tgt)
+                if size > 1:                        # (the caller's place for it: that many bytes, one object)
+                    from .ir import Intrinsic
+                    args[0] = Intrinsic(f"{RESULT_AT}{size}", (args[0],), args[0].bits)
             s.call = Call(target, tuple(args), s.call.bits, tuple(fargs))
             used = dict.fromkeys(x for r in placed if r is not None for x in fp_part(r.lstrip("="))[0].split(":"))
             s.uses = [(r, uses[r]) for r in used if r in uses]

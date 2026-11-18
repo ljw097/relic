@@ -10,14 +10,14 @@ The goal is admittedly ambitious: something as good as IDA Pro with Hex-Rays, an
 can manage it. It isn't there yet. But for the everyday stuff it already works well: opening an
 x86-64 or ARM binary, finding your way around, naming things, reading the pseudocode, and
 measuring an overflow offset in the debugger. The current release is
-[1.5.0](https://github.com/ljw097/relic/releases/tag/v1.5.0).
+[1.6.0](https://github.com/ljw097/relic/releases/tag/v1.6.0).
 
 ![The Relic debugger stopped in vuln() right after gets(): the AAAA… input shows up in the registers and the stack telescope](docs/screenshots/debugger.png)
 
 ## Installing
 
 Grab the executable for your system from the
-[release page](https://github.com/ljw097/relic/releases/tag/v1.5.0) and run it. There's nothing
+[release page](https://github.com/ljw097/relic/releases/tag/v1.6.0) and run it. There's nothing
 to install:
 
 - **Windows**: `relic-<version>-windows-x86_64.exe`
@@ -38,7 +38,7 @@ If you have Python 3.10 or newer, you can install the wheel from the release pag
 
 ```sh
 python3 -m venv .venv
-.venv/bin/pip install https://github.com/ljw097/relic/releases/download/v1.5.0/relic_re-1.5.0-py3-none-any.whl
+.venv/bin/pip install https://github.com/ljw097/relic/releases/download/v1.6.0/relic_re-1.6.0-py3-none-any.whl
 .venv/bin/relic
 ```
 
@@ -143,6 +143,20 @@ matters to me when I'm actually reversing something. Right now it comes to **abo
 
 What I count as 100% for each area, and what's still missing, is in [TODO.md](TODO.md). The
 log of finished work is in [docs/history.md](docs/history.md). Both are in Korean.
+
+### Compared with other open-source tools
+
+Stripped builds of brotli, Lua and zstd (and Relic's test programs) at -O0 and -O2, x86-64 and
+AArch64, against Ghidra, angr, RetDec, radare2 and LIEF. Method, every number and the caveats:
+[docs/benchmarks.md](docs/benchmarks.md).
+
+![Function detection F1 by build: Relic 0.96–0.99 in every build; angr 0.89–0.97; Ghidra 0.98 at -O0 and 0.73–0.79 at -O2; radare2 0.73–0.90; LIEF 0.998 with .eh_frame and 0.018 without](docs/benchmarks/detection-f1.svg)
+
+![Function detection time: Relic 9–18 s per build, angr 19–50 s, radare2 5–19 s, Ghidra 43–257 s](docs/benchmarks/detection-time.svg)
+
+![Share of functions whose pseudocode is valid C: brotli Relic 82%, RetDec 82%, Ghidra 69%, angr 49%; zstd Relic 92%, RetDec 83%, Ghidra 69%, angr 41%; lua Relic 98–99%, Ghidra 95–97%, RetDec 92–97%, angr 88–91%; radare2 0%](docs/benchmarks/decompiler-valid-c.svg)
+
+![Decompiler time per function: Ghidra 7–206 ms, Relic 56–292 ms, angr 198–2,452 ms](docs/benchmarks/decompiler-time.svg)
 
 ## CLI
 

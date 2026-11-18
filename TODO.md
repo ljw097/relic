@@ -30,12 +30,11 @@ tar의 `main`은 20초 동안 158개 함수를 준비합니다.
   deflate/inflate)에 몰려 있습니다. 지금 방식(패턴 매칭 + 복제)으로는 한계가 보여서 조건 기반 구조화(DREAM
   계열)를 검토하려고 합니다. 구조화를 건드리는 변경은 무작위 CFG 테스트
   (`test_random_cfgs_run_like_the_cfg`, `test_emitted_c_runs_like_the_cfg`)를 반드시 통과해야 합니다.
-- [ ] **구조체 값 전달, 남은 것.** x86-64 System V와 AArch64는 됩니다(`decompiler/aggabi.py`). 남은 것은 다른
-  ABI(Win64, ARM, MIPS, RISC-V, PowerPC)와, 필드 둘 이상이 레지스터 하나에 들어가는 구조체(`struct { int a, b; }`,
-  float 둘)입니다. 후자는 -O0에서 레지스터를 통째로 저장했다가 반씩 읽고, -O2에서는 `shrd`나 `bfi`로 쪼개는데,
-  리프터가 `shrd`를 아직 못 풀고 그 비트 연산을 필드로 읽어 내지도 못합니다. AArch64에서 core 레지스터의 `double`
-  필드와 스택으로 넘치는 인자도 아직입니다. 원형이 없는 AArch64 함수가 큰 구조체를 `x8`로 돌려주면 `x8`이 그대로
-  보입니다(`*x8 = a1;`).
+- [ ] **구조체 값 전달, 남은 것.** x86-64 System V와 AArch64는 됩니다(`decompiler/aggabi.py`). 정수 필드 여럿이
+  레지스터 하나에 들어가는 구조체(`struct { int a, b; }`)도 됩니다. 남은 것은 다른 ABI(Win64, ARM, MIPS, RISC-V,
+  PowerPC), float 둘이 레지스터 하나에 들어가는 구조체(비트를 float로 다시 읽어야 함), AArch64에서 core
+  레지스터의 `double` 필드와 스택으로 넘치는 인자입니다. -O0에서 레지스터를 지역 변수로 옮긴 뒤 반씩 읽는 코드는
+  올바르지만 필드 이름 대신 `((int *)&var_20)[1]`로 보입니다.
 
 
 ## P1 — 분석

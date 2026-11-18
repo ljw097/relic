@@ -9,13 +9,13 @@ GUI는 PySide6, 명령어 디코딩은 capstone을 쓰고, 그 위에 올라가�
 목표는 솔직히 좀 거창합니다. IDA Pro + Hex-Rays만큼, 할 수 있다면 그보다 낫게 만드는 겁니다. 아직 거기까지는
 멀었지만, x86-64나 ARM 바이너리를 열어서 함수를 훑어보고, 이름을 붙이고, 의사 코드를 읽고, 디버거로
 오버플로 오프셋을 재는 정도는 지금도 충분히 됩니다. 현재 버전은
-[1.5.0](https://github.com/ljw097/relic/releases/tag/v1.5.0)입니다.
+[1.6.0](https://github.com/ljw097/relic/releases/tag/v1.6.0)입니다.
 
 ![Relic 디버거: vuln()에서 gets() 직후에 멈춘 화면. 입력한 AAAA…가 레지스터와 스택 telescope에 보인다](docs/screenshots/debugger.png)
 
 ## 설치
 
-[릴리스 페이지](https://github.com/ljw097/relic/releases/tag/v1.5.0)에서 운영체제에 맞는 실행 파일을 받아
+[릴리스 페이지](https://github.com/ljw097/relic/releases/tag/v1.6.0)에서 운영체제에 맞는 실행 파일을 받아
 실행하면 됩니다. 설치 과정은 없습니다.
 
 - **Windows**: `relic-<버전>-windows-x86_64.exe`
@@ -34,7 +34,7 @@ Python 3.10 이상이 있다면 릴리스 페이지의 wheel을 설치해도 됩
 
 ```sh
 python3 -m venv .venv
-.venv/bin/pip install https://github.com/ljw097/relic/releases/download/v1.5.0/relic_re-1.5.0-py3-none-any.whl
+.venv/bin/pip install https://github.com/ljw097/relic/releases/download/v1.6.0/relic_re-1.6.0-py3-none-any.whl
 .venv/bin/relic
 ```
 
@@ -132,6 +132,20 @@ ret2win 후보를 찾아 줍니다. IDA에는 기본으로 없는 기능이라 �
 
 영역마다 어디까지를 100%로 보는지, 무엇이 남았는지는 [TODO.md](TODO.md)에 적어 두었습니다.
 끝낸 작업의 기록은 [docs/history.md](docs/history.md)에 있습니다.
+
+### 다른 오픈소스 도구와의 비교
+
+brotli, Lua, zstd(와 Relic의 테스트 프로그램)를 -O0/-O2, x86-64/AArch64로 빌드해 strip한 뒤
+Ghidra, angr, RetDec, radare2, LIEF와 비교했습니다. 방법, 전체 수치와 한계는
+[docs/benchmarks.md](docs/benchmarks.md)에 있습니다(영어).
+
+![빌드별 함수 탐지 F1: Relic은 모든 빌드에서 0.96–0.99, angr 0.89–0.97, Ghidra는 -O0에서 0.98·-O2에서 0.73–0.79, radare2 0.73–0.90, LIEF는 .eh_frame이 있으면 0.998, 없으면 0.018](docs/benchmarks/detection-f1.svg)
+
+![함수 탐지 시간: Relic 빌드당 9–18초, angr 19–50초, radare2 5–19초, Ghidra 43–257초](docs/benchmarks/detection-time.svg)
+
+![의사코드가 올바른 C인 함수의 비율: brotli Relic 82%, RetDec 82%, Ghidra 69%, angr 49%; zstd Relic 92%, RetDec 83%, Ghidra 69%, angr 41%; lua Relic 98–99%, Ghidra 95–97%, RetDec 92–97%, angr 88–91%; radare2 0%](docs/benchmarks/decompiler-valid-c.svg)
+
+![함수당 디컴파일 시간: Ghidra 7–206ms, Relic 56–292ms, angr 198–2,452ms](docs/benchmarks/decompiler-time.svg)
 
 ## CLI
 

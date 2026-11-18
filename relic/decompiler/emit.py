@@ -382,7 +382,7 @@ class CWriter:
                 pos = (sp[1] - f.offset) * 8 + bit
                 for name, b, w in bfs:
                     if b == pos and w == width and pos + width <= (sp[1] - f.offset) * 8 + load.bits:
-                        return f"{self.expr(sp[0], PREC_POSTFIX)}->{name}"
+                        return f"{self.sbase(sp[0], st)}->{name}"
         return None
 
     def _unit_of(self, e: Expr) -> Load | None:
@@ -464,7 +464,7 @@ class CWriter:
             fm = ((1 << (hi - lo)) - 1) << lo
             if keep & fm != fm or const & fm or any(v[0] < hi and v[0] + v[1] > lo for v in values):
                 return None
-        ptr = self.expr(sp[0], PREC_POSTFIX)
+        ptr = self.sbase(sp[0], st)
         out = []
         for name, p, w in sorted(inside, key=lambda x: x[1]):
             fm = ((1 << w) - 1) << p
@@ -589,6 +589,15 @@ class CWriter:
         shown = self.an.struct_names.get(st.name, {}).get("name") or st.name
         self.shown_structs[shown] = st.name
         return shown
+
+    def sbase(self, base: Expr, st) -> str:
+        """The pointer `base` in `base->field` of struct `st`: a value read from memory that isn't a
+        field or global of that pointer type (an element of an integer array, `a1[3]`) is cast to it."""
+        text = self.expr(base, PREC_POSTFIX)
+        # (a global's element printed as a raw read, `*(int64_t *)(i * 8 + 0x4040)`: no type either)
+        if isinstance(base, Load) and (not self.structs.typed_as(base, st) or text.lstrip("(").startswith("*(")):
+            return f"((struct {self.sname(st)} *){self.expr(base, PREC_UNARY)})"
+        return text
 
     def ftype(self, st, f) -> str | None:
         """The user's type of a field; a struct it names is shown by its current name."""
@@ -734,7 +743,11 @@ class CWriter:
         self.agg_fields: dict = {}
         self.ref_subst: dict[str, str] = {}
         agg = self._name_agg_params()
-        for k, r in enumerate([] if agg else self.p.params):
+        params = [] if agg else list(self.p.params)
+        if params[:1] == ["x8"] and self.p.arch.name.startswith("arm64"):
+            self.names["x8"] = "result"         # (AArch64: where the caller wants a struct result)
+            params = params[1:]
+        for k, r in enumerate(params):
             self.names[r] = self.MAIN_PARAMS[k][0] if main else f"a{k + 1}"
             if main:
                 self.types[r] = parse_ctype(self.MAIN_PARAMS[k][1])
@@ -1003,17 +1016,17 @@ class CWriter:
             return ivar
         fa = self.structs.field(addr, bits)
         if fa is not None and not self._bit_unit(*fa[1:]):
-            return f"{self.expr(fa[0], PREC_POSTFIX)}->{self.fname(*fa[1:])}"
+            return f"{self.sbase(fa[0], fa[1])}->{self.fname(*fa[1:])}"
         ar = self.structs.array_ref(addr, bits)
-        if ar is not None:
+        if ar is not None and not self._has_ptr(_bare(ar[3])):
             base, st, f, idx = ar
-            return f"{self.expr(base, PREC_POSTFIX)}->{self.fname(st, f)}[{self.expr(_bare(idx))}]"
+            return f"{self.sbase(base, st)}->{self.fname(st, f)}[{self.expr(_bare(idx))}]"
         if self.an.bin.endian == "little":
             pa = self.structs.part_of_field(addr, bits)
             if pa is not None and not self._bit_unit(*pa[1:]):     # the low bytes of a wider field
-                return f"*({_mem_type(bits)} *)&{self.expr(pa[0], PREC_POSTFIX)}->{self.fname(*pa[1:])}"
+                return f"*({_mem_type(bits)} *)&{self.sbase(pa[0], pa[1])}->{self.fname(*pa[1:])}"
         idx = self._indexed(addr, size)
-        if idx is not None:
+        if idx is not None and not self._has_ptr(idx[1]):   # (an index that is a pointer: not C)
             base, i = idx
             return f"{base}[{self.expr(i)}]"
         if isinstance(addr, BinOp) and addr.op == "+" and isinstance(addr.a, StackAddr) and \
@@ -1210,7 +1223,61 @@ class CWriter:
         k = int(hi) ^ (getattr(self.an.bin, "endian", "little") == "big")
         return f"((unsigned int *)&{self.vname(x.name)})[{k}]"
 
+    def _packed_field(self, e: Expr) -> str | None:
+        """A field read out of a struct parameter's register that several fields share (aggabi):
+        `(int)P` -> `a1.a`, `(int)(P >> 32)` -> `a1.b`, `P >> 32` (the top field, widened) ->
+        `(int64_t)a1.b`. None: not such a read."""
+        if not self.__dict__.get("agg_fields"):
+            return None
+        if isinstance(e, Cast) and e.kind == "low" and isinstance(e.a, BinOp) and \
+                e.a.op in ("+", "-", "*", "&", "|", "^") and not getattr(self, "_in_packed", False):
+            # the low bits of `P + 1` are those of `P`, plus one (`a1.a + 1`): truncation
+            # distributes over these operations
+            def cut(x):
+                return Const(x.value & ((1 << e.bits) - 1), e.bits) if isinstance(x, Const) else Cast("low", x, e.bits)
+            low = BinOp(e.a.op, cut(e.a.a), cut(e.a.b), e.bits)
+            self._in_packed = True
+            try:
+                if any(self._packed_field(x) is not None for x in (low.a, low.b)):
+                    return self.expr(low)
+            finally:
+                self._in_packed = False
+            return None
+        bits, shift, base = e.bits, 0, e
+        if isinstance(base, Cast) and base.kind == "low":
+            base = base.a
+        elif isinstance(base, BinOp) and base.op in (">>u", ">>s") and isinstance(base.b, Const):
+            pass
+        else:
+            return None
+        widen = None
+        if isinstance(base, BinOp) and base.op in (">>u", ">>s") and isinstance(base.b, Const):
+            shift = base.b.value
+            if e is base:                       # (the top field, widened: no low cast around it)
+                widen, bits = e.bits, base.a.bits - shift
+            base = base.a
+        if not isinstance(base, (Var, StackVar)):
+            return None
+        agg = self.agg_fields.get(base.name)
+        if agg is None or agg[1].field is not None or agg[1].float:
+            return None
+        root, piece = agg
+        from .aggabi import struct_of
+        st = struct_of(self.an, self._agg.params[int(root[5:])].ctype) if self._agg and root.startswith("__agg") \
+            else None
+        if st is None:
+            return None
+        f = next(((name, b * 8, ct) for o, b, ct, name in st.fields if o == piece.off + shift // 8 and shift % 8 == 0),
+                 None)
+        if f is None or f[1] != bits:
+            return None
+        text = f"{self.vname(root)}.{f[0]}"
+        return f"({int_type(widen)}){text}" if widen else text
+
     def _expr(self, e: Expr) -> tuple[str, int]:
+        packed = self._packed_field(e) if isinstance(e, (Cast, BinOp)) else None
+        if packed is not None:
+            return packed, PREC_UNARY if packed.startswith("(") else PREC_POSTFIX
         if isinstance(e, (Cast, Extract, Var)) and self.p.arch.name == "arm-aapcs-vfp":
             s = self._vfp_param(e)
             if s is not None:
@@ -1279,6 +1346,8 @@ class CWriter:
             return self._fintrinsic(e)
         if isinstance(e, Intrinsic) and e.name.startswith(STRUCT):
             return self._struct_value(e), PREC_POSTFIX
+        if isinstance(e, Intrinsic) and e.name.startswith("resultat:"):
+            return self._expr(e.args[0])             # (an indirect result's place: its address)
         if isinstance(e, Intrinsic) and e.name.startswith(STRUCT_COPY):
             # the struct there, by value: `buf_48` (a local of that struct), `*p`, else the bytes
             # there as one (`*(struct big *)&var_e0`: a place reused for structs of several types)
@@ -1335,17 +1404,68 @@ class CWriter:
             if fl or len(fields) <= 1 and not (fields and fields[0][0]):
                 parts.append(self.fexpr(a, 0, min(a.bits, 64)) if fl else self.expr(a))
                 continue
-            # several fields in one register: each from its bits (`(int)p`, `(int)(p >> 32)`)
+            # several fields in one register: each from its bits (`(int)p`, `(int)(p >> 32)`) -- out
+            # of `x | y << 32` the term that holds them (`y`)
             for shift, bits, ct in fields:
                 t = ct or int_type(bits)
-                v = self.expr(a, PREC_UNARY) if not shift else f"({self.expr(a, PREC_UNARY + 1)} >> {shift})"
-                parts.append(f"({t}){v}")
+                term, at = _bits_term(a, shift, bits)
+                if isinstance(term, Const):     # (a constant's bits there: `7`)
+                    v = (term.value >> at) & ((1 << bits) - 1)
+                    parts.append(self._num(Const(v, bits)))
+                    continue
+                if at == 0:
+                    x = Cast("low", term, bits) if term.bits > bits else term
+                    v = self.expr(x, PREC_UNARY)
+                    if self._packed_field(x) is not None or isinstance(x, BinOp) and x.bits == bits:
+                        parts.append(v)             # (already the field's width: `a1.b`, `a1.a + 1`)
+                        continue
+                else:
+                    v = f"({self.expr(term, PREC_UNARY + 1)} >> {at})"
+                parts.append(v if v.startswith(f"({t})") else f"({t}){v}")
         return f"(struct {name}){{ {', '.join(parts)} }}"
+
+    def _offset(self, e: Expr, prec: int) -> str:
+        """An offset added to a pointer: a constant is a number there, never the string or the
+        symbol at that address (`(char *)a1 + 123`, not `(char *)a1 + "{"`)."""
+        return self._num(e) if isinstance(e, Const) else self.expr(e, prec)
+
+    _INT_ONLY = ("*", "/u", "/s", "%u", "%s", "&", "|", "^", "<<", ">>u", ">>s")
+
+    def _ptr_var(self, e: Expr) -> bool:
+        """A variable typed as a pointer (or a local array, which C turns into one)."""
+        if isinstance(e, (Var, StackVar)):
+            t = self.types.get(e.name)
+            return t is not None and t.ptr >= 1
+        if isinstance(e, StackAddr):
+            slot = self.p.frame.slots.get(e.offset)
+            return slot is not None and slot.kind == "buffer"
+        if isinstance(e, BinOp) and e.op in ("+", "-") and e.bits == self.ptr_bits:
+            # pointer plus / minus an integer is still a pointer (`(char *)buf + 8`)
+            a, b = self._ptr_var(e.a), self._ptr_var(e.b)
+            return a != b if e.op == "+" else a and not b
+        return False
+
+    def _has_ptr(self, e: Expr) -> bool:
+        """A pointer-typed variable is part of `e` (outside any cast to an integer)."""
+        if self._ptr_var(e):
+            return True
+        if isinstance(e, BinOp) and e.op in ("+", "-"):
+            return self._has_ptr(e.a) or self._has_ptr(e.b)
+        return False
 
     def _binop(self, e: BinOp) -> tuple[str, int]:
         bf = self.bitfield(e) if e.op in ("&", ">>u") else None
         if bf is not None:                        # `p->ihl`
             return bf, PREC_POSTFIX
+        ptrs = [x for x in (e.a, e.b) if self._ptr_var(x)]
+        if ptrs and e.op in BIN and (e.op in self._INT_ONLY or e.op in ("+", "-") and len(ptrs) == 2 or
+                                     e.op == "-" and ptrs == [e.b]):
+            # arithmetic C does not do on pointers (`p & -8`, `p * 2`), or two pointers added, or
+            # subtracted (C would count elements, the machine counts bytes): their integer values
+            op, p = BIN[e.op]
+            ta, tb = (f"({int_type(self.ptr_bits)}){self.expr(x, PREC_UNARY)}" if x in ptrs else
+                      self.expr(x, p + (x is e.b)) for x in (e.a, e.b))
+            return f"{ta} {op} {tb}", p
         if e.op in ("==", "!=") and isinstance(e.b, Const) and isinstance(e.a, BinOp) and e.a.op == "&" and \
                 isinstance(e.a.b, Const):
             # `(unit & 0xe0) == 0x40`: the bit-field there compared with 2
@@ -1360,7 +1480,7 @@ class CWriter:
         if e.op == "+" and e.bits == self.ptr_bits:
             fa = self.structs.field_addr(e)
             if fa is not None and not self._bit_unit(*fa[1:]):     # the address of a field: `&p->f_8`
-                return f"&{self.expr(fa[0], PREC_POSTFIX)}->{self.fname(*fa[1:])}", PREC_UNARY
+                return f"&{self.sbase(fa[0], fa[1])}->{self.fname(*fa[1:])}", PREC_UNARY
         if e.op[0] == "f" and (e.op in FARITH or e.op in FCMP):
             return self._fbinop(e)
         if e.op not in BIN:                       # carry / sborrow ... : flag helpers
@@ -1408,7 +1528,7 @@ class CWriter:
             # a byte offset from a struct pointer (not a field: a loop's end pointer, say)
             if self._struct_ptr(b) and not self._struct_ptr(a):
                 a, b = b, a
-            return f"(char *){self.expr(a, PREC_UNARY)} {op} {self.expr(b, p + 1)}", p
+            return f"(char *){self.expr(a, PREC_UNARY)} {op} {self._offset(b, p + 1)}", p
         if e.op in ("+", "-"):
             ptr = self._scaled(a, b)
             if ptr is not None:
@@ -1418,9 +1538,9 @@ class CWriter:
                 if ptr is not None:
                     a, b = b, ptr
                 elif self._ptr_size(b) > 1:     # (a byte offset that is not a whole element)
-                    return f"(char *){self.expr(b, PREC_UNARY)} + {self.expr(a, p + 1)}", p
+                    return f"(char *){self.expr(b, PREC_UNARY)} + {self._offset(a, p + 1)}", p
             elif self._ptr_size(a) > 1:   # byte offset that is not a whole element
-                return f"(char *){self.expr(a, PREC_UNARY)} {op} {self.expr(b, p + 1)}", p
+                return f"(char *){self.expr(a, PREC_UNARY)} {op} {self._offset(b, p + 1)}", p
         if e.op in ("+", "-"):
             for x, y in ((a, b), (b, a)) if e.op == "+" else ((a, b),):
                 if isinstance(x, (Const, StackAddr)) and not isinstance(y, (Const, StackAddr)) or \
@@ -1571,7 +1691,13 @@ class CWriter:
         if getattr(self.an.bin, "func_descriptors", None) and isinstance(target, Load) and \
                 isinstance(target.addr, (Load, Var, StackVar)):
             target = target.addr                # (PowerPC64 ELFv1: through the function's descriptor)
-        name = self._callee_name(c) or f"(*{self.expr(target, PREC_UNARY)})"
+        name = self._callee_name(c)
+        if name is None:
+            fp = self.expr(target, PREC_UNARY)
+            t = self.types.get(target.name) if isinstance(target, (Var, StackVar)) else None
+            if t is not None and not t.ptr:     # (an integer variable holding the address: a function pointer in C)
+                fp = f"({int_type(c.bits) if c.bits else 'void'} (*)()){fp}"
+            name = f"(*{fp})"
         send = self._objc_send(name, c)
         if send is not None:
             return send
@@ -2088,6 +2214,59 @@ def _tidy(items):
 
 
 # ----------------------------------------------------------------- entry
+def _bit_range(e: Expr) -> tuple[int, int]:
+    """[low, high) of the bits value `e` can have set (a safe over-estimate)."""
+    if isinstance(e, Const):
+        v = e.value
+        return ((v & -v).bit_length() - 1 if v else 0), v.bit_length()
+    if isinstance(e, Cast) and e.kind == "zext":
+        return _bit_range(e.a)[0], min(_bit_range(e.a)[1], e.a.bits)
+    if isinstance(e, Cast) and e.kind == "low":
+        lo, hi = _bit_range(e.a)
+        return min(lo, e.bits), min(hi, e.bits)
+    if isinstance(e, BinOp) and e.op == "<<" and isinstance(e.b, Const):
+        lo, hi = _bit_range(e.a)
+        return min(lo + e.b.value, e.bits), min(hi + e.b.value, e.bits)
+    if isinstance(e, BinOp) and e.op == ">>u" and isinstance(e.b, Const):
+        lo, hi = _bit_range(e.a)
+        return max(lo - e.b.value, 0), max(hi - e.b.value, 0)
+    if isinstance(e, BinOp) and e.op == "&" and isinstance(e.b, Const):
+        lo, hi = _bit_range(e.a)
+        m = e.b.value
+        return max(lo, (m & -m).bit_length() - 1 if m else 0), min(hi, m.bit_length())
+    if isinstance(e, BinOp) and e.op in ("|", "^"):
+        (a0, a1), (b0, b1) = _bit_range(e.a), _bit_range(e.b)
+        return min(a0, b0), max(a1, b1)
+    return 0, e.bits
+
+
+def _bits_term(e: Expr, shift: int, bits: int) -> tuple[Expr, int]:
+    """Out of `x | y << k` (a struct's fields packed into one register), the term that holds bits
+    [shift, shift + bits) and where they are in it: (`y`, shift - k), or (`e`, shift) when no
+    single term does."""
+    if isinstance(e, BinOp) and e.op == "|":
+        terms, todo = [], [e]
+        while todo:
+            t = todo.pop()
+            if isinstance(t, BinOp) and t.op == "|":
+                todo += [t.a, t.b]
+            else:
+                terms.append(t)
+        hit = [t for t in terms if _bit_range(t)[0] < shift + bits and _bit_range(t)[1] > shift]
+        if len(hit) == 1:
+            t = hit[0]
+            if isinstance(t, BinOp) and t.op == "<<" and isinstance(t.b, Const) and t.b.value <= shift:
+                return _bits_term(t.a, shift - t.b.value, bits)
+            return _bits_term(t, shift, bits) if t is not e else (t, shift)
+    if isinstance(e, Cast) and e.kind == "zext" and shift + bits <= e.a.bits:
+        return _bits_term(e.a, shift, bits)
+    if isinstance(e, BinOp) and e.op == "&" and isinstance(e.b, Const):
+        want = ((1 << bits) - 1) << shift
+        if e.b.value & want == want:            # (the mask keeps those bits: what they come from)
+            return _bits_term(e.a, shift, bits)
+    return e, shift
+
+
 def decompile(an: "Analysis", func: "Function") -> Decompiled:
     from .pipeline import prepared
     prep = prepared(an, func)
