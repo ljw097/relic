@@ -3,12 +3,13 @@
 How Relic compares with **Ghidra**, **angr**, **RetDec**, **radare2** and **LIEF** on
 stripped Linux binaries: how many functions each finds and how many of those are real (function
 detection), how well its file loader agrees with LIEF's, and how its decompiler's output
-compares with Ghidra's, angr's, RetDec's and radare2's. Measured 2026-11-17/18 on a 4-core
-x86-64 Linux container. Each timing is a single run.
+compares with Ghidra's, angr's, RetDec's and radare2's: whether it is C, whether it computes
+what the program computes, how close its control flow, data flow and types are to the source.
+Measured 2026-11-17/18 on a 4-core x86-64 Linux container. Each timing is a single run.
 
 | Tool | Version | What it was compared on |
 |---|---|---|
-| Relic | 1.5.0 + this branch | everything |
+| Relic | 1.6.0 + this branch | everything |
 | Ghidra | 12.2 | function detection (headless auto-analysis), decompiler |
 | angr | 10.0.7 | function detection (`CFGFast`), decompiler |
 | RetDec | 5.0 | decompiler |
@@ -134,31 +135,32 @@ function there. "Valid C": the pseudocode of one function, alone, passes `gcc -f
 after a prelude of the types the tool's own output uses (the `<stdint.h>` types for all of them,
 Ghidra's `undefined8`, `byte`, `processEntry` ..., the headers RetDec's output includes); errors
 about what the function uses without declaring it (globals, callees, struct types) are not
-counted, only output that isn't C. Time: per function, not counting the analysis before it
+counted, only output that isn't C; a member missing from a struct the tool declared itself
+counts against it. Time: per function, not counting the analysis before it
 (Relic, Ghidra, angr); RetDec decompiles the whole list in one run, analysis included.
 
 | Binary | Functions | Tool | Decompiled | Valid C | gotos | Lines | Time |
 |---|---:|---|---:|---:|---:|---:|---:|
-| brotli -O2 | 249 | Relic | 247 | **205** | 3,356 | 100,467 | 62 s |
-| | | Ghidra | 249 | 172 | 5,593 | 84,783 | 51 s |
-| | | angr | 246 | 121 | 1,893 | 77,078 | 518 s |
-| | | RetDec | 249 | 203 | 5,234 | 109,316 | 158 s (all) |
-| zstd -O2 | 300 | Relic | 290 | **275** | 3,793 | 130,742 | 85 s |
-| | | Ghidra | 300 | 207 | 3,951 | 89,731 | 27 s |
-| | | angr | 296 | 122 | 2,368 | 101,357 | 726 s |
-| | | RetDec | 298 | 249 | 7,376 | 136,629 | 203 s (all) |
-| lua -O2 | 300 | Relic | 294 | **293** | **47** | 15,643 | 17 s |
-| | | Ghidra | 300 | 291 | 179 | 9,708 | 2.1 s |
-| | | angr | 294 | 263 | 131 | 13,538 | 63 s |
-| | | RetDec | 295 | 291 | 361 | 9,242 | 6.2 s (all) |
-| lua AArch64 -O2 | 300 | Relic | 300 | **297** | **46** | 16,211 | 17 s |
-| | | Ghidra | 300 | 285 | 176 | 9,806 | 2.2 s |
-| | | angr | 299 | 273 | 131 | 15,336 | 59 s |
-| | | RetDec | 288 | 275 | 410 | 9,945 | 4.9 s (all) |
-| vuln, flow (-O0, -O2) | 84 | Relic | 84 | 83 | 3 | 1,346 | 0.8 s |
+| brotli -O2 | 249 | Relic | 247 | **204** | 3,356 | 100,513 | 50 s |
+| | | Ghidra | 249 | 172 | 5,593 | 84,783 | 48 s |
+| | | angr | 246 | 121 | 1,893 | 77,078 | 431 s |
+| | | RetDec | 249 | 203 | 5,234 | 109,315 | 139 s (all) |
+| zstd -O2 | 300 | Relic | 290 | **275** | 3,793 | 130,808 | 65 s |
+| | | Ghidra | 300 | 207 | 3,951 | 89,731 | 25 s |
+| | | angr | 296 | 122 | 2,368 | 101,357 | 594 s |
+| | | RetDec | 298 | 249 | 7,376 | 136,628 | 177 s (all) |
+| lua -O2 | 300 | Relic | 294 | **293** | **46** | 15,908 | 15 s |
+| | | Ghidra | 300 | 291 | 179 | 9,708 | 2.3 s |
+| | | angr | 294 | 263 | 131 | 13,538 | 50 s |
+| | | RetDec | 295 | 291 | 361 | 9,242 | 5.4 s (all) |
+| lua AArch64 -O2 | 300 | Relic | 300 | **297** | **46** | 16,576 | 15 s |
+| | | Ghidra | 300 | 285 | 176 | 9,806 | 1.5 s |
+| | | angr | 299 | 273 | 131 | 15,336 | 45 s |
+| | | RetDec | 288 | 275 | 410 | 9,945 | 4.1 s (all) |
+| vuln, flow (-O0, -O2) | 84 | Relic | 84 | 83 | 3 | 1,344 | 0.7 s |
 | | | Ghidra | 84 | **84** | 1 | 1,462 | 0.5 s |
-| | | angr | 80 | 80 | 1 | 1,239 | 7.6 s |
-| | | RetDec | 84 | 83 | 3 | 1,280 | 0.6 s (all) |
+| | | angr | 80 | 80 | 1 | 1,239 | 6.6 s |
+| | | RetDec | 84 | 83 | 3 | 1,280 | 0.5 s (all) |
 
 radare2 decompiled all of them, 0 valid C (below).
 
@@ -169,11 +171,11 @@ radare2 decompiled all of them, 0 valid C (below).
   92% on zstd (RetDec 83%, Ghidra 69%, angr 41%), 82% on brotli (level with RetDec), 98–99% on
   lua (Ghidra and RetDec 92–97%). What's left in brotli and zstd is mostly `goto`-heavy state
   machines where a value is used both as a pointer and as an integer.
-- **Speed:** Ghidra's decompiler is the fastest per function (7 ms on lua, 90–206 ms on the big
-  functions of zstd and brotli), Relic second (56–292 ms), angr 3.5–8.5× slower than Relic.
+- **Speed:** Ghidra's decompiler is the fastest per function (5–8 ms on lua, 84–192 ms on the
+  big functions of zstd and brotli), Relic second (49–224 ms), angr 3–9× slower than Relic.
   Counted with its analysis, Ghidra takes longer overall (Java start-up and its full
   auto-analysis: 20–55 s per binary, against 1–14 s for Relic's).
-- **gotos:** Relic has the fewest on lua (47 against 131–410) and fewer than Ghidra and RetDec on
+- **gotos:** Relic has the fewest on lua (46 against 131–410) and fewer than Ghidra and RetDec on
   brotli and zstd, but more than angr there (3,356 against 1,893 on brotli).
 - **Relic before this benchmark:** it found several places where Relic printed something gcc
   rejects; they are fixed on this branch (the table above shows the fixed version). Valid
@@ -182,7 +184,7 @@ radare2 decompiled all of them, 0 valid C (below).
   | | brotli | lua | zstd | lua AArch64 |
   |---|---:|---:|---:|---:|
   | Relic before | 114 | 249 | 122 | 264 |
-  | Relic now | 205 | 293 | 275 | 297 |
+  | Relic now | 204 | 293 | 275 | 297 |
 
   What was fixed: arithmetic on pointers that C doesn't allow (`p1 * 8`, `p1 & 7`,
   `p1 + p2`) now casts the pointers to `int64_t`; an offset added to a `char *` prints as a
@@ -197,6 +199,102 @@ radare2 decompiled all of them, 0 valid C (below).
 - **Lines:** Relic's output is the longest on lua (about 1.6× Ghidra's), mostly because it keeps
   a temporary for each value read more than once.
 
+## Decompiler output quality
+
+![Syntax validity, behavioural equivalence, control-flow and data-flow similarity and type recovery per tool](benchmarks/decompiler-quality.svg)
+
+`python tools/compare_decompilers.py ... --save OUT` keeps each tool's pseudocode, then
+`python tools/decomp_quality.py CONFIG.json OUT --corpus CORPUS --json q.json` scores it (CONFIG
+names each binary's `-g` build and its sources; the script's docstring has the format).
+
+Valid C only says gcc parses the output. Five more things are measured on the same pseudocode,
+for six binaries: lua, zstd and brotli at -O2, lua for AArch64, and `tools/bench/equiv.c` at
+-O0 and -O2.
+
+- **Behavioural equivalence.** `tools/bench/equiv.c` is 42 self-contained functions (arithmetic,
+  switches, arrays, strings, structs by pointer and by value, floating point, recursion; libc
+  only). Each tool's pseudocode of one function, decompiled from the stripped build, is compiled
+  again with the libc headers and linked into a harness that calls it and the original on 40
+  inputs each, comparing the results and every byte of memory it was given. A function passes
+  when all 40 agree; not compiling, not linking (a callee or global it names that isn't there),
+  crashing or a wrong answer all fail.
+- **Control-flow similarity.** gcc's CFG of the pseudocode (compiled again at -O0) against gcc's
+  CFG of the original source function at -O0, as a Weisfeiler-Lehman graph-kernel similarity
+  (1.0: the same shape three blocks deep everywhere).
+- **Data-flow similarity.** The same on gcc's SSA def-use graphs, nodes labelled by operation
+  (add, load, store, call, phi ...), so values computed the same way from the same inputs match.
+  Also the number of variables against the source's.
+- **Type recovery.** Each parameter and the return type against the DWARF of the same build
+  (`-g` makes byte-identical code; the scripts check): *kind and size* (integer, float,
+  pointer, struct, and the width), *exact* (also signedness, and what a pointer points to), and
+  whether the number of parameters is right.
+
+To compile pseudocode that uses globals, callees or types it doesn't declare, the scorer adds
+`extern long NAME;` / `typedef long NAME;` until gcc accepts it, and defines the helper
+pseudo-functions some tools print (Ghidra's `CONCAT44`, `SUB84`, `CARRY4` ...) for everyone.
+The similarities are averaged over the functions every C-producing tool's output compiled
+(so no tool is averaged over easier ones): 690 of them.
+
+| | Relic | Ghidra | angr | RetDec | radare2 |
+|---|---:|---:|---:|---:|---:|
+| Syntax validity (1,247 functions) | **93.6%** | 84.0% | 69.9% | 89.5% | 0% |
+| Behavioural equivalence (84: 42 at -O0, 42 at -O2) | **95.2%** (80) | 89.3% (75) | 79.8% (67) | 44.0% (37) | 0% |
+| Control-flow similarity | **0.561** | 0.538 | 0.522 | 0.509 | – |
+| Data-flow similarity | 0.470 | 0.478 | **0.519** | 0.374 | – |
+| Types: kind and size (parameters and results) | **72.6%** | 40.9% | 71.8% | 17.1% | – |
+| Types: exact | **45.8%** | 25.7% | 31.4% | 7.2% | – |
+| Number of parameters right | **93.7%** | 81.4% | 88.7% | 59.4% | – |
+| Return type right (kind and size) | **77.2%** | 56.1% | 67.6% | 15.4% | – |
+| Variables per source variable (median) | 2–4.3 | 1–2 | 1–3.5 | 2.5–6.4 | – |
+
+Per binary, behavioural equivalence: Relic 41 of 42 at -O0 and 39 at -O2, Ghidra 38 / 37, angr
+35 / 32, RetDec 21 / 16. What fails, by tool:
+
+- **Relic:** `powmod` everywhere (its 128-bit `%` is libgcc's `__umodti3`, a function Relic
+  doesn't recognise in a stripped binary: the pseudocode calls `sub_2140`); at -O2 `day_kind`
+  (gcc turned the switch into a table in the binary's read-only data, which the pseudocode
+  reads by address) and `bubble_sort` (gcc swaps two ints with SSE shuffles, which Relic lifts
+  wrongly).
+- **Ghidra:** the switch table read by address (`DAT_001030e0`), `powmod` (128-bit values as
+  `undefined1 auVar1[16]` with `._8_8_` members, not C, and the libgcc call), floating-point
+  constants read by address (`poly`), `atoi_simple` split off as a thunk, and `sat_add`'s
+  overflow test.
+- **angr:** signed division and remainder done on `unsigned long long` (`gcd`, `div_round`,
+  `calc`), `sat_add`, `atoi_simple`, `rect_area`, `mean`, the switch table, libgcc and an SSE
+  swap (`CONCAT`).
+- **RetDec:** no SSE floating point at all (`__asm_addsd`), globals for switch tables, and many
+  wrong answers in plain integer code (a byte read before a loop lost, a struct field dropped).
+
+What the numbers say about Relic:
+
+- It is the most often *right* (equivalence) and has the best types and parameter counts, and
+  the CFG closest to the source on the big programs.
+- Its **data flow** is further from the source than angr's: it keeps two to four times as many
+  variables as the source (a temporary for each value read more than once, separate stack
+  slots), where Ghidra stays near one.
+- **Types on Lua** (63% kind and size against angr's 76%): Relic types 176 pointer parameters
+  (`lua_State *`, `TValue *` ...) as `int64_t`, and returns a pointer as `int64_t` in 33
+  functions; this is the next thing to improve.
+
+### What the benchmark fixed in Relic
+
+Running this found real bugs in Relic's output, now fixed (with tests that compile and run the
+pseudocode, `tests/test_equiv.py`, and check parameters, `tests/test_params.py`):
+
+- `cqo; idiv` (signed 64-bit `/` and `%`) printed as a 128-bit division of an unsigned dividend,
+  wrong for negative values; now `a / b`.
+- Constants with the top bit set in signed comparisons printed as unsigned (`0xffffffff80000000`),
+  which turned the comparison unsigned; now `-0x80000000LL`. Unsigned operands of signed
+  operations are cast.
+- `int *` arithmetic added bytes as elements (`p + i + 8` for 8 bytes: an overrun), and a struct
+  pointer moved by its size printed `p += 8` (8 structs).
+- Rotates and add/subtract overflow flags printed as `__rol()` / `__sborrow()`; now plain C.
+- A struct field overlapping an earlier one was used by name but not declared (94 zstd
+  functions didn't compile).
+- A parameter after an unused one was lost (`lua_typename(L, t)` had none, reading `rsi`), and
+  registers moved into an internal callee's arguments didn't count: Lua parameter counts were
+  right for 62% of the functions, now 91%.
+
 ## Caveats
 
 - One run per measurement, in a shared container: treat timings as ±20%.
@@ -209,5 +307,9 @@ radare2 decompiled all of them, 0 valid C (below).
   reachable here.
 - gzip, grep and SQLite were meant to be in the corpus but their builds (`./configure`) weren't
   run in this environment.
-- Valid C says nothing about whether the pseudocode means the same as the binary; Relic's own
-  tests check that by recompiling and running its output.
+- Valid C says nothing about whether the pseudocode means the same as the binary; behavioural
+  equivalence does, but only on the 42 functions of `tools/bench/equiv.c`, x86-64.
+- Graph similarities compare structure, not meaning, and are capped by what the compiler did:
+  at -O2 inlining and loop transformations make no tool's output look like the source (0.4–0.65).
+- Registers a tool leaves in its output (`rsi`, Ghidra's `in_RSI`) count as undeclared names:
+  syntax validity doesn't catch them, parameter counts do.

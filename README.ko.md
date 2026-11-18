@@ -145,7 +145,12 @@ Ghidra, angr, RetDec, radare2, LIEF와 비교했습니다. 방법, 전체 수치
 
 ![의사코드가 올바른 C인 함수의 비율: brotli Relic 82%, RetDec 82%, Ghidra 69%, angr 49%; zstd Relic 92%, RetDec 83%, Ghidra 69%, angr 41%; lua Relic 98–99%, Ghidra 95–97%, RetDec 92–97%, angr 88–91%; radare2 0%](docs/benchmarks/decompiler-valid-c.svg)
 
-![함수당 디컴파일 시간: Ghidra 7–206ms, Relic 56–292ms, angr 198–2,452ms](docs/benchmarks/decompiler-time.svg)
+![함수당 디컴파일 시간: Ghidra 5–192ms, Relic 49–224ms, angr 151–2,007ms](docs/benchmarks/decompiler-time.svg)
+
+디컴파일 결과를 다시 컴파일해서도 평가했습니다. 원본과 같은 값을 계산하는지(함수마다 입력 40개로 원본과
+비교), 제어 흐름과 데이터 흐름이 소스와 얼마나 비슷한지, 자료형이 디버그 정보와 얼마나 맞는지입니다.
+
+![디컴파일 결과 품질: 문법 유효성 Relic 94%, RetDec 89%, Ghidra 84%, angr 70%; 동작 동치성 Relic 95%, Ghidra 89%, angr 80%, RetDec 44%; 제어 흐름 유사도 Relic 56%, Ghidra 54%, angr 52%, RetDec 51%; 데이터 흐름 유사도 angr 52%, Ghidra 48%, Relic 47%, RetDec 37%; 자료형(종류와 크기) Relic 73%, angr 72%, Ghidra 41%, RetDec 17%; 자료형(정확) Relic 46%, angr 31%, Ghidra 26%, RetDec 7%](docs/benchmarks/decompiler-quality.svg)
 
 ## CLI
 

@@ -156,7 +156,13 @@ AArch64, against Ghidra, angr, RetDec, radare2 and LIEF. Method, every number an
 
 ![Share of functions whose pseudocode is valid C: brotli Relic 82%, RetDec 82%, Ghidra 69%, angr 49%; zstd Relic 92%, RetDec 83%, Ghidra 69%, angr 41%; lua Relic 98–99%, Ghidra 95–97%, RetDec 92–97%, angr 88–91%; radare2 0%](docs/benchmarks/decompiler-valid-c.svg)
 
-![Decompiler time per function: Ghidra 7–206 ms, Relic 56–292 ms, angr 198–2,452 ms](docs/benchmarks/decompiler-time.svg)
+![Decompiler time per function: Ghidra 5–192 ms, Relic 49–224 ms, angr 151–2,007 ms](docs/benchmarks/decompiler-time.svg)
+
+The decompilers' output is also compiled again and scored: does it compute what the program
+computes (each function against the original on 40 inputs), how close are its control flow and
+data flow to the source's, how many types match the debug info.
+
+![Decompiler output quality: syntax validity Relic 94%, RetDec 89%, Ghidra 84%, angr 70%; behavioural equivalence Relic 95%, Ghidra 89%, angr 80%, RetDec 44%; control-flow similarity Relic 56%, Ghidra 54%, angr 52%, RetDec 51%; data-flow similarity angr 52%, Ghidra 48%, Relic 47%, RetDec 37%; types kind and size Relic 73%, angr 72%, Ghidra 41%, RetDec 17%; types exact Relic 46%, angr 31%, Ghidra 26%, RetDec 7%](docs/benchmarks/decompiler-quality.svg)
 
 ## CLI
 
