@@ -213,6 +213,9 @@ void *seccomp_init(unsigned int action);
 int seccomp_rule_add(void *ctx, unsigned int action, int syscall, unsigned int n, ...);
 void __assert_fail(const char *assertion, const char *file, unsigned int line, const char *function);
 int *__errno_location(void);
+const unsigned short **__ctype_b_loc(void);
+const int **__ctype_toupper_loc(void);
+const int **__ctype_tolower_loc(void);
 void __cxa_finalize(void *d);
 """
 

@@ -275,6 +275,8 @@ def main(argv=None) -> int:
     ap.add_argument("--ghidra", help="Ghidra's install directory (holds support/analyzeHeadless)")
     ap.add_argument("--retdec", help="the retdec-decompiler program")
     ap.add_argument("--json")
+    ap.add_argument("--save", help="directory to keep each tool's pseudocode in (DIR/NAME/TOOL.json), for "
+                                   "tools/decomp_quality.py")
     args = ap.parse_args(argv)
     tools = args.tools.split(",")
     results = {}
@@ -297,6 +299,11 @@ def main(argv=None) -> int:
             sizes = sizes_of(full)
             res["retdec"] = run_retdec(args.retdec, full + ".stripped", {a: sizes.get(a, 1) for a in funcs},
                                        args.timeout)
+        if args.save:
+            os.makedirs(os.path.join(args.save, name), exist_ok=True)
+            for tool, got in res.items():
+                with open(os.path.join(args.save, name, f"{tool}.json"), "w") as fp:
+                    json.dump({str(a): d for a, d in got.items()}, fp)
         both = [a for a in funcs if all(a in res[t] for t in res)]
         row = {"functions": len(both)}
         for tool, got in res.items():

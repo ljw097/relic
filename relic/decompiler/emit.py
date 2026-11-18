@@ -1483,8 +1483,14 @@ class CWriter:
                 return f"&{self.sbase(fa[0], fa[1])}->{self.fname(*fa[1:])}", PREC_UNARY
         if e.op[0] == "f" and (e.op in FARITH or e.op in FCMP):
             return self._fbinop(e)
-        if e.op not in BIN:                       # carry / sborrow ... : flag helpers
+        if e.op not in BIN:                       # carry / sborrow / rol ...
+            c = self._helper_c(e)
+            if c is not None:
+                return c, PREC_POSTFIX
             return f"__{e.op}({self.expr(e.a)}, {self.expr(e.b)})", PREC_POSTFIX
+        signed = self._signed_operands(e)
+        if signed is not None:
+            return signed
         if e.op in _NUMERIC_OPS:
             # operands of *, /, %, shifts and bit operations are numbers, never addresses
             a = Const(e.a.value, e.a.bits) if isinstance(e.a, Const) else e.a
@@ -1579,6 +1585,13 @@ class CWriter:
                 return self._SIZES.get(t.base, 0)
             if t is not None and t.ptr >= 2:           # a pointer to pointers
                 return self.ptr_bits // 8
+        if isinstance(e, BinOp) and e.op in ("+", "-") and e.bits == self.ptr_bits:
+            # pointer arithmetic is a pointer too: `a1 + i` an `int *` when the offset scaled to
+            # elements, a `char *` when it didn't (`(char *)a1 + 6`)
+            for p, off in ((e.a, e.b), (e.b, e.a)) if e.op == "+" else ((e.a, e.b),):
+                size = self._ptr_size(p)
+                if size:
+                    return size if self._scaled(p, off) is not None else 1
         return 0
 
     def _scaled(self, ptr: Expr, off: Expr) -> Expr | None:
@@ -1597,10 +1610,73 @@ class CWriter:
             return off.a if k == 0 else BinOp("<<", off.a, Const(k, off.b.bits), off.bits)
         return None
 
+    def _helper_c(self, e: BinOp) -> str | None:
+        """A rotate or an add / subtract flag in plain C: `x << k | x >> (64 - k)`, carry as
+        `(u)(a + b) < a`, signed overflow as the sign of `(a ^ b) & (a ^ (a - b))`."""
+        w = e.a.bits
+        if w not in (8, 16, 32, 64):
+            return None
+        u, sg = int_type(w, True), int_type(w)
+        x = f"({u}){self.expr(e.a, PREC_UNARY)}"
+        if e.op in ("rol", "ror"):
+            left, right = ("<<", ">>") if e.op == "rol" else (">>", "<<")
+            if isinstance(e.b, Const):
+                k = e.b.value % w
+                return f"({u}){self.expr(e.a, PREC_UNARY)}" if k == 0 else \
+                    f"({u})({x} {left} {k} | {x} {right} {w - k})"
+            n = self.expr(e.b, PREC_UNARY)
+            return f"({u})({x} {left} ({n} & {w - 1}) | {x} {right} (-{n} & {w - 1}))"
+        y = f"({u}){self.expr(e.b, PREC_UNARY)}"
+        if e.op == "carry":
+            return f"(({u})({x} + {y}) < {x})"
+        if e.op == "borrow":
+            return f"({x} < {y})"
+        if e.op == "scarry":
+            return f"(({sg})({u})(~({x} ^ {y}) & ({x} ^ ({u})({x} + {y}))) < 0)"
+        if e.op == "sborrow":
+            return f"(({sg})({u})(({x} ^ {y}) & ({x} ^ ({u})({x} - {y}))) < 0)"
+        return None
+
+    def _signed_operands(self, e: BinOp) -> tuple[str, int] | None:
+        """A signed operation (`/`, `%`, `>>`, `<`) with an operand C would take as unsigned: a
+        variable of an unsigned type (cast to the signed one) or a constant with its top bit set
+        (written negative: `0xffffffff80000000` is an unsigned long, and turns the comparison
+        unsigned)."""
+        if e.op not in ("/s", "%s", ">>s", "<s", "<=s"):
+            return None
+        a, b = e.a, e.b
+        shift = e.op == ">>s"
+        if not any(self._unsigned(x) or isinstance(x, Const) and x.value >> (x.bits - 1) and x.bits >= 8
+                   for x in ((a,) if shift else (a, b))):
+            return None
+        op, p = BIN[e.op]
+        if p == 10 and isinstance(a, Const) and not isinstance(b, Const):
+            a, b, op = b, a, FLIP[op]
+
+        def side(x: Expr, prec: int) -> str:
+            if isinstance(x, Const):
+                if x.value >> (x.bits - 1) and x.bits >= 8:
+                    if x.signed == -(1 << (x.bits - 1)):      # (no negative literal for INT_MIN)
+                        return f"({int_type(x.bits)}){number(x.value)}"
+                    # (a hex literal past INT_MAX is unsigned: `-0x80000000` is 2147483648)
+                    return "-" + number(-x.signed) + ("LL" if -x.signed > 0x7FFFFFFF else "")
+                return number(x.value)
+            if self._unsigned(x) and x.bits in (8, 16, 32, 64):
+                return f"({int_type(x.bits)}){self.expr(x, PREC_UNARY)}"
+            return self.expr(x, prec)
+        return f"{side(a, p)} {op} {side(b, p + 1) if not shift else self.expr(b, p + 1)}", p
+
     def _unsigned(self, e: Expr) -> bool:
         if isinstance(e, (Var, StackVar)):
             t = self.types.get(e.name)
             return t is not None and t.ptr == 0 and (t.base.startswith(("unsigned", "uint")) or t.base == "size_t")
+        if isinstance(e, BinOp) and e.bits >= 32 and not self._ptr_var(e):
+            # C's usual arithmetic conversions: an unsigned operand of int's width or more makes
+            # the result unsigned (narrower ones are promoted to int)
+            if e.op in ("/u", "%u", ">>u"):
+                return True
+            if e.op in ("+", "-", "*", "&", "|", "^"):
+                return any(x.bits == e.bits and self._unsigned(x) for x in (e.a, e.b))
         return isinstance(e, Cast) and e.kind == "zext"
 
     def _callee_name(self, c: ir.Call) -> str | None:
