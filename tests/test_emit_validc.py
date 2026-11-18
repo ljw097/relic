@@ -2,8 +2,9 @@
 
 Pointer arithmetic C only allows on integers (two pointers of different types subtracted, a
 pointer masked or shifted), a call through a local that isn't typed as a function pointer, a
-struct whose only field is an array. Each function's pseudocode alone must pass
-`gcc -fsyntax-only`; errors about what it uses without declaring (globals, callees) don't count.
+struct pointer kept in an integer array (`a1[3]->f_18`), a struct whose only field is an array.
+Each function's pseudocode alone must pass `gcc -fsyntax-only`; errors about what it uses without
+declaring (globals, callees) don't count.
 """
 import os
 import shutil
@@ -16,7 +17,7 @@ from relic.decompiler.emit import decompile
 
 SRC = os.path.join(os.path.dirname(__file__), "src", "ptrmath.c")
 PRELUDE = "#include <stdint.h>\n#include <stddef.h>\n#include <stdbool.h>\n"
-FUNCS = ("tget", "tset", "rdist", "ldist", "bucket", "misal", "run", "skip")
+FUNCS = ("tget", "tset", "rdist", "ldist", "bucket", "misal", "run", "skip", "setd", "posd")
 _OK = ("undeclared", "implicit declaration", "unknown type name", "incomplete type", "storage size")
 
 
@@ -49,3 +50,5 @@ def test_struct_with_only_an_array_is_c():
     t.fields[0] = Field(0, 64, name="f_0")
     t.fields[8] = Field(8, 32, name="f_8", array=True)
     assert t.declaration()[2] == "    int f_8[];"
+    t.fields[24] = Field(24, 64, name="f_18")      # an array of unknown length before another field
+    assert t.declaration()[2] == "    int f_8[4];"

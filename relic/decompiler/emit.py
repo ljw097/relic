@@ -382,7 +382,7 @@ class CWriter:
                 pos = (sp[1] - f.offset) * 8 + bit
                 for name, b, w in bfs:
                     if b == pos and w == width and pos + width <= (sp[1] - f.offset) * 8 + load.bits:
-                        return f"{self.expr(sp[0], PREC_POSTFIX)}->{name}"
+                        return f"{self.sbase(sp[0], st)}->{name}"
         return None
 
     def _unit_of(self, e: Expr) -> Load | None:
@@ -464,7 +464,7 @@ class CWriter:
             fm = ((1 << (hi - lo)) - 1) << lo
             if keep & fm != fm or const & fm or any(v[0] < hi and v[0] + v[1] > lo for v in values):
                 return None
-        ptr = self.expr(sp[0], PREC_POSTFIX)
+        ptr = self.sbase(sp[0], st)
         out = []
         for name, p, w in sorted(inside, key=lambda x: x[1]):
             fm = ((1 << w) - 1) << p
@@ -589,6 +589,15 @@ class CWriter:
         shown = self.an.struct_names.get(st.name, {}).get("name") or st.name
         self.shown_structs[shown] = st.name
         return shown
+
+    def sbase(self, base: Expr, st) -> str:
+        """The pointer `base` in `base->field` of struct `st`: a value read from memory that isn't a
+        field or global of that pointer type (an element of an integer array, `a1[3]`) is cast to it."""
+        text = self.expr(base, PREC_POSTFIX)
+        # (a global's element printed as a raw read, `*(int64_t *)(i * 8 + 0x4040)`: no type either)
+        if isinstance(base, Load) and (not self.structs.typed_as(base, st) or text.lstrip("(").startswith("*(")):
+            return f"((struct {self.sname(st)} *){self.expr(base, PREC_UNARY)})"
+        return text
 
     def ftype(self, st, f) -> str | None:
         """The user's type of a field; a struct it names is shown by its current name."""
@@ -1007,15 +1016,15 @@ class CWriter:
             return ivar
         fa = self.structs.field(addr, bits)
         if fa is not None and not self._bit_unit(*fa[1:]):
-            return f"{self.expr(fa[0], PREC_POSTFIX)}->{self.fname(*fa[1:])}"
+            return f"{self.sbase(fa[0], fa[1])}->{self.fname(*fa[1:])}"
         ar = self.structs.array_ref(addr, bits)
         if ar is not None and not self._has_ptr(_bare(ar[3])):
             base, st, f, idx = ar
-            return f"{self.expr(base, PREC_POSTFIX)}->{self.fname(st, f)}[{self.expr(_bare(idx))}]"
+            return f"{self.sbase(base, st)}->{self.fname(st, f)}[{self.expr(_bare(idx))}]"
         if self.an.bin.endian == "little":
             pa = self.structs.part_of_field(addr, bits)
             if pa is not None and not self._bit_unit(*pa[1:]):     # the low bytes of a wider field
-                return f"*({_mem_type(bits)} *)&{self.expr(pa[0], PREC_POSTFIX)}->{self.fname(*pa[1:])}"
+                return f"*({_mem_type(bits)} *)&{self.sbase(pa[0], pa[1])}->{self.fname(*pa[1:])}"
         idx = self._indexed(addr, size)
         if idx is not None and not self._has_ptr(idx[1]):   # (an index that is a pointer: not C)
             base, i = idx
@@ -1471,7 +1480,7 @@ class CWriter:
         if e.op == "+" and e.bits == self.ptr_bits:
             fa = self.structs.field_addr(e)
             if fa is not None and not self._bit_unit(*fa[1:]):     # the address of a field: `&p->f_8`
-                return f"&{self.expr(fa[0], PREC_POSTFIX)}->{self.fname(*fa[1:])}", PREC_UNARY
+                return f"&{self.sbase(fa[0], fa[1])}->{self.fname(*fa[1:])}", PREC_UNARY
         if e.op[0] == "f" and (e.op in FARITH or e.op in FCMP):
             return self._fbinop(e)
         if e.op not in BIN:                       # carry / sborrow ... : flag helpers

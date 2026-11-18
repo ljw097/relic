@@ -1,10 +1,10 @@
 """Draw the charts of docs/benchmarks.md (SVG, no dependencies) from the JSON the compare_*
 scripts write.
 
-    python tools/bench_charts.py --detect detect.json --decomp decomp.json [more.json ...]
+    python tools/bench_charts.py --detect detect.json [more.json ...] --decomp decomp.json [more.json ...]
                                  --out docs/benchmarks
 
-decomp files are merged per binary, so the tools can come from separate runs.
+Files of each kind are merged per binary, so the tools can come from separate runs.
 """
 from __future__ import annotations
 
@@ -14,7 +14,8 @@ import os
 from html import escape
 
 # one colour per tool, always the same one (validated categorical palette, fixed order)
-COLORS = {"Relic": "#2a78d6", "angr": "#eb6834", "radare2": "#1baf7a", "LIEF": "#eda100", "Ghidra": "#e87ba4",
+# (bars in the order the series dict gives; each chart's order is checked for colour-blind separation)
+COLORS = {"Relic": "#2a78d6", "angr": "#eb6834", "radare2": "#1baf7a", "LIEF": "#eda100", "Ghidra": "#6250d6",
           "RetDec": "#008300"}
 NAMES = {"relic": "Relic", "angr": "angr", "r2": "radare2", "lief": "LIEF", "ghidra": "Ghidra", "retdec": "RetDec"}
 SURFACE, INK, INK2, GRID = "#fcfcfb", "#0b0b0b", "#52514e", "#e4e3df"
@@ -71,15 +72,16 @@ def detection(detect: dict) -> tuple[str, str]:
         key = "AArch64 -O2" if "a64" in name else next(b for b, s in builds.items() if name.endswith("-" + s))
         rows[key].append(r)
     f1, secs = {}, {}
-    for tool in ("relic", "angr", "r2", "lief"):
+    tools = [t for t in ("relic", "angr", "r2", "lief", "ghidra") if any(t in r for r in detect.values())]
+    for tool in tools:
         t = NAMES[tool]
         f1[t], secs[t] = [], []
         for b in builds:
             ok = [r[tool] for r in rows[b] if "found" in r.get(tool, {})]
             found, corr = sum(x["found"] for x in ok), sum(x["correct"] for x in ok)
-            true = sum(r["functions"] for r in rows[b])
+            true = sum(r["functions"] for r in rows[b] if "found" in r.get(tool, {}))
             p, rc = (corr / found if found else 0), corr / true
-            f1[t].append(2 * p * rc / (p + rc) if p + rc else 0)
+            f1[t].append(2 * p * rc / (p + rc) if p + rc else None if not ok else 0)
             secs[t].append(sum(x["seconds"] for x in ok))
     n = sum(r["functions"] for r in detect.values())
     a = bars("Function detection (F1)", f"{len(detect)} stripped binaries, {n:,} functions; higher is better",
@@ -94,22 +96,24 @@ def detection(detect: dict) -> tuple[str, str]:
 def decompiler(decomp: dict) -> tuple[str, str]:
     groups = [("brotli-O2", "brotli -O2"), ("zstd-O2", "zstd -O2"), ("lua-O2", "lua -O2"),
               ("lua-a64-O2", "lua AArch64 -O2")]
-    tools = [t for t in ("relic", "ghidra", "angr", "retdec", "r2") if any(t in decomp.get(g, {}) for g, _ in groups)]
+    tools = [t for t in ("relic", "angr", "ghidra", "retdec", "r2") if any(t in decomp.get(g, {}) for g, _ in groups)]
     valid = {NAMES[t]: [100 * decomp[g][t]["valid_c"] / decomp[g]["functions"] if t in decomp.get(g, {}) else None
                         for g, _ in groups] for t in tools}
     ms = {NAMES[t]: [1000 * decomp[g][t]["seconds_total"] / max(decomp[g][t]["decompiled"], 1)
-                     if t in decomp.get(g, {}) else None for g, _ in groups] for t in tools if t != "r2"}
+                     if t in decomp.get(g, {}) else None for g, _ in groups]
+          for t in tools if t not in ("r2", "retdec")}
     a = bars("Decompiler output that is valid C", "share of functions whose pseudocode passes gcc -fsyntax-only; "
              "higher is better", [n for _, n in groups], valid, lambda v: f"{v:.0f}%", 100,
              "radare2's pdc prints pseudo-assembly, not C.")
     b = bars("Decompiler time per function", "average, not counting the analysis before it; lower is better",
-             [n for _, n in groups], ms, lambda v: f"{v:,.0f} ms", max(v for x in ms.values() for v in x if v))
+             [n for _, n in groups], ms, lambda v: f"{v:,.0f} ms", max(v for x in ms.values() for v in x if v),
+             "RetDec and radare2 aren't shown: they decompile in one run with their analysis, not per function.")
     return a, b
 
 
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser()
-    ap.add_argument("--detect", required=True)
+    ap.add_argument("--detect", nargs="+", required=True)
     ap.add_argument("--decomp", nargs="+", required=True)
     ap.add_argument("--out", required=True)
     args = ap.parse_args(argv)
@@ -120,7 +124,11 @@ def main(argv=None) -> int:
             merged = decomp.setdefault(name, {})
             merged.update({k: v for k, v in row.items() if k != "functions"})
             merged["functions"] = min(merged.get("functions", row["functions"]), row["functions"])
-    charts = dict(zip(("detection-f1", "detection-time"), detection(json.load(open(args.detect)))))
+    detect: dict = {}
+    for path in args.detect:
+        for name, row in json.load(open(path)).items():
+            detect.setdefault(name, {}).update(row)
+    charts = dict(zip(("detection-f1", "detection-time"), detection(detect)))
     charts.update(zip(("decompiler-valid-c", "decompiler-time"), decompiler(decomp)))
     for name, svg in charts.items():
         with open(os.path.join(args.out, f"{name}.svg"), "w") as fp:

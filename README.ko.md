@@ -136,16 +136,16 @@ ret2win 후보를 찾아 줍니다. IDA에는 기본으로 없는 기능이라 �
 ### 다른 오픈소스 도구와의 비교
 
 brotli, Lua, zstd(와 Relic의 테스트 프로그램)를 -O0/-O2, x86-64/AArch64로 빌드해 strip한 뒤
-angr, radare2, LIEF와 비교했습니다. 방법, 전체 수치와 한계는
+Ghidra, angr, RetDec, radare2, LIEF와 비교했습니다. 방법, 전체 수치와 한계는
 [docs/benchmarks.md](docs/benchmarks.md)에 있습니다(영어).
 
-![빌드별 함수 탐지 F1: Relic은 모든 빌드에서 0.96–0.99, angr 0.89–0.97, radare2 0.73–0.90, LIEF는 .eh_frame이 있으면 0.998, 없으면 0.018](docs/benchmarks/detection-f1.svg)
+![빌드별 함수 탐지 F1: Relic은 모든 빌드에서 0.96–0.99, angr 0.89–0.97, Ghidra는 -O0에서 0.98·-O2에서 0.73–0.79, radare2 0.73–0.90, LIEF는 .eh_frame이 있으면 0.998, 없으면 0.018](docs/benchmarks/detection-f1.svg)
 
-![함수 탐지 시간: Relic 빌드당 9–18초, angr 19–50초, radare2 5–19초](docs/benchmarks/detection-time.svg)
+![함수 탐지 시간: Relic 빌드당 9–18초, angr 19–50초, radare2 5–19초, Ghidra 43–257초](docs/benchmarks/detection-time.svg)
 
-![바이너리별로 의사코드가 올바른 C인 함수의 비율: Relic, angr, radare2](docs/benchmarks/decompiler-valid-c.svg)
+![의사코드가 올바른 C인 함수의 비율: brotli Relic 82%, RetDec 82%, Ghidra 69%, angr 49%; zstd Relic 92%, RetDec 83%, Ghidra 69%, angr 41%; lua Relic 98–99%, Ghidra 95–97%, RetDec 92–97%, angr 88–91%; radare2 0%](docs/benchmarks/decompiler-valid-c.svg)
 
-![함수당 디컴파일 시간: Relic 56–292ms, angr 198–2,452ms](docs/benchmarks/decompiler-time.svg)
+![함수당 디컴파일 시간: Ghidra 7–206ms, Relic 56–292ms, angr 198–2,452ms](docs/benchmarks/decompiler-time.svg)
 
 ## CLI
 
