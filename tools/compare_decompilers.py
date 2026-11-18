@@ -8,7 +8,8 @@ The functions are the ground truth of tools/compare_tools.py (the unstripped bui
 symbols in .text) that both tools found in the stripped copy, up to --limit per binary. "Valid
 C": the function's pseudocode alone passes `gcc -fsyntax-only` after a prelude of the integer
 types both tools use; errors about undeclared identifiers (globals and functions neither tool
-declares) and implicit declarations are not counted -- only what makes it not C.
+declares) and implicit declarations are not counted -- only what makes it not C (a member
+missing from a struct the tool declared itself counts).
 """
 from __future__ import annotations
 
@@ -87,9 +88,11 @@ typedef unsigned long qword; typedef long sqword; typedef long double float10; t
 """,
     "retdec": "#include <stdio.h>\n#include <stdlib.h>\n#include <unistd.h>\n",   # (what its output includes)
 }
+# (not "has no member named": a struct without a declaration is an incomplete type, so a missing
+# member is a struct the tool declared itself without it)
 _NOT_C = re.compile(r"error: (?!.*(undeclared|implicit declaration|unknown type name|storage size|"
                     r"invalid use of undefined type|dereferencing pointer to incomplete type|"
-                    r"has no member named|incomplete type))")
+                    r"incomplete type))")
 
 
 def run_r2(path: str, addrs: list[int], timeout: int) -> dict:
@@ -275,18 +278,26 @@ def main(argv=None) -> int:
     ap.add_argument("--ghidra", help="Ghidra's install directory (holds support/analyzeHeadless)")
     ap.add_argument("--retdec", help="the retdec-decompiler program")
     ap.add_argument("--json")
+    ap.add_argument("--from-saved", help="score the pseudocode --save kept in this directory instead of "
+                                         "running the tools")
     ap.add_argument("--save", help="directory to keep each tool's pseudocode in (DIR/NAME/TOOL.json), for "
                                    "tools/decomp_quality.py")
     args = ap.parse_args(argv)
-    tools = args.tools.split(",")
     results = {}
     for name in args.names:
+        tools = args.tools.split(",")
         full = os.path.join(args.corpus, name)
         lo, hi = text_range(full)
         funcs = sorted(truth(full))
         if args.limit:
             funcs = funcs[:args.limit]
         res = {}
+        if args.from_saved:
+            for tool in tools:
+                path = os.path.join(args.from_saved, name, f"{tool}.json")
+                if os.path.exists(path):
+                    res[tool] = {int(a): d for a, d in json.load(open(path)).items()}
+            tools = []                             # (nothing to run)
         if "relic" in tools:
             res["relic"] = run(RELIC, sys.executable, full + ".stripped", funcs, args.timeout)
         if "angr" in tools:

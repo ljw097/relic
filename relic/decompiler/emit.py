@@ -1575,6 +1575,14 @@ class CWriter:
             return t is not None and t.ptr >= 1 and (t.base.startswith("struct ") or t.base == "FILE")
         return False
 
+    def _struct_size(self, e: Expr) -> int:
+        """The size of the struct a struct-pointer variable points to (0: not known)."""
+        t = self.types.get(e.name) if isinstance(e, (Var, StackVar)) else None
+        if t is None or t.ptr != 1 or not t.base.startswith("struct ") or "structs" not in self.__dict__:
+            return 0
+        st = self.structs.find(t.base[7:].strip())
+        return st.size if st is not None else 0
+
     def _ptr_size(self, e: Expr) -> int:
         """Element size if `e` is a typed pointer variable (C scales arithmetic on it), else 0."""
         if isinstance(e, (Var, StackVar)):
@@ -1844,6 +1852,12 @@ class CWriter:
                     b = self._scaled(s.dst, b)
                     if b is None:
                         return f"{lhs} = {self.expr(src)};"
+                elif src.op in ("+", "-") and self._struct_ptr(s.dst):
+                    # a struct pointer moved by whole structs (`p++`), else by bytes
+                    size = self._struct_size(s.dst)
+                    if not (size and isinstance(b, Const) and b.value % size == 0):
+                        return f"{lhs} = {self.expr(src)};"
+                    b = Const(b.value // size, b.bits)
                 if src.op in ("+", "-") and isinstance(b, Const) and b.value == 1:
                     return f"{lhs}{src.op}{src.op};"
                 name = self._enum_text(s.dst, b) if src.op in ("&", "|", "^") else None

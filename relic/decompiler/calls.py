@@ -55,6 +55,7 @@ def _livein_arg_regs(an: "Analysis", arch: ArchInfo, target: int) -> list[str]:
     if cache is None:
         cache = an._livein_cache = {}
     if target not in cache:
+        cache[target] = []                  # (while it is worked out: a recursive call takes none)
         cache[target] = _compute_livein(an, arch, target)
     return cache[target]
 
@@ -273,6 +274,7 @@ def _compute_livein(an: "Analysis", arch: ArchInfo, target: int, prefix: bool = 
     phis: dict[Var, Phi] = {}
     used: set[Var] = set()
     passed: set[str] = set()        # argument registers handed on to a call as they came in
+    moved: set[str] = set()         # ... or moved into another argument register a callee takes
     # a function returning a float does not return the integer register: its `return` (which
     # reads that register until the float result is known) is no use of an argument register
     float_result = None
@@ -308,6 +310,17 @@ def _compute_livein(an: "Analysis", arch: ArchInfo, target: int, prefix: bool = 
                     keep = {r for r in place_args(arch, classes, argregs, variadic=True, fixed=sig.fmt + 1)
                             if r in argregs}
                 tops += [v for r, v in s.uses if r in keep]
+                moved |= {v.name for r, v in s.uses if r in keep and isinstance(v, Var) and v.version == 0
+                          and v.name != r}
+            elif prefix and isinstance(s.call.target, Const) and s.call.target.value != target:
+                # an internal callee: what it takes as parameters is read here too (a register
+                # moved into its argument register, or handed on as it came in)
+                callee = an.functions.get(s.call.target.value)
+                if callee is not None and not callee.is_import:
+                    keep = set(_livein_arg_regs(an, arch, callee.addr))
+                    tops += [v for r, v in s.uses if r in keep]
+                    moved |= {v.name for r, v in s.uses if r in keep and isinstance(v, Var) and v.version == 0
+                              and v.name != r}
         used |= {x for top in tops for x in walk(top) if isinstance(x, Var)}
     work = [v for v in used if v in phis]
     while work:
@@ -330,6 +343,7 @@ def _compute_livein(an: "Analysis", arch: ArchInfo, target: int, prefix: bool = 
         from .fpabi import fp_params
         gaps = len(fp_params(an, arch, target))
     regs = int_arg_regs(arch)
+    real = _real_reads(ssa, set(regs)) | moved
     for k, r in enumerate(regs):
         if r not in livein:
             if gaps:
@@ -338,9 +352,42 @@ def _compute_livein(an: "Analysis", arch: ArchInfo, target: int, prefix: bool = 
             if r in passed and any(x in livein for x in regs[k + 1:]):
                 params.append(r)        # (handed on to a call untouched, before one that is read)
                 continue
+            if any(x in real for x in regs[k + 1:]):
+                params.append(r)        # (an unused parameter before one the code reads: `f(L, t)`)
+                continue
             break
         params.append(r)
     return params
+
+
+def _real_reads(ssa, regs: set[str]) -> set[str]:
+    """Argument registers whose entry value the code computes with: not only handed on to a call
+    (its `uses` list every argument register), nor only the bits a partial write keeps (`mov dl,
+    al` merges al into rdx: `rdx & ~0xff | al`)."""
+    real: set[str] = set()
+
+    def visit(e, keep_only: bool):
+        if isinstance(e, Var):
+            if e.version == 0 and e.name in regs and not keep_only:
+                real.add(e.name)
+            return
+        if isinstance(e, BinOp) and e.op == "&" and any(isinstance(k, Const) and k.value & 0xFF == 0
+                                                         for k in (e.a, e.b)):
+            for c in (e.a, e.b):
+                visit(c, True)
+            return
+        for c in children(e):
+            visit(c, False)
+    for st in ssa.stmts():
+        if isinstance(st, CallStmt):
+            visit(st.call, False)
+            continue
+        if isinstance(st, Assign) and isinstance(st.src, Phi):
+            continue
+        for top in stmt_exprs(st):
+            visit(top, False)
+    return real
+
 
 
 def positional_order(arch: ArchInfo, ints: list[str], fps: list) -> list[int] | None:

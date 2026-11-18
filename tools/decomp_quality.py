@@ -623,7 +623,8 @@ def score(name: str, conf: dict, outputs: dict[str, dict], corpus: str, cache: s
     src = source_dumps(conf["sources"], cache) if conf.get("sources") else {}
     sigs = dwarf_signatures(conf["debug"]) if conf.get("debug") else {}
     orig_o = build_original(conf["equiv"], cache) if conf.get("equiv") else None
-    funcs = sorted(truth(full))
+    given = {int(a) for got in outputs.values() for a in got}      # (what the tools were asked for)
+    funcs = sorted(a for a in truth(full) if a in given)
     rows: dict[str, dict] = {}
     for tool, got in outputs.items():
         per = {}
