@@ -1025,6 +1025,9 @@ class CWriter:
             pa = self.structs.part_of_field(addr, bits)
             if pa is not None and not self._bit_unit(*pa[1:]):     # the low bytes of a wider field
                 return f"*({_mem_type(bits)} *)&{self.sbase(pa[0], pa[1])}->{self.fname(*pa[1:])}"
+        ct = self._const_table_ref(addr, bits)
+        if ct is not None:                      # a lookup table in read-only data (`CSWTCH`)
+            return ct
         idx = self._indexed(addr, size)
         if idx is not None and not self._has_ptr(idx[1]):   # (an index that is a pointer: not C)
             base, i = idx
@@ -1048,6 +1051,65 @@ class CWriter:
     def _float_of(base: str, bits: int) -> bool:
         return base == "double" and bits == 64 or base == "float" and bits == 32 or \
             base == "long double" and bits == 80
+
+    @staticmethod
+    def _split_index(addr: Expr, size: int) -> tuple[int, Expr] | None:
+        """(constant base, index) for `base + i*size` / `base + (i << k)`."""
+        if not (isinstance(addr, BinOp) and addr.op == "+"):
+            return None
+        for base, off in ((addr.a, addr.b), (addr.b, addr.a)):
+            if not isinstance(base, Const):
+                continue
+            if isinstance(off, BinOp) and off.op == "*" and isinstance(off.b, Const) and off.b.value == size:
+                return base.value, off.a
+            if isinstance(off, BinOp) and off.op == "<<" and isinstance(off.b, Const) and 1 << off.b.value == size:
+                return base.value, off.a
+            if size == 1 and not isinstance(off, Const):
+                return base.value, off
+        return None
+
+    def const_tables(self) -> dict[int, tuple[int, int]]:
+        """Lookup tables in read-only data the function indexes with a bounded index -- gcc turns
+        `switch (d) { case 0: return 2; ... }` into one (`CSWTCH.49[d]`) -- as table address ->
+        (element bits, count): the pseudocode declares them with their contents, so it does not
+        read the binary's memory. The count comes from the bounds check (`if (d <= 6)`);
+        elements of 1, 2 or 4 bytes (wider ones are often pointers or doubles), no symbol there."""
+        got = self.__dict__.get("_ctables")
+        if got is not None:
+            return got
+        got = self._ctables = {}
+        b = self.an.bin
+        bounds: dict[Expr, int] = {}
+        loads = []
+        for st in self.p.fn.stmts():
+            for top in ir.stmt_exprs(st):
+                for x in ir.walk(top):
+                    if isinstance(x, BinOp) and x.op in ("<u", "<=u"):
+                        if isinstance(x.b, Const):
+                            bounds[_bare(x.a)] = x.b.value + (x.op == "<=u")
+                        elif isinstance(x.a, Const):          # `6 <u d`: d past the table
+                            bounds[_bare(x.b)] = x.a.value + (x.op == "<u")
+                    elif isinstance(x, Load) and x.bits in (8, 16, 32):
+                        loads.append(x)
+        for x in loads:
+            sp = self._split_index(x.addr, x.bits // 8)
+            if sp is None:
+                continue
+            base, idx = sp
+            n = bounds.get(_bare(idx))
+            sec = b.section_at(base)
+            if not n or not 1 <= n <= 1024 or sec is None or sec.w or sec.x or not sec.loaded or \
+                    base + n * x.bits // 8 > sec.end or self.symbol(base) or self.string(base) is not None:
+                continue
+            if got.get(base, (x.bits, 0))[0] == x.bits:
+                got[base] = (x.bits, max(n, got.get(base, (0, 0))[1]))
+        return got
+
+    def _const_table_ref(self, addr: Expr, bits: int) -> str | None:
+        sp = self._split_index(addr, bits // 8)
+        if sp is None or self.const_tables().get(sp[0], (None,))[0] != bits:
+            return None
+        return f"tbl_{sp[0]:x}[{self.expr(_bare(sp[1]))}]"
 
     def _indexed(self, addr: Expr, size: int):
         """(base text, index) for `base + i*size` where base is a symbol or a matching pointer."""
@@ -2112,6 +2174,12 @@ class CWriter:
     def declarations(self, depth: int):
         for note in self.notes:
             self.emit(note, None, depth)
+        for base, (bits, n) in sorted(self.const_tables().items()):
+            vals = [self.an.bin.read_int(base + k * bits // 8, bits // 8, signed=True) for k in range(n)]
+            if None in vals:
+                continue
+            self.emit(f"static const {int_type(bits)} tbl_{base:x}[{n}] = {{ {', '.join(map(str, vals))} }};",
+                      None, depth)
         frame = self.p.frame
         used = {x.name for s in self.p.fn.stmts() for top in ir.stmt_exprs(s) for x in ir.walk(top)
                 if isinstance(x, (StackVar, StackAddr))}

@@ -4,8 +4,8 @@ the same 40 inputs, returns the same values and leaves the same memory (tools/de
 the benchmark in docs/benchmarks.md).
 
 Not yet: `powmod` (its 128-bit `%` is libgcc's `__umodti3`, not recognised in a stripped
-binary), and at -O2 `day_kind` (a lookup table in the original's read-only data) and
-`bubble_sort` (two ints swapped with SSE shuffles).
+binary), and at -O2 `bubble_sort` (two ints swapped with SSE shuffles). (`day_kind` at -O2 reads
+a lookup table gcc made of the switch: the pseudocode declares it with its contents.)
 """
 import os
 import shutil
@@ -20,7 +20,7 @@ import decomp_quality as q  # noqa: E402
 from relic.analysis import analyze  # noqa: E402
 from relic.decompiler.emit import decompile  # noqa: E402
 
-NOT_YET = {"-O0": {"powmod"}, "-O2": {"powmod", "day_kind", "bubble_sort"}}
+NOT_YET = {"-O0": {"powmod"}, "-O2": {"powmod", "bubble_sort"}}
 
 
 @pytest.mark.skipif(shutil.which("gcc") is None or os.uname().machine != "x86_64", reason="needs gcc on x86-64")
