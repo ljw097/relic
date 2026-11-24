@@ -432,7 +432,10 @@ def fp_params(an: "Analysis", arch: ArchInfo, target: int) -> list[tuple[str, in
     c = _cache(an, "params")
     if target in c:
         return c[target]
-    from .calls import _entry_ssa
+    from .calls import _entry_ssa, variadic_fixed
+    if variadic_fixed(an, arch, target) is not None:
+        c[target] = []                      # (va_start saves xmm0-7: no float parameters)
+        return c[target]
     ssa = _entry_ssa(an, arch, target)
     out: list[tuple[str, int]] = []
     if ssa is not None:

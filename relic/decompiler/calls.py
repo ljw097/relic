@@ -9,13 +9,15 @@ of register assignments.
 """
 from __future__ import annotations
 
+import re
+
 from typing import TYPE_CHECKING
 
 from .arch import ArchInfo
-from .ir import (Assign, BinOp, Call, CallStmt, Cast, Const, Reg, Expr, Extract, IRFunction, Phi, Return, Var, children,
-                 stmt_exprs, walk)
+from .ir import (Assign, BinOp, Call, CallStmt, Cast, Const, Reg, Expr, Extract, IRFunction, Load, Phi, Return, Store,
+                 Var, children, stmt_exprs, walk)
 from .fpabi import arg_classes, float_int_params, fp_params, fp_part, fp_sig, is_fp_arch, is_fp_reg, place_args
-from .sigs import arg_count, lookup
+from .sigs import arg_count, arg_type, lookup
 
 if TYPE_CHECKING:
     from ..analysis import Analysis
@@ -49,6 +51,48 @@ def _read_format(an: "Analysis", value) -> str | None:
     return s if s else None
 
 
+def variadic_fixed(an: "Analysis", arch: ArchInfo, target: int) -> int | None:
+    """How many integer parameters a variadic function has before its `...`, from gcc's x86-64
+    prologue for `va_start`: the argument registers past the fixed ones stored side by side
+    (`mov [rsp+0x30], rdx` ... `mov [rsp+0x48], r9`), then `test al, al; je` around the xmm
+    stores. None when the function isn't one (or not on x86-64 System V)."""
+    if arch.name != "x64-sysv":
+        return None
+    cache = an.__dict__.setdefault("_variadic_cache", {})
+    if target in cache:
+        return cache[target]
+    cache[target] = None
+    f = an.functions.get(target)
+    if f is None or f.is_import:
+        return None
+    insns = sorted(f.insns() if callable(f.insns) else f.insns, key=lambda i: i.addr)[:48]
+    regs = ["rdi", "rsi", "rdx", "rcx", "r8", "r9"]
+    stores: dict[str, int] = {}
+    consts: set[int] = set()                # dwords stored: va_list's gp_offset is 8 * fixed
+    xmm_saves = False
+    for k, i in enumerate(insns):
+        m = re.fullmatch(r"qword ptr \[r[sb]p(?: ([+-]) (0x[0-9a-f]+|\d+))?\], (\w+)", i.op_str)
+        if i.mnemonic == "mov" and m and m.group(3) in regs and m.group(3) not in stores:
+            off = int(m.group(2), 0) * (-1 if m.group(1) == "-" else 1) if m.group(2) else 0
+            stores[m.group(3)] = off
+        m = re.fullmatch(r"dword ptr \[r[sb]p(?: [+-] (?:0x[0-9a-f]+|\d+))?\], (0x[0-9a-f]+|\d+)", i.op_str)
+        if i.mnemonic == "mov" and m:
+            consts.add(int(m.group(1), 0))
+        if i.mnemonic == "test" and i.op_str == "al, al" and k + 2 < len(insns) and \
+                insns[k + 1].mnemonic == "je" and insns[k + 2].mnemonic == "movaps" and \
+                insns[k + 2].op_str.endswith("xmm0"):
+            xmm_saves = True
+    # the run of saved argument registers: side by side, ending with r9
+    run = 0
+    while run < 6 and regs[5 - run] in stores and \
+            (run == 0 or stores[regs[5 - run]] == stores[regs[6 - run]] - 8):
+        run += 1
+    fixed = 6 - run
+    if run and (xmm_saves or 8 * fixed in consts and run >= 2) or run == 0 and xmm_saves:
+        cache[target] = fixed
+    return cache[target]
+
+
 def _livein_arg_regs(an: "Analysis", arch: ArchInfo, target: int) -> list[str]:
     """Argument registers an internal callee reads on entry (its parameters, heuristically)."""
     cache = getattr(an, "_livein_cache", None)
@@ -77,6 +121,80 @@ def _entry_ssa(an: "Analysis", arch: ArchInfo, target: int):
             except Exception:  # noqa: BLE001 - no summary for a function that does not lift
                 ssa = None
         cache[target] = ssa
+    return cache[target]
+
+
+def pointer_params(an: "Analysis", arch: ArchInfo, target: int) -> dict[int, str]:
+    """Integer parameters (by position) the function treats as pointers -- the base of a memory
+    access (`void *`), an argument a library function takes as a pointer (its type: `char *`),
+    or one passed on where a callee takes a pointer -- so callers can type what they pass even
+    when the callee never dereferences it itself (`lua_pushstring(L, s)` hands s to luaS_new)."""
+    cache = an.__dict__.setdefault("_pointer_params_cache", {})
+    if target in cache:
+        return cache[target]
+    cache[target] = {}                      # (while it is worked out: recursion sees none)
+    ssa = _entry_opt(an, arch, target)
+    regs = list(int_arg_regs(arch))
+    out: dict[str, str] = {}
+    if ssa is None or not regs:
+        return cache[target]
+
+    # -O0: a parameter spilled to its stack slot and read back from there is still the parameter
+    spills: dict[str, str | None] = {}
+    for st in ssa.stmts():
+        if isinstance(st, Store):
+            src = st.src
+            reg = src.name if isinstance(src, Var) and src.version == 0 and src.name in regs and \
+                src.bits == arch.bits else None
+            key = str(st.dst)
+            spills[key] = reg if key not in spills or spills[key] == reg else None
+
+    defs = {st.dst: st.src for st in ssa.stmts() if isinstance(st, Assign) and not isinstance(st.src, Phi)}
+
+    def entry(e, depth: int = 0) -> str | None:
+        if isinstance(e, Var) and e.version and e in defs and depth < 3:
+            return entry(defs[e], depth + 1)       # (a copy of it, or what was loaded into it)
+        if isinstance(e, Load) and e.bits == arch.bits:
+            return spills.get(str(e.addr))
+        return e.name if isinstance(e, Var) and e.version == 0 and e.name in regs and e.bits == arch.bits else None
+
+    def note(r: str | None, t: str):
+        if r is not None and (r not in out or out[r] == "void *"):
+            out[r] = t
+
+    def base(a):
+        """The register a memory address is based on: `r`, `r + k`, `r + i * s`."""
+        if entry(a):
+            return entry(a)
+        if isinstance(a, BinOp) and a.op in ("+", "-"):
+            sides = [x for x in (a.a, a.b) if not isinstance(x, Const) and
+                     not (isinstance(x, BinOp) and x.op in ("*", "<<"))]
+            if len(sides) == 1:
+                return base(sides[0])
+        return None
+    for st in ssa.stmts():
+        for top in ([st.call] if isinstance(st, CallStmt) else stmt_exprs(st)):
+            for x in walk(top):
+                if isinstance(x, Load):
+                    note(base(x.addr), "void *")
+        if isinstance(st, Store):
+            note(base(st.dst), "void *")
+        if not isinstance(st, CallStmt):
+            continue
+        uses = dict(st.uses)
+        sig = lookup(st.name or (an.name(st.call.target.value) if isinstance(st.call.target, Const) else None), an)
+        if sig is not None:
+            for k, r in enumerate(regs):
+                t = arg_type(sig, k)
+                if t and t.endswith("*"):
+                    note(entry(uses.get(r)), t)
+        elif isinstance(st.call.target, Const) and st.call.target.value != target:
+            callee = an.functions.get(st.call.target.value)
+            if callee is not None and not callee.is_import and not fp_params(an, arch, callee.addr):
+                for k, t in pointer_params(an, arch, callee.addr).items():
+                    if k < len(regs):
+                        note(entry(uses.get(regs[k])), t)
+    cache[target] = {k: out[r] for k, r in enumerate(regs) if r in out}
     return cache[target]
 
 
@@ -264,6 +382,10 @@ def optimized_ssa(an: "Analysis", arch: ArchInfo, target: int):
 
 
 def _compute_livein(an: "Analysis", arch: ArchInfo, target: int, prefix: bool = True):
+    fixed = variadic_fixed(an, arch, target)
+    if fixed is not None:                   # `f(a, fmt, ...)`: the fixed ones (va_start saves the rest)
+        regs = list(int_arg_regs(arch)[:fixed])
+        return regs if prefix else set(regs)
     ssa = _entry_opt(an, arch, target)
     if ssa is None:
         return [] if prefix else set()
@@ -927,6 +1049,13 @@ def recover_calls(fn: IRFunction, an: "Analysis", arch: ArchInfo) -> IRFunction:
                             selected = more
             elif f is not None and not f.is_import:
                 selected = _livein_arg_regs(an, arch, tgt)
+                if variadic_fixed(an, arch, tgt) is not None:
+                    # an internal variadic function: the fixed arguments, then what was set for it
+                    if own is None:
+                        own = _livein_arg_regs(an, arch, fn.addr)
+                    more = _set_before_call(fn, argregs, uses, own)
+                    if len(more) > len(selected) and more[:len(selected)] == selected:
+                        selected = more
                 if indirect_result(an, arch, tgt):
                     selected = ["x8"] + selected        # (where the struct result goes: first)
                 fps = fp_params(an, arch, tgt)

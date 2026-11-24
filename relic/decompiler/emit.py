@@ -172,7 +172,7 @@ class CWriter:
         # pointer type recovered from how memory is accessed says more and is kept
         lib_structs: dict[str, str] = {}
         for name, t in library_types(prep.fn, self.ptr_bits, prep.arch.ret, self._callee_name,
-                                     lambda a: an.bin.read_cstring(a, 512), an).items():
+                                     lambda a: an.bin.read_cstring(a, 512), an, prep.arch).items():
             cur = self.types.get(name)
             if cur is not None and cur.ptr == 0:
                 self.types[name] = t
@@ -2062,6 +2062,9 @@ class CWriter:
                 ret = int_type(self.p.ret_bits)
             else:
                 ret = self._ret_type(vals[0]) if vals else "int"
+        from .calls import variadic_fixed
+        if variadic_fixed(self.an, self.p.arch, fn.addr) is not None:
+            params.append("...")
         return f"{ret}{'' if ret.endswith('*') else ' '}{name}({', '.join(params) or 'void'})"
 
     def _as_declared(self, spelled: str | None, t: CType, name: str) -> str:
