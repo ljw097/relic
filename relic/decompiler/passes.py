@@ -278,6 +278,11 @@ def _widened_pair(a: Expr, b: Expr) -> Expr | None:
         return b
     if isinstance(hi, BinOp) and hi.op == ">>s" and isinstance(hi.b, Const) and hi.b.value == w - 1 and hi.a == x:
         return Cast("sext", x, 2 * w)
+    # a value put back together from its own halves (a 128-bit product passed on in rdi:rsi)
+    if isinstance(x, Cast) and x.kind == "low" and x.a.bits == 2 * w and isinstance(hi, Cast) and \
+            hi.kind == "low" and isinstance(hi.a, BinOp) and hi.a.op == ">>u" and \
+            isinstance(hi.a.b, Const) and hi.a.b.value == w and hi.a.a == x.a:
+        return x.a
     return None
 
 

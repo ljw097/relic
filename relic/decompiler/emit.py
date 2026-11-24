@@ -1387,7 +1387,7 @@ class CWriter:
             if e.a.bits == 1:                     # bool widened to an int: C does this already
                 return self._expr(e.a)
             t = int_type(e.bits, e.kind == "zext")
-            if e.kind == "zext" and e.a.bits in (8, 16, 32) and e.a.bits < e.bits and not self._unsigned(e.a) \
+            if e.kind == "zext" and e.a.bits in (8, 16, 32, 64) and e.a.bits < e.bits and not self._unsigned(e.a) \
                     and not isinstance(e.a, Const):
                 # C widens a signed value with its sign: zero-extend through the unsigned type
                 inner = e.a.a if isinstance(e.a, Cast) and e.a.kind == "low" else e.a

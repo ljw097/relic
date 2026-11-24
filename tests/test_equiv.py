@@ -44,3 +44,18 @@ def test_pseudocode_behaves_like_the_program(tmp_path, opt):
         if not ok:
             failed[name] = f"{why}\n{text}"
     assert not failed, "\n\n".join(f"{n}: {w}" for n, w in failed.items())
+
+
+@pytest.mark.skipif(shutil.which("gcc") is None or os.uname().machine != "x86_64", reason="needs gcc on x86-64")
+@pytest.mark.parametrize("opt", ["-O0", "-O2"])
+def test_libgcc_128_bit_helpers_are_operators(tmp_path, opt):
+    """`__umodti3` & co. (named by the symbol table here, by library signatures in a stripped
+    binary) are the `%` they implement: powmod's `(unsigned __int128)r * b % m` computes right."""
+    src = os.path.join(q.HERE, "bench", "equiv.c")
+    exe = tmp_path / "equiv"
+    subprocess.run(["gcc", opt, "-fno-stack-protector", "-w", "-o", str(exe), src], check=True)
+    an = analyze(str(exe))
+    text = decompile(an, an.function_by_name("powmod")).text
+    assert "__umodti3" not in text and "%" in text, text
+    ok, why = q.equivalent(text, "relic", "powmod", q.build_original(opt, str(tmp_path)), str(tmp_path))
+    assert ok, f"{why}\n{text}"
