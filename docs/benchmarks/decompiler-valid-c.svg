@@ -18,8 +18,8 @@
 <line x1="555.0" y1="86" x2="555.0" y2="482" stroke="#e4e3df" stroke-width="1"/>
 <line x1="690.0" y1="86" x2="690.0" y2="482" stroke="#e4e3df" stroke-width="1"/>
 <text x="140" y="135.0" font-size="12.5" text-anchor="end" fill="#0b0b0b">brotli -O2</text>
-<rect x="150" y="92" width="444.6" height="14" rx="3" fill="#2a78d6"><title>Relic, brotli -O2: 82%</title></rect>
-<text x="599.6" y="103" font-size="11" fill="#52514e">82%</text>
+<rect x="150" y="92" width="440.2" height="14" rx="3" fill="#2a78d6"><title>Relic, brotli -O2: 82%</title></rect>
+<text x="595.2" y="103" font-size="11" fill="#52514e">82%</text>
 <rect x="150" y="108" width="262.4" height="14" rx="3" fill="#eb6834"><title>angr, brotli -O2: 49%</title></rect>
 <text x="417.4" y="119" font-size="11" fill="#52514e">49%</text>
 <rect x="150" y="124" width="373.0" height="14" rx="3" fill="#6250d6"><title>Ghidra, brotli -O2: 69%</title></rect>
@@ -29,8 +29,8 @@
 <rect x="150" y="156" width="2.0" height="14" rx="3" fill="#1baf7a"><title>radare2, brotli -O2: 0%</title></rect>
 <text x="157.0" y="167" font-size="11" fill="#52514e">0%</text>
 <text x="140" y="231.0" font-size="12.5" text-anchor="end" fill="#0b0b0b">zstd -O2</text>
-<rect x="150" y="188" width="495.0" height="14" rx="3" fill="#2a78d6"><title>Relic, zstd -O2: 92%</title></rect>
-<text x="650.0" y="199" font-size="11" fill="#52514e">92%</text>
+<rect x="150" y="188" width="511.2" height="14" rx="3" fill="#2a78d6"><title>Relic, zstd -O2: 95%</title></rect>
+<text x="666.2" y="199" font-size="11" fill="#52514e">95%</text>
 <rect x="150" y="204" width="219.6" height="14" rx="3" fill="#eb6834"><title>angr, zstd -O2: 41%</title></rect>
 <text x="374.6" y="215" font-size="11" fill="#52514e">41%</text>
 <rect x="150" y="220" width="372.6" height="14" rx="3" fill="#6250d6"><title>Ghidra, zstd -O2: 69%</title></rect>

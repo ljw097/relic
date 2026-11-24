@@ -397,7 +397,7 @@ _INT_WIDTHS = {"char": 8, "short": 16, "int": 32, "long long": 64, "int8_t": 8, 
 
 
 def library_types(fn: IRFunction, ptr_bits: int, ret_reg: str, callee=lambda call: None,
-                  cstring=lambda addr: None, an=None) -> dict[str, CType]:
+                  cstring=lambda addr: None, an=None, arch=None) -> dict[str, CType]:
     """Types variables get from the library calls they meet: an argument of `strlen` is a
     `char *`, of `malloc` a `size_t`, the result of `fopen` a `FILE *` (sigs.SIGS), what a
     constant format string's `%s` consumes a `char *`. Only plain variables of the type's width
@@ -433,7 +433,17 @@ def library_types(fn: IRFunction, ptr_bits: int, ret_reg: str, callee=lambda cal
         wanted = an.var_types.get(c.target.value) or {}
         params = [wanted.get(f"a{k + 1}") for k in range(len(c.args))]
         if not any(params) and "@return" not in wanted:
-            return None
+            # no types from the user: the pointers the callee's own code shows (calls.pointer_params)
+            if arch is None:
+                return None
+            from .calls import pointer_params
+            from .fpabi import fp_params
+            if fp_params(an, arch, c.target.value):
+                return None                     # (float parameters: positions are not registers)
+            hints = pointer_params(an, arch, c.target.value)
+            params = [hints.get(k) for k in range(len(c.args))]
+            if not any(params):
+                return None
         for t in [*params, wanted.get("@return")]:
             if t and t not in widths:
                 try:

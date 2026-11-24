@@ -172,7 +172,7 @@ class CWriter:
         # pointer type recovered from how memory is accessed says more and is kept
         lib_structs: dict[str, str] = {}
         for name, t in library_types(prep.fn, self.ptr_bits, prep.arch.ret, self._callee_name,
-                                     lambda a: an.bin.read_cstring(a, 512), an).items():
+                                     lambda a: an.bin.read_cstring(a, 512), an, prep.arch).items():
             cur = self.types.get(name)
             if cur is not None and cur.ptr == 0:
                 self.types[name] = t
@@ -1025,6 +1025,9 @@ class CWriter:
             pa = self.structs.part_of_field(addr, bits)
             if pa is not None and not self._bit_unit(*pa[1:]):     # the low bytes of a wider field
                 return f"*({_mem_type(bits)} *)&{self.sbase(pa[0], pa[1])}->{self.fname(*pa[1:])}"
+        ct = self._const_table_ref(addr, bits)
+        if ct is not None:                      # a lookup table in read-only data (`CSWTCH`)
+            return ct
         idx = self._indexed(addr, size)
         if idx is not None and not self._has_ptr(idx[1]):   # (an index that is a pointer: not C)
             base, i = idx
@@ -1048,6 +1051,65 @@ class CWriter:
     def _float_of(base: str, bits: int) -> bool:
         return base == "double" and bits == 64 or base == "float" and bits == 32 or \
             base == "long double" and bits == 80
+
+    @staticmethod
+    def _split_index(addr: Expr, size: int) -> tuple[int, Expr] | None:
+        """(constant base, index) for `base + i*size` / `base + (i << k)`."""
+        if not (isinstance(addr, BinOp) and addr.op == "+"):
+            return None
+        for base, off in ((addr.a, addr.b), (addr.b, addr.a)):
+            if not isinstance(base, Const):
+                continue
+            if isinstance(off, BinOp) and off.op == "*" and isinstance(off.b, Const) and off.b.value == size:
+                return base.value, off.a
+            if isinstance(off, BinOp) and off.op == "<<" and isinstance(off.b, Const) and 1 << off.b.value == size:
+                return base.value, off.a
+            if size == 1 and not isinstance(off, Const):
+                return base.value, off
+        return None
+
+    def const_tables(self) -> dict[int, tuple[int, int]]:
+        """Lookup tables in read-only data the function indexes with a bounded index -- gcc turns
+        `switch (d) { case 0: return 2; ... }` into one (`CSWTCH.49[d]`) -- as table address ->
+        (element bits, count): the pseudocode declares them with their contents, so it does not
+        read the binary's memory. The count comes from the bounds check (`if (d <= 6)`);
+        elements of 1, 2 or 4 bytes (wider ones are often pointers or doubles), no symbol there."""
+        got = self.__dict__.get("_ctables")
+        if got is not None:
+            return got
+        got = self._ctables = {}
+        b = self.an.bin
+        bounds: dict[Expr, int] = {}
+        loads = []
+        for st in self.p.fn.stmts():
+            for top in ir.stmt_exprs(st):
+                for x in ir.walk(top):
+                    if isinstance(x, BinOp) and x.op in ("<u", "<=u"):
+                        if isinstance(x.b, Const):
+                            bounds[_bare(x.a)] = x.b.value + (x.op == "<=u")
+                        elif isinstance(x.a, Const):          # `6 <u d`: d past the table
+                            bounds[_bare(x.b)] = x.a.value + (x.op == "<u")
+                    elif isinstance(x, Load) and x.bits in (8, 16, 32):
+                        loads.append(x)
+        for x in loads:
+            sp = self._split_index(x.addr, x.bits // 8)
+            if sp is None:
+                continue
+            base, idx = sp
+            n = bounds.get(_bare(idx))
+            sec = b.section_at(base)
+            if not n or not 1 <= n <= 1024 or sec is None or sec.w or sec.x or not sec.loaded or \
+                    base + n * x.bits // 8 > sec.end or self.symbol(base) or self.string(base) is not None:
+                continue
+            if got.get(base, (x.bits, 0))[0] == x.bits:
+                got[base] = (x.bits, max(n, got.get(base, (0, 0))[1]))
+        return got
+
+    def _const_table_ref(self, addr: Expr, bits: int) -> str | None:
+        sp = self._split_index(addr, bits // 8)
+        if sp is None or self.const_tables().get(sp[0], (None,))[0] != bits:
+            return None
+        return f"tbl_{sp[0]:x}[{self.expr(_bare(sp[1]))}]"
 
     def _indexed(self, addr: Expr, size: int):
         """(base text, index) for `base + i*size` where base is a symbol or a matching pointer."""
@@ -1325,7 +1387,7 @@ class CWriter:
             if e.a.bits == 1:                     # bool widened to an int: C does this already
                 return self._expr(e.a)
             t = int_type(e.bits, e.kind == "zext")
-            if e.kind == "zext" and e.a.bits in (8, 16, 32) and e.a.bits < e.bits and not self._unsigned(e.a) \
+            if e.kind == "zext" and e.a.bits in (8, 16, 32, 64) and e.a.bits < e.bits and not self._unsigned(e.a) \
                     and not isinstance(e.a, Const):
                 # C widens a signed value with its sign: zero-extend through the unsigned type
                 inner = e.a.a if isinstance(e.a, Cast) and e.a.kind == "low" else e.a
@@ -1483,8 +1545,14 @@ class CWriter:
                 return f"&{self.sbase(fa[0], fa[1])}->{self.fname(*fa[1:])}", PREC_UNARY
         if e.op[0] == "f" and (e.op in FARITH or e.op in FCMP):
             return self._fbinop(e)
-        if e.op not in BIN:                       # carry / sborrow ... : flag helpers
+        if e.op not in BIN:                       # carry / sborrow / rol ...
+            c = self._helper_c(e)
+            if c is not None:
+                return c, PREC_POSTFIX
             return f"__{e.op}({self.expr(e.a)}, {self.expr(e.b)})", PREC_POSTFIX
+        signed = self._signed_operands(e)
+        if signed is not None:
+            return signed
         if e.op in _NUMERIC_OPS:
             # operands of *, /, %, shifts and bit operations are numbers, never addresses
             a = Const(e.a.value, e.a.bits) if isinstance(e.a, Const) else e.a
@@ -1569,6 +1637,14 @@ class CWriter:
             return t is not None and t.ptr >= 1 and (t.base.startswith("struct ") or t.base == "FILE")
         return False
 
+    def _struct_size(self, e: Expr) -> int:
+        """The size of the struct a struct-pointer variable points to (0: not known)."""
+        t = self.types.get(e.name) if isinstance(e, (Var, StackVar)) else None
+        if t is None or t.ptr != 1 or not t.base.startswith("struct ") or "structs" not in self.__dict__:
+            return 0
+        st = self.structs.find(t.base[7:].strip())
+        return st.size if st is not None else 0
+
     def _ptr_size(self, e: Expr) -> int:
         """Element size if `e` is a typed pointer variable (C scales arithmetic on it), else 0."""
         if isinstance(e, (Var, StackVar)):
@@ -1579,6 +1655,13 @@ class CWriter:
                 return self._SIZES.get(t.base, 0)
             if t is not None and t.ptr >= 2:           # a pointer to pointers
                 return self.ptr_bits // 8
+        if isinstance(e, BinOp) and e.op in ("+", "-") and e.bits == self.ptr_bits:
+            # pointer arithmetic is a pointer too: `a1 + i` an `int *` when the offset scaled to
+            # elements, a `char *` when it didn't (`(char *)a1 + 6`)
+            for p, off in ((e.a, e.b), (e.b, e.a)) if e.op == "+" else ((e.a, e.b),):
+                size = self._ptr_size(p)
+                if size:
+                    return size if self._scaled(p, off) is not None else 1
         return 0
 
     def _scaled(self, ptr: Expr, off: Expr) -> Expr | None:
@@ -1597,10 +1680,73 @@ class CWriter:
             return off.a if k == 0 else BinOp("<<", off.a, Const(k, off.b.bits), off.bits)
         return None
 
+    def _helper_c(self, e: BinOp) -> str | None:
+        """A rotate or an add / subtract flag in plain C: `x << k | x >> (64 - k)`, carry as
+        `(u)(a + b) < a`, signed overflow as the sign of `(a ^ b) & (a ^ (a - b))`."""
+        w = e.a.bits
+        if w not in (8, 16, 32, 64):
+            return None
+        u, sg = int_type(w, True), int_type(w)
+        x = f"({u}){self.expr(e.a, PREC_UNARY)}"
+        if e.op in ("rol", "ror"):
+            left, right = ("<<", ">>") if e.op == "rol" else (">>", "<<")
+            if isinstance(e.b, Const):
+                k = e.b.value % w
+                return f"({u}){self.expr(e.a, PREC_UNARY)}" if k == 0 else \
+                    f"({u})({x} {left} {k} | {x} {right} {w - k})"
+            n = self.expr(e.b, PREC_UNARY)
+            return f"({u})({x} {left} ({n} & {w - 1}) | {x} {right} (-{n} & {w - 1}))"
+        y = f"({u}){self.expr(e.b, PREC_UNARY)}"
+        if e.op == "carry":
+            return f"(({u})({x} + {y}) < {x})"
+        if e.op == "borrow":
+            return f"({x} < {y})"
+        if e.op == "scarry":
+            return f"(({sg})({u})(~({x} ^ {y}) & ({x} ^ ({u})({x} + {y}))) < 0)"
+        if e.op == "sborrow":
+            return f"(({sg})({u})(({x} ^ {y}) & ({x} ^ ({u})({x} - {y}))) < 0)"
+        return None
+
+    def _signed_operands(self, e: BinOp) -> tuple[str, int] | None:
+        """A signed operation (`/`, `%`, `>>`, `<`) with an operand C would take as unsigned: a
+        variable of an unsigned type (cast to the signed one) or a constant with its top bit set
+        (written negative: `0xffffffff80000000` is an unsigned long, and turns the comparison
+        unsigned)."""
+        if e.op not in ("/s", "%s", ">>s", "<s", "<=s"):
+            return None
+        a, b = e.a, e.b
+        shift = e.op == ">>s"
+        if not any(self._unsigned(x) or isinstance(x, Const) and x.value >> (x.bits - 1) and x.bits >= 8
+                   for x in ((a,) if shift else (a, b))):
+            return None
+        op, p = BIN[e.op]
+        if p == 10 and isinstance(a, Const) and not isinstance(b, Const):
+            a, b, op = b, a, FLIP[op]
+
+        def side(x: Expr, prec: int) -> str:
+            if isinstance(x, Const):
+                if x.value >> (x.bits - 1) and x.bits >= 8:
+                    if x.signed == -(1 << (x.bits - 1)):      # (no negative literal for INT_MIN)
+                        return f"({int_type(x.bits)}){number(x.value)}"
+                    # (a hex literal past INT_MAX is unsigned: `-0x80000000` is 2147483648)
+                    return "-" + number(-x.signed) + ("LL" if -x.signed > 0x7FFFFFFF else "")
+                return number(x.value)
+            if self._unsigned(x) and x.bits in (8, 16, 32, 64):
+                return f"({int_type(x.bits)}){self.expr(x, PREC_UNARY)}"
+            return self.expr(x, prec)
+        return f"{side(a, p)} {op} {side(b, p + 1) if not shift else self.expr(b, p + 1)}", p
+
     def _unsigned(self, e: Expr) -> bool:
         if isinstance(e, (Var, StackVar)):
             t = self.types.get(e.name)
             return t is not None and t.ptr == 0 and (t.base.startswith(("unsigned", "uint")) or t.base == "size_t")
+        if isinstance(e, BinOp) and e.bits >= 32 and not self._ptr_var(e):
+            # C's usual arithmetic conversions: an unsigned operand of int's width or more makes
+            # the result unsigned (narrower ones are promoted to int)
+            if e.op in ("/u", "%u", ">>u"):
+                return True
+            if e.op in ("+", "-", "*", "&", "|", "^"):
+                return any(x.bits == e.bits and self._unsigned(x) for x in (e.a, e.b))
         return isinstance(e, Cast) and e.kind == "zext"
 
     def _callee_name(self, c: ir.Call) -> str | None:
@@ -1768,6 +1914,12 @@ class CWriter:
                     b = self._scaled(s.dst, b)
                     if b is None:
                         return f"{lhs} = {self.expr(src)};"
+                elif src.op in ("+", "-") and self._struct_ptr(s.dst):
+                    # a struct pointer moved by whole structs (`p++`), else by bytes
+                    size = self._struct_size(s.dst)
+                    if not (size and isinstance(b, Const) and b.value % size == 0):
+                        return f"{lhs} = {self.expr(src)};"
+                    b = Const(b.value // size, b.bits)
                 if src.op in ("+", "-") and isinstance(b, Const) and b.value == 1:
                     return f"{lhs}{src.op}{src.op};"
                 name = self._enum_text(s.dst, b) if src.op in ("&", "|", "^") else None
@@ -1972,6 +2124,9 @@ class CWriter:
                 ret = int_type(self.p.ret_bits)
             else:
                 ret = self._ret_type(vals[0]) if vals else "int"
+        from .calls import variadic_fixed
+        if variadic_fixed(self.an, self.p.arch, fn.addr) is not None:
+            params.append("...")
         return f"{ret}{'' if ret.endswith('*') else ' '}{name}({', '.join(params) or 'void'})"
 
     def _as_declared(self, spelled: str | None, t: CType, name: str) -> str:
@@ -2019,6 +2174,12 @@ class CWriter:
     def declarations(self, depth: int):
         for note in self.notes:
             self.emit(note, None, depth)
+        for base, (bits, n) in sorted(self.const_tables().items()):
+            vals = [self.an.bin.read_int(base + k * bits // 8, bits // 8, signed=True) for k in range(n)]
+            if None in vals:
+                continue
+            self.emit(f"static const {int_type(bits)} tbl_{base:x}[{n}] = {{ {', '.join(map(str, vals))} }};",
+                      None, depth)
         frame = self.p.frame
         used = {x.name for s in self.p.fn.stmts() for top in ir.stmt_exprs(s) for x in ir.walk(top)
                 if isinstance(x, (StackVar, StackAddr))}

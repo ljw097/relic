@@ -9,13 +9,13 @@ GUI는 PySide6, 명령어 디코딩은 capstone을 쓰고, 그 위에 올라가�
 목표는 솔직히 좀 거창합니다. IDA Pro + Hex-Rays만큼, 할 수 있다면 그보다 낫게 만드는 겁니다. 아직 거기까지는
 멀었지만, x86-64나 ARM 바이너리를 열어서 함수를 훑어보고, 이름을 붙이고, 의사 코드를 읽고, 디버거로
 오버플로 오프셋을 재는 정도는 지금도 충분히 됩니다. 현재 버전은
-[1.6.0](https://github.com/ljw097/relic/releases/tag/v1.6.0)입니다.
+[1.7.0](https://github.com/ljw097/relic/releases/tag/v1.7.0)입니다.
 
 ![Relic 디버거: vuln()에서 gets() 직후에 멈춘 화면. 입력한 AAAA…가 레지스터와 스택 telescope에 보인다](docs/screenshots/debugger.png)
 
 ## 설치
 
-[릴리스 페이지](https://github.com/ljw097/relic/releases/tag/v1.6.0)에서 운영체제에 맞는 실행 파일을 받아
+[릴리스 페이지](https://github.com/ljw097/relic/releases/tag/v1.7.0)에서 운영체제에 맞는 실행 파일을 받아
 실행하면 됩니다. 설치 과정은 없습니다.
 
 - **Windows**: `relic-<버전>-windows-x86_64.exe`
@@ -34,7 +34,7 @@ Python 3.10 이상이 있다면 릴리스 페이지의 wheel을 설치해도 됩
 
 ```sh
 python3 -m venv .venv
-.venv/bin/pip install https://github.com/ljw097/relic/releases/download/v1.6.0/relic_re-1.6.0-py3-none-any.whl
+.venv/bin/pip install https://github.com/ljw097/relic/releases/download/v1.7.0/relic_re-1.7.0-py3-none-any.whl
 .venv/bin/relic
 ```
 
@@ -139,13 +139,18 @@ brotli, Lua, zstd(와 Relic의 테스트 프로그램)를 -O0/-O2, x86-64/AArch6
 Ghidra, angr, RetDec, radare2, LIEF와 비교했습니다. 방법, 전체 수치와 한계는
 [docs/benchmarks.md](docs/benchmarks.md)에 있습니다(영어).
 
-![빌드별 함수 탐지 F1: Relic은 모든 빌드에서 0.96–0.99, angr 0.89–0.97, Ghidra는 -O0에서 0.98·-O2에서 0.73–0.79, radare2 0.73–0.90, LIEF는 .eh_frame이 있으면 0.998, 없으면 0.018](docs/benchmarks/detection-f1.svg)
+![빌드별 함수 탐지 F1: Relic은 모든 빌드에서 0.995–1.000, angr 0.89–0.97, Ghidra는 -O0에서 0.98·-O2에서 0.73–0.79, radare2 0.73–0.90, LIEF는 .eh_frame이 있으면 0.998, 없으면 0.018](docs/benchmarks/detection-f1.svg)
 
-![함수 탐지 시간: Relic 빌드당 9–18초, angr 19–50초, radare2 5–19초, Ghidra 43–257초](docs/benchmarks/detection-time.svg)
+![함수 탐지 시간: Relic 빌드당 7–14초, angr 19–50초, radare2 5–19초, Ghidra 43–257초](docs/benchmarks/detection-time.svg)
 
-![의사코드가 올바른 C인 함수의 비율: brotli Relic 82%, RetDec 82%, Ghidra 69%, angr 49%; zstd Relic 92%, RetDec 83%, Ghidra 69%, angr 41%; lua Relic 98–99%, Ghidra 95–97%, RetDec 92–97%, angr 88–91%; radare2 0%](docs/benchmarks/decompiler-valid-c.svg)
+![의사코드가 올바른 C인 함수의 비율: brotli Relic 82%, RetDec 82%, Ghidra 69%, angr 49%; zstd Relic 95%, RetDec 83%, Ghidra 69%, angr 41%; lua Relic 98–99%, Ghidra 95–97%, RetDec 92–97%, angr 88–91%; radare2 0%](docs/benchmarks/decompiler-valid-c.svg)
 
-![함수당 디컴파일 시간: Ghidra 7–206ms, Relic 56–292ms, angr 198–2,452ms](docs/benchmarks/decompiler-time.svg)
+![함수당 디컴파일 시간: Ghidra 5–192ms, Relic 95–333ms, angr 151–2,007ms](docs/benchmarks/decompiler-time.svg)
+
+디컴파일 결과를 다시 컴파일해서도 평가했습니다. 원본과 같은 값을 계산하는지(함수마다 입력 40개로 원본과
+비교), 제어 흐름과 데이터 흐름이 소스와 얼마나 비슷한지, 자료형이 디버그 정보와 얼마나 맞는지입니다.
+
+![디컴파일 결과 품질: 문법 유효성 Relic 94%, RetDec 89%, Ghidra 84%, angr 70%; 동작 동치성 Relic 96%, Ghidra 89%, angr 80%, RetDec 44%; 제어 흐름 유사도 Relic 56%, Ghidra 54%, angr 53%, RetDec 51%; 데이터 흐름 유사도 angr 52%, Relic 48%, Ghidra 48%, RetDec 37%; 자료형(종류와 크기) Relic 81%, angr 72%, Ghidra 41%, RetDec 17%; 자료형(정확) Relic 48%, angr 31%, Ghidra 26%, RetDec 7%](docs/benchmarks/decompiler-quality.svg)
 
 ## CLI
 

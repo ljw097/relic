@@ -60,12 +60,23 @@ class Struct:
 
     def field_at(self, offset: int, bits: int) -> Field | None:
         f = self.fields.get(offset)
-        return f if f is not None and f.bits == bits and not f.array else None
+        return f if f is not None and f.bits == bits and not f.array and offset in self.declared() else None
+
+    def declared(self) -> set[int]:
+        """The offsets of the fields the declaration shows: one overlapping an earlier field is
+        left out (the code reaches it through casts), so nothing may name it."""
+        out, pos = set(), 0
+        for off in sorted(self.fields):
+            if off >= pos:
+                out.add(off)
+                pos = self.fields[off].end
+        return out
 
     def array_at(self, offset: int, bits: int) -> tuple[Field, int] | None:
         """(array field, element index) for an element-wide access at `offset` inside an array."""
         for f in self.fields.values():
             if f.array and f.bits == bits and offset >= f.offset and (offset - f.offset) % (bits // 8) == 0 \
+                    and f.offset in self.declared() \
                     and (f.count is None or offset < f.end):
                 return f, (offset - f.offset) // (bits // 8)
         return None
@@ -912,7 +923,7 @@ class StructView:
         if sp is None:
             return None
         st = self.struct_of(sp[0])
-        f = st.fields.get(sp[1]) if st is not None else None
+        f = st.fields.get(sp[1]) if st is not None and sp[1] in st.declared() else None
         return (sp[0], st, f) if f is not None and f.bits > bits else None
 
     def field_addr(self, e: Expr) -> tuple[Expr, Struct, Field] | None:
@@ -923,7 +934,7 @@ class StructView:
         st = self.struct_of(sp[0])
         if st is None:
             return None
-        f = st.fields.get(sp[1])
+        f = st.fields.get(sp[1]) if sp[1] in st.declared() else None
         return (sp[0], st, f) if f is not None else None
 
 

@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import argparse
 import json
+from collections import Counter
 import os
 from html import escape
 
@@ -25,7 +26,8 @@ FONT = "font-family=\"-apple-system,BlinkMacSystemFont,'Segoe UI',Helvetica,Aria
 def bars(title: str, subtitle: str, groups: list[str], series: dict[str, list[float | None]], fmt, vmax: float,
          note: str = "") -> str:
     """Grouped horizontal bars: one group per row label, one bar per tool, the value at its end."""
-    w, left, right = 760, 150, 70
+    w, right = 760, 70
+    left = max(150, 7 * max(len(g) for g in groups) + 24)   # (room for the longest row label)
     bar, gap, group_gap = 14, 2, 18
     tools = [t for t in series if any(v is not None for v in series[t])]
     top = 92
@@ -111,11 +113,49 @@ def decompiler(decomp: dict) -> tuple[str, str]:
     return a, b
 
 
+def quality(q: dict, decomp: dict) -> str:
+    """One group per metric, one bar per tool: totals over every binary scored."""
+    tools = [t for t in ("relic", "angr", "ghidra", "retdec", "r2") if any(t in b["summary"] for b in q.values())]
+    agg = {t: Counter() for t in tools}
+    for name, b in q.items():
+        for t in tools:
+            s = b["summary"].get(t)
+            if s is None:
+                continue
+            a = agg[t]
+            a["eq_pass"] += s["equiv_passed"]
+            a["eq_test"] += s["equiv_tested"]
+            for k in ("cfg", "dfg"):
+                if s[f"{k}_common"] is not None:
+                    a[f"{k}_sum"] += s[f"{k}_common"] * s["common"]
+                    a[f"{k}_n"] += s["common"]
+            for k in ("type_slots", "type_kind", "type_exact"):
+                a[k] += s[k]
+            row = decomp.get(name, {}).get(t)
+            if row:
+                a["valid"] += row["valid_c"]
+                a["given"] += decomp[name]["functions"]
+
+    def pct(x, y):
+        return 100 * x / y if y else None
+    metrics = [("Syntax validity", lambda a: pct(a["valid"], a["given"])),
+               ("Behavioural equivalence", lambda a: pct(a["eq_pass"], a["eq_test"])),
+               ("Control-flow similarity", lambda a: pct(a["cfg_sum"], a["cfg_n"])),
+               ("Data-flow similarity", lambda a: pct(a["dfg_sum"], a["dfg_n"])),
+               ("Types: kind and size", lambda a: pct(a["type_kind"], a["type_slots"])),
+               ("Types: exact", lambda a: pct(a["type_exact"], a["type_slots"]))]
+    series = {NAMES[t]: [f(agg[t]) for _, f in metrics] for t in tools}
+    return bars("Decompiler output quality", "totals over every binary scored; higher is better",
+                [m for m, _ in metrics], series, lambda v: f"{v:.0f}%", 100,
+                "Similarities: graph-kernel similarity to the source's CFG / SSA def-use graph, as %.")
+
+
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--detect", nargs="+", required=True)
     ap.add_argument("--decomp", nargs="+", required=True)
     ap.add_argument("--out", required=True)
+    ap.add_argument("--quality", help="tools/decomp_quality.py --json output")
     args = ap.parse_args(argv)
     os.makedirs(args.out, exist_ok=True)
     decomp: dict = {}
@@ -130,6 +170,8 @@ def main(argv=None) -> int:
             detect.setdefault(name, {}).update(row)
     charts = dict(zip(("detection-f1", "detection-time"), detection(detect)))
     charts.update(zip(("decompiler-valid-c", "decompiler-time"), decompiler(decomp)))
+    if args.quality:
+        charts["decompiler-quality"] = quality(json.load(open(args.quality)), decomp)
     for name, svg in charts.items():
         with open(os.path.join(args.out, f"{name}.svg"), "w") as fp:
             fp.write(svg)

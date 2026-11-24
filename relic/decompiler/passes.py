@@ -249,6 +249,43 @@ def _narrow_cmp(op: str, a: Expr, b: Expr) -> Expr | None:
     return BinOp(op, ext.a, narrow, 1) if ext is a else BinOp(op, narrow, ext.a, 1)
 
 
+def _narrow_operand(t: Expr, bits: int, signed: bool) -> Expr | None:
+    """`t`, a value widened from `bits` (sign- or zero-extended as `signed` says) or a constant
+    that fits there, at `bits` again; else None."""
+    if isinstance(t, Cast) and t.kind == ("sext" if signed else "zext") and t.a.bits == bits:
+        return t.a
+    if isinstance(t, Const):
+        v = t.signed if signed else t.value
+        if (-(1 << (bits - 1)) <= v < (1 << (bits - 1))) if signed else v < (1 << bits):
+            return Const(v & mask(bits), bits)
+    return None
+
+
+def _widened_pair(a: Expr, b: Expr) -> Expr | None:
+    """`zext(hi) << w | zext(x)`, a register pair as one double-width value: x86's `cqo` / `cdq`
+    before `idiv` makes hi `x >>s (w - 1)` (that is `sext(x)`), `xor edx, edx` before `div`
+    makes it 0 (`zext(x)`)."""
+    if isinstance(b, BinOp) and b.op == "<<":
+        a, b = b, a
+    if not (isinstance(a, BinOp) and a.op == "<<" and isinstance(a.b, Const) and isinstance(a.a, Cast)
+            and a.a.kind == "zext" and isinstance(b, Cast) and b.kind == "zext"):
+        return None
+    hi, x = a.a.a, b.a
+    w = x.bits
+    if a.b.value != w or hi.bits != w or a.bits != 2 * w or b.bits != 2 * w:
+        return None
+    if isinstance(hi, Const) and hi.value == 0:
+        return b
+    if isinstance(hi, BinOp) and hi.op == ">>s" and isinstance(hi.b, Const) and hi.b.value == w - 1 and hi.a == x:
+        return Cast("sext", x, 2 * w)
+    # a value put back together from its own halves (a 128-bit product passed on in rdi:rsi)
+    if isinstance(x, Cast) and x.kind == "low" and x.a.bits == 2 * w and isinstance(hi, Cast) and \
+            hi.kind == "low" and isinstance(hi.a, BinOp) and hi.a.op == ">>u" and \
+            isinstance(hi.a.b, Const) and hi.a.b.value == w and hi.a.a == x.a:
+        return x.a
+    return None
+
+
 def _simp_node(e: Expr) -> Expr:
     if type(e) in _LEAVES:                  # (every rule below rewrites an operation)
         return e
@@ -291,6 +328,9 @@ def _simp_node(e: Expr) -> Expr:
             if z(b): return a
             if z(a): return b
             if a == b and _droppable(a): return a
+            wide = _widened_pair(a, b)
+            if wide is not None:
+                return wide
             if (ones(a) and _droppable(b)) or (ones(b) and _droppable(a)): return Const(mask(w), w)
         elif op == "&":
             if (z(a) and _droppable(b)) or (z(b) and _droppable(a)): return Const(0, w)
@@ -377,6 +417,12 @@ def _simp_node(e: Expr) -> Expr:
             e.a.a.bits <= e.bits:
         # the low part of a widened value is the narrower widening (`(int)(uint64_t)c`: `(int)c`)
         return e.a.a if e.a.a.bits == e.bits else Cast(e.a.kind, e.a.a, e.bits)
+    elif isinstance(e, Cast) and e.kind == "low" and isinstance(e.a, BinOp) and e.a.op in ("/s", "%s", "/u", "%u") \
+            and all(_narrow_operand(t, e.bits, e.a.op[1] == "s") is not None for t in (e.a.a, e.a.b)):
+        # a division of two widened values, narrowed again: the division at the narrow width
+        # (x86 `cqo; idiv`: `(int64_t)((__int128)x / (__int128)y)` is `x / y`)
+        return BinOp(e.a.op, _narrow_operand(e.a.a, e.bits, e.a.op[1] == "s"),
+                     _narrow_operand(e.a.b, e.bits, e.a.op[1] == "s"), e.bits)
     elif isinstance(e, Extract):
         r = _simp_extract(e)
         if r is not e:

@@ -1034,7 +1034,32 @@ class X86Lifter(X87Mixin):
             return
         target = Const(i.target, self.bits) if i.target is not None else self.read(ops[0])
         name = self.an.call_name(i) or self._reg_import(i, ops[0], func=getattr(self, "_func", None))
+        if self._ti_helper(name or ""):
+            return
         self.emit(CallStmt(i.addr, Call(target, (), self.bits), noreturn=self._noreturn(i), name=name))
+
+    # libgcc's 128-bit arithmetic on x86-64 (`__int128` `/`, `%`, `*` and shifts call these)
+    _TI_OPS = {"__udivti3": "/u", "__umodti3": "%u", "__divti3": "/s", "__modti3": "%s", "__multi3": "*",
+               "__ashlti3": "<<", "__lshrti3": ">>u", "__ashrti3": ">>s"}
+
+    def _ti_helper(self, name: str) -> bool:
+        """A call to libgcc's `__umodti3` & co. (named by library signatures) is the operation it
+        does: operands in rdi:rsi and rdx:rcx (a shift's count in edx), the result in rax:rdx."""
+        op = self._TI_OPS.get(name)
+        if op is None or self.bits != 64:
+            return False
+
+        def pair(lo: str, hi: str) -> Expr:
+            return BinOp("|", BinOp("<<", cast("zext", self.read_reg(hi), 128), Const(64, 8), 128),
+                         cast("zext", self.read_reg(lo), 128), 128)
+        a = self.tmp(pair("rdi", "rsi"))
+        b = Const(0, 8) if op in ("<<", ">>u", ">>s") else self.tmp(pair("rdx", "rcx"))
+        if op in ("<<", ">>u", ">>s"):
+            b = cast("low", self.read_reg("rdx"), 8)
+        v = self.tmp(BinOp(op, a, b, 128))
+        self.write_reg("rax", cast("low", v, 64))
+        self.write_reg("rdx", cast("low", BinOp(">>u", v, Const(64, 8), 128), 64))
+        return True
 
     def _after_epilogue(self, i, func) -> bool:
         """Whether the instructions just before `i` in its block tear the frame down (`pop`,
