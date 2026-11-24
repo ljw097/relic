@@ -14,29 +14,29 @@
 <line x1="555.0" y1="86" x2="555.0" y2="354" stroke="#e4e3df" stroke-width="1"/>
 <line x1="690.0" y1="86" x2="690.0" y2="354" stroke="#e4e3df" stroke-width="1"/>
 <text x="140" y="119.0" font-size="12.5" text-anchor="end" fill="#0b0b0b">brotli -O2</text>
-<rect x="150" y="92" width="54.8" height="14" rx="3" fill="#2a78d6"><title>Relic, brotli -O2: 204 ms</title></rect>
-<text x="209.8" y="103" font-size="11" fill="#52514e">204 ms</text>
+<rect x="150" y="92" width="80.6" height="14" rx="3" fill="#2a78d6"><title>Relic, brotli -O2: 300 ms</title></rect>
+<text x="235.6" y="103" font-size="11" fill="#52514e">300 ms</text>
 <rect x="150" y="108" width="471.5" height="14" rx="3" fill="#eb6834"><title>angr, brotli -O2: 1,752 ms</title></rect>
 <text x="626.5" y="119" font-size="11" fill="#52514e">1,752 ms</text>
 <rect x="150" y="124" width="51.7" height="14" rx="3" fill="#6250d6"><title>Ghidra, brotli -O2: 192 ms</title></rect>
 <text x="206.7" y="135" font-size="11" fill="#52514e">192 ms</text>
 <text x="140" y="183.0" font-size="12.5" text-anchor="end" fill="#0b0b0b">zstd -O2</text>
-<rect x="150" y="156" width="60.3" height="14" rx="3" fill="#2a78d6"><title>Relic, zstd -O2: 224 ms</title></rect>
-<text x="215.3" y="167" font-size="11" fill="#52514e">224 ms</text>
+<rect x="150" y="156" width="89.5" height="14" rx="3" fill="#2a78d6"><title>Relic, zstd -O2: 333 ms</title></rect>
+<text x="244.5" y="167" font-size="11" fill="#52514e">333 ms</text>
 <rect x="150" y="172" width="540.0" height="14" rx="3" fill="#eb6834"><title>angr, zstd -O2: 2,007 ms</title></rect>
 <text x="695.0" y="183" font-size="11" fill="#52514e">2,007 ms</text>
 <rect x="150" y="188" width="22.7" height="14" rx="3" fill="#6250d6"><title>Ghidra, zstd -O2: 84 ms</title></rect>
 <text x="177.7" y="199" font-size="11" fill="#52514e">84 ms</text>
 <text x="140" y="247.0" font-size="12.5" text-anchor="end" fill="#0b0b0b">lua -O2</text>
-<rect x="150" y="220" width="13.6" height="14" rx="3" fill="#2a78d6"><title>Relic, lua -O2: 51 ms</title></rect>
-<text x="168.6" y="231" font-size="11" fill="#52514e">51 ms</text>
+<rect x="150" y="220" width="25.5" height="14" rx="3" fill="#2a78d6"><title>Relic, lua -O2: 95 ms</title></rect>
+<text x="180.5" y="231" font-size="11" fill="#52514e">95 ms</text>
 <rect x="150" y="236" width="45.9" height="14" rx="3" fill="#eb6834"><title>angr, lua -O2: 171 ms</title></rect>
 <text x="200.9" y="247" font-size="11" fill="#52514e">171 ms</text>
 <rect x="150" y="252" width="2.1" height="14" rx="3" fill="#6250d6"><title>Ghidra, lua -O2: 8 ms</title></rect>
 <text x="157.1" y="263" font-size="11" fill="#52514e">8 ms</text>
 <text x="140" y="311.0" font-size="12.5" text-anchor="end" fill="#0b0b0b">lua AArch64 -O2</text>
-<rect x="150" y="284" width="13.2" height="14" rx="3" fill="#2a78d6"><title>Relic, lua AArch64 -O2: 49 ms</title></rect>
-<text x="168.2" y="295" font-size="11" fill="#52514e">49 ms</text>
+<rect x="150" y="284" width="29.3" height="14" rx="3" fill="#2a78d6"><title>Relic, lua AArch64 -O2: 109 ms</title></rect>
+<text x="184.3" y="295" font-size="11" fill="#52514e">109 ms</text>
 <rect x="150" y="300" width="40.7" height="14" rx="3" fill="#eb6834"><title>angr, lua AArch64 -O2: 151 ms</title></rect>
 <text x="195.7" y="311" font-size="11" fill="#52514e">151 ms</text>
 <rect x="150" y="316" width="2.0" height="14" rx="3" fill="#6250d6"><title>Ghidra, lua AArch64 -O2: 5 ms</title></rect>

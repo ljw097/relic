@@ -150,19 +150,19 @@ Stripped builds of brotli, Lua and zstd (and Relic's test programs) at -O0 and -
 AArch64, against Ghidra, angr, RetDec, radare2 and LIEF. Method, every number and the caveats:
 [docs/benchmarks.md](docs/benchmarks.md).
 
-![Function detection F1 by build: Relic 0.96–0.99 in every build; angr 0.89–0.97; Ghidra 0.98 at -O0 and 0.73–0.79 at -O2; radare2 0.73–0.90; LIEF 0.998 with .eh_frame and 0.018 without](docs/benchmarks/detection-f1.svg)
+![Function detection F1 by build: Relic 0.995–1.000 in every build; angr 0.89–0.97; Ghidra 0.98 at -O0 and 0.73–0.79 at -O2; radare2 0.73–0.90; LIEF 0.998 with .eh_frame and 0.018 without](docs/benchmarks/detection-f1.svg)
 
-![Function detection time: Relic 9–18 s per build, angr 19–50 s, radare2 5–19 s, Ghidra 43–257 s](docs/benchmarks/detection-time.svg)
+![Function detection time: Relic 7–14 s per build, angr 19–50 s, radare2 5–19 s, Ghidra 43–257 s](docs/benchmarks/detection-time.svg)
 
-![Share of functions whose pseudocode is valid C: brotli Relic 82%, RetDec 82%, Ghidra 69%, angr 49%; zstd Relic 92%, RetDec 83%, Ghidra 69%, angr 41%; lua Relic 98–99%, Ghidra 95–97%, RetDec 92–97%, angr 88–91%; radare2 0%](docs/benchmarks/decompiler-valid-c.svg)
+![Share of functions whose pseudocode is valid C: brotli Relic 82%, RetDec 82%, Ghidra 69%, angr 49%; zstd Relic 95%, RetDec 83%, Ghidra 69%, angr 41%; lua Relic 98–99%, Ghidra 95–97%, RetDec 92–97%, angr 88–91%; radare2 0%](docs/benchmarks/decompiler-valid-c.svg)
 
-![Decompiler time per function: Ghidra 5–192 ms, Relic 49–224 ms, angr 151–2,007 ms](docs/benchmarks/decompiler-time.svg)
+![Decompiler time per function: Ghidra 5–192 ms, Relic 95–333 ms, angr 151–2,007 ms](docs/benchmarks/decompiler-time.svg)
 
 The decompilers' output is also compiled again and scored: does it compute what the program
 computes (each function against the original on 40 inputs), how close are its control flow and
 data flow to the source's, how many types match the debug info.
 
-![Decompiler output quality: syntax validity Relic 94%, RetDec 89%, Ghidra 84%, angr 70%; behavioural equivalence Relic 95%, Ghidra 89%, angr 80%, RetDec 44%; control-flow similarity Relic 56%, Ghidra 54%, angr 52%, RetDec 51%; data-flow similarity angr 52%, Ghidra 48%, Relic 47%, RetDec 37%; types kind and size Relic 73%, angr 72%, Ghidra 41%, RetDec 17%; types exact Relic 46%, angr 31%, Ghidra 26%, RetDec 7%](docs/benchmarks/decompiler-quality.svg)
+![Decompiler output quality: syntax validity Relic 94%, RetDec 89%, Ghidra 84%, angr 70%; behavioural equivalence Relic 96%, Ghidra 89%, angr 80%, RetDec 44%; control-flow similarity Relic 56%, Ghidra 54%, angr 53%, RetDec 51%; data-flow similarity angr 52%, Relic 48%, Ghidra 48%, RetDec 37%; types kind and size Relic 81%, angr 72%, Ghidra 41%, RetDec 17%; types exact Relic 48%, angr 31%, Ghidra 26%, RetDec 7%](docs/benchmarks/decompiler-quality.svg)
 
 ## CLI
 
