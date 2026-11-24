@@ -135,17 +135,39 @@ def _values(fn: IRFunction) -> dict[Var, Var]:
     return val
 
 
-def _interference(fn: IRFunction) -> dict[Var, set[Var]]:
-    """Variables simultaneously live at some definition point (holding different values)."""
+def _interference(fn: IRFunction, only: set | None = None) -> dict[Var, set[Var]]:
+    """Variables simultaneously live at some definition point (holding different values).
+    `only`: the variables whose interference is wanted (copies may merge only them): pairs of
+    others are left out. (Worked on integer ids: a big function's sets are millions of adds, and
+    a Var hashes slowly.)"""
     values = _values(fn)
+    ids: dict[Var, int] = {}
+    var_of: list[Var] = []
+
+    def num(v: Var) -> int:
+        k = ids.get(v)
+        if k is None:
+            k = ids[v] = len(var_of)
+            var_of.append(v)
+        return k
+    uses_of = {}
+    defs_of = {}
+    for b in fn.blocks.values():
+        for s in b.stmts:
+            uses_of[id(s)] = {num(v) for v in _uses(s)}
+            defs_of[id(s)] = [num(d) for d in stmt_defs(s) if isinstance(d, Var)]
+    val = [num(values.get(v, v)) for v in list(var_of)]
+    while len(val) < len(var_of):                 # (values first numbered above)
+        val.append(num(values.get(var_of[len(val)], var_of[len(val)])))
+    want = None if only is None else {ids[v] for v in only if v in ids}
     succs = {a: [s for s in b.succs if s in fn.blocks] for a, b in fn.blocks.items()}
-    gen: dict[int, set[Var]] = {}
-    kill: dict[int, set[Var]] = {}
+    gen: dict[int, set[int]] = {}
+    kill: dict[int, set[int]] = {}
     for a, b in fn.blocks.items():
         g, k = set(), set()
         for s in b.stmts:
-            g |= _uses(s) - k
-            k |= {d for d in stmt_defs(s) if isinstance(d, Var)}
+            g |= uses_of[id(s)] - k
+            k.update(defs_of[id(s)])
         gen[a], kill[a] = g, k
     live_in = {a: set() for a in fn.blocks}
     changed = True
@@ -158,35 +180,35 @@ def _interference(fn: IRFunction) -> dict[Var, set[Var]]:
                 live_in[a] = new
                 changed = True
 
-    graph: dict[Var, set[Var]] = {}
-
-    def edge(x: Var, y: Var):
-        if x != y:
-            graph.setdefault(x, set()).add(y)
-            graph.setdefault(y, set()).add(x)
-
+    from collections import defaultdict
+    graph: dict[int, set[int]] = defaultdict(set)
     for a, b in fn.blocks.items():
         live = set().union(*(live_in[s] for s in succs[a])) if succs[a] else set()
         for s in reversed(b.stmts):
-            defs = [d for d in stmt_defs(s) if isinstance(d, Var)]
-            skip = s.src if isinstance(s, Assign) and isinstance(s.src, Var) else None
+            defs = defs_of[id(s)]
+            skip = ids.get(s.src) if isinstance(s, Assign) and isinstance(s.src, Var) else None
             for d in defs:
-                graph.setdefault(d, set())
-                vd = values.get(d, d)
-                for v in live:
-                    if v != skip and values.get(v, v) != vd:
-                        edge(d, v)
+                if want is not None and d not in want:
+                    continue
+                vd = val[d]
+                others = [v for v in (live & want if want is not None else live)
+                          if v != d and v != skip and val[v] != vd]
+                mine = graph[d]
+                mine.update(others)
+                for v in others:
+                    graph[v].add(d)
                 for d2 in defs:
-                    edge(d, d2)
-            live -= set(defs)
-            live |= _uses(s)
+                    if d2 != d and (want is None or d2 in want):
+                        mine.add(d2)
+                        graph[d2].add(d)
+            live.difference_update(defs)
+            live |= uses_of[id(s)]
         # values live on entry to the function (entry registers) all coexist
         if a == fn.addr:
-            for x in live:
-                graph.setdefault(x, set())
-                for y in live:
-                    edge(x, y)
-    return graph
+            entry_live = live & want if want is not None else live
+            for x in entry_live:
+                graph[x].update(y for y in entry_live if y != x)
+    return {var_of[k]: {var_of[x] for x in v} for k, v in graph.items()}
 
 
 def out_of_ssa(fn: IRFunction) -> IRFunction:
@@ -194,7 +216,11 @@ def out_of_ssa(fn: IRFunction) -> IRFunction:
     fn = copy.deepcopy(fn)
     _prune_dead(fn)
     copies = _insert_copies(fn)
-    graph = _interference(fn)
+    # (only variables a copy connects can merge: interference between them is all that is asked)
+    related = {v for cp in copies for v in (cp.dst, cp.src) if isinstance(v, Var)}
+    related |= {v for s in fn.stmts() if isinstance(s, Assign) and isinstance(s.dst, Var) and isinstance(s.src, Var)
+                for v in (s.dst, s.src)}
+    graph = _interference(fn, related)
     uf = _UF()
     members: dict[Var, set[Var]] = {}
     nbrs: dict[Var, set[Var]] = {}

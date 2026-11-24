@@ -256,15 +256,30 @@ def recover_division(fn: IRFunction, sext_params: frozenset = frozenset()) -> in
     from .ssa import reachable_order
     count = 0
     out_avail: dict[int, dict] = {}
+    leaves_cache: dict[int, tuple] = {}         # id(expression) -> (expression, its leaves)
+
+    def leaves_of(e: Expr) -> set:
+        got = leaves_cache.get(id(e))
+        if got is None or got[0] is not e:
+            got = leaves_cache[id(e)] = (e, _leaves(e))
+        return got[1]
     order = [fn.blocks[a] for a in reachable_order(fn) if a in fn.blocks]
-    order += [b for b in fn.blocks.values() if b not in order]
+    seen = {id(b) for b in order}
+    order += [b for b in fn.blocks.values() if id(b) not in seen]
+    out_rev: dict[int, dict] = {}               # block -> (leaf -> keys whose expansion reads it)
     for b in order:
         # single-def variable -> its definition (one level); a straight-line predecessor's
         # definitions still hold here (an epilogue block after the computation, -O0)
         pred = fn.blocks.get(b.preds[0]) if len(b.preds) == 1 else None
-        avail: dict[Expr, Expr] = dict(out_avail.get(pred.addr, {})) if pred is not None and \
-            pred.succs == [b.addr] else {}
+        inherit = pred is not None and pred.succs == [b.addr]
+        avail: dict[Expr, Expr] = dict(out_avail.get(pred.addr, {})) if inherit else {}
+        rev: dict = {k: set(v) for k, v in out_rev.get(pred.addr, {}).items()} if inherit else {}
         out_avail[b.addr] = avail
+        out_rev[b.addr] = rev
+
+        def forget(k):
+            for leaf in leaves_of(avail.pop(k)):
+                rev.get(leaf, set()).discard(k)
 
         def expand(e: Expr, keep=None) -> Expr:
             """Substitute block-local definitions (except `keep`, the dividend), following chains."""
@@ -320,15 +335,22 @@ def recover_division(fn: IRFunction, sext_params: frozenset = frozenset()) -> in
             # keep `avail` sound: a definition kills every expansion that reads what it writes
             written = {d for d in stmt_defs(st) if isinstance(d, (Var, StackVar))}
             clobbers_memory = isinstance(st, (Store, CallStmt, Effect, Unknown))
-            for k in list(avail):
-                lv = _leaves(avail[k])
-                if k in written or lv & written or (clobbers_memory and any(isinstance(n, StackVar) for n in lv)):
-                    del avail[k]
+            if written or clobbers_memory:
+                dead = {k for w in written for k in rev.get(w, ())} | {w for w in written if w in avail}
+                if clobbers_memory:
+                    dead |= {k for leaf, ks in rev.items() if isinstance(leaf, StackVar) for k in ks}
+                for k in dead:
+                    if k in avail:
+                        forget(k)
             # a definition stays usable until something it reads (or its target) is written again;
             # one that reads its own target (`x = x / 10`) cannot be substituted for it
             if isinstance(st, Assign) and isinstance(st.dst, Var) and _pure(st.src) \
-                    and st.dst not in _leaves(st.src):
+                    and st.dst not in leaves_of(st.src):
+                if st.dst in avail:
+                    forget(st.dst)
                 avail[st.dst] = st.src
+                for leaf in leaves_of(st.src):
+                    rev.setdefault(leaf, set()).add(st.dst)
     return count
 
 
