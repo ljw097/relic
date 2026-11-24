@@ -418,11 +418,12 @@ class FunctionAnalyzer:
         x86 = self.dis.arch in ("x64", "x86")
         cet = x86 and b.entry is not None and b.read(b.entry, 4) in _ENDBR
         inside = self._covered()
+        labels = self._label_tables()
         for r in getattr(b, "relocs", ()):
             if "RELATIVE" not in r.kind or b.is_exec(r.addr):
                 continue
             a = r.addend or b.read_ptr(r.addr)
-            if not a or a in self.funcs or not b.is_exec(a & ~1) or inside(a & ~1):
+            if not a or a in self.funcs or not b.is_exec(a & ~1) or inside(a & ~1) or labels(r.addr, a):
                 continue
             if x86 and not (b.read(a, 4) in _ENDBR if cet else a % 16 == 0):
                 continue
@@ -431,6 +432,42 @@ class FunctionAnalyzer:
             if self._looks_like_code(a & ~1):
                 self._queue.append(a)
         self._drain()
+
+    def _label_tables(self):
+        """`labels(slot, target)`: whether the relocated pointer at `slot` is a label of the function
+        that jumps through its table -- GNU C's computed `goto` (`static void *disptab[] =
+        { &&L_OP_MOVE, ... }; goto *disptab[op];`), whose labels a CET build starts with `endbr64`
+        like functions. A table is the run of relocated slots around `slot`; it is a label table
+        when a function with an indirect jump takes its address and the target lies between that
+        function's start and the next function's."""
+        b = self.bin
+        word = b.bits // 8
+        slots = {r.addr for r in getattr(b, "relocs", ()) if "RELATIVE" in r.kind}
+        owners: dict[int, int] = {}             # table address a function takes -> that function
+        for f in self.funcs.values():
+            if f.is_import:
+                continue
+            ins = list(f.insns() if callable(f.insns) else f.insns)
+            if not any(i.kind == JMP and i.target is None for i in ins):
+                continue
+            for i in ins:
+                for ref in i.refs:
+                    if ref in slots:
+                        owners.setdefault(ref, f.addr)
+        if not owners:
+            return lambda slot, target: False
+        starts = sorted(self.funcs)
+
+        def labels(slot: int, target: int) -> bool:
+            t = slot
+            while t not in owners and t - word in slots and slot - t < 0x10000:
+                t -= word
+            host = owners.get(t)
+            if host is None or target <= host:
+                return False
+            k = bisect.bisect_right(starts, host)
+            return k >= len(starts) or target < starts[k]
+        return labels
 
     _WIDTH = {"byte": 1, "word": 2, "dword": 4, "qword": 8, "xmmword": 16, "ymmword": 32, "tbyte": 10}
 
@@ -616,6 +653,8 @@ class FunctionAnalyzer:
                     else:
                         self._jt_func = f.addr
                         table = self._jump_table(i)
+                        if not table and (x86 or self.dis.arch == "arm64"):
+                            table = self._computed_goto(i, start, insns)
                         if table:
                             f.jump_tables[i.addr] = table
                             succ = list(dict.fromkeys(table))
@@ -1279,6 +1318,90 @@ class FunctionAnalyzer:
             out.append(t)
         return out
 
+    def _computed_goto(self, jmp: Insn, start: int, insns: dict) -> list[int]:
+        """GNU C's computed `goto` (`static void *disptab[] = { &&L_OP_MOVE, ... }; goto
+        *disptab[op];`, Lua's interpreter loop): `jmp [base + idx*8]` (or `jmp reg` loaded from
+        there), `base` set by a `lea base, [rip + table]` in this function, the table's slots the
+        loader relocates, each the address of a label here. The labels, in table order."""
+        b = self.bin
+        ptr = b.bits // 8
+        rel = self.__dict__.get("_relative")
+        if rel is None:
+            rel = self._relative = {r.addr: r.addend or b.read_ptr(r.addr)
+                                    for r in getattr(b, "relocs", ()) if "RELATIVE" in r.kind}
+        if not rel:
+            return []
+        if self.dis.arch == "arm64":
+            table = self._arm64_label_table(jmp, insns, rel)
+            return self._label_run(table, start, rel) if table is not None else []
+        mem = None
+        ops = jmp.cs.operands
+        if ops and ops[0].type == 3:
+            mem = ops[0].mem
+        elif ops and ops[0].type == 1:              # `jmp rax` after `mov rax, [base + idx*8]`
+            reg = jmp.cs.reg_name(ops[0].reg)
+            for i in reversed(self._back(jmp.addr, 4)):
+                if i.mnemonic == "mov" and i.op_str.startswith(reg + ",") and len(i.cs.operands) == 2 and \
+                        i.cs.operands[1].type == 3:
+                    mem = i.cs.operands[1].mem
+                    break
+        table = None
+        if mem is not None and mem.base and mem.index and mem.scale == ptr and not mem.disp:
+            base = jmp.cs.reg_name(mem.base)
+            for i in insns.values():
+                if i.mnemonic == "lea" and "rip" in i.op_str and i.op_str.startswith(base + ",") and i.refs:
+                    table = i.refs[0]
+        elif ops and ops[0].type == 1:
+            # -O0: `lea rax, [rip + table]; mov rax, [rdx + rax]` in a block that then jumps to a
+            # shared `jmp rax`
+            seq = sorted(insns.values(), key=lambda i: i.addr)
+            for i, nxt in zip(seq, seq[1:]):
+                if i.mnemonic == "lea" and "rip" in i.op_str and i.refs and i.refs[0] in rel and \
+                        nxt.mnemonic == "mov" and "qword ptr [" in nxt.op_str and \
+                        i.op_str.split(",")[0] in nxt.op_str.split("[", 1)[1]:
+                    table = i.refs[0]
+                    break
+        if table is None or table not in rel:
+            return []
+        return self._label_run(table, start, rel)
+
+    def _label_run(self, table: int, start: int, rel: dict) -> list[int]:
+        """The relocated slots from `table` on that point into the function at `start`."""
+        b = self.bin
+        out, p = [], table
+        while p in rel and len(out) < 4096:
+            v = rel[p]
+            if not b.is_exec(v) or v < start or v in self.funcs and v != start:
+                break
+            out.append(v)
+            p += b.bits // 8
+        return out if len(out) >= 2 else []
+
+    def _arm64_label_table(self, jmp: Insn, insns: dict, rel: dict) -> int | None:
+        """AArch64: `br x1` after `ldr x1, [x20, x0, lsl #3]`, x20 the table (`adrp` + `add`)."""
+        m = re.fullmatch(r"(x\d+)", jmp.op_str.strip())
+        if jmp.mnemonic != "br" or m is None:
+            return None
+        base = None
+        for i in reversed(self._back(jmp.addr, 4)):
+            ld = re.fullmatch(rf"{m.group(1)}, \[(x\d+), x\d+, lsl #3\]", i.op_str)
+            if i.mnemonic == "ldr" and ld:
+                base = ld.group(1)
+                break
+        if base is None:
+            return None
+        pages: dict[str, int] = {}
+        for i in sorted(insns.values(), key=lambda i: i.addr):
+            m = re.fullmatch(r"(x\d+), #(0x[0-9a-f]+|\d+)", i.op_str)
+            if i.mnemonic == "adrp" and m:
+                pages[m.group(1)] = int(m.group(2), 0)
+            m = re.fullmatch(rf"{base}, (x\d+), #(0x[0-9a-f]+|\d+)", i.op_str)
+            if i.mnemonic == "add" and m and m.group(1) in pages:
+                t = pages[m.group(1)] + int(m.group(2), 0)
+                if t in rel:
+                    return t
+        return None
+
     def _jump_table(self, jmp: Insn) -> list[int]:
         """Resolve `jmp reg` / `jmp [table+reg*N]` switch dispatch on x86."""
         if self.dis.arch.startswith("riscv"):
@@ -1337,7 +1460,12 @@ class FunctionAnalyzer:
         count = None
         for k, i in enumerate(hist):
             if i.mnemonic in ("ja", "jae", "jb", "jbe") and k + 1 < len(hist):
-                cmp = hist[k + 1]
+                # the compare setting the flags: gcc may schedule moves in between
+                # (`cmp word ptr [rsp + 0x28], 7; mov ...; mov ...; ja default`)
+                j = k + 1
+                while j < min(len(hist), k + 6) and hist[j].mnemonic in ("mov", "lea", "movsxd", "movzx", "movsx"):
+                    j += 1
+                cmp = hist[j] if j < len(hist) else hist[k + 1]
                 if cmp.mnemonic == "cmp" and cmp.cs.operands[-1].type == 2:
                     width = cmp.cs.operands[0].size * 8
                     v = cmp.cs.operands[-1].imm & ((1 << width) - 1)
