@@ -94,8 +94,11 @@ whatever toolchains you have installed (`relic sigs build --system`).
 
 **Decompiler.** Besides the usual control flow recovery, it works out structs from the way memory
 is accessed, and you can set types yourself with `Y`. It knows libc and Windows API prototypes,
-handles floating point, and can import C headers. The test suite recompiles the output and checks
-that it behaves like the original.
+handles floating point, and can import C headers. Parameters and their types come from what the
+function and the functions it calls do with them, variadic functions get their `...`, and
+switches gcc turned into lookup tables or computed `goto`s come back whole. The output is meant
+to be C you can compile again: the test suite recompiles it and checks that it behaves like the
+original, and in the benchmark below it does for 81 of 84 functions (Ghidra 75, angr 67).
 
 **Automatic names.** In a stripped binary, functions get names when their code gives them away:
 the name passed to an `assert()` (`table_insert`), a log message that starts with the function
@@ -126,16 +129,16 @@ fixed. With `--port` it carries your names, comments and variable names over to 
 
 These numbers are my own rough estimates. Each one is the share of what IDA does in that area
 that Relic does about as well. The total is a weighted average, weighted by how much each area
-matters to me when I'm actually reversing something. Right now it comes to **about 91%**.
+matters to me when I'm actually reversing something. Right now it comes to **about 92%**.
 
 | Area (weight) | Progress | Notes |
 |---|---|---|
 | File formats (8) | 100% | Including Mach-O with Objective-C (`[obj msg:arg]` in the pseudocode) |
 | Processors (8) | 100% | Decompiles x86/x64, ARM/Thumb, AArch64, MIPS32/64, RISC-V and PowerPC 32/64. Disassembles SPARC, SystemZ, M68K, SH, TriCore, eBPF and WebAssembly |
-| Auto-analysis (14) | 100% | Finds 99.9% of the functions in stripped bash, and 99.96% even with `.eh_frame` removed. C++ classes from RTTI, virtual and indirect call targets, data mixed into code. bash takes about 7 seconds |
+| Auto-analysis (14) | 100% | Finds 99.9% of the functions in stripped bash, and 99.96% even with `.eh_frame` removed; F1 0.995–1.000 on the benchmark builds of brotli, Lua and zstd. C++ classes from RTTI, virtual and indirect call targets, computed `goto` tables, data mixed into code. bash takes about 7 seconds |
 | Library identification (8) | 100% | Names 83–94% of the original functions in stripped static test binaries, with no wrong names |
-| Type system (10) | 95% | libc flags print as their constants (`PROT_READ \| PROT_WRITE`), header `#define` groups become enums. Structs passed and returned by value work on x86-64 Linux and AArch64 (from a header's prototypes), not yet on other ABIs or when two fields share a register |
-| Decompiler (20) | 60% | Half as many gotos as when I started measuring; most of the rest are in big state machines like gnulib's `quotearg`. SSE/AVX shows as intrinsics, x87 works, `long double` included |
+| Type system (10) | 95% | libc flags print as their constants (`PROT_READ \| PROT_WRITE`), header `#define` groups become enums. Structs passed and returned by value work on x86-64 Linux and AArch64 (from a header's prototypes), integer fields sharing a register included; not yet on other ABIs, nor floats packed in one register. Parameter types against debug info: 81% right in kind and size (angr 72%, Ghidra 41%) |
+| Decompiler (20) | 65% | The output compiles again and computes what the program computes for 81 of 84 benchmark functions, more than Ghidra or angr. Half as many gotos as when I started measuring; most of the rest are in big state machines like gnulib's `quotearg`. Keeps more variables than the source has. SSE/AVX shows as intrinsics, x87 works, `long double` included |
 | Interactive UI (12) | 100% | |
 | Scripting & extensions (8) | 100% | |
 | Debugger (7) | 100% | Windows programs run under wine with Windows' own gdbserver.exe |
@@ -148,7 +151,10 @@ log of finished work is in [docs/history.md](docs/history.md). Both are in Korea
 
 Stripped builds of brotli, Lua and zstd (and Relic's test programs) at -O0 and -O2, x86-64 and
 AArch64, against Ghidra, angr, RetDec, radare2 and LIEF. Method, every number and the caveats:
-[docs/benchmarks.md](docs/benchmarks.md).
+[docs/benchmarks.md](docs/benchmarks.md). In short: Relic finds the functions most accurately of
+the code analysers, faster than angr and Ghidra, and its pseudocode is the most often valid C
+and the most often *right* (run against the original), with the best types. Ghidra's decompiler
+is faster per function, and angr's output keeps the data flow closest to the source.
 
 ![Function detection F1 by build: Relic 0.995–1.000 in every build; angr 0.89–0.97; Ghidra 0.98 at -O0 and 0.73–0.79 at -O2; radare2 0.73–0.90; LIEF 0.998 with .eh_frame and 0.018 without](docs/benchmarks/detection-f1.svg)
 
